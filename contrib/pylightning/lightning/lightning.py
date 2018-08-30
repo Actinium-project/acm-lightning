@@ -331,13 +331,14 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("listpeers", payload)
 
-    def fundchannel(self, node_id, satoshi):
+    def fundchannel(self, node_id, satoshi, feerate=None):
         """
         Fund channel with {id} using {satoshi} satoshis"
         """
         payload = {
             "id": node_id,
-            "satoshi": satoshi
+            "satoshi": satoshi,
+            "feerate": feerate
         }
         return self.call("fundchannel", payload)
 
@@ -404,14 +405,15 @@ class LightningRpc(UnixDomainSocketRpc):
         """
         return self.call("dev-memleak")
 
-    def withdraw(self, destination, satoshi):
+    def withdraw(self, destination, satoshi, feerate=None):
         """
         Send to {destination} address {satoshi} (or "all")
         amount via Bitcoin transaction
         """
         payload = {
             "destination": destination,
-            "satoshi": satoshi
+            "satoshi": satoshi,
+            "feerate": feerate
         }
         return self.call("withdraw", payload)
 
