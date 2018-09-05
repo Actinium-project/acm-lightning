@@ -1,5 +1,6 @@
 #include "json.h"
 #include <arpa/inet.h>
+#include <ccan/mem/mem.h>
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
 #include <common/json.h>
@@ -91,19 +92,30 @@ void json_add_txid(struct json_result *result, const char *fieldname,
 	json_add_string(result, fieldname, hex);
 }
 
+bool json_tok_array(struct command *cmd, const char *name,
+		    const char *buffer, const jsmntok_t *tok,
+		    const jsmntok_t **arr)
+{
+	if (tok->type == JSMN_ARRAY)
+		return (*arr = tok);
+
+	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+		     "'%s' should be an array, not '%.*s'",
+		     name, tok->end - tok->start, buffer + tok->start);
+	return false;
+}
+
 bool json_tok_bool(struct command *cmd, const char *name,
 		   const char *buffer, const jsmntok_t *tok,
 		   bool **b)
 {
 	*b = tal(cmd, bool);
 	if (tok->type == JSMN_PRIMITIVE) {
-		if (tok->end - tok->start == strlen("true")
-		    && !memcmp(buffer + tok->start, "true", strlen("true"))) {
+		if (memeqstr(buffer + tok->start, tok->end - tok->start, "true")) {
 			**b = true;
 			return true;
 		}
-		if (tok->end - tok->start == strlen("false")
-		    && !memcmp(buffer + tok->start, "false", strlen("false"))) {
+		if (memeqstr(buffer + tok->start, tok->end - tok->start, "false")) {
 			**b = false;
 			return true;
 		}
@@ -119,13 +131,55 @@ bool json_tok_double(struct command *cmd, const char *name,
 		     double **num)
 {
 	*num = tal(cmd, double);
-	if (!json_to_double(buffer, tok, *num)) {
-		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-			     "'%s' should be a double, not '%.*s'",
-			     name, tok->end - tok->start, buffer + tok->start);
-		return false;
+	if (json_to_double(buffer, tok, *num))
+		return true;
+
+	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+		     "'%s' should be a double, not '%.*s'",
+		     name, tok->end - tok->start, buffer + tok->start);
+	return false;
+}
+
+bool json_tok_escaped_string(struct command *cmd, const char *name,
+			     const char * buffer, const jsmntok_t *tok,
+			     const char **str)
+{
+	struct json_escaped *esc = json_to_escaped_string(cmd, buffer, tok);
+	if (esc) {
+		*str = json_escaped_unescape(cmd, esc);
+		if (*str)
+			return true;
 	}
+	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+		     "'%s' should be a string, not '%.*s'"
+		     " (note, we don't allow \\u)",
+		     name,
+		     tok->end - tok->start, buffer + tok->start);
+	return false;
+}
+
+bool json_tok_string(struct command *cmd, const char *name,
+		     const char * buffer, const jsmntok_t *tok,
+		     const char **str)
+{
+	*str = tal_strndup(cmd, buffer + tok->start,
+			   tok->end - tok->start);
 	return true;
+}
+
+bool json_tok_label(struct command *cmd, const char *name,
+		    const char * buffer, const jsmntok_t *tok,
+		    struct json_escaped **label)
+{
+	/* We accept both strings and number literals here. */
+	*label = json_escaped_string_(cmd, buffer + tok->start, tok->end - tok->start);
+	if (*label && (tok->type == JSMN_STRING || json_tok_is_num(buffer, tok)))
+		    return true;
+
+	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+		     "'%s' should be a string or number, not '%.*s'",
+		     name, tok->end - tok->start, buffer + tok->start);
+	return false;
 }
 
 bool json_tok_number(struct command *cmd, const char *name,
@@ -133,13 +187,13 @@ bool json_tok_number(struct command *cmd, const char *name,
 		     unsigned int **num)
 {
 	*num = tal(cmd, unsigned int);
-	if (!json_to_number(buffer, tok, *num)) {
-		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-			     "'%s' should be an integer, not '%.*s'",
-			     name, tok->end - tok->start, buffer + tok->start);
-		return false;
-	}
-	return true;
+	if (json_to_number(buffer, tok, *num))
+		return true;
+
+	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+		     "'%s' should be an integer, not '%.*s'",
+		     name, tok->end - tok->start, buffer + tok->start);
+	return false;
 }
 
 bool json_tok_sha256(struct command *cmd, const char *name,
@@ -158,18 +212,54 @@ bool json_tok_sha256(struct command *cmd, const char *name,
 	return false;
 }
 
+bool json_tok_msat(struct command *cmd, const char *name,
+		   const char *buffer, const jsmntok_t * tok,
+		   u64 **msatoshi_val)
+{
+	if (json_tok_streq(buffer, tok, "any")) {
+		*msatoshi_val = NULL;
+		return true;
+	}
+	*msatoshi_val = tal(cmd, u64);
+
+	if (json_to_u64(buffer, tok, *msatoshi_val) && *msatoshi_val != 0)
+		return true;
+
+	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+		     "'%s' should be a positive number or 'any', not '%.*s'",
+		     name,
+		     tok->end - tok->start,
+		     buffer + tok->start);
+	return false;
+}
+
+bool json_tok_percent(struct command *cmd, const char *name,
+		      const char *buffer, const jsmntok_t *tok,
+		      double **num)
+{
+	*num = tal(cmd, double);
+	if (json_to_double(buffer, tok, *num))
+		if (**num >= 0.0 && **num <= 100.0)
+			return true;
+
+	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+		     "'%s' should be a double in range [0.0, 100.0], not '%.*s'",
+		     name, tok->end - tok->start, buffer + tok->start);
+	return false;
+}
+
 bool json_tok_u64(struct command *cmd, const char *name,
 		  const char *buffer, const jsmntok_t *tok,
 		  uint64_t **num)
 {
 	*num = tal(cmd, uint64_t);
-	if (!json_to_u64(buffer, tok, *num)) {
-		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-			     "'%s' should be an unsigned 64 bit integer, not '%.*s'",
-			     name, tok->end - tok->start, buffer + tok->start);
-		return false;
-	}
-	return true;
+	if (json_to_u64(buffer, tok, *num))
+		return true;
+
+	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+		     "'%s' should be an unsigned 64 bit integer, not '%.*s'",
+		     name, tok->end - tok->start, buffer + tok->start);
+	return false;
 }
 
 bool json_to_pubkey(const char *buffer, const jsmntok_t *tok,
@@ -213,8 +303,7 @@ bool json_tok_short_channel_id(struct command *cmd, const char *name,
 			       struct short_channel_id **scid)
 {
 	*scid = tal(cmd, struct short_channel_id);
-	if (short_channel_id_from_str(buffer + tok->start,
-				      tok->end - tok->start, *scid))
+	if (json_to_short_channel_id(buffer, tok, *scid))
 		return true;
 
 	command_fail(cmd, JSONRPC2_INVALID_PARAMS,

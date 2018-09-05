@@ -61,9 +61,17 @@ struct chan {
 	u64 satoshis;
 };
 
+/* A local channel can exist which isn't announcable. */
 static inline bool is_chan_public(const struct chan *chan)
 {
 	return chan->channel_announce != NULL;
+}
+
+/* A channel is only announced once we have a channel_update to send
+ * with it. */
+static inline bool is_chan_announced(const struct chan *chan)
+{
+	return chan->channel_announcement_index != 0;
 }
 
 static inline bool is_halfchan_defined(const struct half_chan *hc)
@@ -300,9 +308,13 @@ bool routing_add_channel_update(struct routing_state *rstate,
  * Directly add the node being announced to the network view, without verifying
  * it. This must be from a trusted source, e.g., gossip_store. For untrusted
  * sources (peers) please use @see{handle_node_announcement}.
+ *
+ * Populates *unknown_node if it isn't NULL and this returns false to indicate
+ * if failure was due to an unknown node_id.
  */
 bool routing_add_node_announcement(struct routing_state *rstate,
-                                  const u8 *msg TAKES);
+				   const u8 *msg TAKES,
+				   bool *unknown_node);
 
 
 /**

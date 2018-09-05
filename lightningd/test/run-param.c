@@ -413,61 +413,6 @@ static void sendpay_nulltok(void)
 	assert(msatoshi == NULL);
 }
 
-static bool json_tok_msat(struct command *cmd,
-			  const char *name,
-			  const char *buffer,
-			  const jsmntok_t * tok,
-			  u64 **msatoshi_val)
-{
-	if (json_tok_streq(buffer, tok, "any")) {
-		*msatoshi_val = NULL;
-		return true;
-	}
-	*msatoshi_val = tal(cmd, u64);
-
-	if (json_to_u64(buffer, tok, *msatoshi_val) && *msatoshi_val != 0)
-		return true;
-
-	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-		     "'%s' should be a positive number or 'any', not '%.*s'",
-		     name,
-		     tok->end - tok->start,
-		     buffer + tok->start);
-	return false;
-}
-
-/*
- * New version of json_tok_label conforming to advanced style. This can eventually
- * replace the existing json_tok_label.
- */
-static bool json_tok_label_x(struct command *cmd,
-			     const char *name,
-			     const char *buffer,
-			     const jsmntok_t *tok,
-			     struct json_escaped **label)
-{
-	if ((*label = json_tok_escaped_string(cmd, buffer, tok)))
-		return true;
-
-	/* Allow literal numbers */
-	if (tok->type != JSMN_PRIMITIVE)
-		goto fail;
-
-	for (int i = tok->start; i < tok->end; i++)
-		if (!cisdigit(buffer[i]))
-			goto fail;
-
-	if ((*label = json_escaped_string_(cmd, buffer + tok->start,
-					   tok->end - tok->start)))
-		return true;
-
-fail:
-	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-		     "'%s' should be a string or number, not '%.*s'",
-		     name, tok->end - tok->start, buffer + tok->start);
-	return false;
-}
-
 static void advanced(void)
 {
 	{
@@ -479,7 +424,7 @@ static void advanced(void)
 		const jsmntok_t *tok;
 
 		assert(param(cmd, j->buffer, j->toks,
-			     p_req("description", json_tok_label_x, &label),
+			     p_req("description", json_tok_label, &label),
 			     p_req("msat", json_tok_msat, &msat),
 			     p_req("tok", json_tok_tok, &tok),
 			     p_opt("msat_opt1", json_tok_msat, &msat_opt1),
@@ -497,8 +442,8 @@ static void advanced(void)
 		struct json *j = json_parse(cmd, "[ 3 'foo' ]");
 		struct json_escaped *label, *foo;
 		assert(param(cmd, j->buffer, j->toks,
-			      p_req("label", json_tok_label_x, &label),
-			      p_opt("foo", json_tok_label_x, &foo),
+			      p_req("label", json_tok_label, &label),
+			      p_opt("foo", json_tok_label, &foo),
 			      NULL));
 		assert(!strcmp(label->s, "3"));
 		assert(!strcmp(foo->s, "foo"));
@@ -531,6 +476,36 @@ static void advanced_fail(void)
 	}
 }
 
+#define test_cb(cb, T, json_, value, pass) \
+{ \
+	struct json *j = json_parse(cmd, json_); \
+	T *v; \
+	bool ret = cb(cmd, "name", j->buffer, j->toks + 1, &v); \
+	assert(ret == pass); \
+	if (ret) { \
+		assert(v); \
+		assert(*v == value); \
+	} \
+}
+
+static void json_tok_tests(void)
+{
+	test_cb(json_tok_bool, bool, "[ true ]", true, true);
+	test_cb(json_tok_bool, bool, "[ false ]", false, true);
+	test_cb(json_tok_bool, bool, "[ tru ]", false, false);
+	test_cb(json_tok_bool, bool, "[ 1 ]", false, false);
+
+	test_cb(json_tok_percent, double, "[ -0.01 ]", 0, false);
+	test_cb(json_tok_percent, double, "[ 0.00 ]", 0, true);
+	test_cb(json_tok_percent, double, "[ 1 ]", 1, true);
+	test_cb(json_tok_percent, double, "[ 1.1 ]", 1.1, true);
+	test_cb(json_tok_percent, double, "[ 1.01 ]", 1.01, true);
+	test_cb(json_tok_percent, double, "[ 99.99 ]", 99.99, true);
+	test_cb(json_tok_percent, double, "[ 100.0 ]", 100, true);
+	test_cb(json_tok_percent, double, "[ 100.001 ]", 0, false);
+	test_cb(json_tok_percent, double, "[ 1000 ]", 0, false);
+	test_cb(json_tok_percent, double, "[ 'wow' ]", 0, false);
+}
 
 int main(void)
 {
@@ -552,6 +527,7 @@ int main(void)
 	sendpay_nulltok();
 	advanced();
 	advanced_fail();
+	json_tok_tests();
 	tal_free(tmpctx);
 	printf("run-params ok\n");
 }

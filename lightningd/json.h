@@ -16,6 +16,7 @@
 struct bitcoin_txid;
 struct channel_id;
 struct command;
+struct json_escaped;
 struct json_result;
 struct pubkey;
 struct route_hop;
@@ -43,6 +44,11 @@ void json_add_pubkey(struct json_result *response,
 void json_add_txid(struct json_result *result, const char *fieldname,
 		   const struct bitcoin_txid *txid);
 
+/* Extract json array token */
+bool json_tok_array(struct command *cmd, const char *name,
+		    const char *buffer, const jsmntok_t *tok,
+		    const jsmntok_t **arr);
+
 /* Extract boolean this (must be a true or false) */
 bool json_tok_bool(struct command *cmd, const char *name,
 		   const char *buffer, const jsmntok_t *tok,
@@ -53,6 +59,21 @@ bool json_tok_double(struct command *cmd, const char *name,
 		     const char *buffer, const jsmntok_t *tok,
 		     double **num);
 
+/* Extract an escaped string (and unescape it) */
+bool json_tok_escaped_string(struct command *cmd, const char *name,
+			     const char * buffer, const jsmntok_t *tok,
+			     const char **str);
+
+/* Extract a string */
+bool json_tok_string(struct command *cmd, const char *name,
+		     const char * buffer, const jsmntok_t *tok,
+		     const char **str);
+
+/* Extract a label. It is either an escaped string or a number. */
+bool json_tok_label(struct command *cmd, const char *name,
+		    const char * buffer, const jsmntok_t *tok,
+		    struct json_escaped **label);
+
 /* Extract number from this (may be a string, or a number literal) */
 bool json_tok_number(struct command *cmd, const char *name,
 		     const char *buffer, const jsmntok_t *tok,
@@ -62,6 +83,16 @@ bool json_tok_number(struct command *cmd, const char *name,
 bool json_tok_sha256(struct command *cmd, const char *name,
 		     const char *buffer, const jsmntok_t *tok,
 		     struct sha256 **hash);
+
+/* Extract positive integer, or NULL if tok is 'any'. */
+bool json_tok_msat(struct command *cmd, const char *name,
+		   const char *buffer, const jsmntok_t * tok,
+		   u64 **msatoshi_val);
+
+/* Extract double in range [0.0, 100.0] */
+bool json_tok_percent(struct command *cmd, const char *name,
+		      const char *buffer, const jsmntok_t *tok,
+		      double **num);
 
 /* Extract a pubkey from this */
 bool json_to_pubkey(const char *buffer, const jsmntok_t *tok,

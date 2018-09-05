@@ -52,10 +52,10 @@ struct wallet *wallet_new(struct lightningd *ld,
 	wallet->db = db_setup(wallet, log);
 	wallet->log = log;
 	wallet->bip32_base = NULL;
-	wallet->invoices = invoices_new(wallet, wallet->db, log, timers);
 	list_head_init(&wallet->unstored_payments);
 
 	db_begin_transaction(wallet->db);
+	wallet->invoices = invoices_new(wallet, wallet->db, log, timers);
 	outpointfilters_init(wallet);
 	db_commit_transaction(wallet->db);
 	return wallet;
@@ -609,13 +609,26 @@ static struct channel *wallet_stmt2channel(const tal_t *ctx, struct wallet *w, s
 	remote_shutdown_scriptpubkey = sqlite3_column_arr(tmpctx, stmt, 28, u8);
 
 	/* Do we have a last_sent_commit, if yes, populate */
-	if (sqlite3_column_type(stmt, 30) != SQLITE_NULL) {
+	if (sqlite3_column_type(stmt, 41) != SQLITE_NULL) {
+		const u8 *cursor = sqlite3_column_blob(stmt, 41);
+		size_t len = sqlite3_column_bytes(stmt, 41);
+		size_t n = 0;
+		last_sent_commit = tal_arr(tmpctx, struct changed_htlc, n);
+		while (len) {
+			tal_resize(&last_sent_commit, n+1);
+			fromwire_changed_htlc(&cursor, &len,
+					      &last_sent_commit[n++]);
+		}
+	} else
+		last_sent_commit = NULL;
+
+#ifdef COMPAT_V060
+	if (!last_sent_commit && sqlite3_column_type(stmt, 30) != SQLITE_NULL) {
 		last_sent_commit = tal(tmpctx, struct changed_htlc);
 		last_sent_commit->newstate = sqlite3_column_int64(stmt, 30);
 		last_sent_commit->id = sqlite3_column_int64(stmt, 31);
-	} else {
-		last_sent_commit = NULL;
 	}
+#endif
 
 	if (sqlite3_column_type(stmt, 40) != SQLITE_NULL) {
 		future_per_commitment_point = tal(tmpctx, struct pubkey);
@@ -715,7 +728,8 @@ static const char *channel_fields =
     /*30*/ "last_sent_commit_state, last_sent_commit_id, "
     /*32*/ "last_tx, last_sig, last_was_revoke, first_blocknum, "
     /*36*/ "min_possible_feerate, max_possible_feerate, "
-    /*38*/ "msatoshi_to_us_min, msatoshi_to_us_max, future_per_commitment_point ";
+    /*38*/ "msatoshi_to_us_min, msatoshi_to_us_max, future_per_commitment_point, "
+    /*41*/ "last_sent_commit";
 
 bool wallet_channels_load_active(const tal_t *ctx, struct wallet *w)
 {
@@ -893,6 +907,7 @@ u64 wallet_get_channel_dbid(struct wallet *wallet)
 void wallet_channel_save(struct wallet *w, struct channel *chan)
 {
 	sqlite3_stmt *stmt;
+	u8 *last_sent_commit;
 	assert(chan->first_blocknum);
 
 	wallet_channel_config_save(w, &chan->our_config);
@@ -996,17 +1011,23 @@ void wallet_channel_save(struct wallet *w, struct channel *chan)
 	db_exec_prepared(w->db, stmt);
 
 	/* If we have a last_sent_commit, store it */
-	if (chan->last_sent_commit) {
-		stmt = db_prepare(w->db,
-				  "UPDATE channels SET"
-				  "  last_sent_commit_state=?,"
-				  "  last_sent_commit_id=?"
-				  " WHERE id=?");
-		sqlite3_bind_int(stmt, 1, chan->last_sent_commit->newstate);
-		sqlite3_bind_int64(stmt, 2, chan->last_sent_commit->id);
-		sqlite3_bind_int64(stmt, 3, chan->dbid);
-		db_exec_prepared(w->db, stmt);
-	}
+	last_sent_commit = tal_arr(tmpctx, u8, 0);
+	for (size_t i = 0; i < tal_count(chan->last_sent_commit); i++)
+		towire_changed_htlc(&last_sent_commit,
+				    &chan->last_sent_commit[i]);
+
+	stmt = db_prepare(w->db,
+			  "UPDATE channels SET"
+			  "  last_sent_commit=?"
+			  " WHERE id=?");
+	if (tal_count(last_sent_commit))
+		sqlite3_bind_blob(stmt, 1,
+				  last_sent_commit, tal_count(last_sent_commit),
+				  SQLITE_TRANSIENT);
+	else
+		sqlite3_bind_null(stmt, 1);
+	sqlite3_bind_int64(stmt, 2, chan->dbid);
+	db_exec_prepared(w->db, stmt);
 }
 
 void wallet_channel_insert(struct wallet *w, struct channel *chan)
@@ -1383,51 +1404,6 @@ bool wallet_htlcs_load_for_channel(struct wallet *wallet,
 	return ok;
 }
 
-bool wallet_htlcs_reconnect(struct wallet *wallet,
-			    struct htlc_in_map *htlcs_in,
-			    struct htlc_out_map *htlcs_out)
-{
-	struct htlc_in_map_iter ini;
-	struct htlc_out_map_iter outi;
-	struct htlc_in *hin;
-	struct htlc_out *hout;
-
-	for (hout = htlc_out_map_first(htlcs_out, &outi); hout;
-	     hout = htlc_out_map_next(htlcs_out, &outi)) {
-
-		if (hout->origin_htlc_id == 0) {
-			continue;
-		}
-
-		for (hin = htlc_in_map_first(htlcs_in, &ini); hin;
-		     hin = htlc_in_map_next(htlcs_in, &ini)) {
-			if (hout->origin_htlc_id == hin->dbid) {
-				log_debug(wallet->log,
-					  "Found corresponding htlc_in %" PRIu64
-					  " for htlc_out %" PRIu64,
-					  hin->dbid, hout->dbid);
-				hout->in = hin;
-				break;
-			}
-		}
-
-		if (!hout->in) {
-			log_broken(
-			    wallet->log,
-			    "Unable to find corresponding htlc_in %"PRIu64" for htlc_out %"PRIu64,
-			    hout->origin_htlc_id, hout->dbid);
-		}
-
-	}
-	return true;
-}
-
-/* Almost all wallet_invoice_* functions delegate to the
- * appropriate invoices_* function. */
-bool wallet_invoice_load(struct wallet *wallet)
-{
-	return invoices_load(wallet->invoices);
-}
 bool wallet_invoice_create(struct wallet *wallet,
 			   struct invoice *pinvoice,
 			   u64 *msatoshi TAKES,
