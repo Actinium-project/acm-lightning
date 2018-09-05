@@ -35,7 +35,7 @@ endif
 
 ifeq ($(COMPAT),1)
 # We support compatibility with pre-0.6.
-COMPAT_CFLAGS=-DCOMPAT_V052=1
+COMPAT_CFLAGS=-DCOMPAT_V052=1 -DCOMPAT_V060=1
 endif
 
 PYTEST_OPTS := -v -x
@@ -216,7 +216,7 @@ check:
 
 pytest: $(ALL_PROGRAMS)
 ifndef PYTEST
-	@echo "py.test is required to run the integration tests, please install using 'pip3 install -r tests/requirements.txt'"
+	@echo "py.test is required to run the integration tests, please install using 'pip3 install -r tests/requirements.txt', and rerun 'configure'."
 	exit 1
 else
 # Explicitly hand DEVELOPER and VALGRIND so you can override on make cmd line.
@@ -307,7 +307,7 @@ ncc: external/libwally-core/src/libwallycore.la
 
 # Ignore test/ directories.
 TAGS: FORCE
-	$(RM) TAGS; find * -name test -type d -prune -o -name '*.[ch]' -print | xargs etags --append
+	$(RM) TAGS; find * -name test -type d -prune -o -name '*.[ch]' -print -o -name '*.py' -print | xargs etags --append
 FORCE::
 
 ccan/ccan/cdump/tools/cdump-enumstr: ccan/ccan/cdump/tools/cdump-enumstr.o $(CDUMP_OBJS) $(CCAN_OBJS)

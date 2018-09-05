@@ -76,6 +76,8 @@ struct lightningd {
 	/* Are we told to run in the background. */
 	bool daemon;
 
+	int pid_fd;
+
 	/* Our config dir, and rpc file */
 	char *config_dir;
 
@@ -205,7 +207,7 @@ struct lightningd {
 const struct chainparams *get_chainparams(const struct lightningd *ld);
 
 /* Check we can run subdaemons, and check their versions */
-void test_daemons(const struct lightningd *ld);
+void test_subdaemons(const struct lightningd *ld);
 
 /* Notify lightningd about new blocks. */
 void notify_new_block(struct lightningd *ld, u32 block_height);

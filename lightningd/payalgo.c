@@ -596,40 +596,24 @@ static void json_pay_stop_retrying(struct pay *pay)
 	json_pay_failure(pay, sr);
 }
 
-/* Extract double in range [0.0, 100.0] */
-static bool json_tok_percent(struct command *cmd, const char *name,
-			     const char *buffer, const jsmntok_t *tok,
-			     double **num)
-{
-	*num = tal(cmd, double);
-	if (json_to_double(buffer, tok, *num))
-		if (**num >= 0.0 && **num >= 100.0)
-			return true;
-
-	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-		     "'%s' should be a double in range [0.0, 100.0], not '%.*s'",
-		     name, tok->end - tok->start, buffer + tok->start);
-	return false;
-}
-
 static void json_pay(struct command *cmd,
 		     const char *buffer, const jsmntok_t *params)
 {
-	const jsmntok_t *bolt11tok, *desctok;
 	double *riskfactor;
 	double *maxfeepercent;
 	u64 *msatoshi;
 	struct pay *pay = tal(cmd, struct pay);
 	struct bolt11 *b11;
-	char *fail, *b11str, *desc;
+	const char *b11str, *desc;
+	char *fail;
 	unsigned int *retryfor;
 	unsigned int *maxdelay;
 	unsigned int *exemptfee;
 
 	if (!param(cmd, buffer, params,
-		   p_req("bolt11", json_tok_tok, &bolt11tok),
+		   p_req("bolt11", json_tok_string, &b11str),
 		   p_opt("msatoshi", json_tok_u64, &msatoshi),
-		   p_opt("description", json_tok_tok, &desctok),
+		   p_opt("description", json_tok_string, &desc),
 		   p_opt_def("riskfactor", json_tok_double, &riskfactor, 1.0),
 		   p_opt_def("maxfeepercent", json_tok_percent, &maxfeepercent, 0.5),
 		   p_opt_def("retry_for", json_tok_number, &retryfor, 60),
@@ -638,14 +622,6 @@ static void json_pay(struct command *cmd,
 		   p_opt_def("exemptfee", json_tok_number, &exemptfee, 5000),
 		   NULL))
 		return;
-
-	b11str = tal_strndup(cmd, buffer + bolt11tok->start,
-			     bolt11tok->end - bolt11tok->start);
-	if (desctok)
-		desc = tal_strndup(cmd, buffer + desctok->start,
-				   desctok->end - desctok->start);
-	else
-		desc = NULL;
 
 	b11 = bolt11_decode(pay, b11str, desc, &fail);
 	if (!b11) {

@@ -945,84 +945,46 @@ static void json_sendpay_on_resolve(const struct sendpay_result* r,
 static void json_sendpay(struct command *cmd,
 			 const char *buffer, const jsmntok_t *params)
 {
-	const jsmntok_t *routetok, *desctok;
+	const jsmntok_t *routetok;
 	const jsmntok_t *t, *end;
 	size_t n_hops;
 	struct sha256 *rhash;
 	struct route_hop *route;
 	u64 *msatoshi;
-	const struct json_escaped *desc;
 	const char *description;
 
 	if (!param(cmd, buffer, params,
-		   p_req("route", json_tok_tok, &routetok),
+		   p_req("route", json_tok_array, &routetok),
 		   p_req("payment_hash", json_tok_sha256, &rhash),
-		   p_opt("description", json_tok_tok, &desctok),
+		   p_opt("description", json_tok_escaped_string, &description),
 		   p_opt("msatoshi", json_tok_u64, &msatoshi),
 		   NULL))
 		return;
-
-	if (routetok->type != JSMN_ARRAY) {
-		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-			     "'%.*s' is not an array",
-			     routetok->end - routetok->start,
-			     buffer + routetok->start);
-		return;
-	}
 
 	end = json_next(routetok);
 	n_hops = 0;
 	route = tal_arr(cmd, struct route_hop, n_hops);
 
 	for (t = routetok + 1; t < end; t = json_next(t)) {
-		/* FIXME: Use param() to handle parsing each route? -- @wythe */
-		const jsmntok_t *amttok, *idtok, *delaytok, *chantok;
+		u64 *amount;
+		struct pubkey *id;
+		struct short_channel_id *channel;
+		unsigned *delay;
 
-		if (t->type != JSMN_OBJECT) {
-			command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				     "Route %zu '%.*s' is not an object",
-				     n_hops,
-				     t->end - t->start,
-				     buffer + t->start);
+		if (!param(cmd, buffer, t,
+			   p_req("msatoshi", json_tok_u64, &amount),
+			   p_req("id", json_tok_pubkey, &id),
+			   p_req("delay", json_tok_number, &delay),
+			   p_req("channel", json_tok_short_channel_id, &channel),
+			   NULL))
 			return;
-		}
-		amttok = json_get_member(buffer, t, "msatoshi");
-		idtok = json_get_member(buffer, t, "id");
-		delaytok = json_get_member(buffer, t, "delay");
-		chantok = json_get_member(buffer, t, "channel");
-		if (!amttok || !idtok || !delaytok || !chantok) {
-			command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				     "Route %zu needs msatoshi/id/channel/delay",
-				     n_hops);
-			return;
-		}
 
 		tal_resize(&route, n_hops + 1);
 
-		/* What that hop will forward */
-		if (!json_to_u64(buffer, amttok, &route[n_hops].amount)) {
-			command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				     "Route %zu invalid msatoshi",
-				     n_hops);
-			return;
-		}
-
-		if (!json_to_short_channel_id(buffer, chantok,
-					      &route[n_hops].channel_id)) {
-			command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				     "Route %zu invalid channel_id", n_hops);
-			return;
-		}
-		if (!json_to_pubkey(buffer, idtok, &route[n_hops].nodeid)) {
-			command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				     "Route %zu invalid id", n_hops);
-			return;
-		}
-		if (!json_to_number(buffer, delaytok, &route[n_hops].delay)) {
-			command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				     "Route %zu invalid delay", n_hops);
-			return;
-		}
+		route[n_hops].amount = *amount;
+		route[n_hops].nodeid = *id;
+		route[n_hops].delay = *delay;
+		route[n_hops].channel_id = *channel;
 		n_hops++;
 	}
 
@@ -1044,28 +1006,6 @@ static void json_sendpay(struct command *cmd,
 				     *msatoshi);
 			return;
 		}
-	}
-
-	if (desctok) {
-		desc = json_tok_escaped_string(cmd, buffer, desctok);
-		if (!desc) {
-			command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				     "description '%.*s' not a string",
-				     desctok->end - desctok->start,
-				     buffer + desctok->start);
-			return;
-		}
-		description = json_escaped_unescape(cmd, desc);
-		if (description == NULL) {
-			command_fail(
-			    cmd, JSONRPC2_INVALID_PARAMS,
-			    "description '%.*s' not a valid escaped string",
-			    desctok->end - desctok->start,
-			    buffer + desctok->start);
-			return;
-		}
-	} else {
-		description = NULL;
 	}
 
 	if (send_payment(cmd, cmd->ld, rhash, route,
@@ -1121,28 +1061,26 @@ static void json_listpayments(struct command *cmd, const char *buffer,
 {
 	const struct wallet_payment **payments;
 	struct json_result *response = new_json_result(cmd);
-	const jsmntok_t *bolt11tok, *rhashtok;
-	struct sha256 *rhash = NULL;
+	struct sha256 *rhash;
+	const char *b11str;
 
 	if (!param(cmd, buffer, params,
-		   p_opt("bolt11", json_tok_tok, &bolt11tok),
-		   p_opt("payment_hash", json_tok_tok, &rhashtok),
+		   p_opt("bolt11", json_tok_string, &b11str),
+		   p_opt("payment_hash", json_tok_sha256, &rhash),
 		   NULL))
 		return;
 
-	if (rhashtok && bolt11tok) {
+	if (rhash && b11str) {
 		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 			     "Can only specify one of"
 			     " {bolt11} or {payment_hash}");
 		return;
 	}
 
-	if (bolt11tok) {
+	if (b11str) {
 		struct bolt11 *b11;
-		char *b11str, *fail;
+		char *fail;
 
-		b11str = tal_strndup(cmd, buffer + bolt11tok->start,
-				     bolt11tok->end - bolt11tok->start);
 		b11 = bolt11_decode(cmd, b11str, NULL, &fail);
 		if (!b11) {
 			command_fail(cmd, JSONRPC2_INVALID_PARAMS,
@@ -1150,17 +1088,6 @@ static void json_listpayments(struct command *cmd, const char *buffer,
 			return;
 		}
 		rhash = &b11->payment_hash;
-	} else if (rhashtok) {
-		rhash = tal(cmd, struct sha256);
-		if (!hex_decode(buffer + rhashtok->start,
-				rhashtok->end - rhashtok->start,
-				rhash, sizeof(*rhash))) {
-			command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				     "'%.*s' is not a valid sha256 hash",
-				     rhashtok->end - rhashtok->start,
-				     buffer + rhashtok->start);
-			return;
-		}
 	}
 
 	payments = wallet_payment_list(cmd, cmd->ld->wallet, rhash);
