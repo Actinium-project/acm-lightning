@@ -662,7 +662,7 @@ static const char* segwit_addr_net_decode(int *witness_version,
 				   size_t *witness_program_len,
 				   const char *addrz)
 {
-	const char *network[] = { "bc", "tb", "bcrt" };
+	const char *network[] = { "bc", "tb", "bcrt", "acm", "tacm" };
 	for (int i = 0; i < sizeof(network) / sizeof(*network); ++i) {
 		if (segwit_addr_decode(witness_version,
 				       witness_program, witness_program_len,
