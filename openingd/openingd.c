@@ -353,9 +353,10 @@ static u8 *funder_channel(struct state *state,
 
 	temporary_channel_id(&state->channel_id);
 
-	if (state->funding_satoshis > MAX_FUNDING_SATOSHI)
+	if (state->funding_satoshis > state->chainparams->max_funding_satoshi)
 		status_failed(STATUS_FAIL_MASTER_IO,
-			      "funding_satoshis must be < 2^24, not %"PRIu64,
+			      "funding_satoshis must be < %"PRIu64", not %"PRIu64,
+			      state->chainparams->max_funding_satoshi,
 			      state->funding_satoshis);
 
 	/* BOLT #2:
@@ -503,6 +504,7 @@ static u8 *funder_channel(struct state *state,
 	bitcoin_txid(funding, &state->funding_txid);
 
 	state->channel = new_initial_channel(state,
+					     &state->chainparams->genesis_blockhash,
 					     &state->funding_txid,
 					     state->funding_txout,
 					     state->funding_satoshis,
@@ -721,7 +723,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	 *
 	 * The receiving node ... MUST fail the channel if `funding-satoshis`
 	 * is greater than or equal to 2^24 */
-	if (state->funding_satoshis > MAX_FUNDING_SATOSHI) {
+	if (state->funding_satoshis > state->chainparams->max_funding_satoshi) {
 		negotiation_failed(state, false,
 				   "funding_satoshis %"PRIu64" too large",
 				   state->funding_satoshis);
@@ -842,6 +844,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 			    type_to_string(msg, struct channel_id, &id_in));
 
 	state->channel = new_initial_channel(state,
+					     &chain_hash,
 					     &state->funding_txid,
 					     state->funding_txout,
 					     state->funding_satoshis,
@@ -1092,7 +1095,7 @@ int main(int argc, char *argv[])
 	u8 *msg, *inner;
 	struct pollfd pollfd[3];
 	struct state *state = tal(NULL, struct state);
-	u32 network_index;
+	struct bitcoin_blkid chain_hash;
 	struct secret *none;
 
 	subdaemon_setup(argc, argv);
@@ -1101,7 +1104,7 @@ int main(int argc, char *argv[])
 
 	msg = wire_sync_read(tmpctx, REQ_FD);
 	if (!fromwire_opening_init(tmpctx, msg,
-				   &network_index,
+				   &chain_hash,
 				   &state->localconf,
 				   &state->max_to_self_delay,
 				   &state->min_effective_htlc_capacity_msat,
@@ -1122,7 +1125,7 @@ int main(int argc, char *argv[])
 		fail_if_all_error(inner);
 	}
 
-	state->chainparams = chainparams_by_index(network_index);
+	state->chainparams = chainparams_by_chainhash(&chain_hash);
 	/* Initially we're not associated with a channel, but
 	 * handle_peer_gossip_or_error wants this. */
 	memset(&state->channel_id, 0, sizeof(state->channel_id));

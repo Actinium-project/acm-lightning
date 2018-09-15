@@ -75,12 +75,12 @@ LIGHTNINGD_SRC :=				\
 	lightningd/payalgo.c			\
 	lightningd/peer_control.c		\
 	lightningd/peer_htlcs.c			\
+	lightningd/ping.c			\
 	lightningd/subd.c			\
 	lightningd/watch.c
 
 # Source files without corresponding headers
 LIGHTNINGD_SRC_NOHDR :=				\
-	lightningd/ping.c			\
 	lightningd/memdump.c
 
 LIGHTNINGD_OBJS := $(LIGHTNINGD_SRC:.c=.o) $(LIGHTNINGD_SRC_NOHDR:.c=.o)
@@ -100,8 +100,10 @@ LIGHTNINGD_HEADERS_GEN =			\
 
 ALL_GEN_HEADERS += $(LIGHTNINGD_HEADERS_GEN)
 
+include wallet/Makefile
+
 # All together in one convenient var
-LIGHTNINGD_HEADERS = $(LIGHTNINGD_HEADERS_NOGEN) $(LIGHTNINGD_HEADERS_GEN) $(EXTERNAL_HEADERS) $(WIRE_HEADERS) $(BITCOIN_HEADERS) $(COMMON_HEADERS) $(WALLET_LIB_HEADERS) $(LIGHTNINGD_HSM_CLIENT_HEADERS)
+LIGHTNINGD_HEADERS = $(LIGHTNINGD_HEADERS_NOGEN) $(LIGHTNINGD_HEADERS_GEN) $(WALLET_LIB_HEADERS)
 
 $(LIGHTNINGD_OBJS): $(LIGHTNINGD_HEADERS)
 
