@@ -1088,19 +1088,23 @@ def test_fundee_forget_funding_tx_unconfirmed(node_factory, bitcoind):
     # Let blocks settle.
     time.sleep(1)
 
-    # Prevent funder from broadcasting funding tx.
-    l1.bitcoind_cmd_override('exit 1')
+    def mock_sendrawtransaction(r):
+        return {'error': 'sendrawtransaction disabled'}
+
+    # Prevent funder from broadcasting funding tx (any tx really).
+    l1.daemon.rpcproxy.mock_rpc('sendrawtransaction', mock_sendrawtransaction)
+
     # Fund the channel.
     # The process will complete, but funder will be unable
     # to broadcast and confirm funding tx.
     l1.rpc.fundchannel(l2.info['id'], 10**6)
-    # Prevent l1 from timing out bitcoin-cli.
-    l1.bitcoind_cmd_remove_override()
+
     # Generate blocks until unconfirmed.
     bitcoind.generate_block(blocks)
 
     # fundee will forget channel!
     l2.daemon.wait_for_log('Forgetting channel: It has been {} blocks'.format(blocks))
+
     # fundee will also forget and disconnect from peer.
     assert len(l2.rpc.listpeers(l1.info['id'])['peers']) == 0
 
@@ -1108,8 +1112,11 @@ def test_fundee_forget_funding_tx_unconfirmed(node_factory, bitcoind):
 @unittest.skipIf(not DEVELOPER, "needs dev_fail")
 def test_no_fee_estimate(node_factory, bitcoind, executor):
     l1 = node_factory.get_node(start=False)
-    l1.bitcoind_cmd_override(cmd='estimatesmartfee',
-                             failscript="""echo '{ "errors": [ "Insufficient data or no feerate found" ], "blocks": 0 }'; exit 0""")
+
+    # Fail any fee estimation requests until we allow them further down
+    l1.daemon.rpcproxy.mock_rpc('estimatesmartfee', {
+        'error': {"errors": ["Insufficient data or no feerate found"], "blocks": 0}
+    })
     l1.start()
 
     l2 = node_factory.get_node()

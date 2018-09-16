@@ -4,17 +4,16 @@ import random
 import re
 import shutil
 import sqlite3
-import stat
 import string
 import subprocess
 import threading
 import time
 
+from btcproxy import BitcoinRpcProxy
 from bitcoin.rpc import RawProxy as BitcoinProxy
 from decimal import Decimal
 from ephemeral_port_reserve import reserve
 from lightning import LightningRpc
-
 
 BITCOIND_CONFIG = {
     "regtest": 1,
@@ -233,7 +232,8 @@ class SimpleBitcoinProxy:
         # Create a callable to do the actual call
         proxy = BitcoinProxy(btc_conf_file=self.__btc_conf_file__)
 
-        f = lambda *args: proxy._call(name, *args)
+        def f(*args):
+            return proxy._call(name, *args)
 
         # Make debuggers show <function bitcoin.rpc.name> rather than <function
         # bitcoin.rpc.<lambda>>
@@ -286,21 +286,24 @@ class BitcoinD(TailableProc):
 
 
 class LightningD(TailableProc):
-    def __init__(self, lightning_dir, bitcoin_dir, port=9735, random_hsm=False, node_id=0):
+    def __init__(self, lightning_dir, bitcoind, port=9735, random_hsm=False, node_id=0):
         TailableProc.__init__(self, lightning_dir)
         self.lightning_dir = lightning_dir
         self.port = port
         self.cmd_prefix = []
         self.disconnect_file = None
 
+        self.rpcproxy = BitcoinRpcProxy(bitcoind)
+
         self.opts = LIGHTNINGD_CONFIG.copy()
         opts = {
-            'bitcoin-datadir': bitcoin_dir,
             'lightning-dir': lightning_dir,
             'addr': '127.0.0.1:{}'.format(port),
             'allow-deprecated-apis': 'false',
             'network': 'regtest',
             'ignore-fee-limits': 'false',
+            'bitcoin-rpcuser': BITCOIND_CONFIG['rpcuser'],
+            'bitcoin-rpcpassword': BITCOIND_CONFIG['rpcpassword'],
         }
 
         for k, v in opts.items():
@@ -341,6 +344,9 @@ class LightningD(TailableProc):
         return self.cmd_prefix + ['lightningd/lightningd'] + opts
 
     def start(self):
+        self.rpcproxy.start()
+
+        self.opts['bitcoin-rpcport'] = self.rpcproxy.rpcport
         TailableProc.start(self)
         self.wait_for_log("Server started with public key")
         logging.info("LightningD started")
@@ -352,6 +358,7 @@ class LightningD(TailableProc):
         not return before the timeout triggers.
         """
         self.proc.wait(timeout)
+        self.rpcproxy.stop()
         return self.proc.returncode
 
 
@@ -592,31 +599,30 @@ class LightningNode(object):
         # wait for sendpay to comply
         self.rpc.waitsendpay(rhash)
 
-    def bitcoind_cmd_override(self, failscript='exit 1', cmd=None):
-        # Create and rename, for atomicity.
-        f = os.path.join(self.daemon.lightning_dir, "bitcoin-cli-fail.tmp")
-        with open(f, "w") as text_file:
-            text_file.write(failscript)
-        os.chmod(f, os.stat(f).st_mode | stat.S_IEXEC)
-        if cmd:
-            failfile = "bitcoin-cli-fail-{}".format(cmd)
-        else:
-            failfile = "bitcoin-cli-fail"
-        os.rename(f, os.path.join(self.daemon.lightning_dir, failfile))
-
-    def bitcoind_cmd_remove_override(self, cmd=None):
-        if cmd:
-            failfile = "bitcoin-cli-fail-{}".format(cmd)
-        else:
-            failfile = "bitcoin-cli-fail"
-        os.remove(os.path.join(self.daemon.lightning_dir, failfile))
-
     # Note: this feeds through the smoother in update_feerate, so changing
     # it on a running daemon may not give expected result!
     def set_feerates(self, feerates, wait_for_effect=True):
         # (bitcoind returns bitcoin per kb, so these are * 4)
-        self.bitcoind_cmd_override("""case "$*" in *2\ CONSERVATIVE*) FEERATE={};; *4\ ECONOMICAL*) FEERATE={};; *100\ ECONOMICAL*) FEERATE={};; *) exit 98;; esac; echo '{{ "feerate": '$(printf 0.%08u $FEERATE)' }}'; exit 0""".format(feerates[0] * 4, feerates[1] * 4, feerates[2] * 4),
-                                   'estimatesmartfee')
+
+        def mock_estimatesmartfee(r):
+            params = r['params']
+            if params == [2, 'CONSERVATIVE']:
+                feerate = feerates[0] * 4
+            elif params == [4, 'ECONOMICAL']:
+                feerate = feerates[1] * 4
+            elif params == [100, 'ECONOMICAL']:
+                feerate = feerates[2] * 4
+            else:
+                raise ValueError()
+            return {
+                'id': r['id'],
+                'error': None,
+                'result': {
+                    'feerate': Decimal(feerate) / 10**8
+                },
+            }
+        self.daemon.rpcproxy.mock_rpc('estimatesmartfee', mock_estimatesmartfee)
+
         if wait_for_effect:
             self.daemon.wait_for_log('Feerate estimate for .* set to')
 
@@ -673,7 +679,9 @@ class NodeFactory(object):
 
         return [j.result() for j in jobs]
 
-    def get_node(self, disconnect=None, options=None, may_fail=False, may_reconnect=False, random_hsm=False, feerates=(15000, 7500, 3750), start=True, fake_bitcoin_cli=False, log_all_io=False):
+    def get_node(self, disconnect=None, options=None, may_fail=False,
+                 may_reconnect=False, random_hsm=False,
+                 feerates=(15000, 7500, 3750), start=True, log_all_io=False):
         with self.lock:
             node_id = self.next_id
             self.next_id += 1
@@ -687,7 +695,7 @@ class NodeFactory(object):
 
         socket_path = os.path.join(lightning_dir, "lightning-rpc").format(node_id)
         daemon = LightningD(
-            lightning_dir, self.bitcoind.bitcoin_dir,
+            lightning_dir, self.bitcoind,
             port=port, random_hsm=random_hsm, node_id=node_id
         )
         # If we have a disconnect string, dump it to a file for daemon.
@@ -709,17 +717,6 @@ class NodeFactory(object):
                 daemon.env["LIGHTNINGD_DEV_NO_BACKTRACE"] = "1"
             if not may_reconnect:
                 daemon.opts["dev-no-reconnect"] = None
-
-        cli = os.path.join(lightning_dir, "fake-bitcoin-cli")
-        with open(cli, "w") as text_file:
-            text_file.write('#! /bin/sh\n'
-                            '! [ -x bitcoin-cli-fail ] || exec ./bitcoin-cli-fail "$@"\n'
-                            'for a in "$@"; do\n'
-                            '\t! [ -x bitcoin-cli-fail-"$a" ] || exec ./bitcoin-cli-fail-"$a" "$@"\n'
-                            'done\n'
-                            'exec bitcoin-cli "$@"\n')
-        os.chmod(cli, os.stat(cli).st_mode | stat.S_IEXEC)
-        daemon.opts['bitcoin-cli'] = cli
 
         if options is not None:
             daemon.opts.update(options)

@@ -1,5 +1,5 @@
 from concurrent import futures
-from utils import NodeFactory
+from utils import NodeFactory, BitcoinD
 
 import logging
 import os
@@ -8,7 +8,6 @@ import re
 import shutil
 import sys
 import tempfile
-import utils
 
 
 with open('config.vars') as configfile:
@@ -69,7 +68,7 @@ def test_name(request):
 
 @pytest.fixture
 def bitcoind(directory):
-    bitcoind = utils.BitcoinD(bitcoin_dir=directory, rpcport=None)
+    bitcoind = BitcoinD(bitcoin_dir=directory)
     try:
         bitcoind.start()
     except Exception:
