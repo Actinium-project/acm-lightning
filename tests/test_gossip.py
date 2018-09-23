@@ -1,9 +1,10 @@
 from fixtures import *  # noqa: F401,F403
-from utils import wait_for
+from utils import wait_for, TIMEOUT, only_one
 
 import json
 import logging
 import os
+import struct
 import subprocess
 import time
 import unittest
@@ -821,11 +822,7 @@ def test_gossip_store_load(node_factory):
     """Make sure we can read canned gossip store"""
     l1 = node_factory.get_node(start=False)
     with open(os.path.join(l1.daemon.lightning_dir, 'gossip_store'), 'wb') as f:
-        f.write(bytearray.fromhex("02"  # GOSSIP_VERSION
-                                  "00000099"  # len
-                                  "12abbbba"  # csum
-                                  "1002"  # WIRE_GOSSIP_STORE_NODE_ANNOUNCEMENT
-                                  "00950101cf5d870bc7ecabcb7cd16898ef66891e5f0c6c5851bd85b670f03d325bc44d7544d367cd852e18ec03f7f4ff369b06860a3b12b07b29f36fb318ca11348bf8ec00005aab817c03f113414ebdc6c1fb0f33c99cd5a1d09dd79e7fdf2468cf1fe1af6674361695d23974b250757a7a6c6549544300000000000000000000000000000000000000000000000007010566933e2607"
+        f.write(bytearray.fromhex("03"  # GOSSIP_VERSION
                                   "000001bc"  # len
                                   "521ef598"  # csum
                                   "1000"  # WIRE_GOSSIP_STORE_CHANNEL_ANNOUNCEMENT
@@ -833,9 +830,85 @@ def test_gossip_store_load(node_factory):
                                   "00000086"  # len
                                   "88c703c8"  # csum
                                   "1001"  # WIRE_GOSSIP_STORE_CHANNEL_UPDATE
-                                  "008201021ea7c2eadf8a29eb8690511a519b5656e29aa0a853771c4e38e65c5abf43d907295a915e69e451f4c7a0c3dc13dd943cfbe3ae88c0b96667cd7d58955dbfedcf43497fd7f826957108f4a30fd9cec3aeba79972084e90ead01ea33090000000013a63c0000b500015b8d9b440000009000000000000003e8000003e800000001"))
+                                  "008201021ea7c2eadf8a29eb8690511a519b5656e29aa0a853771c4e38e65c5abf43d907295a915e69e451f4c7a0c3dc13dd943cfbe3ae88c0b96667cd7d58955dbfedcf43497fd7f826957108f4a30fd9cec3aeba79972084e90ead01ea33090000000013a63c0000b500015b8d9b440000009000000000000003e8000003e800000001"
+                                  "00000099"  # len
+                                  "12abbbba"  # csum
+                                  "1002"  # WIRE_GOSSIP_STORE_NODE_ANNOUNCEMENT
+                                  "00950101cf5d870bc7ecabcb7cd16898ef66891e5f0c6c5851bd85b670f03d325bc44d7544d367cd852e18ec03f7f4ff369b06860a3b12b07b29f36fb318ca11348bf8ec00005aab817c03f113414ebdc6c1fb0f33c99cd5a1d09dd79e7fdf2468cf1fe1af6674361695d23974b250757a7a6c6549544300000000000000000000000000000000000000000000000007010566933e2607"))
 
     l1.start()
     # May preceed the Started msg waited for in 'start'.
     wait_for(lambda: l1.daemon.is_in_log('gossip_store: Read 1/1/1/0 cannounce/cupdate/nannounce/cdelete from store in 744 bytes'))
     assert not l1.daemon.is_in_log('gossip_store.*truncating')
+
+
+def test_gossipwith(node_factory):
+    l1, l2 = node_factory.line_graph(2, announce=True)
+
+    out = subprocess.run(['devtools/gossipwith',
+                          '--initial-sync',
+                          '--max-messages=5',
+                          '{}@localhost:{}'.format(l1.info['id'], l1.port)],
+                         check=True,
+                         timeout=TIMEOUT, stdout=subprocess.PIPE).stdout
+
+    num_msgs = 0
+    while len(out):
+        l, t = struct.unpack('>HH', out[0:4])
+        # channel_announcement node_announcement or channel_update
+        assert t == 256 or t == 257 or t == 258
+        out = out[2 + l:]
+        num_msgs += 1
+
+    # one channel announcement, two channel_updates, two node announcements.
+    assert num_msgs == 5
+
+
+def test_gossip_notices_close(node_factory, bitcoind):
+    # We want IO logging so we can replay a channel_announce to l1.
+    l1 = node_factory.get_node(options={'log-level': 'io'})
+    l2, l3 = node_factory.line_graph(2)
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    # FIXME: sending SIGUSR1 immediately may kill it before handler installed.
+    l1.daemon.wait_for_log('Handed peer, entering loop')
+    subprocess.run(['kill', '-USR1', l1.subd_pid('openingd')])
+
+    bitcoind.generate_block(5)
+
+    # Make sure l1 learns about channel.
+    wait_for(lambda: len(l1.rpc.listchannels()['channels']) == 2)
+    wait_for(lambda: len(l1.rpc.listnodes()['nodes']) == 2)
+    l1.rpc.disconnect(l2.info['id'])
+
+    # Grab channel_announcement from io logs (ends in ')
+    channel_announcement = l1.daemon.is_in_log('\[IN\] 0100').split(' ')[-1][:-1]
+    channel_update = l1.daemon.is_in_log('\[IN\] 0102').split(' ')[-1][:-1]
+    node_announcement = l1.daemon.is_in_log('\[IN\] 0101').split(' ')[-1][:-1]
+
+    l2.rpc.close(l3.info['id'])
+    wait_for(lambda: only_one(l2.rpc.listpeers(l3.info['id'])['peers'])['channels'][0]['state'] == 'CLOSINGD_COMPLETE')
+    bitcoind.generate_block(1)
+
+    wait_for(lambda: l1.rpc.listchannels()['channels'] == [])
+    wait_for(lambda: l1.rpc.listnodes()['nodes'] == [])
+
+    # FIXME: This is a hack: we should have a framework for canned conversations
+    # This doesn't naturally terminate, so we give it 5 seconds.
+    try:
+        subprocess.run(['devtools/gossipwith',
+                        '{}@localhost:{}'.format(l1.info['id'], l1.port),
+                        channel_announcement,
+                        channel_update,
+                        node_announcement],
+                       timeout=5, stdout=subprocess.PIPE)
+    except subprocess.TimeoutExpired:
+        pass
+
+    # l1 should reject it.
+    assert(l1.rpc.listchannels()['channels'] == [])
+    assert(l1.rpc.listnodes()['nodes'] == [])
+
+    l1.stop()
+    l1.start()
+    assert(l1.rpc.listchannels()['channels'] == [])
+    assert(l1.rpc.listnodes()['nodes'] == [])

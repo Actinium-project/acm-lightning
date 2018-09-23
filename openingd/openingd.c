@@ -23,7 +23,7 @@
 #include <common/version.h>
 #include <common/wire_error.h>
 #include <errno.h>
-#include <hsmd/gen_hsm_client_wire.h>
+#include <hsmd/gen_hsm_wire.h>
 #include <inttypes.h>
 #include <openingd/gen_opening_wire.h>
 #include <poll.h>
@@ -440,7 +440,6 @@ static u8 *funder_channel(struct state *state,
 	/* BOLT #2:
 	 *
 	 * The receiver:
-	 *...
 	 *  - if `minimum_depth` is unreasonably large:
 	 *    - MAY reject the channel.
 	 */
@@ -704,10 +703,9 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 
 	/* BOLT #2:
 	 *
-	 * The receiver:
-	 *  - if the `chain_hash` value, within the `open_channel`, message is
-	 *    set to a hash of a chain that is unknown to the receiver:
-	 *     - MUST reject the channel.
+	 * The receiving node MUST fail the channel if:
+	 *  - the `chain_hash` value is set to a hash of a chain
+	 *  that is unknown to the receiver.
 	 */
 	if (!bitcoin_blkid_eq(&chain_hash,
 			      &state->chainparams->genesis_blockhash)) {
@@ -733,6 +731,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	/* BOLT #2:
 	 *
 	 * The receiving node MUST fail the channel if:
+	 * ...
 	 *   - `push_msat` is greater than `funding_satoshis` * 1000.
 	 */
 	if (state->push_msat > state->funding_satoshis * 1000) {
@@ -1157,10 +1156,11 @@ int main(int argc, char *argv[])
 		 * don't try to service more than one fd per loop. */
 		if (pollfd[0].revents & POLLIN)
 			msg = handle_master_in(state);
-		else if (pollfd[1].revents & POLLIN)
-			handle_gossip_in(state);
 		else if (pollfd[2].revents & POLLIN)
 			msg = handle_peer_in(state);
+		else if (pollfd[1].revents & POLLIN)
+			handle_gossip_in(state);
+
 		clean_tmpctx();
 	}
 

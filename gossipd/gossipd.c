@@ -36,8 +36,7 @@
 #include <gossipd/broadcast.h>
 #include <gossipd/gen_gossip_wire.h>
 #include <gossipd/routing.h>
-#include <hsmd/client.h>
-#include <hsmd/gen_hsm_client_wire.h>
+#include <hsmd/gen_hsm_wire.h>
 #include <inttypes.h>
 #include <lightningd/gossip_msg.h>
 #include <netdb.h>
@@ -1009,7 +1008,11 @@ static u8 *create_channel_update(const tal_t *ctx,
 	secp256k1_ecdsa_signature dummy_sig;
 	u8 *update, *msg;
 	u32 timestamp = time_now().ts.tv_sec;
-	u16 flags;
+	u8 message_flags, channel_flags;
+
+	/* `message_flags` are optional.
+	 * Currently, not set by c-lightning */
+	message_flags = 0;
 
 	/* So valgrind doesn't complain */
 	memset(&dummy_sig, 0, sizeof(dummy_sig));
@@ -1019,15 +1022,16 @@ static u8 *create_channel_update(const tal_t *ctx,
 	    && timestamp == chan->half[direction].last_timestamp)
 		timestamp++;
 
-	flags = direction;
+	channel_flags = direction;
 	if (disable)
-		flags |= ROUTING_FLAGS_DISABLED;
+		channel_flags |= ROUTING_FLAGS_DISABLED;
 
 	update = towire_channel_update(ctx, &dummy_sig,
 				       &rstate->chain_hash,
 				       &chan->scid,
 				       timestamp,
-				       flags, cltv_expiry_delta,
+				       message_flags, channel_flags,
+				       cltv_expiry_delta,
 				       htlc_minimum_msat,
 				       fee_base_msat,
 				       fee_proportional_millionths);
@@ -1056,7 +1060,7 @@ static bool update_redundant(const struct half_chan *hc,
 	if (!is_halfchan_defined(hc))
 		return false;
 
-	return !(hc->flags & ROUTING_FLAGS_DISABLED) == !disable
+	return !(hc->channel_flags & ROUTING_FLAGS_DISABLED) == !disable
 		&& hc->delay == cltv_delta
 		&& hc->htlc_minimum_msat == htlc_minimum_msat
 		&& hc->base_fee == fee_base_msat
@@ -1109,11 +1113,11 @@ static void apply_delayed_local_update(struct local_update *local_update)
 					    &local_update->scid),
 			     local_update->direction,
 			     is_halfchan_defined(hc)
-			     ? (hc->flags & ROUTING_FLAGS_DISABLED ? "DISABLED" : "ACTIVE")
+			     ? (hc->channel_flags & ROUTING_FLAGS_DISABLED ? "DISABLED" : "ACTIVE")
 			     : "UNDEFINED",
 			     hc->last_timestamp,
 			     (u32)time_now().ts.tv_sec,
-			     hc->flags,
+			     hc->channel_flags,
 			     local_update->disable);
 		tal_free(local_update);
 		return;
@@ -1442,7 +1446,8 @@ static void append_half_channel(struct gossip_getchannels_entry **entries,
 	e->source = chan->nodes[idx]->id;
 	e->destination = chan->nodes[!idx]->id;
 	e->satoshis = chan->satoshis;
-	e->flags = c->flags;
+	e->channel_flags = c->channel_flags;
+	e->message_flags = c->message_flags;
 	e->local_disabled = chan->local_disabled;
 	e->public = is_chan_public(chan);
 	e->short_channel_id = chan->scid;
@@ -1768,7 +1773,7 @@ static void gossip_send_keepalive_update(struct routing_state *rstate,
 
 	/* Generate a new update, with up to date timestamp */
 	update = create_channel_update(tmpctx, rstate, chan,
-				       hc->flags & ROUTING_FLAGS_DIRECTION,
+				       hc->channel_flags & ROUTING_FLAGS_DIRECTION,
 				       false,
 				       hc->delay,
 				       hc->htlc_minimum_msat,
@@ -1835,7 +1840,7 @@ static void gossip_disable_outgoing_halfchan(struct daemon *daemon,
 {
 	u8 direction;
 	struct half_chan *hc;
-	u16 flags;
+	u8 message_flags, channel_flags;
 	u32 timestamp;
 	struct bitcoin_blkid chain_hash;
 	secp256k1_ecdsa_signature sig;
@@ -1859,7 +1864,8 @@ static void gossip_disable_outgoing_halfchan(struct daemon *daemon,
 
 	if (!fromwire_channel_update(
 		hc->channel_update, &sig, &chain_hash,
-		&local_update->scid, &timestamp, &flags,
+		&local_update->scid, &timestamp,
+		&message_flags, &channel_flags,
 		&local_update->cltv_delta,
 		&local_update->htlc_minimum_msat,
 		&local_update->fee_base_msat,
@@ -2258,7 +2264,6 @@ int main(int argc, char *argv[])
 	daemon_conn_init(daemon, &daemon->master, STDIN_FILENO, recv_req,
 			 master_gone);
 	status_setup_async(&daemon->master);
-	hsm_setup(HSM_FD);
 	daemon_conn_init(daemon, &daemon->connectd, CONNECTD_FD, connectd_req,
 			 NULL);
 

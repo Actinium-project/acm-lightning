@@ -17,7 +17,7 @@
 #include <errno.h>
 #include <gossipd/gen_gossip_wire.h>
 #include <hsmd/capabilities.h>
-#include <hsmd/gen_hsm_client_wire.h>
+#include <hsmd/gen_hsm_wire.h>
 #include <inttypes.h>
 #include <lightningd/connect_control.h>
 #include <lightningd/gossip_msg.h>
@@ -26,6 +26,7 @@
 #include <lightningd/jsonrpc.h>
 #include <lightningd/jsonrpc_errors.h>
 #include <lightningd/log.h>
+#include <lightningd/options.h>
 #include <lightningd/param.h>
 #include <lightningd/ping.h>
 #include <sodium/randombytes.h>
@@ -148,19 +149,8 @@ void gossip_init(struct lightningd *ld, int connectd_fd)
 {
 	u8 *msg;
 	int hsmfd;
-	u64 capabilities = HSM_CAP_SIGN_GOSSIP;
 
-	msg = towire_hsm_client_hsmfd(tmpctx, &ld->id, 0, capabilities);
-	if (!wire_sync_write(ld->hsm_fd, msg))
-		fatal("Could not write to HSM: %s", strerror(errno));
-
-	msg = wire_sync_read(tmpctx, ld->hsm_fd);
-	if (!fromwire_hsm_client_hsmfd_reply(msg))
-		fatal("Malformed hsmfd response: %s", tal_hex(msg, msg));
-
-	hsmfd = fdpass_recv(ld->hsm_fd);
-	if (hsmfd < 0)
-		fatal("Could not read fd from HSM: %s", strerror(errno));
+	hsmfd = hsm_get_global_fd(ld, HSM_CAP_SIGN_GOSSIP);
 
 	ld->gossip = new_global_subd(ld, "lightning_gossipd",
 				     gossip_wire_type_name, gossip_msg,
@@ -327,7 +317,7 @@ static const struct json_command getroute_command = {
 	json_getroute,
 	"Show route to {id} for {msatoshi}, using {riskfactor} and optional {cltv} (default 9). "
 	"If specified search from {fromid} otherwise use this node as source. "
-	"Randomize the route with up to {fuzzpercent} (0.0 -> 100.0, default 5.0) "
+	"Randomize the route with up to {fuzzpercent} (default 5.0) "
 	"using {seed} as an arbitrary-size string seed."
 };
 AUTODATA(json_command, &getroute_command);
@@ -357,9 +347,13 @@ static void json_listchannels_reply(struct subd *gossip UNUSED, const u8 *reply,
 					       &entries[i].short_channel_id));
 		json_add_bool(response, "public", entries[i].public);
 		json_add_u64(response, "satoshis", entries[i].satoshis);
-		json_add_num(response, "flags", entries[i].flags);
+		json_add_num(response, "message_flags", entries[i].message_flags);
+		json_add_num(response, "channel_flags", entries[i].channel_flags);
+		/* Prior to spec v0891374d47ddffa64c5a2e6ad151247e3d6b7a59, these two were a single u16 field */
+		if (deprecated_apis)
+			json_add_num(response, "flags", ((u16)entries[i].message_flags << 8) | entries[i].channel_flags);
 		json_add_bool(response, "active",
-			      !(entries[i].flags & ROUTING_FLAGS_DISABLED)
+			      !(entries[i].channel_flags & ROUTING_FLAGS_DISABLED)
 			      && !entries[i].local_disabled);
 		json_add_num(response, "last_update",
 			     entries[i].last_update_timestamp);

@@ -8,7 +8,7 @@
 #include <common/status.h>
 #include <common/utils.h>
 #include <errno.h>
-#include <hsmd/gen_hsm_client_wire.h>
+#include <hsmd/gen_hsm_wire.h>
 #include <inttypes.h>
 #include <lightningd/hsm_control.h>
 #include <lightningd/log.h>
@@ -19,7 +19,7 @@
 #include <wally_bip32.h>
 #include <wire/wire_sync.h>
 
-int hsm_get_client_fd(struct lightningd *ld,
+static int hsm_get_fd(struct lightningd *ld,
 		      const struct pubkey *id,
 		      u64 dbid,
 		      int capabilities)
@@ -27,7 +27,6 @@ int hsm_get_client_fd(struct lightningd *ld,
 	int hsm_fd;
 	u8 *msg;
 
-	assert(dbid);
 	msg = towire_hsm_client_hsmfd(NULL, id, dbid, capabilities);
 	if (!wire_sync_write(ld->hsm_fd, take(msg)))
 		fatal("Could not write to HSM: %s", strerror(errno));
@@ -42,6 +41,40 @@ int hsm_get_client_fd(struct lightningd *ld,
 	return hsm_fd;
 }
 
+int hsm_get_client_fd(struct lightningd *ld,
+		      const struct pubkey *id,
+		      u64 dbid,
+		      int capabilities)
+{
+	assert(dbid);
+
+	return hsm_get_fd(ld, id, dbid, capabilities);
+}
+
+int hsm_get_global_fd(struct lightningd *ld, int capabilities)
+{
+	return hsm_get_fd(ld, &ld->id, 0, capabilities);
+}
+
+static unsigned int hsm_msg(struct subd *hsmd,
+			    const u8 *msg, const int *fds UNUSED)
+{
+	/* We only expect one thing from the HSM that's not a STATUS message */
+	struct pubkey client_id;
+	u8 *bad_msg;
+	char *desc;
+
+	if (!fromwire_hsmstatus_client_bad_request(tmpctx, msg, &client_id,
+						   &desc, &bad_msg))
+		fatal("Bad status message from hsmd: %s", tal_hex(tmpctx, msg));
+
+	/* This should, of course, never happen. */
+	log_broken(hsmd->log, "client %s %s (request %s)",
+		   type_to_string(tmpctx, struct pubkey, &client_id),
+		   desc, tal_hex(tmpctx, bad_msg));
+	return 0;
+}
+
 void hsm_init(struct lightningd *ld)
 {
 	u8 *msg;
@@ -51,7 +84,9 @@ void hsm_init(struct lightningd *ld)
 	if (socketpair(AF_LOCAL, SOCK_STREAM, 0, fds) != 0)
 		err(1, "Could not create hsm socketpair");
 
-	ld->hsm = new_global_subd(ld, "lightning_hsmd", NULL, NULL,
+	ld->hsm = new_global_subd(ld, "lightning_hsmd",
+				  hsm_wire_type_name,
+				  hsm_msg,
 				  take(&fds[1]), NULL);
 	if (!ld->hsm)
 		err(1, "Could not subd hsm");

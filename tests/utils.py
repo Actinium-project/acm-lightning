@@ -557,7 +557,7 @@ class LightningNode(object):
 
     def is_channel_active(self, chanid):
         channels = self.rpc.listchannels()['channels']
-        active = [(c['short_channel_id'], c['flags']) for c in channels if c['active']]
+        active = [(c['short_channel_id'], c['channel_flags']) for c in channels if c['active']]
         return (chanid, 0) in active and (chanid, 1) in active
 
     def wait_for_channel_onchain(self, peerid):
@@ -627,8 +627,24 @@ class LightningNode(object):
             }
         self.daemon.rpcproxy.mock_rpc('estimatesmartfee', mock_estimatesmartfee)
 
+        # Technically, this waits until it's called, not until it's processed.
+        # We wait until all three levels have been called.
         if wait_for_effect:
-            self.daemon.wait_for_log('Feerate estimate for .* set to')
+            wait_for(lambda: self.daemon.rpcproxy.mock_counts['estimatesmartfee'] >= 3)
+
+    def wait_for_onchaind_broadcast(self, name, resolve=None):
+        """Wait for onchaind to drop tx name to resolve (if any)"""
+        if resolve:
+            r = self.daemon.wait_for_log('Broadcasting {} .* to resolve {}'
+                                         .format(name, resolve))
+        else:
+            r = self.daemon.wait_for_log('Broadcasting {} .* to resolve '
+                                         .format(name))
+
+        rawtx = re.search('.* \(([0-9a-fA-F]*)\) ', r).group(1)
+        txid = self.bitcoin.rpc.decoderawtransaction(rawtx, True)['txid']
+
+        wait_for(lambda: txid in self.bitcoin.rpc.getrawmempool())
 
 
 class NodeFactory(object):

@@ -31,7 +31,11 @@ struct half_chan {
 
 	/* Flags as specified by the `channel_update`s, among other
 	 * things indicated direction wrt the `channel_id` */
-	u16 flags;
+	u8 channel_flags;
+
+	/* Flags as specified by the `channel_update`s, indicates
+	 * optional fields.  */
+	u8 message_flags;
 
 	/* If greater than current time, this connection should not
 	 * be used for routing. */
@@ -81,7 +85,7 @@ static inline bool is_halfchan_defined(const struct half_chan *hc)
 
 static inline bool is_halfchan_enabled(const struct half_chan *hc)
 {
-	return is_halfchan_defined(hc) && !(hc->flags & ROUTING_FLAGS_DISABLED);
+	return is_halfchan_defined(hc) && !(hc->channel_flags & ROUTING_FLAGS_DISABLED);
 }
 
 struct node {
@@ -308,13 +312,9 @@ bool routing_add_channel_update(struct routing_state *rstate,
  * Directly add the node being announced to the network view, without verifying
  * it. This must be from a trusted source, e.g., gossip_store. For untrusted
  * sources (peers) please use @see{handle_node_announcement}.
- *
- * Populates *unknown_node if it isn't NULL and this returns false to indicate
- * if failure was due to an unknown node_id.
  */
 bool routing_add_node_announcement(struct routing_state *rstate,
-				   const u8 *msg TAKES,
-				   bool *unknown_node);
+                                  const u8 *msg TAKES);
 
 
 /**
