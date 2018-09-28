@@ -1,3 +1,4 @@
+#include <ccan/array_size/array_size.h>
 #include <ccan/asort/asort.h>
 #include <ccan/build_assert/build_assert.h>
 #include <ccan/cast/cast.h>
@@ -84,7 +85,7 @@ struct daemon {
 	/* Global features to list in node_announcement. */
 	u8 *globalfeatures;
 
-	u8 alias[33];
+	u8 alias[32];
 	u8 rgb[3];
 
 	/* What we can actually announce. */
@@ -338,13 +339,49 @@ static void send_node_announcement(struct daemon *daemon)
 			      tal_hex(tmpctx, err));
 }
 
+/* Return true if the only change would be the timestamp. */
+static bool node_announcement_redundant(struct daemon *daemon)
+{
+	struct node *n = get_node(daemon->rstate, &daemon->id);
+	if (!n)
+		return false;
+
+	if (n->last_timestamp == -1)
+		return false;
+
+	if (tal_count(n->addresses) != tal_count(daemon->announcable))
+		return false;
+
+	for (size_t i = 0; i < tal_count(n->addresses); i++)
+		if (!wireaddr_eq(&n->addresses[i], &daemon->announcable[i]))
+			return false;
+
+	BUILD_ASSERT(ARRAY_SIZE(daemon->alias) == ARRAY_SIZE(n->alias));
+	if (!memeq(daemon->alias, ARRAY_SIZE(daemon->alias),
+		   n->alias, ARRAY_SIZE(n->alias)))
+		return false;
+
+	BUILD_ASSERT(ARRAY_SIZE(daemon->rgb) == ARRAY_SIZE(n->rgb_color));
+	if (!memeq(daemon->rgb, ARRAY_SIZE(daemon->rgb),
+		   n->rgb_color, ARRAY_SIZE(n->rgb_color)))
+		return false;
+
+	if (!memeq(daemon->globalfeatures, tal_count(daemon->globalfeatures),
+		   n->gfeatures, tal_count(n->gfeatures)))
+		return false;
+
+	return true;
+}
+
 /* Should we announce our own node? */
 static void maybe_send_own_node_announce(struct daemon *daemon)
 {
 	if (!daemon->rstate->local_channel_announced)
 		return;
 
-	/* FIXME: We may not need to retransmit here, if previous still valid. */
+	if (node_announcement_redundant(daemon))
+		return;
+
 	send_node_announcement(daemon);
 	daemon->rstate->local_channel_announced = false;
 }
@@ -1410,8 +1447,10 @@ static void append_node(const struct gossip_getnodes_entry ***nodes,
 	} else {
 		new->last_timestamp = n->last_timestamp;
 		new->addresses = n->addresses;
-		new->alias = n->alias;
-		memcpy(new->color, n->rgb_color, 3);
+		BUILD_ASSERT(ARRAY_SIZE(new->alias) == ARRAY_SIZE(n->alias));
+		BUILD_ASSERT(ARRAY_SIZE(new->color) == ARRAY_SIZE(n->rgb_color));
+		memcpy(new->alias, n->alias, ARRAY_SIZE(new->alias));
+		memcpy(new->color, n->rgb_color, ARRAY_SIZE(new->color));
 	}
 	*tal_arr_expand(nodes) = new;
 }
@@ -1802,6 +1841,10 @@ static struct io_plan *gossip_init(struct daemon_conn *master,
 
 	/* Now disable all local channels, they can't be connected yet. */
 	gossip_disable_local_channels(daemon);
+
+	/* If that announced channels, we can announce ourselves (options
+	 * or addresses might have changed!) */
+	maybe_send_own_node_announce(daemon);
 
 	new_reltimer(&daemon->timers, daemon,
 		     time_from_sec(daemon->rstate->prune_timeout/4),
