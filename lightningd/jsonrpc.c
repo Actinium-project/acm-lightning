@@ -62,7 +62,7 @@ static void json_help(struct command *cmd,
 static const struct json_command help_command = {
 	"help",
 	json_help,
-	"List available commands, or give verbose help on one command.",
+	"List available commands, or give verbose help on one {command}.",
 
 	.verbose = "help [command]\n"
 	"Without [command]:\n"
@@ -77,6 +77,9 @@ static void json_stop(struct command *cmd,
 		      const char *buffer UNUSED, const jsmntok_t *params UNUSED)
 {
 	struct json_result *response = new_json_result(cmd);
+
+	if (!param(cmd, buffer, params, NULL))
+		return;
 
 	/* This can't have closed yet! */
 	cmd->jcon->stop = true;
@@ -121,6 +124,9 @@ AUTODATA(json_command, &dev_rhash_command);
 static void json_crash(struct command *cmd UNUSED,
 		       const char *buffer UNUSED, const jsmntok_t *params UNUSED)
 {
+	if (!param(cmd, buffer, params, NULL))
+		return;
+
 	fatal("Crash at user request");
 }
 
@@ -136,6 +142,9 @@ static void json_getinfo(struct command *cmd,
 			 const char *buffer UNUSED, const jsmntok_t *params UNUSED)
 {
 	struct json_result *response = new_json_result(cmd);
+
+	if (!param(cmd, buffer, params, NULL))
+		return;
 
 	json_object_start(response, NULL);
 	json_add_pubkey(response, "id", &cmd->ld->id);
@@ -187,7 +196,10 @@ static void json_help(struct command *cmd,
 	struct json_result *response = new_json_result(cmd);
 	struct json_command **cmdlist = get_cmdlist();
 	const jsmntok_t *cmdtok;
+	char *usage;
 
+	/* FIXME: This is never called with a command parameter because lightning-cli
+	 * attempts to launch the man page and then exits. */
 	if (!param(cmd, buffer, params,
 		   p_opt("command", json_tok_tok, &cmdtok),
 		   NULL))
@@ -222,11 +234,15 @@ static void json_help(struct command *cmd,
 		return;
 	}
 
+	cmd->mode = CMD_USAGE;
 	json_array_start(response, "help");
 	for (i = 0; i < num_cmdlist; i++) {
+		cmdlist[i]->dispatch(cmd, NULL, NULL);
+		usage = tal_fmt(cmd, "%s %s", cmdlist[i]->name,
+			cmd->usage);
 		json_add_object(response,
 				"command", JSMN_STRING,
-				cmdlist[i]->name,
+				usage,
 				"description", JSMN_STRING,
 				cmdlist[i]->description,
 				NULL);
@@ -273,6 +289,8 @@ static void connection_complete_ok(struct json_connection *jcon,
 {
 	assert(id != NULL);
 	assert(result != NULL);
+	if (cmd->ok)
+		*(cmd->ok) = true;
 
 	/* This JSON is simple enough that we build manually */
 	json_done(jcon, cmd, take(tal_fmt(jcon,
@@ -300,6 +318,9 @@ static void connection_complete_error(struct json_connection *jcon,
 		data_str = "";
 
 	assert(id != NULL);
+
+	if (cmd->ok)
+		*(cmd->ok) = false;
 
 	json_done(jcon, cmd, take(tal_fmt(tmpctx,
 					  "{ \"jsonrpc\": \"2.0\", "
@@ -442,6 +463,8 @@ static void parse_request(struct json_connection *jcon, const jsmntok_t tok[])
 	c->id = tal_strndup(c,
 			    json_tok_contents(jcon->buffer, id),
 			    json_tok_len(id));
+	c->mode = CMD_NORMAL;
+	c->ok = NULL;
 	list_add(&jcon->commands, &c->list);
 	tal_add_destructor(c, destroy_cmd);
 

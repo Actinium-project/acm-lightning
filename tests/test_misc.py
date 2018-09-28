@@ -622,7 +622,7 @@ def test_cli(node_factory):
                                    .format(l1.daemon.lightning_dir),
                                    'help']).decode('utf-8')
     # Test some known output.
-    assert 'help\n    List available commands, or give verbose help on one command' in out
+    assert 'help [command]\n    List available commands, or give verbose help on one {command}' in out
 
     # Test JSON output.
     out = subprocess.check_output(['cli/lightning-cli',
@@ -947,8 +947,8 @@ def test_logging(node_factory):
     wait_for(check_new_log)
 
 
-@unittest.skipIf(VALGRIND and not DEVELOPER,
-                 "Backtrace upsets valgrind: only suppressed in DEVELOPER mode")
+@unittest.skipIf(VALGRIND,
+                 "Valgrind sometimes fails assert on injected SEGV")
 def test_crashlog(node_factory):
     l1 = node_factory.get_node(may_fail=True)
 

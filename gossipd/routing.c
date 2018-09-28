@@ -291,7 +291,6 @@ struct chan *new_chan(struct routing_state *rstate,
 {
 	struct chan *chan = tal(rstate, struct chan);
 	int n1idx = pubkey_idx(id1, id2);
-	size_t n;
 	struct node *n1, *n2;
 
 	/* We should never add a channel twice */
@@ -314,12 +313,8 @@ struct chan *new_chan(struct routing_state *rstate,
 	chan->satoshis = satoshis;
 	chan->local_disabled = false;
 
-	n = tal_count(n2->chans);
-	tal_resize(&n2->chans, n+1);
-	n2->chans[n] = chan;
-	n = tal_count(n1->chans);
-	tal_resize(&n1->chans, n+1);
-	n1->chans[n] = chan;
+	*tal_arr_expand(&n2->chans) = chan;
+	*tal_arr_expand(&n1->chans) = chan;
 
 	/* Populate with (inactive) connections */
 	init_half_chan(rstate, chan, n1idx);
@@ -753,11 +748,16 @@ bool routing_add_channel_announcement(struct routing_state *rstate,
 	/* Channel is now public. */
 	chan->channel_announce = tal_dup_arr(chan, u8, msg, tal_count(msg), 0);
 
-	/* Clear any private updates: new updates will trigger broadcast of
-	 * this channel_announce. */
-	for (size_t i = 0; i < ARRAY_SIZE(chan->half); i++)
-		chan->half[i].channel_update
-			= tal_free(chan->half[i].channel_update);
+	/* Apply any private updates. */
+	for (size_t i = 0; i < ARRAY_SIZE(chan->half); i++) {
+		const u8 *update = chan->half[i].channel_update;
+		if (!update)
+			continue;
+
+		/* Remove from channel, otherwise it will be freed! */
+		chan->half[i].channel_update = NULL;
+		routing_add_channel_update(rstate, take(update));
+	}
 
 	return true;
 }
@@ -1055,7 +1055,6 @@ bool routing_add_channel_update(struct routing_state *rstate,
 	struct bitcoin_blkid chain_hash;
 	struct chan *chan;
 	u8 direction;
-	bool have_broadcast_announce;
 
 	if (!fromwire_channel_update(update, &signature, &chain_hash,
 				     &short_channel_id, &timestamp,
@@ -1066,10 +1065,6 @@ bool routing_add_channel_update(struct routing_state *rstate,
 	chan = get_channel(rstate, &short_channel_id);
 	if (!chan)
 		return false;
-
-	/* We broadcast announce once we have one update */
-	have_broadcast_announce = is_halfchan_defined(&chan->half[0])
-		|| is_halfchan_defined(&chan->half[1]);
 
 	direction = channel_flags & 0x1;
 	set_connection_values(chan, direction, fee_base_msat,
@@ -1093,7 +1088,7 @@ bool routing_add_channel_update(struct routing_state *rstate,
 	 *   - MUST consider whether to send the `channel_announcement` after
 	 *     receiving the first corresponding `channel_update`.
 	 */
-	if (!have_broadcast_announce)
+	if (chan->channel_announcement_index == 0)
 		add_channel_announce_to_broadcast(rstate, chan, timestamp);
 
 	persistent_broadcast(rstate, chan->half[direction].channel_update,
@@ -1101,7 +1096,7 @@ bool routing_add_channel_update(struct routing_state *rstate,
 	return true;
 }
 
-u8 *handle_channel_update(struct routing_state *rstate, const u8 *update,
+u8 *handle_channel_update(struct routing_state *rstate, const u8 *update TAKES,
 			  const char *source)
 {
 	u8 *serialized;
@@ -1252,7 +1247,6 @@ static struct wireaddr *read_addresses(const tal_t *ctx, const u8 *ser)
 	const u8 *cursor = ser;
 	size_t len = tal_count(ser);
 	struct wireaddr *wireaddrs = tal_arr(ctx, struct wireaddr, 0);
-	int numaddrs = 0;
 
 	while (cursor && len) {
 		struct wireaddr wireaddr;
@@ -1278,9 +1272,7 @@ static struct wireaddr *read_addresses(const tal_t *ctx, const u8 *ser)
 			break;
 		}
 
-		tal_resize(&wireaddrs, numaddrs+1);
-		wireaddrs[numaddrs] = wireaddr;
-		numaddrs++;
+		*tal_arr_expand(&wireaddrs) = wireaddr;
 	}
 	return wireaddrs;
 }

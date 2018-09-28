@@ -23,10 +23,7 @@ static bool param_add(struct param **params,
 	if (!(name && cbx && arg))
 		return false;
 #endif
-	struct param *last;
-
-	tal_resize(params, tal_count(*params) + 1);
-	last = &(*params)[tal_count(*params) - 1];
+	struct param *last = tal_arr_expand(params);
 
 	last->is_set = false;
 	last->name = name;
@@ -223,13 +220,28 @@ static bool check_params(struct param *params)
 }
 #endif
 
+static char *param_usage(const tal_t *ctx,
+			 const struct param *params)
+{
+	char *usage = tal_strdup(ctx, "");
+	for (size_t i = 0; i < tal_count(params); i++) {
+		if (i != 0)
+			tal_append_fmt(&usage, " ");
+		if (params[i].required)
+			tal_append_fmt(&usage, "%s", params[i].name);
+		else
+			tal_append_fmt(&usage, "[%s]", params[i].name);
+	}
+	return usage;
+}
+
 static bool param_arr(struct command *cmd, const char *buffer,
 		      const jsmntok_t tokens[],
 		      struct param *params)
 {
 #if DEVELOPER
 	if (!check_params(params)) {
-		command_fail(cmd, PARAM_DEV_ERROR, "developer error");
+		command_fail(cmd, PARAM_DEV_ERROR, "developer error: check_params");
 		return false;
 	}
 #endif
@@ -256,12 +268,18 @@ bool param(struct command *cmd, const char *buffer,
 		param_cbx cbx = va_arg(ap, param_cbx);
 		void *arg = va_arg(ap, void *);
 		if  (!param_add(&params, name, required, cbx, arg)) {
-			command_fail(cmd, PARAM_DEV_ERROR, "developer error");
+			command_fail(cmd, PARAM_DEV_ERROR,
+				     "developer error: param_add %s", name);
 			va_end(ap);
 			return false;
 		}
 	}
 	va_end(ap);
+
+	if (cmd->mode == CMD_USAGE) {
+		cmd->usage = param_usage(cmd, params);
+		return false;
+	}
 
 	return param_arr(cmd, buffer, tokens, params);
 }

@@ -10,6 +10,14 @@ struct bitcoin_txid;
 struct wireaddr;
 struct wallet_tx;
 
+/* The command mode tells param() how to process. */
+enum command_mode {
+	/* Normal command processing */
+	CMD_NORMAL,
+	/* Create command usage string, nothing else. */
+	CMD_USAGE
+};
+
 /* Context for a command (from JSON, but might outlive the connection!)
  * You can allocate off this for temporary objects. */
 struct command {
@@ -25,6 +33,11 @@ struct command {
 	struct json_connection *jcon;
 	/* Have we been marked by command_still_pending?  For debugging... */
 	bool pending;
+	/* Tell param() how to process the command */
+	enum command_mode mode;
+	/* This is created if mode is CMD_USAGE */
+	const char *usage;
+	bool *ok;
 };
 
 struct json_connection {
@@ -89,8 +102,7 @@ enum address_parse_result {
 /* Return result of address parsing and fills in *scriptpubkey
  * allocated off ctx if ADDRESS_PARSE_SUCCESS
  */
-enum address_parse_result
-json_tok_address_scriptpubkey(const tal_t *ctx,
+enum address_parse_result json_tok_address_scriptpubkey(const tal_t *ctx,
 			      const struct chainparams *chainparams,
 			      const char *buffer,
 			      const jsmntok_t *tok, const u8 **scriptpubkey);

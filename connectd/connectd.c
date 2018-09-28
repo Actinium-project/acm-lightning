@@ -1,3 +1,12 @@
+/*~ Welcome to the connect daemon: maintainer of connectivity!
+ *
+ * This is another separate daemon which is responsible for reaching out to
+ * other peers, and also accepting their incoming connections.  It talks to
+ * them for just long enough to validate their identity using a cryptographic
+ * handshake, then receive and send supported feature sets; then it hands them
+ * up to lightningd which will fire up a specific per-peer daemon to talk to
+ * it.
+ */
 #include <ccan/asort/asort.h>
 #include <ccan/build_assert/build_assert.h>
 #include <ccan/cast/cast.h>
@@ -13,7 +22,6 @@
 #include <ccan/noerr/noerr.h>
 #include <ccan/take/take.h>
 #include <ccan/tal/str/str.h>
-#include <ccan/timer/timer.h>
 #include <common/bech32.h>
 #include <common/bech32_util.h>
 #include <common/cryptomsg.h>
@@ -24,7 +32,6 @@
 #include <common/pseudorand.h>
 #include <common/status.h>
 #include <common/subdaemon.h>
-#include <common/timeout.h>
 #include <common/type_to_string.h>
 #include <common/utils.h>
 #include <common/version.h>
@@ -35,6 +42,7 @@
 #include <connectd/gen_connect_wire.h>
 #include <connectd/handshake.h>
 #include <connectd/netaddress.h>
+#include <connectd/peer_exchange_initmsg.h>
 #include <connectd/tor.h>
 #include <connectd/tor_autoservice.h>
 #include <errno.h>
@@ -58,68 +66,77 @@
 #include <wire/wire_sync.h>
 #include <zlib.h>
 
-#define CONNECT_MAX_REACH_ATTEMPTS 10
-
+/*~ We are passed two file descriptors when exec'ed from `lightningd`: the
+ * first is a connection to `hsmd`, which we need for the cryptographic
+ * handshake, and the second is to `gossipd`: it gathers network gossip and
+ * thus may know how to reach certain peers. */
 #define HSM_FD 3
 #define GOSSIPCTL_FD 4
 
+/*~ In C convention, constants are UPPERCASE macros.  Not everything needs to
+ * be a constant, but it soothes the programmer's conscience to encapsulate
+ * arbitrary decisions like these in one place. */
+#define MAX_CONNECT_ATTEMPTS 10
 #define INITIAL_WAIT_SECONDS	1
 #define MAX_WAIT_SECONDS	300
 
-struct listen_fd {
-	int fd;
-	/* If we bind() IPv6 then IPv4 to same port, we *may* fail to listen()
-	 * on the IPv4 socket: under Linux, by default, the IPv6 listen()
-	 * covers IPv4 too.  Normally we'd consider failing to listen on a
-	 * port to be fatal, so we note this when setting up addresses. */
-	bool mayfail;
-};
-
-static const struct pubkey *
-pubkey_keyof(const struct pubkey *pk)
+/*~ We keep a hash table (ccan/htable) of public keys, which tells us what
+ * peers are already connected.  The HTABLE_DEFINE_TYPE() macro needs a
+ * keyof() function to extract the key.  For this simple use case, that's the
+ * identity function: */
+static const struct pubkey *pubkey_keyof(const struct pubkey *pk)
 {
 	return pk;
 }
 
+/*~ We also need to define a hashing function. siphash24 is a fast yet
+ * cryptographic hash in ccan/crypto/siphash24; we might be able to get away
+ * with a slightly faster hash with fewer guarantees, but it's good hygiene to
+ * use this unless it's a proven bottleneck.  siphash_seed() is a function in
+ * common/pseudorand which sets up a seed for our hashing; it's different
+ * every time the program is run. */
 static size_t pubkey_hash(const struct pubkey *id)
 {
 	return siphash24(siphash_seed(), id, sizeof(*id));
 }
 
+/*~ This defines 'struct pubkey_set' which contains 'struct pubkey' pointers. */
 HTABLE_DEFINE_TYPE(struct pubkey,
 		   pubkey_keyof,
 		   pubkey_hash,
 		   pubkey_eq,
 		   pubkey_set);
 
+/*~ This is the global state, like `struct lightningd *ld` in lightningd. */
 struct daemon {
 	/* Who am I? */
 	struct pubkey id;
 
-	/* Peers we know of */
+	/* Peers that we've handed to `lightningd`, which it hasn't told us
+	 * have disconnected. */
 	struct pubkey_set peers;
 
-	/* Peers reconnecting now (waiting for current peer to die). */
-	struct list_head reconnecting;
-
 	/* Peers we are trying to reach */
-	struct list_head reaching;
+	struct list_head connecting;
 
 	/* Connection to main daemon. */
 	struct daemon_conn master;
 
-	struct timers timers;
-
 	/* Local and global features to offer to peers. */
 	u8 *localfeatures, *globalfeatures;
 
-	/* Allow localhost to be considered "public" */
+	/* Allow localhost to be considered "public": DEVELOPER-only option,
+	 * but for simplicity we don't #if DEVELOPER-wrap it here. */
 	bool dev_allow_localhost;
 
+	/* We support use of a SOCKS5 proxy (e.g. Tor) */
 	struct addrinfo *proxyaddr;
+
+	/* They can tell us we must use proxy even for non-Tor addresses. */
 	bool use_proxy_always;
 
-	/* @see lightningd.config.use_dns */
+	/* There are DNS seeds we can use to look up node addresses as a last
+	 * resort, but doing so leaks our address so can be disabled. */
 	bool use_dns;
 
 	/* The address that the broken response returns instead of
@@ -130,9 +147,10 @@ struct daemon {
 	struct listen_fd *listen_fds;
 };
 
-/* Peers we're trying to reach. */
-struct reaching {
-	/* daemon->reaching */
+/* Peers we're trying to reach: we iterate through addrs until we succeed
+ * or fail. */
+struct connecting {
+	/* daemon->connecting */
 	struct list_node list;
 
 	struct daemon *daemon;
@@ -157,63 +175,14 @@ struct reaching {
 	u32 seconds_waited;
 };
 
-/* This is a transitory structure: we hand off to the master daemon as soon
- * as we've completed INIT read/write. */
-struct peer {
-	/* For reconnecting peers, this is in daemon->reconnecting. */
-	struct list_node list;
+/*~ C programs should generally be written bottom-to-top, with the root
+ * function at the bottom, and functions it calls above it.  That avoids
+ * us having to pre-declare functions; but in the case of mutual recursion
+ * pre-declarations are necessary (also, sometimes we do it to avoid making
+ * a patch hard to review with gratuitous reorganizations). */
+static void try_connect_one_addr(struct connecting *connect);
 
-	struct daemon *daemon;
-
-	/* The ID of the peer */
-	struct pubkey id;
-
-	/* Where it's connected to. */
-	struct wireaddr_internal addr;
-
-	/* Feature bitmaps. */
-	u8 *gfeatures, *lfeatures;
-
-	/* Cryptostate */
-	struct peer_crypto_state pcs;
-
-	/* Our connection (and owner) */
-	struct io_conn *conn;
-};
-
-/* Mutual recursion */
-static void try_reach_one_addr(struct reaching *reach);
-
-static struct peer *find_reconnecting_peer(struct daemon *daemon,
-					   const struct pubkey *id)
-{
-	struct peer *peer;
-
-	list_for_each(&daemon->reconnecting, peer, list)
-		if (pubkey_eq(&peer->id, id))
-			return peer;
-	return NULL;
-}
-
-static void destroy_reconnecting_peer(struct peer *peer)
-{
-	list_del_from(&peer->daemon->reconnecting, &peer->list);
-	/* This is safe even if we're being destroyed because of peer->conn,
-	 * since tal_free protects against loops. */
-	io_close(peer->conn);
-}
-
-static void add_reconnecting_peer(struct daemon *daemon, struct peer *peer)
-{
-	/* Drop any previous connecting peer */
-	tal_free(find_reconnecting_peer(peer->daemon, &peer->id));
-
-	list_add_tail(&daemon->reconnecting, &peer->list);
-	tal_add_destructor(peer, destroy_reconnecting_peer);
-}
-
-/**
- * Some ISP resolvers will reply with a dummy IP to queries that would otherwise
+/*~ Some ISP resolvers will reply with a dummy IP to queries that would otherwise
  * result in an NXDOMAIN reply. This just checks whether we have one such
  * resolver upstream and remembers its reply so we can try to filter future
  * dummies out.
@@ -222,275 +191,256 @@ static bool broken_resolver(struct daemon *daemon)
 {
 	struct addrinfo *addrinfo;
 	struct addrinfo hints;
-	char *hostname = "nxdomain-test.doesntexist";
+	const char *hostname = "nxdomain-test.doesntexist";
 	int err;
+
+	/* If they told us to never do DNS queries, don't even do this one */
+	if (!daemon->use_dns) {
+		daemon->broken_resolver_response = NULL;
+		return false;
+	}
+
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_STREAM;
 	hints.ai_protocol = 0;
 	hints.ai_flags = AI_ADDRCONFIG;
 	err = getaddrinfo(hostname, tal_fmt(tmpctx, "%d", 42),
-			      &hints, &addrinfo);
+			  &hints, &addrinfo);
 
-	daemon->broken_resolver_response =
-	    tal_free(daemon->broken_resolver_response);
-
+	/*~ Note the use of tal_dup here: it is a memdup for tal, but it's
+	 * type-aware so it's less error-prone. */
 	if (err == 0) {
-		daemon->broken_resolver_response = tal_dup(daemon, struct sockaddr, addrinfo->ai_addr);
+		daemon->broken_resolver_response
+			= tal_dup(daemon, struct sockaddr, addrinfo->ai_addr);
 		freeaddrinfo(addrinfo);
-	}
+	} else
+		daemon->broken_resolver_response = NULL;
 
-	return 	daemon->broken_resolver_response != NULL;
+	return daemon->broken_resolver_response != NULL;
 }
 
-static struct peer *new_peer(struct io_conn *conn,
-			     struct daemon *daemon,
-			     const struct pubkey *their_id,
-			     const struct wireaddr_internal *addr,
-			     const struct crypto_state *cs)
+/*~ Here we see our first tal destructor: in this case the 'struct connect'
+ * simply removes itself from the list of all 'connect' structs. */
+static void destroy_connecting(struct connecting *connect)
 {
-	struct peer *peer = tal(conn, struct peer);
-
-	peer->conn = conn;
-	peer->id = *their_id;
-	peer->addr = *addr;
-	peer->daemon = daemon;
-	init_peer_crypto_state(peer, &peer->pcs);
-	peer->pcs.cs = *cs;
-
-	return peer;
+	/*~ We don't *need* the list_head here; `list_del(&connect->list)`
+	 * would work.  But we have access to it, and `list_del_from()` is
+	 * clearer for readers, and also does a very brief sanity check that
+	 * the list isn't already empty which catches a surprising number of
+	 * bugs!  (If CCAN_LIST_DEBUG were defined, it would perform a
+	 * complete list traverse to check it was in the list before
+	 * deletion). */
+	list_del_from(&connect->daemon->connecting, &connect->list);
 }
 
-static void destroy_reaching(struct reaching *reach)
+/*~ Most simple search functions start with find_; in this case, search
+ * for an existing attempt to connect the given peer id. */
+static struct connecting *find_connecting(struct daemon *daemon,
+					  const struct pubkey *id)
 {
-	list_del_from(&reach->daemon->reaching, &reach->list);
-}
+	struct connecting *i;
 
-static struct reaching *find_reaching(struct daemon *daemon,
-				      const struct pubkey *id)
-{
-	struct reaching *r;
-
-	list_for_each(&daemon->reaching, r, list)
-		if (pubkey_eq(id, &r->id))
-			return r;
+	/*~ Note the pubkey_eq function: this is generally preferred over
+	 * doing a memcmp() manually, as it is both typesafe and can handle
+	 * any padding which the C compiler is allowed to insert between
+	 * members (unnecessary here, as there's no padding in a `struct
+	 * pubkey`). */
+	list_for_each(&daemon->connecting, i, list)
+		if (pubkey_eq(id, &i->id))
+			return i;
 	return NULL;
 }
 
-static void reached_peer(struct peer *peer, struct io_conn *conn)
+/*~ Once we've connected, we disable the callback which would cause us to
+ * to try the next address. */
+static void connected_to_peer(struct daemon *daemon,
+			      struct io_conn *conn,
+			      const struct pubkey *id)
 {
-	/* OK, we've reached the peer successfully, tell everyone. */
-	struct reaching *r = find_reaching(peer->daemon, &peer->id);
-
-	if (!r)
-		return;
-
 	/* Don't call destroy_io_conn */
 	io_set_finish(conn, NULL, NULL);
 
-	/* Don't free conn with reach */
-	tal_steal(peer->daemon, conn);
-	tal_free(r);
+	/* We allocate 'conn' as a child of 'connect': we don't want to free
+	 * it just yet though.  tal_steal() it onto the permanent 'daemon'
+	 * struct. */
+	tal_steal(daemon, conn);
+
+	/* Now free the 'connecting' struct. */
+	tal_free(find_connecting(daemon, id));
 }
 
-static int get_gossipfd(struct peer *peer)
+/*~ Every per-peer daemon needs a connection to the gossip daemon; this allows
+ * it to forward gossip to/from the peer.  The gossip daemon needs to know a
+ * few of the features of the peer and its id (for reporting).
+ *
+ * The 'localfeatures' is a field in the `init` message, indicating properties
+ * when you're connected to it like we are: there are also 'globalfeatures'
+ * which specify requirements to route a payment through a node. */
+static int get_gossipfd(struct daemon *daemon,
+			const struct pubkey *id,
+			const u8 *localfeatures)
 {
 	bool gossip_queries_feature, initial_routing_sync, success;
 	u8 *msg;
 
+	/*~ The way features generally work is that both sides need to offer it;
+	 * we always offer `gossip_queries`, but this check is explicit. */
 	gossip_queries_feature
-		= feature_offered(peer->lfeatures, LOCAL_GOSSIP_QUERIES)
-		&& feature_offered(peer->daemon->localfeatures,
+		= feature_offered(localfeatures, LOCAL_GOSSIP_QUERIES)
+		&& feature_offered(daemon->localfeatures,
 				   LOCAL_GOSSIP_QUERIES);
-	initial_routing_sync
-		= feature_offered(peer->lfeatures, LOCAL_INITIAL_ROUTING_SYNC);
 
-	/* We do this communication sync. */
-	msg = towire_gossip_new_peer(NULL, &peer->id, gossip_queries_feature,
+	/*~ `initial_routing_sync is supported by every node, since it was in
+	 * the initial lightning specification: it means the peer wants the
+	 * backlog of existing gossip. */
+	initial_routing_sync
+		= feature_offered(localfeatures, LOCAL_INITIAL_ROUTING_SYNC);
+
+	/*~ We do this communication sync, since gossipd is our friend and
+	 * it's easier.  If gossipd fails, we fail. */
+	msg = towire_gossip_new_peer(NULL, id, gossip_queries_feature,
 				     initial_routing_sync);
 	if (!wire_sync_write(GOSSIPCTL_FD, take(msg)))
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Failed writing to gossipctl: %s",
 			      strerror(errno));
 
-	msg = wire_sync_read(peer, GOSSIPCTL_FD);
+	msg = wire_sync_read(tmpctx, GOSSIPCTL_FD);
 	if (!fromwire_gossip_new_peer_reply(msg, &success))
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Failed parsing msg gossipctl: %s",
 			      tal_hex(tmpctx, msg));
+
+	/* Gossipd might run out of file descriptors, so it tell us, and we
+	 * give up on connecting this peer. */
 	if (!success) {
 		status_broken("Gossipd did not give us an fd: losing peer %s",
-			      type_to_string(tmpctx, struct pubkey, &peer->id));
+			      type_to_string(tmpctx, struct pubkey, id));
 		return -1;
 	}
+
+	/* Otherwise, the next thing in the socket will be the file descriptor
+	 * for the per-peer daemon. */
 	return fdpass_recv(GOSSIPCTL_FD);
 }
 
-static struct io_plan *peer_close_after_error(struct io_conn *conn,
-					      struct peer *peer)
-{
-	status_trace("%s: we sent them a fatal error, closing",
-		     type_to_string(tmpctx, struct pubkey, &peer->id));
-	return io_close(conn);
-}
+/*~ This is an ad-hoc marshalling structure where we store arguments so we
+ * can call peer_connected again. */
+struct peer_reconnected {
+	struct daemon *daemon;
+	struct pubkey id;
+	const u8 *peer_connected_msg;
+	const u8 *localfeatures;
+};
 
-/* Mutual recursion */
-static struct io_plan *peer_connected(struct io_conn *conn, struct peer *peer);
+/*~ For simplicity, lightningd only ever deals with a single connection per
+ * peer.  So if we already know about a peer, we tell lightning to disconnect
+ * the old one and retry once it does. */
 static struct io_plan *retry_peer_connected(struct io_conn *conn,
-					    struct peer *peer)
+					    struct peer_reconnected *pr)
 {
+	struct io_plan *plan;
+
+	/*~ As you can see, we've had issues with this code before :( */
 	status_trace("peer %s: processing now old peer gone",
-		     type_to_string(tmpctx, struct pubkey, &peer->id));
+		     type_to_string(tmpctx, struct pubkey, &pr->id));
 
-	/* Clean up reconnecting state, try again */
-	list_del_from(&peer->daemon->reconnecting, &peer->list);
-	tal_del_destructor(peer, destroy_reconnecting_peer);
-
-	return peer_connected(conn, peer);
+	/*~ Usually the pattern is to return this directly, but we have to free
+	 * our temporary structure. */
+	plan = peer_connected(conn, pr->daemon, &pr->id,
+			      take(pr->peer_connected_msg),
+			      take(pr->localfeatures));
+	tal_free(pr);
+	return plan;
 }
 
-static struct io_plan *peer_connected(struct io_conn *conn, struct peer *peer)
+/*~ If we already know about this peer, we tell lightningd and it disconnects
+ * the old one.  We wait until it tells us that's happened. */
+static struct io_plan *peer_reconnected(struct io_conn *conn,
+					struct daemon *daemon,
+					const struct pubkey *id,
+					const u8 *peer_connected_msg TAKES,
+					const u8 *localfeatures TAKES)
 {
-	struct daemon *daemon = peer->daemon;
 	u8 *msg;
+	struct peer_reconnected *r;
+
+	status_trace("peer %s: reconnect",
+		     type_to_string(tmpctx, struct pubkey, id));
+
+	/* Tell master to kill it: will send peer_disconnect */
+	msg = towire_connect_reconnected(NULL, id);
+	daemon_conn_send(&daemon->master, take(msg));
+
+	/* Save arguments for next time. */
+	r = tal(daemon, struct peer_reconnected);
+	r->daemon = daemon;
+	r->id = *id;
+
+	/*~ Note that tal_dup_arr() will do handle the take() of
+	 * peer_connected_msg and localfeatures (turning it into a simply
+	 * tal_steal() in those cases). */
+	r->peer_connected_msg
+		= tal_dup_arr(r, u8, peer_connected_msg,
+			      tal_count(peer_connected_msg), 0);
+	r->localfeatures
+		= tal_dup_arr(r, u8, localfeatures, tal_count(localfeatures), 0);
+
+	/*~ ccan/io supports waiting on an address: in this case, the key in
+	 * the peer set.  When someone calls `io_wake()` on that address, it
+	 * will call retry_peer_connected above. */
+	return io_wait(conn, pubkey_set_get(&daemon->peers, id),
+		       retry_peer_connected, r);
+}
+
+/*~ Note the lack of static: this is called by peer_exchange_initmsg.c once the
+ * INIT messages are exchanged, and also by the retry code above. */
+struct io_plan *peer_connected(struct io_conn *conn,
+			       struct daemon *daemon,
+			       const struct pubkey *id,
+			       const u8 *peer_connected_msg TAKES,
+			       const u8 *localfeatures TAKES)
+{
 	int gossip_fd;
 
-	/* FIXME: We could do this before exchanging init msgs. */
-	if (pubkey_set_get(&daemon->peers, &peer->id)) {
-		status_trace("peer %s: reconnect",
-			     type_to_string(tmpctx, struct pubkey, &peer->id));
+	if (pubkey_set_get(&daemon->peers, id))
+		return peer_reconnected(conn, daemon, id, peer_connected_msg,
+					localfeatures);
 
-		/* Tell master to kill it: will send peer_disconnect */
-		msg = towire_connect_reconnected(NULL, &peer->id);
-		daemon_conn_send(&daemon->master, take(msg));
-		add_reconnecting_peer(daemon, peer);
-		return io_wait(conn, peer, retry_peer_connected, peer);
-	}
+	/* We've successfully connected. */
+	connected_to_peer(daemon, conn, id);
 
-	reached_peer(peer, conn);
+	gossip_fd = get_gossipfd(daemon, id, localfeatures);
 
-	gossip_fd = get_gossipfd(peer);
+	/* We promised we'd take it by marking it TAKEN above; simply free it. */
+	if (taken(localfeatures))
+		tal_free(localfeatures);
+
+	/* If gossipd can't give us a file descriptor, we give up connecting. */
 	if (gossip_fd < 0)
 		return io_close(conn);
 
-	msg = towire_connect_peer_connected(tmpctx, &peer->id, &peer->addr,
-					    &peer->pcs.cs,
-					    peer->gfeatures, peer->lfeatures);
-	daemon_conn_send(&daemon->master, msg);
+	/*~ daemon_conn is a message queue for inter-daemon communication: we
+	 * queue up the `connect_peer_connected` message to tell lightningd
+	 * we have connected, and give the the peer and gossip fds. */
+	daemon_conn_send(&daemon->master, peer_connected_msg);
+	/* io_conn_fd() extracts the fd from ccan/io's io_conn */
 	daemon_conn_send_fd(&daemon->master, io_conn_fd(conn));
 	daemon_conn_send_fd(&daemon->master, gossip_fd);
 
-	pubkey_set_add(&daemon->peers,
-		       tal_dup(daemon, struct pubkey, &peer->id));
+	/*~ Finally, we add it to the set of pubkeys: tal_dup will handle
+	 * take() args for us, by simply tal_steal()ing it. */
+	pubkey_set_add(&daemon->peers, tal_dup(daemon, struct pubkey, id));
 
-	/* This frees the peer. */
+	/*~ We want to free the connection, but not close the fd (which is
+	 * queued to go to lightningd), so use this variation on io_close: */
 	return io_close_taken_fd(conn);
 }
 
-static struct io_plan *peer_init_received(struct io_conn *conn,
-					  struct peer *peer,
-					  u8 *msg)
-{
-	if (!fromwire_init(peer, msg, &peer->gfeatures, &peer->lfeatures)) {
-		status_trace("peer %s bad fromwire_init '%s', closing",
-			     type_to_string(tmpctx, struct pubkey, &peer->id),
-			     tal_hex(tmpctx, msg));
-		return io_close(conn);
-	}
-
-	if (!features_supported(peer->gfeatures, peer->lfeatures)) {
-		const u8 *global_features = get_offered_global_features(msg);
-		const u8 *local_features = get_offered_local_features(msg);
-		msg = towire_errorfmt(NULL, NULL, "Unsupported features %s/%s:"
-				      " we only offer globalfeatures %s"
-				      " and localfeatures %s",
-				      tal_hex(msg, peer->gfeatures),
-				      tal_hex(msg, peer->lfeatures),
-				      tal_hexstr(msg,
-						 global_features,
-						 tal_count(global_features)),
-				      tal_hexstr(msg,
-						 local_features,
-						 tal_count(local_features)));
-		return peer_write_message(conn, &peer->pcs, take(msg),
-					  peer_close_after_error);
-	}
-
-	return peer_connected(conn, peer);
-}
-
-static struct io_plan *read_init(struct io_conn *conn, struct peer *peer)
-{
-	/* BOLT #1:
-	 *
-	 * The receiving node:
-	 *  - MUST wait to receive `init` before sending any other messages.
-	 */
-	return peer_read_message(conn, &peer->pcs, peer_init_received);
-}
-
-/* This creates a temporary peer which is not in the list and is owner
- * by the connection; it's placed in the list and owned by daemon once
- * we have the features. */
-static struct io_plan *init_new_peer(struct io_conn *conn,
-				     const struct pubkey *their_id,
-				     const struct wireaddr_internal *addr,
-				     const struct crypto_state *cs,
-				     struct daemon *daemon)
-{
-	struct peer *peer = new_peer(conn, daemon, their_id, addr, cs);
-	u8 *initmsg;
-
-	/* BOLT #1:
-	 *
-	 * The sending node:
-	 *   - MUST send `init` as the first Lightning message for any
-	 *     connection.
-	 */
-	initmsg = towire_init(NULL,
-			      daemon->globalfeatures, daemon->localfeatures);
-	return peer_write_message(conn, &peer->pcs, take(initmsg), read_init);
-}
-
-static int make_listen_fd(int domain, void *addr, socklen_t len, bool mayfail)
-{
-	int fd = socket(domain, SOCK_STREAM, 0);
-	if (fd < 0) {
-		if (!mayfail)
-			status_failed(STATUS_FAIL_INTERNAL_ERROR,
-				      "Failed to create %u socket: %s",
-				      domain, strerror(errno));
-		status_trace("Failed to create %u socket: %s",
-			     domain, strerror(errno));
-		return -1;
-	}
-
-	if (addr) {
-		int on = 1;
-
-		/* Re-use, please.. */
-		if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)))
-			status_unusual("Failed setting socket reuse: %s",
-				       strerror(errno));
-
-		if (bind(fd, addr, len) != 0) {
-			if (!mayfail)
-				status_failed(STATUS_FAIL_INTERNAL_ERROR,
-					      "Failed to bind on %u socket: %s",
-					      domain, strerror(errno));
-			status_trace("Failed to create %u socket: %s",
-				     domain, strerror(errno));
-			goto fail;
-		}
-	}
-
-	return fd;
-
-fail:
-	close_noerr(fd);
-	return -1;
-}
-
+/*~ handshake.c's handles setting up the crypto state once we get a connection
+ * in; we hand it straight to peer_exchange_initmsg() to send and receive INIT
+ * and call peer_connected(). */
 static struct io_plan *handshake_in_success(struct io_conn *conn,
 					    const struct pubkey *id,
 					    const struct wireaddr_internal *addr,
@@ -499,15 +449,18 @@ static struct io_plan *handshake_in_success(struct io_conn *conn,
 {
 	status_trace("Connect IN from %s",
 		     type_to_string(tmpctx, struct pubkey, id));
-	return init_new_peer(conn, id, addr, cs, daemon);
+	return peer_exchange_initmsg(conn, daemon, cs, id, addr);
 }
 
+/*~ When we get a connection in we set up its network address then call
+ * handshake.c to set up the crypto state. */
 static struct io_plan *connection_in(struct io_conn *conn, struct daemon *daemon)
 {
 	struct wireaddr_internal addr;
 	struct sockaddr_storage s = {};
 	socklen_t len = sizeof(s);
 
+	/* The cast here is a weird Berkeley sockets API feature... */
 	if (getpeername(io_conn_fd(conn), (struct sockaddr *)&s, &len) != 0) {
 		status_trace("Failed to get peername for incoming conn: %s",
 			     strerror(errno));
@@ -535,16 +488,327 @@ static struct io_plan *connection_in(struct io_conn *conn, struct daemon *daemon
 	}
 
 	/* FIXME: Timeout */
+	/*~ The crypto handshake differs depending on whether you received or
+	 * initiated the socket connection, so there are two entry points. */
 	return responder_handshake(conn, &daemon->id, &addr,
 				   handshake_in_success, daemon);
 }
 
+/*~ These are the mirror functions for the connecting-out case. */
+static struct io_plan *handshake_out_success(struct io_conn *conn,
+					     const struct pubkey *id,
+					     const struct wireaddr_internal *addr,
+					     const struct crypto_state *cs,
+					     struct connecting *connect)
+{
+	connect->connstate = "Exchanging init messages";
+	status_trace("Connect OUT to %s",
+		     type_to_string(tmpctx, struct pubkey, id));
+	return peer_exchange_initmsg(conn, connect->daemon, cs, id, addr);
+}
+
+struct io_plan *connection_out(struct io_conn *conn, struct connecting *connect)
+{
+	/* FIXME: Timeout */
+	status_trace("Connected out for %s",
+		     type_to_string(tmpctx, struct pubkey, &connect->id));
+
+	connect->connstate = "Cryptographic handshake";
+	return initiator_handshake(conn, &connect->daemon->id, &connect->id,
+				   &connect->addrs[connect->addrnum],
+				   handshake_out_success, connect);
+}
+
+/*~ When we've exhausted all addresses without success, we come here. */
+static void PRINTF_FMT(5,6)
+	connect_failed(struct daemon *daemon,
+		       const struct pubkey *id,
+		       u32 seconds_waited,
+		       const struct wireaddr_internal *addrhint,
+		       const char *errfmt, ...)
+{
+	u8 *msg;
+	va_list ap;
+	char *err;
+	u32 wait_seconds;
+
+	va_start(ap, errfmt);
+	err = tal_vfmt(tmpctx, errfmt, ap);
+	va_end(ap);
+
+	/* Wait twice as long to reconnect, between min and max. */
+	wait_seconds = seconds_waited * 2;
+	if (wait_seconds > MAX_WAIT_SECONDS)
+		wait_seconds = MAX_WAIT_SECONDS;
+	if (wait_seconds < INITIAL_WAIT_SECONDS)
+		wait_seconds = INITIAL_WAIT_SECONDS;
+
+	/* lightningd may have a connect command waiting to know what
+	 * happened.  We leave it to lightningd to decide if it wants to try
+	 * again, with the wait_seconds as a hint of how long before
+	 * asking. */
+	msg = towire_connectctl_connect_failed(NULL, id, err, wait_seconds,
+					       addrhint);
+	daemon_conn_send(&daemon->master, take(msg));
+
+	status_trace("Failed connected out for %s: %s",
+		     type_to_string(tmpctx, struct pubkey, id),
+		     err);
+}
+
+/*~ This is the destructor for the (unsuccessful) connection.  We accumulate
+ * the errors which occurred, so we can report to lightningd properly in case
+ * they all fail, and try the next address.
+ *
+ * This is a specialized form of destructor which takes an extra argument;
+ * it set up by either the creatively-named tal_add_destructor2(), or by
+ * the ccan/io's io_set_finish() on a connection. */
+static void destroy_io_conn(struct io_conn *conn, struct connecting *connect)
+{
+	/*~ tal_append_fmt appends to a tal string.  It's terribly convenient */
+	tal_append_fmt(&connect->errors,
+		       "%s: %s: %s. ",
+		       type_to_string(tmpctx, struct wireaddr_internal,
+				      &connect->addrs[connect->addrnum]),
+		       connect->connstate, strerror(errno));
+	connect->addrnum++;
+	try_connect_one_addr(connect);
+}
+
+/* This initializes a fresh io_conn by setting it to io_connect to the
+ * destination */
+static struct io_plan *conn_init(struct io_conn *conn,
+				 struct connecting *connect)
+{
+	/*~ I generally dislike the pattern of "set to NULL, assert if NULL at
+	 * bottom".  On -O2 and above the compiler will warn you at compile time
+	 * if a there is a path by which the variable is not set, which is always
+	 * preferable to a runtime assertion.  In this case, it's the best way
+	 * to use the "enum in a switch" trick to make sure we handle all enum
+	 * cases, so I use it. */
+	struct addrinfo *ai = NULL;
+	const struct wireaddr_internal *addr = &connect->addrs[connect->addrnum];
+
+	switch (addr->itype) {
+	case ADDR_INTERNAL_SOCKNAME:
+		ai = wireaddr_internal_to_addrinfo(tmpctx, addr);
+		break;
+	case ADDR_INTERNAL_ALLPROTO:
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Can't connect to all protocols");
+		break;
+	case ADDR_INTERNAL_AUTOTOR:
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Can't connect to autotor address");
+		break;
+	case ADDR_INTERNAL_FORPROXY:
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Can't connect to forproxy address");
+		break;
+	case ADDR_INTERNAL_WIREADDR:
+		/* If it was a Tor address, we wouldn't be here. */
+		ai = wireaddr_to_addrinfo(tmpctx, &addr->u.wireaddr);
+		break;
+	}
+	assert(ai);
+
+	io_set_finish(conn, destroy_io_conn, connect);
+	return io_connect(conn, ai, connection_out, connect);
+}
+
+/* This initializes a fresh io_conn by setting it to io_connect to the
+ * SOCKS proxy, as handled in tor.c. */
+static struct io_plan *conn_proxy_init(struct io_conn *conn,
+				       struct connecting *connect)
+{
+	const char *host = NULL;
+	u16 port;
+	const struct wireaddr_internal *addr = &connect->addrs[connect->addrnum];
+
+	switch (addr->itype) {
+	case ADDR_INTERNAL_FORPROXY:
+		host = addr->u.unresolved.name;
+		port = addr->u.unresolved.port;
+		break;
+	case ADDR_INTERNAL_WIREADDR:
+		host = fmt_wireaddr_without_port(tmpctx, &addr->u.wireaddr);
+		port = addr->u.wireaddr.port;
+		break;
+	case ADDR_INTERNAL_SOCKNAME:
+	case ADDR_INTERNAL_ALLPROTO:
+	case ADDR_INTERNAL_AUTOTOR:
+		break;
+	}
+
+	if (!host)
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Can't connect to %u address", addr->itype);
+
+	io_set_finish(conn, destroy_io_conn, connect);
+	return io_tor_connect(conn, connect->daemon->proxyaddr, host, port,
+			      connect);
+}
+
+/*~ This is the routine which tries to connect. */
+static void try_connect_one_addr(struct connecting *connect)
+{
+ 	int fd, af;
+	bool use_proxy = connect->daemon->use_proxy_always;
+	const struct wireaddr_internal *addr = &connect->addrs[connect->addrnum];
+
+	/* Out of addresses? */
+	if (connect->addrnum == tal_count(connect->addrs)) {
+		connect_failed(connect->daemon, &connect->id,
+			       connect->seconds_waited,
+			       connect->addrhint, "%s", connect->errors);
+		tal_free(connect);
+		return;
+	}
+
+ 	/* Might not even be able to create eg. IPv6 sockets */
+ 	af = -1;
+
+	switch (addr->itype) {
+	case ADDR_INTERNAL_SOCKNAME:
+		af = AF_LOCAL;
+		/* Local sockets don't use tor proxy */
+		use_proxy = false;
+		break;
+	case ADDR_INTERNAL_ALLPROTO:
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Can't connect ALLPROTO");
+	case ADDR_INTERNAL_AUTOTOR:
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Can't connect AUTOTOR");
+	case ADDR_INTERNAL_FORPROXY:
+		use_proxy = true;
+		break;
+	case ADDR_INTERNAL_WIREADDR:
+		switch (addr->u.wireaddr.type) {
+		case ADDR_TYPE_TOR_V2:
+		case ADDR_TYPE_TOR_V3:
+			use_proxy = true;
+			break;
+		case ADDR_TYPE_IPV4:
+			af = AF_INET;
+			break;
+		case ADDR_TYPE_IPV6:
+			af = AF_INET6;
+			break;
+		case ADDR_TYPE_PADDING:
+			break;
+		}
+	}
+
+	/* If we have to use proxy but we don't have one, we fail. */
+	if (use_proxy) {
+		if (!connect->daemon->proxyaddr) {
+			status_debug("Need proxy");
+			af = -1;
+		} else
+			af = connect->daemon->proxyaddr->ai_family;
+	}
+
+	if (af == -1) {
+		fd = -1;
+		errno = EPROTONOSUPPORT;
+	} else
+		fd = socket(af, SOCK_STREAM, 0);
+
+	/* We might not have eg. IPv6 support, or it might be an onion addr
+	 * and we have no proxy. */
+	if (fd < 0) {
+		tal_append_fmt(&connect->errors,
+			       "%s: opening %i socket gave %s. ",
+			       type_to_string(tmpctx, struct wireaddr_internal,
+					      addr),
+			       af, strerror(errno));
+		/* This causes very limited recursion. */
+		connect->addrnum++;
+		try_connect_one_addr(connect);
+		return;
+	}
+
+	/* This creates the new connection using our fd, with the initialization
+	 * function one of the above. */
+	if (use_proxy)
+		io_new_conn(connect, fd, conn_proxy_init, connect);
+	else
+		io_new_conn(connect, fd, conn_init, connect);
+}
+
+/*~ connectd is responsible for incoming connections, but it's the process of
+ * setting up the listening ports which gives us information we need for startup
+ * (such as our own address).  So we perform setup in two phases: first we bind
+ * the sockets according to the command line arguments (if any), then we start
+ * listening for connections to them once lightningd is ready.
+ *
+ * This stores the fds we're going to listen on: */
+struct listen_fd {
+	int fd;
+	/* If we bind() IPv6 then IPv4 to same port, we *may* fail to listen()
+	 * on the IPv4 socket: under Linux, by default, the IPv6 listen()
+	 * covers IPv4 too.  Normally we'd consider failing to listen on a
+	 * port to be fatal, so we note this when setting up addresses. */
+	bool mayfail;
+};
+
 static void add_listen_fd(struct daemon *daemon, int fd, bool mayfail)
 {
-	size_t n = tal_count(daemon->listen_fds);
-	tal_resize(&daemon->listen_fds, n+1);
-	daemon->listen_fds[n].fd = fd;
-	daemon->listen_fds[n].mayfail = mayfail;
+	/*~ utils.h contains a convenience macro tal_arr_expand which
+	 * reallocates a tal_arr to make it one longer, then returns a pointer
+	 * to the (new) last element. */
+	struct listen_fd *l = tal_arr_expand(&daemon->listen_fds);
+	l->fd = fd;
+	l->mayfail = mayfail;
+}
+
+/*~ Helper routine to create and bind a socket of a given type; like many
+ * daemons we set it SO_REUSEADDR so we won't have to wait 2 minutes to reuse
+ * it on restart.
+ *
+ * I generally avoid "return -1 on error", but for file-descriptors it's the
+ * UNIX standard, so it's not as offensive here as it would be in other
+ * contexts.
+ */
+static int make_listen_fd(int domain, void *addr, socklen_t len, bool mayfail)
+{
+	int fd = socket(domain, SOCK_STREAM, 0);
+	int on = 1;
+
+	if (fd < 0) {
+		if (!mayfail)
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				      "Failed to create %u socket: %s",
+				      domain, strerror(errno));
+		status_trace("Failed to create %u socket: %s",
+			     domain, strerror(errno));
+		return -1;
+	}
+
+
+	/* Re-use, please.. */
+	if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)))
+		status_unusual("Failed setting socket reuse: %s",
+			       strerror(errno));
+
+	if (bind(fd, addr, len) != 0) {
+		if (!mayfail)
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				      "Failed to bind on %u socket: %s",
+				      domain, strerror(errno));
+		status_trace("Failed to create %u socket: %s",
+			     domain, strerror(errno));
+		goto fail;
+	}
+
+	return fd;
+
+fail:
+	/*~ ccan/noerr contains convenient routines which don't clobber the
+	 * errno global; in this case, the caller can report errno. */
+	close_noerr(fd);
+	return -1;
 }
 
 /* Return true if it created socket successfully. */
@@ -556,6 +820,8 @@ static bool handle_wireaddr_listen(struct daemon *daemon,
 	struct sockaddr_in addr;
 	struct sockaddr_in6 addr6;
 
+	/* Note the use of a switch() over enum here, even though it must be
+	 * IPv4 or IPv6 here; that will catch future changes. */
 	switch (wireaddr->type) {
 	case ADDR_TYPE_IPV4:
 		wireaddr_to_ipv4(wireaddr, &addr);
@@ -595,31 +861,35 @@ static bool public_address(struct daemon *daemon, struct wireaddr *wireaddr)
 			return false;
 	}
 
+	/* --dev-allow-localhost treats the localhost as "public" for testing */
 	return address_routable(wireaddr, daemon->dev_allow_localhost);
 }
 
 static void add_announcable(struct wireaddr **announcable,
 			    const struct wireaddr *addr)
 {
-	size_t n = tal_count(*announcable);
-	tal_resize(announcable, n+1);
-	(*announcable)[n] = *addr;
+	*tal_arr_expand(announcable) = *addr;
 }
 
 static void add_binding(struct wireaddr_internal **binding,
 			const struct wireaddr_internal *addr)
 {
-	size_t n = tal_count(*binding);
-	tal_resize(binding, n+1);
-	(*binding)[n] = *addr;
+	*tal_arr_expand(binding) = *addr;
 }
 
+/*~ ccan/asort provides a type-safe sorting function; it requires a comparison
+ * function, which takes an optional extra argument which is usually unused as
+ * here, but deeply painful if you need it and don't have it! */
 static int wireaddr_cmp_type(const struct wireaddr *a,
 			     const struct wireaddr *b, void *unused)
 {
+	/* Returns > 0 if a belongs after b, < 0 if before, == 0 if don't care */
 	return (int)a->type - (int)b->type;
 }
 
+/*~ The spec for we-can't-remember reasons specifies only one address of each
+ * type.  I think there was a bias against "hubs" which would want this.  So
+ * we sort and uniquify. */
 static void finalize_announcable(struct wireaddr **announcable)
 {
 	size_t n = tal_count(*announcable);
@@ -645,6 +915,8 @@ static void finalize_announcable(struct wireaddr **announcable)
 					      &(*announcable)[i]),
 			       type_to_string(tmpctx, struct wireaddr,
 					      &(*announcable)[i-1]));
+
+		/* Move and shrink; step back because i++ above would skip. */
 		memmove(*announcable + i,
 			*announcable + i + 1,
 			(n - i - 1) * sizeof((*announcable)[0]));
@@ -653,10 +925,20 @@ static void finalize_announcable(struct wireaddr **announcable)
 	}
 }
 
-/* Initializes daemon->announcable array, returns addresses we bound to. */
+/*~ The user can specify three kinds of addresses: ones we bind to but don't
+ * announce, ones we announce but don't bind to, and ones we bind to and
+ * announce if they seem to be public addresses.
+ *
+ * This routine sorts out the mess: it populates the daemon->announcable array,
+ * and returns the addresses we bound to (by convention, return is allocated
+ * off `ctx` argument).
+ */
 static struct wireaddr_internal *setup_listeners(const tal_t *ctx,
 						 struct daemon *daemon,
+						 /* The proposed address. */
 						 const struct wireaddr_internal *proposed_wireaddr,
+						 /* For each one, listen,
+						    announce or both */
 						 const enum addr_listen_announce *proposed_listen_announce,
 						 const char *tor_password,
 						 struct wireaddr **announcable)
@@ -665,6 +947,7 @@ static struct wireaddr_internal *setup_listeners(const tal_t *ctx,
 	int fd;
 	struct wireaddr_internal *binding;
 
+	/* Start with empty arrays, for tal_arr_expand() */
 	binding = tal_arr(ctx, struct wireaddr_internal, 0);
 	*announcable = tal_arr(ctx, struct wireaddr, 0);
 
@@ -673,11 +956,12 @@ static struct wireaddr_internal *setup_listeners(const tal_t *ctx,
 	for (size_t i = 0; i < tal_count(proposed_wireaddr); i++) {
 		struct wireaddr_internal wa = proposed_wireaddr[i];
 
+		/* We want announce-only addresses. */
 		if (proposed_listen_announce[i] & ADDR_LISTEN)
 			continue;
 
 		assert(proposed_listen_announce[i] & ADDR_ANNOUNCE);
-		/* You can only announce wiretypes! */
+		/* You can only announce wiretypes, not internal formats! */
 		assert(proposed_wireaddr[i].itype
 		       == ADDR_INTERNAL_WIREADDR);
 		add_announcable(announcable, &wa.u.wireaddr);
@@ -692,6 +976,7 @@ static struct wireaddr_internal *setup_listeners(const tal_t *ctx,
 			continue;
 
 		switch (wa.itype) {
+		/* We support UNIX domain sockets, but can't announce */
 		case ADDR_INTERNAL_SOCKNAME:
 			addrun.sun_family = AF_UNIX;
 			memcpy(addrun.sun_path, wa.u.sockname,
@@ -708,6 +993,7 @@ static struct wireaddr_internal *setup_listeners(const tal_t *ctx,
 		case ADDR_INTERNAL_AUTOTOR:
 			/* We handle these after we have all bindings. */
 			continue;
+		/* Special case meaning IPv6 and IPv4 */
 		case ADDR_INTERNAL_ALLPROTO: {
 			bool ipv6_ok;
 
@@ -746,6 +1032,7 @@ static struct wireaddr_internal *setup_listeners(const tal_t *ctx,
 			}
 			continue;
 		}
+		/* This is a vanilla wireaddr as per BOLT #7 */
 		case ADDR_INTERNAL_WIREADDR:
 			handle_wireaddr_listen(daemon, &wa.u.wireaddr, false);
 			add_binding(&binding, &wa);
@@ -761,7 +1048,8 @@ static struct wireaddr_internal *setup_listeners(const tal_t *ctx,
 			      proposed_wireaddr[i].itype);
 	}
 
-	/* Now we have bindings, set up any Tor auto addresses */
+	/* Now we have bindings, set up any Tor auto addresses: we will point
+	 * it at the first bound IPv4 or IPv6 address we have. */
 	for (size_t i = 0; i < tal_count(proposed_wireaddr); i++) {
 		if (!(proposed_listen_announce[i] & ADDR_LISTEN))
 			continue;
@@ -779,15 +1067,16 @@ static struct wireaddr_internal *setup_listeners(const tal_t *ctx,
 						binding));
 	}
 
+	/* Sort and uniquify. */
 	finalize_announcable(announcable);
 
 	return binding;
 }
 
 
-/* Parse an incoming connect init message and assign config variables
- * to the daemon.
- */
+/*~ Parse the incoming connect init message from lightningd ("master") and
+ * assign config variables to the daemon; it should be the first message we
+ * get. */
 static struct io_plan *connect_init(struct daemon_conn *master,
 				   struct daemon *daemon,
 				   const u8 *msg)
@@ -799,6 +1088,7 @@ static struct io_plan *connect_init(struct daemon_conn *master,
 	struct wireaddr *announcable;
 	char *tor_password;
 
+	/* Fields which require allocation are allocated off daemon */
 	if (!fromwire_connectctl_init(
 		daemon, msg,
 		&daemon->id, &daemon->globalfeatures,
@@ -807,10 +1097,13 @@ static struct io_plan *connect_init(struct daemon_conn *master,
 		&proxyaddr, &daemon->use_proxy_always,
 		&daemon->dev_allow_localhost, &daemon->use_dns,
 		&tor_password)) {
+		/* This is a helper which prints the type expected and the actual
+		 * message, then exits (it should never be called!). */
 		master_badmsg(WIRE_CONNECTCTL_INIT, msg);
 	}
 
-	/* Resolve Tor proxy address if any */
+	/* Resolve Tor proxy address if any: we need an addrinfo to connect()
+	 * to. */
 	if (proxyaddr) {
 		status_trace("Proxy address: %s",
 			     fmt_wireaddr(tmpctx, proxyaddr));
@@ -823,20 +1116,24 @@ static struct io_plan *connect_init(struct daemon_conn *master,
 			     "dummy replies");
 	}
 
+	/* Figure out our addresses. */
 	binding = setup_listeners(tmpctx, daemon,
 				  proposed_wireaddr,
 				  proposed_listen_announce,
 				  tor_password,
 				  &announcable);
 
+	/* Tell it we're ready, handing it the addresses we have. */
 	daemon_conn_send(&daemon->master,
 			 take(towire_connectctl_init_reply(NULL,
 							   binding,
 							   announcable)));
 
+	/* Read the next message. */
 	return daemon_conn_read_next(master->conn, master);
 }
 
+/*~ lightningd tells us to go! */
 static struct io_plan *connect_activate(struct daemon_conn *master,
 				       struct daemon *daemon,
 				       const u8 *msg)
@@ -846,6 +1143,7 @@ static struct io_plan *connect_activate(struct daemon_conn *master,
 	if (!fromwire_connectctl_activate(msg, &do_listen))
 		master_badmsg(WIRE_CONNECTCTL_ACTIVATE, msg);
 
+	/* If we're --offline, lightningd tells us not to actually listen. */
 	if (do_listen) {
 		for (size_t i = 0; i < tal_count(daemon->listen_fds); i++) {
 			/* On Linux, at least, we may bind to all addresses
@@ -861,6 +1159,7 @@ static struct io_plan *connect_activate(struct daemon_conn *master,
 					connection_in, daemon);
 		}
 	}
+	/* Free, with NULL assignment just as an extra sanity check. */
 	daemon->listen_fds = tal_free(daemon->listen_fds);
 
 	/* OK, we're ready! */
@@ -869,144 +1168,7 @@ static struct io_plan *connect_activate(struct daemon_conn *master,
 	return daemon_conn_read_next(master->conn, master);
 }
 
-static struct io_plan *handshake_out_success(struct io_conn *conn,
-					     const struct pubkey *id,
-					     const struct wireaddr_internal *addr,
-					     const struct crypto_state *cs,
-					     struct reaching *reach)
-{
-	reach->connstate = "Exchanging init messages";
-	status_trace("Connect OUT to %s",
-		     type_to_string(tmpctx, struct pubkey, id));
-	return init_new_peer(conn, id, addr, cs, reach->daemon);
-}
-
-struct io_plan *connection_out(struct io_conn *conn, struct reaching *reach)
-{
-	/* FIXME: Timeout */
-	status_trace("Connected out for %s",
-		     type_to_string(tmpctx, struct pubkey, &reach->id));
-
-	reach->connstate = "Cryptographic handshake";
-	return initiator_handshake(conn, &reach->daemon->id, &reach->id,
-				   &reach->addrs[reach->addrnum],
-				   handshake_out_success, reach);
-}
-
-static void PRINTF_FMT(5,6)
-	connect_failed(struct daemon *daemon,
-		       const struct pubkey *id,
-		       u32 seconds_waited,
-		       const struct wireaddr_internal *addrhint,
-		       const char *errfmt, ...)
-{
-	u8 *msg;
-	va_list ap;
-	char *err;
-	u32 wait_seconds;
-
-	va_start(ap, errfmt);
-	err = tal_vfmt(tmpctx, errfmt, ap);
-	va_end(ap);
-
-	/* Wait twice as long to reconnect, between min and max. */
-	wait_seconds = seconds_waited * 2;
-	if (wait_seconds > MAX_WAIT_SECONDS)
-		wait_seconds = MAX_WAIT_SECONDS;
-	if (wait_seconds < INITIAL_WAIT_SECONDS)
-		wait_seconds = INITIAL_WAIT_SECONDS;
-
-	/* Tell any connect command what happened. */
-	msg = towire_connectctl_connect_failed(NULL, id, err, wait_seconds,
-					       addrhint);
-	daemon_conn_send(&daemon->master, take(msg));
-
-	status_trace("Failed connected out for %s: %s",
-		     type_to_string(tmpctx, struct pubkey, id),
-		     err);
-}
-
-static void destroy_io_conn(struct io_conn *conn, struct reaching *reach)
-{
-	tal_append_fmt(&reach->errors,
-		       "%s: %s: %s. ",
-		       type_to_string(tmpctx, struct wireaddr_internal,
-				      &reach->addrs[reach->addrnum]),
-		       reach->connstate, strerror(errno));
-	reach->addrnum++;
-	try_reach_one_addr(reach);
-}
-
-static struct io_plan *conn_init(struct io_conn *conn, struct reaching *reach)
-{
-	struct addrinfo *ai = NULL;
-	const struct wireaddr_internal *addr = &reach->addrs[reach->addrnum];
-
-	switch (addr->itype) {
-	case ADDR_INTERNAL_SOCKNAME:
-		ai = wireaddr_internal_to_addrinfo(tmpctx, addr);
-		break;
-	case ADDR_INTERNAL_ALLPROTO:
-		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			      "Can't reach to all protocols");
-		break;
-	case ADDR_INTERNAL_AUTOTOR:
-		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			      "Can't reach to autotor address");
-		break;
-	case ADDR_INTERNAL_FORPROXY:
-		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			      "Can't reach to forproxy address");
-		break;
-	case ADDR_INTERNAL_WIREADDR:
-		/* If it was a Tor address, we wouldn't be here. */
-		ai = wireaddr_to_addrinfo(tmpctx, &addr->u.wireaddr);
-		break;
-	}
-	assert(ai);
-
-	io_set_finish(conn, destroy_io_conn, reach);
-	return io_connect(conn, ai, connection_out, reach);
-}
-
-static struct io_plan *conn_proxy_init(struct io_conn *conn,
-				       struct reaching *reach)
-{
-	const char *host = NULL;
-	u16 port;
-	const struct wireaddr_internal *addr = &reach->addrs[reach->addrnum];
-
-	switch (addr->itype) {
-	case ADDR_INTERNAL_FORPROXY:
-		host = addr->u.unresolved.name;
-		port = addr->u.unresolved.port;
-		break;
-	case ADDR_INTERNAL_WIREADDR:
-		host = fmt_wireaddr_without_port(tmpctx, &addr->u.wireaddr);
-		port = addr->u.wireaddr.port;
-		break;
-	case ADDR_INTERNAL_SOCKNAME:
-	case ADDR_INTERNAL_ALLPROTO:
-	case ADDR_INTERNAL_AUTOTOR:
-		break;
-	}
-
-	if (!host)
-		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			      "Can't reach to %u address", addr->itype);
-
-	io_set_finish(conn, destroy_io_conn, reach);
-	return io_tor_connect(conn, reach->daemon->proxyaddr, host, port, reach);
-}
-
-static void append_addr(struct wireaddr_internal **addrs,
-			const struct wireaddr_internal *addr)
-{
-	size_t n = tal_count(*addrs);
-	tal_resize(addrs, n+1);
-	(*addrs)[n] = *addr;
-}
-
+/*~ This is where we'd put a BOLT #10 reference, but it doesn't exist :( */
 static const char *seedname(const tal_t *ctx, const struct pubkey *id)
 {
 	char bech32[100];
@@ -1019,6 +1181,13 @@ static const char *seedname(const tal_t *ctx, const struct pubkey *id)
 	return tal_fmt(ctx, "%s.lseed.bitcoinstats.com", bech32);
 }
 
+/*~ As a last resort, we do a DNS lookup to the lightning DNS seed to
+ * resolve a node name when they say to connect to it.  This is synchronous,
+ * so connectd blocks, but it's not very common so we haven't fixed it.
+ *
+ * This "seed by DNS" approach is similar to what bitcoind uses, and in fact
+ * has the nice property that DNS is cached, and the seed only sees a request
+ * from the ISP, not directly from the user. */
 static void add_seed_addrs(struct wireaddr_internal **addrs,
 			   const struct pubkey *id,
 			   struct sockaddr *broken_reply)
@@ -1038,22 +1207,26 @@ static void add_seed_addrs(struct wireaddr_internal **addrs,
 		status_trace("Resolved %s to %s", addr,
 			     type_to_string(tmpctx, struct wireaddr,
 					    &a.u.wireaddr));
-		append_addr(addrs, &a);
+		*tal_arr_expand(addrs) = a;
 	}
 }
 
+/*~ This asks gossipd for any addresses advertized by the node. */
 static void add_gossip_addrs(struct wireaddr_internal **addrs,
 			     const struct pubkey *id)
 {
 	u8 *msg;
 	struct wireaddr *normal_addrs;
 
+	/* For simplicity, we do this synchronous. */
 	msg = towire_gossip_get_addrs(NULL, id);
 	if (!wire_sync_write(GOSSIPCTL_FD, take(msg)))
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Failed writing to gossipctl: %s",
 			      strerror(errno));
 
+	/* This returns 'struct wireaddr's since that's what's supported by
+	 * the BOLT #7 protocol. */
 	msg = wire_sync_read(tmpctx, GOSSIPCTL_FD);
 	if (!fromwire_gossip_get_addrs_reply(tmpctx, msg, &normal_addrs))
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
@@ -1065,150 +1238,86 @@ static void add_gossip_addrs(struct wireaddr_internal **addrs,
 		struct wireaddr_internal addr;
 		addr.itype = ADDR_INTERNAL_WIREADDR;
 		addr.u.wireaddr = normal_addrs[i];
-		append_addr(addrs, &addr);
+		*tal_arr_expand(addrs) = addr;
 	}
 }
 
-static void try_reach_one_addr(struct reaching *reach)
-{
- 	int fd, af;
-	bool use_proxy = reach->daemon->use_proxy_always;
-	const struct wireaddr_internal *addr = &reach->addrs[reach->addrnum];
-
-	if (reach->addrnum == tal_count(reach->addrs)) {
-		connect_failed(reach->daemon, &reach->id, reach->seconds_waited,
-			       reach->addrhint, "%s", reach->errors);
-		tal_free(reach);
-		return;
-	}
-
- 	/* Might not even be able to create eg. IPv6 sockets */
- 	af = -1;
-
-	switch (addr->itype) {
-	case ADDR_INTERNAL_SOCKNAME:
-		af = AF_LOCAL;
-		/* Local sockets don't use tor proxy */
-		use_proxy = false;
-		break;
-	case ADDR_INTERNAL_ALLPROTO:
-		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			      "Can't reach ALLPROTO");
-	case ADDR_INTERNAL_AUTOTOR:
-		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			      "Can't reach AUTOTOR");
-	case ADDR_INTERNAL_FORPROXY:
-		use_proxy = true;
-		break;
-	case ADDR_INTERNAL_WIREADDR:
-		switch (addr->u.wireaddr.type) {
-		case ADDR_TYPE_TOR_V2:
-		case ADDR_TYPE_TOR_V3:
-			use_proxy = true;
-			break;
-		case ADDR_TYPE_IPV4:
-			af = AF_INET;
-			break;
-		case ADDR_TYPE_IPV6:
-			af = AF_INET6;
-			break;
-		case ADDR_TYPE_PADDING:
-			break;
-		}
-	}
-
-	/* If we have to use proxy but we don't have one, we fail. */
-	if (use_proxy) {
-		if (!reach->daemon->proxyaddr) {
-			status_debug("Need proxy");
-			af = -1;
-		} else
-			af = reach->daemon->proxyaddr->ai_family;
-	}
-
-	if (af == -1) {
-		fd = -1;
-		errno = EPROTONOSUPPORT;
-	} else
-		fd = socket(af, SOCK_STREAM, 0);
-
-	if (fd < 0) {
-		tal_append_fmt(&reach->errors,
-			       "%s: opening %i socket gave %s. ",
-			       type_to_string(tmpctx, struct wireaddr_internal,
-					      addr),
-			       af, strerror(errno));
-		reach->addrnum++;
-		try_reach_one_addr(reach);
-		return;
-	}
-
-	if (use_proxy)
-		io_new_conn(reach, fd, conn_proxy_init, reach);
-	else
-		io_new_conn(reach, fd, conn_init, reach);
-}
-
-/* Consumes addrhint if not NULL */
-static void try_reach_peer(struct daemon *daemon,
-			   const struct pubkey *id,
-			   u32 seconds_waited,
-			   struct wireaddr_internal *addrhint)
+/*~ Consumes addrhint if not NULL.
+ *
+ * That's a pretty ugly interface: we should use TAKEN, but we only have one
+ * caller so it's marginal. */
+static void try_connect_peer(struct daemon *daemon,
+			     const struct pubkey *id,
+			     u32 seconds_waited,
+			     struct wireaddr_internal *addrhint)
 {
 	struct wireaddr_internal *addrs;
 	bool use_proxy = daemon->use_proxy_always;
-	struct reaching *reach;
+	struct connecting *connect;
 
 	/* Already done?  May happen with timer. */
 	if (pubkey_set_get(&daemon->peers, id))
 		return;
 
-	/* If we're trying to reach it right now, that's OK. */
-	if (find_reaching(daemon, id))
+	/* If we're trying to connect it right now, that's OK. */
+	if (find_connecting(daemon, id))
 		return;
 
+	/* Start an array of addresses to try. */
 	addrs = tal_arr(tmpctx, struct wireaddr_internal, 0);
+
+	/* They can supply an optional address for the connect RPC */
 	if (addrhint)
-		append_addr(&addrs, addrhint);
+		*tal_arr_expand(&addrs) = *addrhint;
 
 	add_gossip_addrs(&addrs, id);
 
 	if (tal_count(addrs) == 0) {
 		/* Don't resolve via DNS seed if we're supposed to use proxy. */
 		if (use_proxy) {
+			/* You're allowed to use names with proxies; in fact it's
+			 * a good idea. */
 			struct wireaddr_internal unresolved;
 			wireaddr_from_unresolved(&unresolved,
 						 seedname(tmpctx, id),
 						 DEFAULT_PORT);
-			append_addr(&addrs, &unresolved);
+			*tal_arr_expand(&addrs) = unresolved;
 		} else if (daemon->use_dns) {
 			add_seed_addrs(&addrs, id,
 				       daemon->broken_resolver_response);
 		}
 	}
 
+	/* Still no address?  Fail immediately.  Lightningd can still choose
+	* to retry; an address may get gossiped or appear on the DNS seed. */
 	if (tal_count(addrs) == 0) {
 		connect_failed(daemon, id, seconds_waited, addrhint,
 			       "No address known");
 		return;
 	}
 
-	/* Start connecting to it */
-	reach = tal(daemon, struct reaching);
-	reach->daemon = daemon;
-	reach->id = *id;
-	reach->addrs = tal_steal(reach, addrs);
-	reach->addrnum = 0;
-	reach->connstate = "Connection establishment";
-	reach->seconds_waited = seconds_waited;
-	reach->addrhint = tal_steal(reach, addrhint);
-	reach->errors = tal_strdup(reach, "");
-	list_add_tail(&daemon->reaching, &reach->list);
-	tal_add_destructor(reach, destroy_reaching);
+	/* Start connecting to it: since this is the only place we allocate
+	 * a 'struct connecting' we don't write a separate new_connecting(). */
+	connect = tal(daemon, struct connecting);
+	connect->daemon = daemon;
+	connect->id = *id;
+	connect->addrs = tal_steal(connect, addrs);
+	connect->addrnum = 0;
+	/* connstate is supposed to be updated as we go, to give context for
+	 * errors which occur.  We miss it in a few places; would be nice to
+	 * fix! */
+	connect->connstate = "Connection establishment";
+	connect->seconds_waited = seconds_waited;
+	connect->addrhint = tal_steal(connect, addrhint);
+	connect->errors = tal_strdup(connect, "");
+	list_add_tail(&daemon->connecting, &connect->list);
+	tal_add_destructor(connect, destroy_connecting);
 
-	try_reach_one_addr(reach);
+	/* Now we kick it off by trying connect->addrs[connect->addrnum] */
+	try_connect_one_addr(connect);
 }
 
+/* lightningd tells us to connect to a peer by id, with optional addr hint. */
 static struct io_plan *connect_to_peer(struct io_conn *conn,
 				       struct daemon *daemon, const u8 *msg)
 {
@@ -1221,35 +1330,35 @@ static struct io_plan *connect_to_peer(struct io_conn *conn,
 						 &addrhint))
 		master_badmsg(WIRE_CONNECTCTL_CONNECT_TO_PEER, msg);
 
-	try_reach_peer(daemon, &id, seconds_waited, addrhint);
+	try_connect_peer(daemon, &id, seconds_waited, addrhint);
 	return daemon_conn_read_next(conn, &daemon->master);
 }
 
+/* lightningd tells us a peer has disconnected. */
 static struct io_plan *peer_disconnected(struct io_conn *conn,
 					 struct daemon *daemon, const u8 *msg)
 {
 	struct pubkey id, *key;
-	struct peer *peer;
 
 	if (!fromwire_connectctl_peer_disconnected(msg, &id))
 		master_badmsg(WIRE_CONNECTCTL_PEER_DISCONNECTED, msg);
 
+	/* We should stay in sync with lightningd at all times. */
 	key = pubkey_set_get(&daemon->peers, &id);
 	if (!key)
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "peer_disconnected unknown peer: %s",
 			      type_to_string(tmpctx, struct pubkey, &id));
 	pubkey_set_del(&daemon->peers, key);
+
+	/* Wake up in case there's a reconnecting peer waiting in io_wait. */
+	io_wake(key);
+
+	/* Note: deleting from a htable (a-la pubkey_set_del) does not free it:
+	 * htable doesn't assume it's a tal object at all. */
 	tal_free(key);
 
-	status_trace("Forgetting peer %s",
-		     type_to_string(tmpctx, struct pubkey, &id));
-
-	/* If there was a connecting peer waiting, wake it now */
-	peer = find_reconnecting_peer(daemon, &id);
-	if (peer)
-		io_wake(peer);
-
+	/* Read the next message from lightningd. */
 	return daemon_conn_read_next(conn, &daemon->master);
 }
 
@@ -1258,6 +1367,8 @@ static struct io_plan *recv_req(struct io_conn *conn, struct daemon_conn *master
 	struct daemon *daemon = container_of(master, struct daemon, master);
 	enum connect_wire_type t = fromwire_peektype(master->msg_in);
 
+	/* Demux requests from lightningd: we expect INIT then ACTIVATE, then
+	 * connect requests and disconnected messages. */
 	switch (t) {
 	case WIRE_CONNECTCTL_INIT:
 		return connect_init(master, daemon, master->msg_in);
@@ -1285,7 +1396,11 @@ static struct io_plan *recv_req(struct io_conn *conn, struct daemon_conn *master
 		      t, tal_hex(tmpctx, master->msg_in));
 }
 
-/* Helper for handshake.c */
+/*~ Helper for handshake.c: we ask `hsmd` to do the ECDH to get the shared
+ * secret.  It's here because it's nicer then giving the handshake code
+ * knowledge of the HSM, but also at one stage I made a hacky gossip vampire
+ * tool which used the handshake code, so it's nice to keep that
+ * standalone. */
 bool hsm_do_ecdh(struct secret *ss, const struct pubkey *point)
 {
 	u8 *req = towire_hsm_ecdh_req(tmpctx, point), *resp;
@@ -1300,7 +1415,12 @@ bool hsm_do_ecdh(struct secret *ss, const struct pubkey *point)
 	return true;
 }
 
-#ifndef TESTING
+/*~ UNUSED is defined to an __attribute__ for GCC; at one stage we tried to use
+ * it ubiquitously to make us compile cleanly with -Wunused, but it's bitrotted
+ * and we'd need to start again.
+ *
+ * The C++ method of omitting unused parameter names is *much* neater, and I
+ * hope we'll eventually see it in a C standard. */
 static void master_gone(struct io_conn *unused UNUSED, struct daemon_conn *dc UNUSED)
 {
 	/* Can't tell master, it's gone. */
@@ -1313,34 +1433,29 @@ int main(int argc, char *argv[])
 
 	struct daemon *daemon;
 
+	/* Common subdaemon setup code. */
 	subdaemon_setup(argc, argv);
 
+	/* Allocate and set up our simple top-level structure. */
 	daemon = tal(NULL, struct daemon);
 	pubkey_set_init(&daemon->peers);
-	list_head_init(&daemon->reconnecting);
-	list_head_init(&daemon->reaching);
-	timers_init(&daemon->timers, time_mono());
-	daemon->broken_resolver_response = NULL;
+	list_head_init(&daemon->connecting);
 	daemon->listen_fds = tal_arr(daemon, struct listen_fd, 0);
 	/* stdin == control */
 	daemon_conn_init(daemon, &daemon->master, STDIN_FILENO, recv_req,
 			 master_gone);
+
+	/* This tells the status_* subsystem to use this connection to send
+	 * our status_ and failed messages. */
 	status_setup_async(&daemon->master);
 
-	/* When conn closes, everything is freed. */
-	tal_steal(daemon->master.conn, daemon);
-
-	for (;;) {
-		struct timer *expired = NULL;
-		io_loop(&daemon->timers, &expired);
-
-		if (!expired) {
-			break;
-		} else {
-			timer_expired(daemon, expired);
-		}
-	}
-	daemon_shutdown();
-	return 0;
+	/* Should never exit. */
+	io_loop(NULL, NULL);
+	abort();
 }
-#endif
+
+/*~ Getting bored?  This was a pretty simple daemon!
+ *
+ * The good news is that the next daemon gossipd/gossipd.c is the most complex
+ * global daemon we have!
+ */

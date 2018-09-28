@@ -116,6 +116,7 @@ static unsigned gossip_msg(struct subd *gossip, const u8 *msg, const int *fds)
 	case WIRE_GOSSIP_QUERY_SCIDS:
 	case WIRE_GOSSIP_QUERY_CHANNEL_RANGE:
 	case WIRE_GOSSIP_SEND_TIMESTAMP_FILTER:
+	case WIRE_GOSSIP_GET_INCOMING_CHANNELS:
 	case WIRE_GOSSIP_DEV_SET_MAX_SCIDS_ENCODE_SIZE:
 	case WIRE_GOSSIP_DEV_SUPPRESS:
 	/* This is a reply, so never gets through to here. */
@@ -126,6 +127,7 @@ static unsigned gossip_msg(struct subd *gossip, const u8 *msg, const int *fds)
 	case WIRE_GOSSIP_SCIDS_REPLY:
 	case WIRE_GOSSIP_QUERY_CHANNEL_RANGE_REPLY:
 	case WIRE_GOSSIP_RESOLVE_CHANNEL_REPLY:
+	case WIRE_GOSSIP_GET_INCOMING_CHANNELS_REPLY:
 	/* These are inter-daemon messages, not received by us */
 	case WIRE_GOSSIP_LOCAL_ADD_CHANNEL:
 	case WIRE_GOSSIP_LOCAL_CHANNEL_UPDATE:
@@ -161,7 +163,7 @@ void gossip_init(struct lightningd *ld, int connectd_fd)
 	msg = towire_gossipctl_init(
 	    tmpctx, ld->config.broadcast_interval,
 	    &get_chainparams(ld)->genesis_blockhash, &ld->id,
-	    get_offered_global_features(tmpctx),
+	    get_offered_globalfeatures(tmpctx),
 	    ld->rgb,
 	    ld->alias, ld->config.channel_update_interval,
 	    ld->announcable);
@@ -206,8 +208,11 @@ static void json_getnodes_reply(struct subd *gossip UNUSED, const u8 *reply,
 			     nodes[i]->color, ARRAY_SIZE(nodes[i]->color));
 		json_add_u64(response, "last_timestamp",
 			     nodes[i]->last_timestamp);
-		json_add_hex_talarr(response, "global_features",
-				    nodes[i]->global_features);
+		json_add_hex_talarr(response, "globalfeatures",
+				    nodes[i]->globalfeatures);
+		if (deprecated_apis)
+			json_add_hex_talarr(response, "global_features",
+					    nodes[i]->globalfeatures);
 		json_array_start(response, "addresses");
 		for (j=0; j<tal_count(nodes[i]->addresses); j++) {
 			json_add_address(response, NULL, &nodes[i]->addresses[j]);

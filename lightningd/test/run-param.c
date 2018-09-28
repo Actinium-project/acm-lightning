@@ -253,6 +253,16 @@ static void null_params(void)
 	assert(*intptrs[6] == 888);
 }
 
+static void no_params(void)
+{
+	struct json *j = json_parse(cmd, "[]");
+	assert(param(cmd, j->buffer, j->toks, NULL));
+
+	j = json_parse(cmd, "[ 'unexpected' ]");
+	assert(!param(cmd, j->buffer, j->toks, NULL));
+}
+
+
 #if DEVELOPER
 /*
  * Check to make sure there are no programming mistakes.
@@ -431,7 +441,7 @@ static void advanced(void)
 			     p_opt("msat_opt2", json_tok_msat, &msat_opt2),
 			     NULL));
 		assert(label != NULL);
-		assert(!strcmp(label->s, "lightning"));
+		assert(streq(label->s, "lightning"));
 		assert(*msat == 24);
 		assert(tok);
 		assert(msat_opt1);
@@ -445,8 +455,8 @@ static void advanced(void)
 			      p_req("label", json_tok_label, &label),
 			      p_opt("foo", json_tok_label, &foo),
 			      NULL));
-		assert(!strcmp(label->s, "3"));
-		assert(!strcmp(foo->s, "foo"));
+		assert(streq(label->s, "3"));
+		assert(streq(foo->s, "foo"));
 	}
 	{
 		u64 *msat;
@@ -507,17 +517,67 @@ static void json_tok_tests(void)
 	test_cb(json_tok_percent, double, "[ 'wow' ]", 0, false);
 }
 
+static void test_invoice(struct command *cmd, const char *buffer,
+			 const jsmntok_t *params)
+{
+	u64 *msatoshi_val;
+	struct json_escaped *label_val;
+	const char *desc_val;
+	u64 *expiry;
+	const jsmntok_t *fallbacks;
+	const jsmntok_t *preimagetok;
+
+	assert(cmd->mode == CMD_USAGE);
+	if(!param(cmd, buffer, params,
+		  p_req("msatoshi", json_tok_msat, &msatoshi_val),
+		  p_req("label", json_tok_label, &label_val),
+		  p_req("description", json_tok_escaped_string, &desc_val),
+		  p_opt("expiry", json_tok_u64, &expiry),
+		  p_opt("fallbacks", json_tok_array, &fallbacks),
+		  p_opt("preimage", json_tok_tok, &preimagetok), NULL))
+		return;
+
+	/* should not be here since we are in the mode of CMD_USAGE
+	 * and it always returns false. */
+	abort();
+}
+
+static void usage(void)
+{
+	/* Do this to simulate a call to our pretend handler (test_invoice) */
+	struct json_command invoice_command = {
+		"invoice",
+		test_invoice,
+		"",
+		false,
+		""
+	};
+
+	cmd->mode = CMD_USAGE;
+	cmd->json_cmd = &invoice_command;
+
+	cmd->json_cmd->dispatch(cmd, NULL, NULL);
+
+	assert(streq(cmd->usage,
+		     "msatoshi label description "
+		     "[expiry] [fallbacks] [preimage]"));
+
+	cmd->mode = CMD_NORMAL;
+}
+
 int main(void)
 {
 	setup_locale();
 	setup_tmpctx();
 	cmd = tal(tmpctx, struct command);
+	cmd->mode = CMD_NORMAL;
 	fail_msg = tal_arr(cmd, char, 10000);
 
 	zero_params();
 	sanity();
 	tok_tok();
 	null_params();
+	no_params();
 #if DEVELOPER
 	bad_programmer();
 #endif
@@ -528,6 +588,8 @@ int main(void)
 	advanced();
 	advanced_fail();
 	json_tok_tests();
+	usage();
+
 	tal_free(tmpctx);
 	printf("run-params ok\n");
 }

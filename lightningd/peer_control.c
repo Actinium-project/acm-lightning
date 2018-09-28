@@ -79,21 +79,24 @@ static void copy_to_parent_log(const char *prefix,
 }
 
 static void peer_update_features(struct peer *peer,
-				 const u8 *gfeatures TAKES,
-				 const u8 *lfeatures TAKES)
+				 const u8 *globalfeatures TAKES,
+				 const u8 *localfeatures TAKES)
 {
-	tal_free(peer->global_features);
-	tal_free(peer->local_features);
-	peer->global_features = tal_dup_arr(peer, u8,
-					    gfeatures, tal_count(gfeatures), 0);
-	peer->local_features = tal_dup_arr(peer, u8,
-					   lfeatures, tal_count(lfeatures), 0);
+	tal_free(peer->globalfeatures);
+	tal_free(peer->localfeatures);
+	peer->globalfeatures = tal_dup_arr(peer, u8,
+					   globalfeatures,
+					   tal_count(globalfeatures), 0);
+	peer->localfeatures = tal_dup_arr(peer, u8,
+					  localfeatures,
+					  tal_count(localfeatures), 0);
 }
 
 struct peer *new_peer(struct lightningd *ld, u64 dbid,
 		      const struct pubkey *id,
 		      const struct wireaddr_internal *addr,
-		      const u8 *gfeatures TAKES, const u8 *lfeatures TAKES)
+		      const u8 *globalfeatures TAKES,
+		      const u8 *localfeatures TAKES)
 {
 	/* We are owned by our channels, and freed manually by destroy_channel */
 	struct peer *peer = tal(NULL, struct peer);
@@ -109,8 +112,8 @@ struct peer *new_peer(struct lightningd *ld, u64 dbid,
 		peer->addr.itype = ADDR_INTERNAL_WIREADDR;
 		peer->addr.u.wireaddr.type = ADDR_TYPE_PADDING;
 	}
-	peer->global_features = peer->local_features = NULL;
-	peer_update_features(peer, gfeatures, lfeatures);
+	peer->globalfeatures = peer->localfeatures = NULL;
+	peer_update_features(peer, globalfeatures, localfeatures);
 	list_head_init(&peer->channels);
 	peer->direction = get_channel_direction(&peer->ld->id, &peer->id);
 
@@ -419,7 +422,7 @@ void peer_connected(struct lightningd *ld, const u8 *msg,
 {
 	struct pubkey id;
 	struct crypto_state cs;
-	u8 *gfeatures, *lfeatures;
+	u8 *globalfeatures, *localfeatures;
 	u8 *error;
 	struct channel *channel;
 	struct wireaddr_internal addr;
@@ -427,7 +430,7 @@ void peer_connected(struct lightningd *ld, const u8 *msg,
 
 	if (!fromwire_connect_peer_connected(msg, msg,
 					     &id, &addr, &cs,
-					     &gfeatures, &lfeatures))
+					     &globalfeatures, &localfeatures))
 		fatal("Connectd gave bad CONNECT_PEER_CONNECTED message %s",
 		      tal_hex(msg, msg));
 
@@ -438,9 +441,10 @@ void peer_connected(struct lightningd *ld, const u8 *msg,
 	 * subdaemon.  Otherwise, we'll hand to openingd to wait there. */
 	peer = peer_by_id(ld, &id);
 	if (!peer)
-		peer = new_peer(ld, 0, &id, &addr, gfeatures, lfeatures);
+		peer = new_peer(ld, 0, &id, &addr,
+				globalfeatures, localfeatures);
 	else
-		peer_update_features(peer, gfeatures, lfeatures);
+		peer_update_features(peer, globalfeatures, localfeatures);
 
 	/* Can't be opening, since we wouldn't have sent peer_disconnected. */
 	assert(!peer->uncommitted_channel);
@@ -593,6 +597,56 @@ void channel_watch_funding(struct lightningd *ld, struct channel *channel)
 		  funding_spent);
 }
 
+static void json_add_htlcs(struct lightningd *ld,
+			   struct json_result *response,
+			   const struct channel *channel)
+{
+	/* FIXME: make per-channel htlc maps! */
+	const struct htlc_in *hin;
+	struct htlc_in_map_iter ini;
+	const struct htlc_out *hout;
+	struct htlc_out_map_iter outi;
+
+	/* FIXME: Add more fields. */
+	json_array_start(response, "htlcs");
+	for (hin = htlc_in_map_first(&ld->htlcs_in, &ini);
+	     hin;
+	     hin = htlc_in_map_next(&ld->htlcs_in, &ini)) {
+		if (hin->key.channel != channel)
+			continue;
+
+		json_object_start(response, NULL);
+		json_add_string(response, "direction", "in");
+		json_add_u64(response, "id", hin->key.id);
+		json_add_u64(response, "msatoshi", hin->msatoshi);
+		json_add_u64(response, "expiry", hin->cltv_expiry);
+		json_add_hex(response, "payment_hash",
+			     &hin->payment_hash, sizeof(hin->payment_hash));
+		json_add_string(response, "state",
+				htlc_state_name(hin->hstate));
+		json_object_end(response);
+	}
+
+	for (hout = htlc_out_map_first(&ld->htlcs_out, &outi);
+	     hout;
+	     hout = htlc_out_map_next(&ld->htlcs_out, &outi)) {
+		if (hout->key.channel != channel)
+			continue;
+
+		json_object_start(response, NULL);
+		json_add_string(response, "direction", "out");
+		json_add_u64(response, "id", hout->key.id);
+		json_add_u64(response, "msatoshi", hout->msatoshi);
+		json_add_u64(response, "expiry", hout->cltv_expiry);
+		json_add_hex(response, "payment_hash",
+			     &hout->payment_hash, sizeof(hout->payment_hash));
+		json_add_string(response, "state",
+				htlc_state_name(hout->hstate));
+		json_object_end(response);
+	}
+	json_array_end(response);
+}
+
 static void json_add_peer(struct lightningd *ld,
 			  struct json_result *response,
 			  struct peer *p,
@@ -625,11 +679,16 @@ static void json_add_peer(struct lightningd *ld,
 						       struct wireaddr_internal,
 						       &p->addr));
 		json_array_end(response);
-		json_add_hex_talarr(response, "global_features",
-				    p->global_features);
-
-		json_add_hex_talarr(response, "local_features",
-				    p->local_features);
+		if (deprecated_apis) {
+			json_add_hex_talarr(response, "global_features",
+					    p->globalfeatures);
+			json_add_hex_talarr(response, "local_features",
+					    p->localfeatures);
+		}
+		json_add_hex_talarr(response, "globalfeatures",
+				    p->globalfeatures);
+		json_add_hex_talarr(response, "localfeatures",
+				    p->localfeatures);
 	}
 
 	json_array_start(response, "channels");
@@ -744,6 +803,7 @@ static void json_add_peer(struct lightningd *ld,
 		json_add_u64(response, "out_msatoshi_fulfilled",
 			     channel_stats.out_msatoshi_fulfilled);
 
+		json_add_htlcs(ld, response, channel);
 		json_object_end(response);
 	}
 	json_array_end(response);
