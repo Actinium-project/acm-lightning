@@ -516,14 +516,14 @@ class LightningNode(object):
 
         # We wait until gossipd sees both local updates, as well as status NORMAL,
         # so it can definitely route through.
-        self.daemon.wait_for_logs(['update for channel {}\(0\) now ACTIVE'
+        self.daemon.wait_for_logs([r'update for channel {}\(0\) now ACTIVE'
                                    .format(scid),
-                                   'update for channel {}\(1\) now ACTIVE'
+                                   r'update for channel {}\(1\) now ACTIVE'
                                    .format(scid),
                                    'to CHANNELD_NORMAL'])
-        l2.daemon.wait_for_logs(['update for channel {}\(0\) now ACTIVE'
+        l2.daemon.wait_for_logs([r'update for channel {}\(0\) now ACTIVE'
                                  .format(scid),
-                                 'update for channel {}\(1\) now ACTIVE'
+                                 r'update for channel {}\(1\) now ACTIVE'
                                  .format(scid),
                                  'to CHANNELD_NORMAL'])
         return scid
@@ -646,7 +646,7 @@ class LightningNode(object):
             r = self.daemon.wait_for_log('Broadcasting {} .* to resolve '
                                          .format(name))
 
-        rawtx = re.search('.* \(([0-9a-fA-F]*)\) ', r).group(1)
+        rawtx = re.search(r'.* \(([0-9a-fA-F]*)\) ', r).group(1)
         txid = self.bitcoin.rpc.decoderawtransaction(rawtx, True)['txid']
 
         wait_for(lambda: txid in self.bitcoin.rpc.getrawmempool())
@@ -804,15 +804,27 @@ class NodeFactory(object):
 
         # Confirm all channels and wait for them to become usable
         bitcoin.generate_block(1)
+        scids = []
         for src, dst in connections:
             wait_for(lambda: src.channel_state(dst) == 'CHANNELD_NORMAL')
             scid = src.get_channel_scid(dst)
             src.daemon.wait_for_log(r'Received channel_update for channel {scid}\(.\) now ACTIVE'.format(scid=scid))
+            scids.append(scid)
 
         if not announce:
             return nodes
 
         bitcoin.generate_block(5)
+
+        def both_dirs_ready(n, scid):
+            resp = n.rpc.listchannels(scid)
+            return [a['active'] for a in resp['channels']] == [True, True]
+
+        # Make sure everyone sees all channels: we can cheat and
+        # simply check the ends (since it's a line).
+        wait_for(lambda: both_dirs_ready(nodes[0], scids[-1]))
+        wait_for(lambda: both_dirs_ready(nodes[-1], scids[0]))
+
         return nodes
 
     def killall(self, expected_successes):

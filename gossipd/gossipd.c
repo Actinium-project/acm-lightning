@@ -367,7 +367,7 @@ static bool node_announcement_redundant(struct daemon *daemon)
 		return false;
 
 	if (!memeq(daemon->globalfeatures, tal_count(daemon->globalfeatures),
-		   n->gfeatures, tal_count(n->gfeatures)))
+		   n->globalfeatures, tal_count(n->globalfeatures)))
 		return false;
 
 	return true;
@@ -782,15 +782,6 @@ static void handle_reply_channel_range(struct peer *peer, u8 *msg)
 	peer->query_channel_blocks = tal_free(peer->query_channel_blocks);
 }
 
-/* We keep a simple array of node ids while we're sending channel info */
-static void append_query_node(struct peer *peer, const struct pubkey *id)
-{
-	size_t n;
-	n = tal_count(peer->scid_query_nodes);
-	tal_resize(&peer->scid_query_nodes, n+1);
-	peer->scid_query_nodes[n] = *id;
-}
-
 /* Arbitrary ordering function of pubkeys.
  *
  * Note that we could use memcmp() here: even if they had somehow different
@@ -856,8 +847,8 @@ static bool create_next_scid_reply(struct peer *peer)
 			queue_peer_msg(peer, chan->half[1].channel_update);
 
 		/* Record node ids for later transmission of node_announcement */
-		append_query_node(peer, &chan->nodes[0]->id);
-		append_query_node(peer, &chan->nodes[1]->id);
+		*tal_arr_expand(&peer->scid_query_nodes) = chan->nodes[0]->id;
+		*tal_arr_expand(&peer->scid_query_nodes) = chan->nodes[1]->id;
 		sent = true;
 	}
 
@@ -1349,16 +1340,18 @@ static struct io_plan *getroute_req(struct io_conn *conn, struct daemon *daemon,
 	double fuzz;
 	struct siphash_seed seed;
 
-	fromwire_gossip_getroute_request(msg,
-					 &source, &destination,
-					 &msatoshi, &riskfactor, &final_cltv,
-					 &fuzz, &seed);
+	if (!fromwire_gossip_getroute_request(msg,
+					      &source, &destination,
+					      &msatoshi, &riskfactor,
+					      &final_cltv, &fuzz, &seed))
+		master_badmsg(WIRE_GOSSIP_GETROUTE_REQUEST, msg);
+
 	status_trace("Trying to find a route from %s to %s for %"PRIu64" msatoshi",
 		     pubkey_to_hexstr(tmpctx, &source),
 		     pubkey_to_hexstr(tmpctx, &destination), msatoshi);
 
 	hops = get_route(tmpctx, daemon->rstate, &source, &destination,
-			 msatoshi, 1, final_cltv,
+			 msatoshi, riskfactor, final_cltv,
 			 fuzz, &seed);
 
 	out = towire_gossip_getroute_reply(msg, hops);
@@ -1407,7 +1400,8 @@ static struct io_plan *getchannels_req(struct io_conn *conn, struct daemon *daem
 	struct chan *chan;
 	struct short_channel_id *scid;
 
-	fromwire_gossip_getchannels_request(msg, msg, &scid);
+	if (!fromwire_gossip_getchannels_request(msg, msg, &scid))
+		master_badmsg(WIRE_GOSSIP_GETCHANNELS_REQUEST, msg);
 
 	entries = tal_arr(tmpctx, struct gossip_getchannels_entry, 0);
 	if (scid) {
@@ -1429,30 +1423,25 @@ static struct io_plan *getchannels_req(struct io_conn *conn, struct daemon *daem
 	return daemon_conn_read_next(conn, &daemon->master);
 }
 
-static void append_node(const struct gossip_getnodes_entry ***nodes,
-			const struct pubkey *nodeid,
-			const u8 *globalfeatures,
-			/* If non-NULL, contains more information */
+/* We keep pointers into n, assuming it won't change! */
+static void append_node(const struct gossip_getnodes_entry ***entries,
 			const struct node *n)
 {
-	struct gossip_getnodes_entry *new;
+	struct gossip_getnodes_entry *e;
 
-	new = tal(*nodes, struct gossip_getnodes_entry);
-	new->nodeid = *nodeid;
-	new->globalfeatures = tal_dup_arr(*nodes, u8, globalfeatures,
-					  tal_count(globalfeatures), 0);
-	if (!n || n->last_timestamp < 0) {
-		new->last_timestamp = -1;
-		new->addresses = NULL;
-	} else {
-		new->last_timestamp = n->last_timestamp;
-		new->addresses = n->addresses;
-		BUILD_ASSERT(ARRAY_SIZE(new->alias) == ARRAY_SIZE(n->alias));
-		BUILD_ASSERT(ARRAY_SIZE(new->color) == ARRAY_SIZE(n->rgb_color));
-		memcpy(new->alias, n->alias, ARRAY_SIZE(new->alias));
-		memcpy(new->color, n->rgb_color, ARRAY_SIZE(new->color));
-	}
-	*tal_arr_expand(nodes) = new;
+	*tal_arr_expand(entries) = e
+		= tal(*entries, struct gossip_getnodes_entry);
+	e->nodeid = n->id;
+	e->last_timestamp = n->last_timestamp;
+	if (e->last_timestamp < 0)
+		return;
+
+	e->globalfeatures = n->globalfeatures;
+	e->addresses = n->addresses;
+	BUILD_ASSERT(ARRAY_SIZE(e->alias) == ARRAY_SIZE(n->alias));
+	BUILD_ASSERT(ARRAY_SIZE(e->color) == ARRAY_SIZE(n->rgb_color));
+	memcpy(e->alias, n->alias, ARRAY_SIZE(e->alias));
+	memcpy(e->color, n->rgb_color, ARRAY_SIZE(e->color));
 }
 
 static struct io_plan *getnodes(struct io_conn *conn, struct daemon *daemon,
@@ -1463,18 +1452,19 @@ static struct io_plan *getnodes(struct io_conn *conn, struct daemon *daemon,
 	const struct gossip_getnodes_entry **nodes;
 	struct pubkey *id;
 
-	fromwire_gossip_getnodes_request(tmpctx, msg, &id);
+	if (!fromwire_gossip_getnodes_request(tmpctx, msg, &id))
+		master_badmsg(WIRE_GOSSIP_GETNODES_REQUEST, msg);
 
 	nodes = tal_arr(tmpctx, const struct gossip_getnodes_entry *, 0);
 	if (id) {
 		n = get_node(daemon->rstate, id);
 		if (n)
-			append_node(&nodes, id, n->gfeatures, n);
+			append_node(&nodes, n);
 	} else {
 		struct node_map_iter i;
 		n = node_map_first(daemon->rstate->nodes, &i);
 		while (n != NULL) {
-			append_node(&nodes, &n->id, n->gfeatures, n);
+			append_node(&nodes, n);
 			n = node_map_next(daemon->rstate->nodes, &i);
 		}
 	}
@@ -1803,14 +1793,13 @@ static void gossip_refresh_network(struct daemon *daemon)
 static void gossip_disable_local_channels(struct daemon *daemon)
 {
 	struct node *local_node = get_node(daemon->rstate, &daemon->id);
-	size_t i;
 
 	/* We don't have a local_node, so we don't have any channels yet
 	 * either */
 	if (!local_node)
 		return;
 
-	for (i = 0; i < tal_count(local_node->chans); i++)
+	for (size_t i = 0; i < tal_count(local_node->chans); i++)
 		local_node->chans[i]->local_disabled = true;
 }
 

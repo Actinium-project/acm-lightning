@@ -9,7 +9,7 @@ CCANDIR := ccan
 
 # Where we keep the BOLT RFCs
 BOLTDIR := ../lightning-rfc/
-BOLTVERSION := 0891374d47ddffa64c5a2e6ad151247e3d6b7a59
+BOLTVERSION := b6ae60d24138a3601561fbc1c9d82d983595ae4f
 
 -include config.vars
 
@@ -35,7 +35,7 @@ endif
 
 ifeq ($(COMPAT),1)
 # We support compatibility with pre-0.6.
-COMPAT_CFLAGS=-DCOMPAT_V052=1 -DCOMPAT_V060=1
+COMPAT_CFLAGS=-DCOMPAT_V052=1 -DCOMPAT_V060=1 -DCOMPAT_V061=1
 endif
 
 PYTEST_OPTS := -v
@@ -243,7 +243,7 @@ check-makefile:
 
 # Any mention of BOLT# must be followed by an exact quote, modulo whitespace.
 bolt-check/%: % bolt-precheck tools/check-bolt
-	@if [ -d .tmp.lightningrfc ]; then tools/check-bolt .tmp.lightningrfc $<; else Not checking BOLTs: BOLTDIR $(BOLTDIR) does not exist >&2; fi
+	@if [ -d .tmp.lightningrfc ]; then tools/check-bolt .tmp.lightningrfc $<; else echo "Not checking BOLTs: BOLTDIR $(BOLTDIR) does not exist" >&2; fi
 
 LOCAL_BOLTDIR=.tmp.lightningrfc
 
@@ -285,7 +285,7 @@ check-cppcheck: .cppcheck-suppress
 	@trap 'rm -f .cppcheck-suppress' 0; git ls-files -- "*.c" "*.h" | grep -vE '^ccan/' | xargs cppcheck -q --language=c --std=c11 --error-exitcode=1 --suppressions-list=.cppcheck-suppress
 
 check-shellcheck:
-	git ls-files -- "*.sh" | xargs shellcheck
+	@git ls-files -- "*.sh" | xargs shellcheck
 
 check-setup_locale:
 	@tools/check-setup_locale.sh

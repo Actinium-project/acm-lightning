@@ -145,7 +145,7 @@ static struct node *new_node(struct routing_state *rstate,
 	n = tal(rstate, struct node);
 	n->id = *id;
 	n->chans = tal_arr(n, struct chan *, 0);
-	n->gfeatures = NULL;
+	n->globalfeatures = NULL;
 	n->node_announcement = NULL;
 	n->node_announcement_index = 0;
 	n->last_timestamp = -1;
@@ -361,6 +361,15 @@ static u64 risk_fee(u64 amount, u32 delay, double riskfactor)
 	return 1 + amount * delay * riskfactor;
 }
 
+/* Check that we can fit through this channel's indicated
+ * maximum_ and minimum_msat requirements.
+ */
+static bool hc_can_carry(const struct half_chan *hc, u64 requiredcap)
+{
+	return hc->htlc_maximum_msat >= requiredcap &&
+		hc->htlc_minimum_msat <= requiredcap;
+}
+
 /* We track totals, rather than costs.  That's because the fee depends
  * on the current amount passing through. */
 static void bfg_one_edge(struct node *node,
@@ -398,13 +407,9 @@ static void bfg_one_edge(struct node *node,
 		risk = node->bfg[h].risk +
 		       risk_fee(requiredcap, c->delay, riskfactor);
 
-		if (requiredcap > chan->satoshis * 1000) {
-			/* Skip this edge if the channel has insufficient
-			 * capacity to route the required amount */
-			continue;
-		} else if (requiredcap < c->htlc_minimum_msat) {
-			/* Skip a channels if it indicated that it won't route
-			 * the requeuested amount. */
+		if (!hc_can_carry(c, requiredcap)) {
+			/* Skip a channel if it indicated that it won't route
+			 * the requested amount. */
 			continue;
 		} else if (requiredcap >= MAX_MSATOSHI) {
 			SUPERVERBOSE("...extreme %"PRIu64
@@ -1009,12 +1014,14 @@ static void set_connection_values(struct chan *chan,
 				  u8 message_flags,
 				  u8 channel_flags,
 				  u64 timestamp,
-				  u32 htlc_minimum_msat)
+				  u64 htlc_minimum_msat,
+				  u64 htlc_maximum_msat)
 {
 	struct half_chan *c = &chan->half[idx];
 
 	c->delay = delay;
 	c->htlc_minimum_msat = htlc_minimum_msat;
+	c->htlc_maximum_msat = htlc_maximum_msat;
 	c->base_fee = base_fee;
 	c->proportional_fee = proportional_fee;
 	c->message_flags = message_flags;
@@ -1051,6 +1058,7 @@ bool routing_add_channel_update(struct routing_state *rstate,
 	u64 htlc_minimum_msat;
 	u32 fee_base_msat;
 	u32 fee_proportional_millionths;
+	u64 htlc_maximum_msat;
 	struct bitcoin_blkid chain_hash;
 	struct chan *chan;
 	u8 direction;
@@ -1061,15 +1069,37 @@ bool routing_add_channel_update(struct routing_state *rstate,
 				     &expiry, &htlc_minimum_msat, &fee_base_msat,
 				     &fee_proportional_millionths))
 		return false;
+	/* If it's flagged as containing the optional field, reparse for
+	 * the optional field */
+	if ((message_flags & ROUTING_OPT_HTLC_MAX_MSAT) &&
+			!fromwire_channel_update_option_channel_htlc_max(
+				update, &signature, &chain_hash,
+				&short_channel_id, &timestamp,
+				&message_flags, &channel_flags,
+				&expiry, &htlc_minimum_msat, &fee_base_msat,
+				&fee_proportional_millionths,
+				&htlc_maximum_msat))
+		return false;
 	chan = get_channel(rstate, &short_channel_id);
 	if (!chan)
 		return false;
+
+	if (message_flags & ROUTING_OPT_HTLC_MAX_MSAT) {
+		/* Reject update if the `htlc_maximum_msat` is greater
+		 * than the total available channel satoshis */
+		if (htlc_maximum_msat > chan->satoshis * 1000)
+			return false;
+	} else {
+		/* If not indicated, set htlc_max_msat to channel capacity */
+		htlc_maximum_msat = chan->satoshis * 1000;
+	}
 
 	direction = channel_flags & 0x1;
 	set_connection_values(chan, direction, fee_base_msat,
 			      fee_proportional_millionths, expiry,
 			      message_flags, channel_flags,
-			      timestamp, htlc_minimum_msat);
+			      timestamp, htlc_minimum_msat,
+			      htlc_maximum_msat);
 
 	/* Replace any old one. */
 	tal_free(chan->half[direction].channel_update);
@@ -1307,8 +1337,8 @@ bool routing_add_node_announcement(struct routing_state *rstate, const u8 *msg T
 	node->last_timestamp = timestamp;
 	memcpy(node->rgb_color, rgb_color, ARRAY_SIZE(node->rgb_color));
 	memcpy(node->alias, alias, ARRAY_SIZE(node->alias));
-	tal_free(node->gfeatures);
-	node->gfeatures = tal_steal(node, features);
+	tal_free(node->globalfeatures);
+	node->globalfeatures = tal_steal(node, features);
 
 	tal_free(node->node_announcement);
 	node->node_announcement = tal_dup_arr(node, u8, msg, tal_count(msg), 0);

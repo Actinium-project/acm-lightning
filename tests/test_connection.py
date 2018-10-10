@@ -1,6 +1,7 @@
+from collections import namedtuple
 from fixtures import *  # noqa: F401,F403
 from lightning import RpcError
-from utils import DEVELOPER, only_one, wait_for, sync_blockheight
+from utils import DEVELOPER, only_one, wait_for, sync_blockheight, VALGRIND
 
 
 import os
@@ -1331,3 +1332,110 @@ def test_restart_multi_htlc_rexmit(node_factory, bitcoind, executor):
     # Payments will fail due to restart, but we can see results in listpayments.
     print(l1.rpc.listpayments())
     wait_for(lambda: [p['status'] for p in l1.rpc.listpayments()['payments']] == ['complete', 'complete'])
+
+
+@unittest.skipIf(not DEVELOPER, "needs dev-disconnect")
+def test_fulfill_incoming_first(node_factory, bitcoind):
+    """Test that we handle the case where we completely resolve incoming htlc
+    before fulfilled outgoing htlc"""
+
+    # We agree on fee change first, then add HTLC, then remove; stop after remove.
+    disconnects = ['+WIRE_COMMITMENT_SIGNED*3']
+    # We manually reconnect l2 & l3, after 100 blocks; hence allowing manual
+    # reconnect, but disabling auto connect, and massive cltv so 2/3 doesn't
+    # time out.
+    l1, l2, l3 = node_factory.line_graph(3, opts=[{},
+                                                  {'may_reconnect': True,
+                                                   'dev-no-reconnect': None},
+                                                  {'may_reconnect': True,
+                                                   'dev-no-reconnect': None,
+                                                   'disconnect': disconnects,
+                                                   'cltv-final': 200}],
+                                         announce=True)
+
+    # This succeeds.
+    l1.rpc.pay(l3.rpc.invoice(200000000, 'test_fulfill_incoming_first', 'desc')['bolt11'])
+
+    # l1 can shutdown, fine.
+    l1.rpc.close(l2.info['id'])
+    l1.wait_for_channel_onchain(l2.info['id'])
+    bitcoind.generate_block(100)
+    l2.daemon.wait_for_log('onchaind complete, forgetting peer')
+
+    # Now, l2 should restore from DB fine, even though outgoing HTLC no longer
+    # has an incoming.
+    l2.restart()
+
+    # Manually reconnect l2->l3.
+    l2.rpc.connect(l3.info['id'], 'localhost', l3.port)
+
+    # Fulfill should be retransmitted OK (ignored result).
+    l2.rpc.close(l3.info['id'])
+    l2.wait_for_channel_onchain(l3.info['id'])
+    bitcoind.generate_block(100)
+    l2.daemon.wait_for_log('onchaind complete, forgetting peer')
+    l3.daemon.wait_for_log('onchaind complete, forgetting peer')
+
+
+def test_restart_many_payments(node_factory):
+    l1 = node_factory.get_node(may_reconnect=True)
+
+    # On my laptop, these take 74 seconds and 44 seconds (with restart commented out)
+    if VALGRIND:
+        num = 2
+    else:
+        num = 5
+
+    # Nodes with channels into the main node
+    innodes = node_factory.get_nodes(num, opts={'may_reconnect': True})
+    inchans = []
+    for n in innodes:
+        n.rpc.connect(l1.info['id'], 'localhost', l1.port)
+        inchans.append(n.fund_channel(l1, 10**6))
+
+    # Nodes with channels out of the main node
+    outnodes = node_factory.get_nodes(len(innodes), opts={'may_reconnect': True})
+    outchans = []
+    for n in outnodes:
+        n.rpc.connect(l1.info['id'], 'localhost', l1.port)
+        outchans.append(l1.fund_channel(n, 10**6))
+
+    # Manually create routes, get invoices
+    Payment = namedtuple('Payment', ['innode', 'route', 'payment_hash'])
+
+    to_pay = []
+    for i in range(len(innodes)):
+        # This one will cause WIRE_INCORRECT_CLTV_EXPIRY from l1.
+        route = [{'msatoshi': 100001001,
+                  'id': l1.info['id'],
+                  'delay': 10,
+                  'channel': inchans[i]},
+                 {'msatoshi': 100000000,
+                  'id': outnodes[i].info['id'],
+                  'delay': 5,
+                  'channel': outchans[i]}]
+        payment_hash = outnodes[i].rpc.invoice(100000000, "invoice", "invoice")['payment_hash']
+        to_pay.append(Payment(innodes[i], route, payment_hash))
+
+        # This one should be routed through to the outnode.
+        route = [{'msatoshi': 100001001,
+                  'id': l1.info['id'],
+                  'delay': 11,
+                  'channel': inchans[i]},
+                 {'msatoshi': 100000000,
+                  'id': outnodes[i].info['id'],
+                  'delay': 5,
+                  'channel': outchans[i]}]
+        payment_hash = outnodes[i].rpc.invoice(100000000, "invoice2", "invoice2")['payment_hash']
+        to_pay.append(Payment(innodes[i], route, payment_hash))
+
+    # sendpay is async.
+    for p in to_pay:
+        p.innode.rpc.sendpay(p.route, p.payment_hash)
+
+    # Now restart l1 while traffic is flowing...
+    l1.restart()
+
+    # Wait for them to finish.
+    for n in innodes:
+        wait_for(lambda: 'pending' not in [p['status'] for p in n.rpc.listpayments()['payments']])

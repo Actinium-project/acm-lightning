@@ -83,7 +83,7 @@ bool fromwire_channel_offer_htlc_reply(const tal_t *ctx UNNEEDED, const void *p 
 bool fromwire_channel_sending_commitsig(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u64 *commitnum UNNEEDED, u32 *feerate UNNEEDED, struct changed_htlc **changed UNNEEDED, secp256k1_ecdsa_signature *commit_sig UNNEEDED, secp256k1_ecdsa_signature **htlc_sigs UNNEEDED)
 { fprintf(stderr, "fromwire_channel_sending_commitsig called!\n"); abort(); }
 /* Generated stub for fromwire_connect_peer_connected */
-bool fromwire_connect_peer_connected(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, struct pubkey *id UNNEEDED, struct wireaddr_internal *addr UNNEEDED, struct crypto_state *crypto_state UNNEEDED, u8 **gfeatures UNNEEDED, u8 **lfeatures UNNEEDED)
+bool fromwire_connect_peer_connected(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, struct pubkey *id UNNEEDED, struct wireaddr_internal *addr UNNEEDED, struct crypto_state *crypto_state UNNEEDED, u8 **globalfeatures UNNEEDED, u8 **localfeatures UNNEEDED)
 { fprintf(stderr, "fromwire_connect_peer_connected called!\n"); abort(); }
 /* Generated stub for fromwire_gossip_resolve_channel_reply */
 bool fromwire_gossip_resolve_channel_reply(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, struct pubkey **keys UNNEEDED)
@@ -963,11 +963,14 @@ static bool test_htlc_crud(struct lightningd *ld, const tal_t *ctx)
 	wallet_err = tal_free(wallet_err);
 
 	/* Update */
-	CHECK_MSG(transaction_wrap(w->db, wallet_htlc_update(w, in.dbid, RCVD_ADD_HTLC, NULL)),
+	CHECK_MSG(transaction_wrap(w->db, wallet_htlc_update(w, in.dbid, RCVD_ADD_HTLC, NULL, 0, NULL)),
 		  "Update HTLC with null payment_key failed");
 	CHECK_MSG(
-		transaction_wrap(w->db, wallet_htlc_update(w, in.dbid, SENT_REMOVE_HTLC, &payment_key)),
+		transaction_wrap(w->db, wallet_htlc_update(w, in.dbid, SENT_REMOVE_HTLC, &payment_key, 0, NULL)),
 	    "Update HTLC with payment_key failed");
+	CHECK_MSG(
+		transaction_wrap(w->db, wallet_htlc_update(w, in.dbid, SENT_REMOVE_HTLC, NULL, 0, tal_arrz(tmpctx, u8, 100))),
+	    "Update HTLC with failreason failed");
 
 	CHECK_MSG(transaction_wrap(w->db, wallet_htlc_save_out(w, chan, &out)),
 		  tal_fmt(ctx, "Save htlc_out failed: %s", wallet_err));

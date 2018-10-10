@@ -27,7 +27,10 @@ struct half_chan {
 	s64 last_timestamp;
 
 	/* Minimum number of msatoshi in an HTLC */
-	u32 htlc_minimum_msat;
+	u64 htlc_minimum_msat;
+
+	/* Maximum number of msatoshis in an HTLC */
+	u64 htlc_maximum_msat;
 
 	/* Flags as specified by the `channel_update`s, among other
 	 * things indicated direction wrt the `channel_id` */
@@ -117,7 +120,7 @@ struct node {
 	u8 rgb_color[3];
 
 	/* (Global) features */
-	u8 *gfeatures;
+	u8 *globalfeatures;
 
 	/* Cached `node_announcement` we might forward to new peers (or NULL). */
 	const u8 *node_announcement;
