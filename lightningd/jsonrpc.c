@@ -189,6 +189,36 @@ static struct json_command **get_cmdlist(void)
 	return cmdlist;
 }
 
+static void json_add_help_command(struct command *cmd,
+				  struct json_result *response,
+				  struct json_command *json_command)
+{
+	char *usage;
+	cmd->mode = CMD_USAGE;
+	json_command->dispatch(cmd, NULL, NULL);
+	usage = tal_fmt(cmd, "%s %s", json_command->name, cmd->usage);
+
+	json_object_start(response, NULL);
+
+	json_add_string(response, "command", usage);
+	json_add_string(response, "description", json_command->description);
+
+	if (!json_command->verbose) {
+		json_add_string(response, "verbose",
+				"HELP! Please contribute"
+				" a description for this"
+				" json_command!");
+	} else {
+		struct json_escaped *esc;
+
+		esc = json_escape(NULL, json_command->verbose);
+		json_add_escaped_string(response, "verbose", take(esc));
+	}
+
+	json_object_end(response);
+
+}
+
 static void json_help(struct command *cmd,
 		      const char *buffer, const jsmntok_t *params)
 {
@@ -196,34 +226,16 @@ static void json_help(struct command *cmd,
 	struct json_result *response = new_json_result(cmd);
 	struct json_command **cmdlist = get_cmdlist();
 	const jsmntok_t *cmdtok;
-	char *usage;
 
-	/* FIXME: This is never called with a command parameter because lightning-cli
-	 * attempts to launch the man page and then exits. */
 	if (!param(cmd, buffer, params,
 		   p_opt("command", json_tok_tok, &cmdtok),
 		   NULL))
 		return;
 
-	json_object_start(response, NULL);
 	if (cmdtok) {
 		for (i = 0; i < num_cmdlist; i++) {
 			if (json_tok_streq(buffer, cmdtok, cmdlist[i]->name)) {
-				if (!cmdlist[i]->verbose)
-					json_add_string(response,
-							"verbose",
-							"HELP! Please contribute"
-							" a description for this"
-							" command!");
-				else {
-					struct json_escaped *esc;
-
-					esc = json_escape(NULL,
-							  cmdlist[i]->verbose);
-					json_add_escaped_string(response,
-								"verbose",
-								take(esc));
-				}
+				json_add_help_command(cmd, response, cmdlist[i]);
 				goto done;
 			}
 		}
@@ -234,23 +246,15 @@ static void json_help(struct command *cmd,
 		return;
 	}
 
-	cmd->mode = CMD_USAGE;
+	json_object_start(response, NULL);
 	json_array_start(response, "help");
 	for (i = 0; i < num_cmdlist; i++) {
-		cmdlist[i]->dispatch(cmd, NULL, NULL);
-		usage = tal_fmt(cmd, "%s %s", cmdlist[i]->name,
-			cmd->usage);
-		json_add_object(response,
-				"command", JSMN_STRING,
-				usage,
-				"description", JSMN_STRING,
-				cmdlist[i]->description,
-				NULL);
+		json_add_help_command(cmd, response, cmdlist[i]);
 	}
 	json_array_end(response);
+	json_object_end(response);
 
 done:
-	json_object_end(response);
 	command_success(cmd, response);
 }
 
@@ -506,6 +510,9 @@ static void parse_request(struct json_connection *jcon, const jsmntok_t tok[])
 		assert(c->pending);
 }
 
+static struct io_plan *locked_write_json(struct io_conn *conn,
+					 struct json_connection *jcon);
+
 static struct io_plan *write_json(struct io_conn *conn,
 				  struct json_connection *jcon)
 {
@@ -520,8 +527,9 @@ static struct io_plan *write_json(struct io_conn *conn,
 			return io_close(conn);
 		}
 
+		io_lock_release(jcon->lock);
 		/* Wait for more output. */
-		return io_out_wait(conn, jcon, write_json, jcon);
+		return io_out_wait(conn, jcon, locked_write_json, jcon);
 	}
 
 	jcon->outbuf = tal_steal(jcon, out->json);
@@ -530,6 +538,12 @@ static struct io_plan *write_json(struct io_conn *conn,
 	log_io(jcon->log, LOG_IO_OUT, "", jcon->outbuf, strlen(jcon->outbuf));
 	return io_write(conn,
 			jcon->outbuf, strlen(jcon->outbuf), write_json, jcon);
+}
+
+static struct io_plan *locked_write_json(struct io_conn *conn,
+					   struct json_connection *jcon)
+{
+	return io_lock_acquire_out(conn, jcon->lock, write_json, jcon);
 }
 
 static struct io_plan *read_json(struct io_conn *conn,
@@ -596,6 +610,7 @@ static struct io_plan *jcon_connected(struct io_conn *conn,
 	jcon->used = 0;
 	jcon->buffer = tal_arr(jcon, char, 64);
 	jcon->stop = false;
+	jcon->lock = io_lock_new(jcon);
 	list_head_init(&jcon->commands);
 
 	/* We want to log on destruction, so we free this in destructor. */
@@ -609,7 +624,7 @@ static struct io_plan *jcon_connected(struct io_conn *conn,
 			 io_read_partial(conn, jcon->buffer,
 					 tal_count(jcon->buffer),
 					 &jcon->len_read, read_json, jcon),
-			 write_json(conn, jcon));
+			 locked_write_json(conn, jcon));
 }
 
 static struct io_plan *incoming_jcon_connected(struct io_conn *conn,

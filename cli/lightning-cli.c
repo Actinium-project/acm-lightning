@@ -14,6 +14,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define NO_ERROR 0
@@ -88,22 +89,24 @@ static size_t human_readable(const char *buffer, const jsmntok_t *t, char term)
 	abort();
 }
 
-static void human_help(const char *buffer, const jsmntok_t *result) {
+static void human_help(const char *buffer, const jsmntok_t *result, bool has_command) {
 	int i;
 	const jsmntok_t * help_array = result + 2;
 	/* the first command object */
 	const jsmntok_t * curr = help_array + 1;
 	/* iterate through all commands, printing the name and description */
-	for (i = 0; i<help_array->size; i++) {
+	for (i = 0; i < help_array->size; i++) {
 		curr += 2;
 		printf("%.*s\n", curr->end - curr->start, buffer + curr->start);
 		curr += 2;
 		printf("    %.*s\n\n", curr->end - curr->start, buffer + curr->start);
+		curr += 2;
 		/* advance to next command */
 		curr++;
 	}
 
-	printf("---\nrun `lightning-cli help <command>` for more information on a specific command\n");
+	if (!has_command)
+		printf("---\nrun `lightning-cli help <command>` for more information on a specific command\n");
 }
 
 enum format {
@@ -171,9 +174,23 @@ static void add_input(char **cmd, const char *input,
 }
 
 static void
-exec_man (const char *page) {
-	execlp("man", "man", page, (char *)NULL);
-	err(1, "Running man command");
+try_exec_man (const char *page) {
+	int status;
+
+	switch (fork()) {
+	case -1:
+		err(1, "Forking man command");
+	case 0:
+		/* child, run man command. */
+		execlp("man", "man", page, (char *)NULL);
+		err(1, "Running man command");
+	default:
+		break;
+	}
+
+	wait(&status);
+	if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+		exit(0);
 }
 
 int main(int argc, char *argv[])
@@ -192,6 +209,7 @@ int main(int argc, char *argv[])
 	int parserr;
 	enum format format = DEFAULT_FORMAT;
 	enum input input = DEFAULT_INPUT;
+	char *command = NULL;
 
 	err_set_progname(argv[0]);
 	jsmn_init(&parser);
@@ -234,9 +252,10 @@ int main(int argc, char *argv[])
 	/* Launch a manpage if we have a help command with an argument. We do
 	 * not need to have lightningd running in this case. */
 	if (streq(method, "help") && format == HUMAN && argc >= 3) {
-		char command[strlen(argv[2]) + sizeof("lightning-")];
-		snprintf(command, sizeof(command), "lightning-%s", argv[2]);
-		exec_man(command);
+		command = argv[2];
+		char page[strlen(command) + sizeof("lightning-")];
+		snprintf(page, sizeof(page), "lightning-%s", command);
+		try_exec_man(page);
 	}
 
 	if (chdir(lightning_dir) != 0)
@@ -346,9 +365,12 @@ int main(int argc, char *argv[])
 		     json_tok_len(id), json_tok_contents(resp, id));
 
 	if (!error || json_tok_is_null(resp, error)) {
+		// if we have specific help command
 		if (format == HUMAN)
-			if (streq(method, "help")) human_help(resp, result);
-			else human_readable(resp, result, '\n');
+			if (streq(method, "help") && command == NULL)
+				human_help(resp, result, false);
+			else
+				human_readable(resp, result, '\n');
 		else
 			printf("%.*s\n",
 			       json_tok_len(result),
