@@ -4,7 +4,7 @@
 
 # Initialize the gossip daemon.
 gossipctl_init,3000
-gossipctl_init,,broadcast_interval,u32
+gossipctl_init,,broadcast_interval_msec,u32
 gossipctl_init,,chain_hash,struct bitcoin_blkid
 gossipctl_init,,id,struct pubkey
 gossipctl_init,,gflen,u16
@@ -93,13 +93,12 @@ gossip_query_channel_range_reply,,scids,num*struct short_channel_id
 gossip_dev_set_max_scids_encode_size,3030
 gossip_dev_set_max_scids_encode_size,,max,u32
 
-# Given a short_channel_id, return the endpoints
-gossip_resolve_channel_request,3009
-gossip_resolve_channel_request,,channel_id,struct short_channel_id
+# Given a short_channel_id, return the other endpoint (or none if DNE)
+gossip_get_channel_peer,3009
+gossip_get_channel_peer,,channel_id,struct short_channel_id
 
-gossip_resolve_channel_reply,3109
-gossip_resolve_channel_reply,,num_keys,u16
-gossip_resolve_channel_reply,,keys,num_keys*struct pubkey
+gossip_get_channel_peer_reply,3109
+gossip_get_channel_peer_reply,,peer_id,?struct pubkey
 
 # Channel daemon can ask for updates for a specific channel, for sending
 # errors.  Must be distinct from WIRE_CHANNEL_ANNOUNCEMENT etc. gossip msgs!
@@ -131,6 +130,7 @@ gossip_local_channel_update,,cltv_expiry_delta,u16
 gossip_local_channel_update,,htlc_minimum_msat,u64
 gossip_local_channel_update,,fee_base_msat,u32
 gossip_local_channel_update,,fee_proportional_millionths,u32
+gossip_local_channel_update,,htlc_maximum_msat,u64
 
 gossip_local_channel_close,3027
 gossip_local_channel_close,,short_channel_id,struct short_channel_id

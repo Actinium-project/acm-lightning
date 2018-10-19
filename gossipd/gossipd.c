@@ -80,7 +80,7 @@ struct daemon {
 
 	struct timers timers;
 
-	u32 broadcast_interval;
+	u32 broadcast_interval_msec;
 
 	/* Global features to list in node_announcement. */
 	u8 *globalfeatures;
@@ -90,9 +90,6 @@ struct daemon {
 
 	/* What we can actually announce. */
 	struct wireaddr *announcable;
-
-	/* To make sure our node_announcement timestamps increase */
-	u32 last_announce_timestamp;
 };
 
 struct peer {
@@ -313,11 +310,17 @@ static void send_node_announcement(struct daemon *daemon)
 	u32 timestamp = time_now().ts.tv_sec;
 	secp256k1_ecdsa_signature sig;
 	u8 *msg, *nannounce, *err;
+	s64 last_timestamp;
+	struct node *self = get_node(daemon->rstate, &daemon->id);
+
+	if (self)
+		last_timestamp = self->last_timestamp;
+	else
+		last_timestamp = -1;
 
 	/* Timestamps must move forward, or announce will be ignored! */
-	if (timestamp <= daemon->last_announce_timestamp)
-		timestamp = daemon->last_announce_timestamp + 1;
-	daemon->last_announce_timestamp = timestamp;
+	if (timestamp <= last_timestamp)
+		timestamp = last_timestamp + 1;
 
 	nannounce = create_node_announcement(tmpctx, daemon, NULL, timestamp);
 
@@ -929,7 +932,7 @@ static bool maybe_queue_gossip(struct peer *peer)
 	/* Gossip is drained.  Wait for next timer. */
 	peer->gossip_timer
 		= new_reltimer(&peer->daemon->timers, peer,
-			       time_from_msec(peer->daemon->broadcast_interval),
+			       time_from_msec(peer->daemon->broadcast_interval_msec),
 			       wake_gossip_out, peer);
 	return false;
 }
@@ -942,16 +945,13 @@ static void update_local_channel(struct daemon *daemon,
 				 u64 htlc_minimum_msat,
 				 u32 fee_base_msat,
 				 u32 fee_proportional_millionths,
+				 u64 htlc_maximum_msat,
 				 const char *caller)
 {
 	secp256k1_ecdsa_signature dummy_sig;
 	u8 *update, *msg;
 	u32 timestamp = time_now().ts.tv_sec;
 	u8 message_flags, channel_flags;
-
-	/* `message_flags` are optional.
-	 * Currently, not set by c-lightning */
-	message_flags = 0;
 
 	/* So valgrind doesn't complain */
 	memset(&dummy_sig, 0, sizeof(dummy_sig));
@@ -965,7 +965,10 @@ static void update_local_channel(struct daemon *daemon,
 	if (disable)
 		channel_flags |= ROUTING_FLAGS_DISABLED;
 
-	update = towire_channel_update(tmpctx, &dummy_sig,
+	// We set the htlc_maximum_msat value
+	message_flags = 0 | ROUTING_OPT_HTLC_MAX_MSAT;
+
+	update = towire_channel_update_option_channel_htlc_max(tmpctx, &dummy_sig,
 				       &daemon->rstate->chain_hash,
 				       &chan->scid,
 				       timestamp,
@@ -973,7 +976,8 @@ static void update_local_channel(struct daemon *daemon,
 				       cltv_expiry_delta,
 				       htlc_minimum_msat,
 				       fee_base_msat,
-				       fee_proportional_millionths);
+				       fee_proportional_millionths,
+				       htlc_maximum_msat);
 
 	if (!wire_sync_write(HSM_FD,
 			     towire_hsm_cupdate_sig_req(tmpctx, update))) {
@@ -1026,6 +1030,7 @@ static void maybe_update_local_channel(struct daemon *daemon,
 			     hc->htlc_minimum_msat,
 			     hc->base_fee,
 			     hc->proportional_fee,
+			     hc->htlc_maximum_msat,
 			     __func__);
 }
 
@@ -1093,7 +1098,8 @@ out:
 /* Return true if the information has changed. */
 static bool halfchan_new_info(const struct half_chan *hc,
 			      u16 cltv_delta, u64 htlc_minimum_msat,
-			      u32 fee_base_msat, u32 fee_proportional_millionths)
+			      u32 fee_base_msat, u32 fee_proportional_millionths,
+			      u64 htlc_maximum_msat)
 {
 	if (!is_halfchan_defined(hc))
 		return true;
@@ -1101,7 +1107,8 @@ static bool halfchan_new_info(const struct half_chan *hc,
 	return hc->delay != cltv_delta
 		|| hc->htlc_minimum_msat != htlc_minimum_msat
 		|| hc->base_fee != fee_base_msat
-		|| hc->proportional_fee != fee_proportional_millionths;
+		|| hc->proportional_fee != fee_proportional_millionths
+		|| hc->htlc_maximum_msat != htlc_maximum_msat;
 }
 
 static void handle_local_channel_update(struct peer *peer, const u8 *msg)
@@ -1111,6 +1118,7 @@ static void handle_local_channel_update(struct peer *peer, const u8 *msg)
 	bool disable;
 	u16 cltv_expiry_delta;
 	u64 htlc_minimum_msat;
+	u64 htlc_maximum_msat;
 	u32 fee_base_msat;
 	u32 fee_proportional_millionths;
 	int direction;
@@ -1121,7 +1129,8 @@ static void handle_local_channel_update(struct peer *peer, const u8 *msg)
 						  &cltv_expiry_delta,
 						  &htlc_minimum_msat,
 						  &fee_base_msat,
-						  &fee_proportional_millionths)) {
+						  &fee_proportional_millionths,
+						  &htlc_maximum_msat)) {
 		status_broken("peer %s bad local_channel_update %s",
 			      type_to_string(tmpctx, struct pubkey, &peer->id),
 			      tal_hex(tmpctx, msg));
@@ -1151,7 +1160,8 @@ static void handle_local_channel_update(struct peer *peer, const u8 *msg)
 	 * Or, if it's an unannounced channel (only sending to peer). */
 	if (halfchan_new_info(&chan->half[direction],
 			      cltv_expiry_delta, htlc_minimum_msat,
-			      fee_base_msat, fee_proportional_millionths)
+			      fee_base_msat, fee_proportional_millionths,
+			      htlc_maximum_msat)
 	    || ((chan->half[direction].channel_flags & ROUTING_FLAGS_DISABLED)
 		&& !disable)
 	    || !is_chan_public(chan)) {
@@ -1161,6 +1171,7 @@ static void handle_local_channel_update(struct peer *peer, const u8 *msg)
 				     htlc_minimum_msat,
 				     fee_base_msat,
 				     fee_proportional_millionths,
+				     htlc_maximum_msat,
 				     __func__);
 	}
 
@@ -1538,6 +1549,10 @@ static struct io_plan *get_incoming_channels(struct io_conn *conn,
 			const struct half_chan *hc;
 			struct route_info *ri;
 
+			/* Don't leak private channels. */
+			if (!is_chan_public(c))
+				continue;
+
 			hc = &c->half[half_chan_to(node, c)];
 
 			if (!is_halfchan_enabled(hc))
@@ -1744,6 +1759,7 @@ static void gossip_send_keepalive_update(struct daemon *daemon,
 			     hc->htlc_minimum_msat,
 			     hc->base_fee,
 			     hc->proportional_fee,
+			     hc->htlc_maximum_msat,
 			     __func__);
 }
 
@@ -1814,7 +1830,7 @@ static struct io_plan *gossip_init(struct daemon_conn *master,
 	u32 update_channel_interval;
 
 	if (!fromwire_gossipctl_init(
-		daemon, msg, &daemon->broadcast_interval, &chain_hash,
+		daemon, msg, &daemon->broadcast_interval_msec, &chain_hash,
 		&daemon->id, &daemon->globalfeatures,
 		daemon->rgb,
 		daemon->alias, &update_channel_interval,
@@ -1842,32 +1858,32 @@ static struct io_plan *gossip_init(struct daemon_conn *master,
 	return daemon_conn_read_next(master->conn, master);
 }
 
-static struct io_plan *resolve_channel_req(struct io_conn *conn,
-					   struct daemon *daemon, const u8 *msg)
+static struct io_plan *get_channel_peer(struct io_conn *conn,
+					struct daemon *daemon, const u8 *msg)
 {
 	struct short_channel_id scid;
 	struct chan *chan;
-	struct pubkey *keys;
+	const struct pubkey *key;
+	int direction;
 
-	if (!fromwire_gossip_resolve_channel_request(msg, &scid))
-		master_badmsg(WIRE_GOSSIP_RESOLVE_CHANNEL_REQUEST, msg);
+	if (!fromwire_gossip_get_channel_peer(msg, &scid))
+		master_badmsg(WIRE_GOSSIP_GET_CHANNEL_PEER, msg);
 
 	chan = get_channel(daemon->rstate, &scid);
 	if (!chan) {
 		status_trace("Failed to resolve channel %s",
 			     type_to_string(tmpctx, struct short_channel_id, &scid));
-		keys = NULL;
+		key = NULL;
+	} else if (local_direction(daemon, chan, &direction)) {
+		key = &chan->nodes[!direction]->id;
 	} else {
-		keys = tal_arr(msg, struct pubkey, 2);
-		keys[0] = chan->nodes[0]->id;
-		keys[1] = chan->nodes[1]->id;
-		status_trace("Resolved channel %s %s<->%s",
-			     type_to_string(tmpctx, struct short_channel_id, &scid),
-			     type_to_string(tmpctx, struct pubkey, &keys[0]),
-			     type_to_string(tmpctx, struct pubkey, &keys[1]));
+		status_trace("Resolved channel %s was not local",
+			     type_to_string(tmpctx, struct short_channel_id,
+					    &scid));
+		key = NULL;
 	}
 	daemon_conn_send(&daemon->master,
-			 take(towire_gossip_resolve_channel_reply(NULL, keys)));
+			 take(towire_gossip_get_channel_peer_reply(NULL, key)));
 	return daemon_conn_read_next(conn, &daemon->master);
 }
 
@@ -1996,8 +2012,8 @@ static struct io_plan *recv_req(struct io_conn *conn, struct daemon_conn *master
 	case WIRE_GOSSIP_GETCHANNELS_REQUEST:
 		return getchannels_req(conn, daemon, daemon->master.msg_in);
 
-	case WIRE_GOSSIP_RESOLVE_CHANNEL_REQUEST:
-		return resolve_channel_req(conn, daemon, daemon->master.msg_in);
+	case WIRE_GOSSIP_GET_CHANNEL_PEER:
+		return get_channel_peer(conn, daemon, daemon->master.msg_in);
 
 	case WIRE_GOSSIP_GET_TXOUT_REPLY:
 		return handle_txout_reply(conn, daemon, master->msg_in);
@@ -2053,7 +2069,7 @@ static struct io_plan *recv_req(struct io_conn *conn, struct daemon_conn *master
 	case WIRE_GOSSIP_PING_REPLY:
 	case WIRE_GOSSIP_SCIDS_REPLY:
 	case WIRE_GOSSIP_QUERY_CHANNEL_RANGE_REPLY:
-	case WIRE_GOSSIP_RESOLVE_CHANNEL_REPLY:
+	case WIRE_GOSSIP_GET_CHANNEL_PEER_REPLY:
 	case WIRE_GOSSIP_GET_INCOMING_CHANNELS_REPLY:
 	case WIRE_GOSSIP_GET_UPDATE:
 	case WIRE_GOSSIP_GET_UPDATE_REPLY:
@@ -2136,8 +2152,6 @@ int main(int argc, char *argv[])
 	daemon = tal(NULL, struct daemon);
 	list_head_init(&daemon->peers);
 	timers_init(&daemon->timers, time_mono());
-	daemon->broadcast_interval = 30000;
-	daemon->last_announce_timestamp = 0;
 
 	/* stdin == control */
 	daemon_conn_init(daemon, &daemon->master, STDIN_FILENO, recv_req,
