@@ -15,7 +15,6 @@
 #include <common/dev_disconnect.h>
 #include <common/features.h>
 #include <common/initial_commit_tx.h>
-#include <common/json_escaped.h>
 #include <common/key_derive.h>
 #include <common/status.h>
 #include <common/timeout.h>
@@ -233,7 +232,7 @@ static void remove_sig(struct bitcoin_tx *signed_tx)
 static void
 resolve_one_close_command(struct close_command *cc, bool cooperative)
 {
-	struct json_result *result = new_json_result(cc);
+	struct json_stream *result = json_stream_success(cc->cmd);
 	u8 *tx = linearize_tx(result, cc->channel->last_tx);
 	struct bitcoin_txid txid;
 
@@ -598,7 +597,7 @@ void channel_watch_funding(struct lightningd *ld, struct channel *channel)
 }
 
 static void json_add_htlcs(struct lightningd *ld,
-			   struct json_result *response,
+			   struct json_stream *response,
 			   const struct channel *channel)
 {
 	/* FIXME: make per-channel htlc maps! */
@@ -648,7 +647,7 @@ static void json_add_htlcs(struct lightningd *ld,
 }
 
 static void json_add_peer(struct lightningd *ld,
-			  struct json_result *response,
+			  struct json_stream *response,
 			  struct peer *p,
 			  const enum log_level *ll)
 {
@@ -819,7 +818,7 @@ static void json_listpeers(struct command *cmd,
 	enum log_level *ll;
 	struct pubkey *specific_id;
 	struct peer *peer;
-	struct json_result *response = new_json_result(cmd);
+	struct json_stream *response;
 
 	if (!param(cmd, buffer, params,
 		   p_opt("id", json_tok_pubkey, &specific_id),
@@ -827,6 +826,7 @@ static void json_listpeers(struct command *cmd,
 		   NULL))
 		return;
 
+	response = json_stream_success(cmd);
 	json_object_start(response, NULL);
 	json_array_start(response, "peers");
 	if (specific_id) {
@@ -995,6 +995,7 @@ static void activate_peer(struct peer *peer)
 		msg = towire_connectctl_connect_to_peer(NULL, &peer->id, 0,
 							&peer->addr);
 		subd_send_msg(ld->connectd, take(msg));
+		channel_set_billboard(channel, false, "Attempting to reconnect");
 	}
 
 	list_for_each(&peer->channels, channel, list) {
@@ -1083,7 +1084,7 @@ static void json_sign_last_tx(struct command *cmd,
 {
 	struct pubkey *peerid;
 	struct peer *peer;
-	struct json_result *response = new_json_result(cmd);
+	struct json_stream *response;
 	u8 *linear;
 	struct channel *channel;
 
@@ -1105,6 +1106,7 @@ static void json_sign_last_tx(struct command *cmd,
 		return;
 	}
 
+	response = json_stream_success(cmd);
 	log_debug(channel->log, "dev-sign-last-tx: signing tx with %zu outputs",
 		  tal_count(channel->last_tx->output));
 	sign_last_tx(channel);
@@ -1231,7 +1233,7 @@ static void process_dev_forget_channel(struct bitcoind *bitcoind UNUSED,
 				       const struct bitcoin_tx_output *txout,
 				       void *arg)
 {
-	struct json_result *response;
+	struct json_stream *response;
 	struct dev_forget_channel_cmd *forget = arg;
 	if (txout != NULL && !forget->force) {
 		command_fail(forget->cmd, LIGHTNINGD,
@@ -1244,7 +1246,7 @@ static void process_dev_forget_channel(struct bitcoind *bitcoind UNUSED,
 			     "channel");
 		return;
 	}
-	response = new_json_result(forget->cmd);
+	response = json_stream_success(forget->cmd);
 	json_object_start(response, NULL);
 	json_add_bool(response, "forced", forget->force);
 	json_add_bool(response, "funding_unspent", txout != NULL);

@@ -380,8 +380,12 @@ class LightningNode(object):
         self.may_fail = may_fail
         self.may_reconnect = may_reconnect
 
-    def openchannel(self, remote_node, capacity, addrtype="p2sh-segwit", confirm=True, announce=True):
+    def openchannel(self, remote_node, capacity, addrtype="p2sh-segwit", confirm=True, announce=True, connect=True):
         addr, wallettxid = self.fundwallet(10 * capacity, addrtype)
+
+        if connect and remote_node.info['id'] not in [p['id'] for p in self.rpc.listpeers()['peers']]:
+            self.rpc.connect(remote_node.info['id'], '127.0.0.1', remote_node.daemon.port)
+
         fundingtx = self.rpc.fundchannel(remote_node.info['id'], capacity)
 
         # Wait for the funding transaction to be in bitcoind's mempool
@@ -828,6 +832,11 @@ class NodeFactory(object):
         # simply check the ends (since it's a line).
         wait_for(lambda: both_dirs_ready(nodes[0], scids[-1]))
         wait_for(lambda: both_dirs_ready(nodes[-1], scids[0]))
+
+        # Make sure we have all node announcements, too (just check ends)
+        for n in nodes:
+            for end in (nodes[0], nodes[-1]):
+                wait_for(lambda: 'alias' in only_one(end.rpc.listnodes(n.info['id'])['nodes']))
 
         return nodes
 

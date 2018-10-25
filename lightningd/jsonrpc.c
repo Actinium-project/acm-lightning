@@ -6,11 +6,11 @@
 #include <bitcoin/script.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/err/err.h>
+#include <ccan/io/backend.h>
 #include <ccan/io/io.h>
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
 #include <common/bech32.h>
-#include <common/json_escaped.h>
 #include <common/memleak.h>
 #include <common/version.h>
 #include <common/wallet_tx.h>
@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/json.h>
+#include <lightningd/json_escaped.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/jsonrpc_errors.h>
 #include <lightningd/lightningd.h>
@@ -31,29 +32,32 @@
 #include <sys/types.h>
 #include <sys/un.h>
 
-struct json_output {
-	struct list_node list;
-	const char *json;
-};
+/* Realloc helper for tal membufs */
+static void *membuf_tal_realloc(struct membuf *mb,
+				void *rawelems, size_t newsize)
+{
+	char *p = rawelems;
+
+	tal_resize(&p, newsize);
+	return p;
+}
 
 /* jcon and cmd have separate lifetimes: we detach them on either destruction */
 static void destroy_jcon(struct json_connection *jcon)
 {
-	struct command *cmd;
-
-	list_for_each(&jcon->commands, cmd, list) {
+	if (jcon->command) {
 		log_debug(jcon->log, "Abandoning command");
-		cmd->jcon = NULL;
+		jcon->command->jcon = NULL;
 	}
 
 	/* Make sure this happens last! */
 	tal_free(jcon->log);
 }
 
-static void destroy_cmd(struct command *cmd)
+/* FIXME: This, or something prettier (io_replan?) belong in ccan/io! */
+static void adjust_io_write(struct io_conn *conn, ptrdiff_t delta)
 {
-	if (cmd->jcon)
-		list_del_from(&cmd->jcon->commands, &cmd->list);
+	conn->plan[IO_OUT].arg.u1.cp += delta;
 }
 
 static void json_help(struct command *cmd,
@@ -76,13 +80,14 @@ AUTODATA(json_command, &help_command);
 static void json_stop(struct command *cmd,
 		      const char *buffer UNUSED, const jsmntok_t *params UNUSED)
 {
-	struct json_result *response = new_json_result(cmd);
+	struct json_stream *response;
 
 	if (!param(cmd, buffer, params, NULL))
 		return;
 
 	/* This can't have closed yet! */
 	cmd->jcon->stop = true;
+	response = json_stream_success(cmd);
 	json_add_string(response, NULL, "Shutting down");
 	command_success(cmd, response);
 }
@@ -98,7 +103,7 @@ AUTODATA(json_command, &stop_command);
 static void json_rhash(struct command *cmd,
 		       const char *buffer, const jsmntok_t *params)
 {
-	struct json_result *response = new_json_result(cmd);
+	struct json_stream *response;
 	struct sha256 *secret;
 
 	if (!param(cmd, buffer, params,
@@ -108,6 +113,7 @@ static void json_rhash(struct command *cmd,
 
 	/* Hash in place. */
 	sha256(secret, secret, sizeof(*secret));
+	response = json_stream_success(cmd);
 	json_object_start(response, NULL);
 	json_add_hex(response, "rhash", secret, sizeof(*secret));
 	json_object_end(response);
@@ -141,11 +147,12 @@ AUTODATA(json_command, &dev_crash_command);
 static void json_getinfo(struct command *cmd,
 			 const char *buffer UNUSED, const jsmntok_t *params UNUSED)
 {
-	struct json_result *response = new_json_result(cmd);
+	struct json_stream *response;
 
 	if (!param(cmd, buffer, params, NULL))
 		return;
 
+	response = json_stream_success(cmd);
 	json_object_start(response, NULL);
 	json_add_pubkey(response, "id", &cmd->ld->id);
 	json_add_string(response, "alias", (const char *)cmd->ld->alias);
@@ -167,6 +174,8 @@ static void json_getinfo(struct command *cmd,
 	json_add_string(response, "version", version());
 	json_add_num(response, "blockheight", get_block_height(cmd->ld->topology));
 	json_add_string(response, "network", get_chainparams(cmd->ld)->network_name);
+	json_add_u64(response, "msatoshi_fees_collected",
+		     wallet_total_forward_fees(cmd->ld->wallet));
 	json_object_end(response);
 	command_success(cmd, response);
 }
@@ -190,7 +199,7 @@ static struct json_command **get_cmdlist(void)
 }
 
 static void json_add_help_command(struct command *cmd,
-				  struct json_result *response,
+				  struct json_stream *response,
 				  struct json_command *json_command)
 {
 	char *usage;
@@ -223,7 +232,7 @@ static void json_help(struct command *cmd,
 		      const char *buffer, const jsmntok_t *params)
 {
 	unsigned int i;
-	struct json_result *response = new_json_result(cmd);
+	struct json_stream *response;
 	struct json_command **cmdlist = get_cmdlist();
 	const jsmntok_t *cmdtok;
 
@@ -235,6 +244,7 @@ static void json_help(struct command *cmd,
 	if (cmdtok) {
 		for (i = 0; i < num_cmdlist; i++) {
 			if (json_tok_streq(buffer, cmdtok, cmdlist[i]->name)) {
+				response = json_stream_success(cmd);
 				json_add_help_command(cmd, response, cmdlist[i]);
 				goto done;
 			}
@@ -246,6 +256,7 @@ static void json_help(struct command *cmd,
 		return;
 	}
 
+	response = json_stream_success(cmd);
 	json_object_start(response, NULL);
 	json_array_start(response, "help");
 	for (i = 0; i < num_cmdlist; i++) {
@@ -272,152 +283,117 @@ static const struct json_command *find_cmd(const char *buffer,
 	return NULL;
 }
 
-static void json_done(struct json_connection *jcon,
-		      struct command *cmd,
-		      const char *json TAKES)
+/* Make sure jcon->outbuf has room for len */
+static void json_connection_mkroom(struct json_connection *jcon, size_t len)
 {
-	struct json_output *out = tal(jcon, struct json_output);
-	out->json = tal_strdup(out, json);
+	ptrdiff_t delta = membuf_prepare_space(&jcon->outbuf, len);
 
-	/* Can be NULL if we failed to parse! */
-	tal_free(cmd);
+	/* If io_write is in progress, we shift it to point to new buffer pos */
+	if (io_lock_taken(jcon->lock))
+		adjust_io_write(jcon->conn, delta);
+}
 
-	/* Queue for writing, and wake writer. */
-	list_add_tail(&jcon->output, &out->list);
+void jcon_append(struct json_connection *jcon, const char *str)
+{
+	size_t len = strlen(str);
+
+	json_connection_mkroom(jcon, len);
+	memcpy(membuf_add(&jcon->outbuf, len), str, len);
+
+	/* Wake writer. */
 	io_wake(jcon);
 }
 
-static void connection_complete_ok(struct json_connection *jcon,
-				   struct command *cmd,
-				   const char *id,
-				   const struct json_result *result)
+void jcon_append_vfmt(struct json_connection *jcon, const char *fmt, va_list ap)
 {
-	assert(id != NULL);
-	assert(result != NULL);
-	if (cmd->ok)
-		*(cmd->ok) = true;
+	size_t fmtlen;
+	va_list ap2;
 
-	/* This JSON is simple enough that we build manually */
-	json_done(jcon, cmd, take(tal_fmt(jcon,
-					  "{ \"jsonrpc\": \"2.0\", "
-					  "\"result\" : %s,"
-					  " \"id\" : %s }\n",
-					  json_result_string(result), id)));
+	/* Make a copy in case we need it below. */
+	va_copy(ap2, ap);
+
+	/* Try printing in place first. */
+	fmtlen = vsnprintf(membuf_space(&jcon->outbuf),
+			   membuf_num_space(&jcon->outbuf), fmt, ap);
+
+	/* Horrible subtlety: vsnprintf *will* NUL terminate, even if it means
+	 * chopping off the last character.  So if fmtlen ==
+	 * membuf_num_space(&jcon->outbuf), the result was truncated! */
+	if (fmtlen < membuf_num_space(&jcon->outbuf)) {
+		membuf_added(&jcon->outbuf, fmtlen);
+	} else {
+		/* Make room for NUL terminator, even though we don't want it */
+		json_connection_mkroom(jcon, fmtlen + 1);
+		vsprintf(membuf_space(&jcon->outbuf), fmt, ap2);
+		membuf_added(&jcon->outbuf, fmtlen);
+	}
+
+	va_end(ap2);
+
+	/* Wake writer. */
+	io_wake(jcon);
 }
 
-static void connection_complete_error(struct json_connection *jcon,
-				      struct command *cmd,
-				      const char *id,
-				      const char *errmsg,
-				      int code,
-				      const struct json_result *data)
+struct json_stream *null_response(struct command *cmd)
 {
-	struct json_escaped *esc;
-	const char *data_str;
+	struct json_stream *response;
 
-	esc = json_escape(tmpctx, errmsg);
-	if (data)
-		data_str = tal_fmt(tmpctx, ", \"data\" : %s",
-				   json_result_string(data));
-	else
-		data_str = "";
-
-	assert(id != NULL);
-
-	/* cmd *can be* NULL if we failed to parse! */
-	if (cmd && cmd->ok)
-		*(cmd->ok) = false;
-
-	json_done(jcon, cmd, take(tal_fmt(tmpctx,
-					  "{ \"jsonrpc\": \"2.0\", "
-					  " \"error\" : "
-					  "{ \"code\" : %d,"
-					  " \"message\" : \"%s\"%s },"
-					  " \"id\" : %s }\n",
-					  code,
-					  esc->s,
-					  data_str,
-					  id)));
-}
-
-struct json_result *null_response(const tal_t *ctx)
-{
-	struct json_result *response;
-
-	response = new_json_result(ctx);
+	response = json_stream_success(cmd);
 	json_object_start(response, NULL);
 	json_object_end(response);
 	return response;
 }
 
-static bool cmd_in_jcon(const struct json_connection *jcon,
-			const struct command *cmd)
+/* This can be called directly on shutdown, even with unfinished cmd */
+static void destroy_command(struct command *cmd)
 {
-	const struct command *i;
-
-	list_for_each(&jcon->commands, i, list)
-		if (i == cmd)
-			return true;
-	return false;
-}
-
-void command_success(struct command *cmd, struct json_result *result)
-{
-	struct json_connection *jcon = cmd->jcon;
-
-	if (!jcon) {
+	if (!cmd->jcon) {
 		log_debug(cmd->ld->log,
 			    "Command returned result after jcon close");
-		tal_free(cmd);
-		return;
-	}
-	assert(cmd_in_jcon(jcon, cmd));
-	connection_complete_ok(jcon, cmd, cmd->id, result);
-}
-
-static void command_fail_v(struct command *cmd,
-			   int code,
-			   const struct json_result *data,
-			   const char *fmt, va_list ap)
-{
-	char *error;
-	struct json_connection *jcon = cmd->jcon;
-
-	if (!jcon) {
-		log_debug(cmd->ld->log,
-			  "%s: Command failed after jcon close",
-			  cmd->json_cmd->name);
-		tal_free(cmd);
 		return;
 	}
 
-	error = tal_vfmt(cmd, fmt, ap);
-
-	/* cmd->json_cmd can be NULL, if we're failing for command not found! */
-	log_debug(jcon->log, "Failing %s: %s",
-		  cmd->json_cmd ? cmd->json_cmd->name : "invalid cmd",
-		  error);
-
-	assert(cmd_in_jcon(jcon, cmd));
-	connection_complete_error(jcon, cmd, cmd->id, error, code, data);
+	assert(cmd->jcon->command == cmd);
+	cmd->jcon->command = NULL;
 }
 
-void command_fail(struct command *cmd, int code, const char *fmt, ...)
+/* FIXME: Remove result arg here! */
+void command_success(struct command *cmd, struct json_stream *result)
 {
-	va_list ap;
-	va_start(ap, fmt);
-	command_fail_v(cmd, code, NULL, fmt, ap);
-	va_end(ap);
+	assert(cmd);
+	assert(cmd->have_json_stream);
+	if (cmd->jcon)
+		jcon_append(cmd->jcon, " }\n");
+	if (cmd->ok)
+		*(cmd->ok) = true;
+	tal_free(cmd);
 }
 
-void command_fail_detailed(struct command *cmd,
-			   int code, const struct json_result *data,
-			   const char *fmt, ...)
+/* FIXME: Remove result arg here! */
+void command_failed(struct command *cmd, struct json_stream *result)
 {
+	assert(cmd->have_json_stream);
+	/* Have to close error */
+	if (cmd->jcon)
+		jcon_append(cmd->jcon, " } }\n");
+	if (cmd->ok)
+		*(cmd->ok) = false;
+	tal_free(cmd);
+}
+
+void PRINTF_FMT(3, 4) command_fail(struct command *cmd, int code,
+				   const char *fmt, ...)
+{
+	const char *errmsg;
+	struct json_stream *r;
 	va_list ap;
+
 	va_start(ap, fmt);
-	command_fail_v(cmd, code, data, fmt, ap);
+	errmsg = tal_vfmt(cmd, fmt, ap);
 	va_end(ap);
+	r = json_stream_fail_nodata(cmd, code, errmsg);
+
+	command_failed(cmd, r);
 }
 
 void command_still_pending(struct command *cmd)
@@ -427,15 +403,27 @@ void command_still_pending(struct command *cmd)
 	cmd->pending = true;
 }
 
+static void jcon_start(struct json_connection *jcon, const char *id)
+{
+	jcon_append(jcon, "{ \"jsonrpc\": \"2.0\", \"id\" : ");
+	jcon_append(jcon, id);
+	jcon_append(jcon, ", ");
+}
+
 static void json_command_malformed(struct json_connection *jcon,
 				   const char *id,
 				   const char *error)
 {
-	return connection_complete_error(jcon, NULL, id, error,
-					 JSONRPC2_INVALID_REQUEST, NULL);
+	jcon_start(jcon, id);
+	jcon_append(jcon,
+		    tal_fmt(tmpctx, " \"error\" : "
+			    "{ \"code\" : %d,"
+			    " \"message\" : \"%s\" } }\n",
+			    JSONRPC2_INVALID_REQUEST, error));
 }
 
-static void parse_request(struct json_connection *jcon, const jsmntok_t tok[])
+/* Returns true if command already completed. */
+static bool parse_request(struct json_connection *jcon, const jsmntok_t tok[])
 {
 	const jsmntok_t *method, *id, *params;
 	struct command *c;
@@ -443,7 +431,7 @@ static void parse_request(struct json_connection *jcon, const jsmntok_t tok[])
 	if (tok[0].type != JSMN_OBJECT) {
 		json_command_malformed(jcon, "null",
 				       "Expected {} for json command");
-		return;
+		return true;
 	}
 
 	method = json_get_member(jcon->buffer, tok, "method");
@@ -452,12 +440,12 @@ static void parse_request(struct json_connection *jcon, const jsmntok_t tok[])
 
 	if (!id) {
 		json_command_malformed(jcon, "null", "No id");
-		return;
+		return true;
 	}
 	if (id->type != JSMN_STRING && id->type != JSMN_PRIMITIVE) {
 		json_command_malformed(jcon, "null",
 				       "Expected string/primitive for id");
-		return;
+		return true;
 	}
 
 	/* This is a convenient tal parent for duration of command
@@ -466,24 +454,28 @@ static void parse_request(struct json_connection *jcon, const jsmntok_t tok[])
 	c->jcon = jcon;
 	c->ld = jcon->ld;
 	c->pending = false;
+	c->have_json_stream = false;
 	c->id = tal_strndup(c,
 			    json_tok_contents(jcon->buffer, id),
 			    json_tok_len(id));
 	c->mode = CMD_NORMAL;
 	c->ok = NULL;
-	list_add(&jcon->commands, &c->list);
-	tal_add_destructor(c, destroy_cmd);
+	jcon->command = c;
+	tal_add_destructor(c, destroy_command);
+
+	/* Write start of response: rest will be appended directly. */
+	jcon_start(jcon, c->id);
 
 	if (!method || !params) {
 		command_fail(c, JSONRPC2_INVALID_REQUEST,
 			     method ? "No params" : "No method");
-		return;
+		return true;
 	}
 
 	if (method->type != JSMN_STRING) {
 		command_fail(c, JSONRPC2_INVALID_REQUEST,
 			     "Expected string for method");
-		return;
+		return true;
 	}
 
 	c->json_cmd = find_cmd(jcon->buffer, method);
@@ -492,14 +484,14 @@ static void parse_request(struct json_connection *jcon, const jsmntok_t tok[])
 			     "Unknown command '%.*s'",
 			     method->end - method->start,
 			     jcon->buffer + method->start);
-		return;
+		return true;
 	}
 	if (c->json_cmd->deprecated && !deprecated_apis) {
 		command_fail(c, JSONRPC2_METHOD_NOT_FOUND,
 			     "Command '%.*s' is deprecated",
 			      method->end - method->start,
 			      jcon->buffer + method->start);
-		return;
+		return true;
 	}
 
 	db_begin_transaction(jcon->ld->wallet->db);
@@ -507,38 +499,51 @@ static void parse_request(struct json_connection *jcon, const jsmntok_t tok[])
 	db_commit_transaction(jcon->ld->wallet->db);
 
 	/* If they didn't complete it, they must call command_still_pending */
-	if (cmd_in_jcon(jcon, c))
+	if (jcon->command == c)
 		assert(c->pending);
+
+	return jcon->command == NULL;
 }
 
+/* Mutual recursion */
 static struct io_plan *locked_write_json(struct io_conn *conn,
 					 struct json_connection *jcon);
+static struct io_plan *write_json(struct io_conn *conn,
+				  struct json_connection *jcon);
+
+static struct io_plan *write_json_done(struct io_conn *conn,
+				       struct json_connection *jcon)
+{
+	membuf_consume(&jcon->outbuf, jcon->out_amount);
+
+ 	/* If we have more to write, do it now. */
+ 	if (membuf_num_elems(&jcon->outbuf))
+		return write_json(conn, jcon);
+
+	if (jcon->stop) {
+		log_unusual(jcon->log, "JSON-RPC shutdown");
+		/* Return us to toplevel lightningd.c */
+		io_break(jcon->ld);
+		return io_close(conn);
+	}
+
+	/* If command is done and we've output everything, wake read_json
+	 * for next command. */
+	if (!jcon->command)
+		io_wake(conn);
+
+	io_lock_release(jcon->lock);
+	/* Wait for more output. */
+	return io_out_wait(conn, jcon, locked_write_json, jcon);
+}
 
 static struct io_plan *write_json(struct io_conn *conn,
 				  struct json_connection *jcon)
 {
-	struct json_output *out;
-
-	out = list_pop(&jcon->output, struct json_output, list);
-	if (!out) {
-		if (jcon->stop) {
-			log_unusual(jcon->log, "JSON-RPC shutdown");
-			/* Return us to toplevel lightningd.c */
-			io_break(jcon->ld);
-			return io_close(conn);
-		}
-
-		io_lock_release(jcon->lock);
-		/* Wait for more output. */
-		return io_out_wait(conn, jcon, locked_write_json, jcon);
-	}
-
-	jcon->outbuf = tal_steal(jcon, out->json);
-	tal_free(out);
-
-	log_io(jcon->log, LOG_IO_OUT, "", jcon->outbuf, strlen(jcon->outbuf));
+	jcon->out_amount = membuf_num_elems(&jcon->outbuf);
 	return io_write(conn,
-			jcon->outbuf, strlen(jcon->outbuf), write_json, jcon);
+			membuf_elems(&jcon->outbuf), jcon->out_amount,
+			write_json_done, jcon);
 }
 
 static struct io_plan *locked_write_json(struct io_conn *conn,
@@ -551,21 +556,21 @@ static struct io_plan *read_json(struct io_conn *conn,
 				 struct json_connection *jcon)
 {
 	jsmntok_t *toks;
-	bool valid;
+	bool valid, completed;
 
-	log_io(jcon->log, LOG_IO_IN, "",
-	       jcon->buffer + jcon->used, jcon->len_read);
+	if (jcon->len_read)
+		log_io(jcon->log, LOG_IO_IN, "",
+		       jcon->buffer + jcon->used, jcon->len_read);
 
 	/* Resize larger if we're full. */
 	jcon->used += jcon->len_read;
 	if (jcon->used == tal_count(jcon->buffer))
 		tal_resize(&jcon->buffer, jcon->used * 2);
 
-again:
 	toks = json_parse_input(jcon->buffer, jcon->used, &valid);
 	if (!toks) {
 		if (!valid) {
-			log_unusual(jcon->ld->log,
+			log_unusual(jcon->log,
 				    "Invalid token in json input: '%.*s'",
 				    (int)jcon->used, jcon->buffer);
 			json_command_malformed(
@@ -583,16 +588,28 @@ again:
 		goto read_more;
 	}
 
-	parse_request(jcon, toks);
+	completed = parse_request(jcon, toks);
 
 	/* Remove first {}. */
 	memmove(jcon->buffer, jcon->buffer + toks[0].end,
 		tal_count(jcon->buffer) - toks[0].end);
 	jcon->used -= toks[0].end;
-	tal_free(toks);
 
-	/* See if we can parse the rest. */
-	goto again;
+	/* If we haven't completed, wait for cmd completion. */
+	jcon->len_read = 0;
+	if (!completed) {
+		tal_free(toks);
+		return io_wait(conn, conn, read_json, jcon);
+	}
+
+	/* If we have more to process, try again.  FIXME: this still gets
+	 * first priority in io_loop, so can starve others.  Hack would be
+	 * a (non-zero) timer, but better would be to have io_loop avoid
+	 * such livelock */
+	if (jcon->used) {
+		tal_free(toks);
+		return io_always(conn, read_json, jcon);
+	}
 
 read_more:
 	tal_free(toks);
@@ -607,25 +624,33 @@ static struct io_plan *jcon_connected(struct io_conn *conn,
 	struct json_connection *jcon;
 
 	jcon = tal(conn, struct json_connection);
+	jcon->conn = conn;
 	jcon->ld = ld;
 	jcon->used = 0;
 	jcon->buffer = tal_arr(jcon, char, 64);
 	jcon->stop = false;
 	jcon->lock = io_lock_new(jcon);
-	list_head_init(&jcon->commands);
+	membuf_init(&jcon->outbuf,
+		    tal_arr(jcon, char, 64), 64, membuf_tal_realloc);
+	jcon->len_read = 0;
+	jcon->command = NULL;
 
 	/* We want to log on destruction, so we free this in destructor. */
 	jcon->log = new_log(ld->log_book, ld->log_book, "%sjcon fd %i:",
 			    log_prefix(ld->log), io_conn_fd(conn));
-	list_head_init(&jcon->output);
 
 	tal_add_destructor(jcon, destroy_jcon);
 
+	/* Note that write_json and read_json alternate manually, by waking
+	 * each other.  It would be simpler to not use a duplex io, and have
+	 * read_json parse one command, then io_wait() for command completion
+	 * and go to write_json.
+	 *
+	 * However, if we ever have notifications, this neat cmd-response
+	 * pattern would break down, so we use this trick. */
 	return io_duplex(conn,
-			 io_read_partial(conn, jcon->buffer,
-					 tal_count(jcon->buffer),
-					 &jcon->len_read, read_json, jcon),
-			 locked_write_json(conn, jcon));
+			 read_json(conn, jcon),
+			 io_out_wait(conn, jcon, locked_write_json, jcon));
 }
 
 static struct io_plan *incoming_jcon_connected(struct io_conn *conn,

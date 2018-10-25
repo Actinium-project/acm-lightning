@@ -5,7 +5,6 @@
 #include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
 #include <channeld/gen_channel_wire.h>
-#include <common/json_escaped.h>
 #include <common/overflows.h>
 #include <common/sphinx.h>
 #include <common/timeout.h>
@@ -13,6 +12,7 @@
 #include <lightningd/chaintopology.h>
 #include <lightningd/htlc_end.h>
 #include <lightningd/json.h>
+#include <lightningd/json_escaped.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/jsonrpc_errors.h>
 #include <lightningd/lightningd.h>
@@ -722,8 +722,11 @@ static void fulfill_our_htlc_out(struct channel *channel, struct htlc_out *hout,
 
 	if (hout->am_origin)
 		payment_succeeded(ld, hout, preimage);
-	else if (hout->in)
+	else if (hout->in) {
 		fulfill_htlc(hout->in, preimage);
+		wallet_forwarded_payment_add(ld->wallet, hout->in, hout,
+					     FORWARD_SETTLED);
+	}
 }
 
 static bool peer_fulfilled_our_htlc(struct channel *channel,
@@ -813,31 +816,11 @@ static bool peer_failed_our_htlc(struct channel *channel,
 	log_debug(channel->log, "Our HTLC %"PRIu64" failed (%u)", failed->id,
 		  hout->failcode);
 	htlc_out_check(hout, __func__);
+
+	if (hout->in)
+		wallet_forwarded_payment_add(ld->wallet, hout->in, hout, FORWARD_FAILED);
+
 	return true;
-}
-
-/* FIXME: Crazy slow! */
-struct htlc_out *find_htlc_out_by_ripemd(const struct channel *channel,
-					 const struct ripemd160 *ripemd)
-{
-	struct htlc_out_map_iter outi;
-	struct htlc_out *hout;
-	struct lightningd *ld = channel->peer->ld;
-
-	for (hout = htlc_out_map_first(&ld->htlcs_out, &outi);
-	     hout;
-	     hout = htlc_out_map_next(&ld->htlcs_out, &outi)) {
-		struct ripemd160 hash;
-
-		if (hout->key.channel != channel)
-			continue;
-
-		ripemd160(&hash,
-			  &hout->payment_hash, sizeof(hout->payment_hash));
-		if (ripemd160_eq(&hash, ripemd))
-			return hout;
-	}
-	return NULL;
 }
 
 void onchain_failed_our_htlc(const struct channel *channel,
@@ -845,7 +828,11 @@ void onchain_failed_our_htlc(const struct channel *channel,
 			     const char *why)
 {
 	struct lightningd *ld = channel->peer->ld;
-	struct htlc_out *hout = find_htlc_out_by_ripemd(channel, &htlc->ripemd);
+	struct htlc_out *hout;
+
+	hout = find_htlc_out(&ld->htlcs_out, channel, htlc->id);
+	if (!hout)
+		return;
 
 	/* Don't fail twice (or if already succeeded)! */
 	if (hout->failuremsg || hout->failcode || hout->preimage)
@@ -856,7 +843,7 @@ void onchain_failed_our_htlc(const struct channel *channel,
 	/* Force state to something which expects a failure, and save to db */
 	hout->hstate = RCVD_REMOVE_HTLC;
 	htlc_out_check(hout, __func__);
-	wallet_htlc_update(channel->peer->ld->wallet, hout->dbid, hout->hstate,
+	wallet_htlc_update(ld->wallet, hout->dbid, hout->hstate,
 			   hout->preimage, hout->failcode, hout->failuremsg);
 
 	if (hout->am_origin) {
@@ -961,6 +948,10 @@ static bool update_out_htlc(struct channel *channel,
 		wallet_channel_stats_incr_out_offered(ld->wallet,
 						      channel->dbid,
 						      hout->msatoshi);
+
+		if (hout->in)
+			wallet_forwarded_payment_add(ld->wallet, hout->in, hout,
+						     FORWARD_OFFERED);
 
 		/* For our own HTLCs, we commit payment to db lazily */
 		if (hout->origin_htlc_id == 0)
@@ -1831,3 +1822,49 @@ static const struct json_command dev_ignore_htlcs = {
 };
 AUTODATA(json_command, &dev_ignore_htlcs);
 #endif /* DEVELOPER */
+
+static void listforwardings_add_forwardings(struct json_stream *response, struct wallet *wallet)
+{
+	const struct forwarding *forwardings;
+	forwardings = wallet_forwarded_payments_get(wallet, tmpctx);
+
+	json_array_start(response, "forwards");
+	for (size_t i=0; i<tal_count(forwardings); i++) {
+		const struct forwarding *cur = &forwardings[i];
+		json_object_start(response, NULL);
+
+		json_add_short_channel_id(response, "in_channel", &cur->channel_in);
+		json_add_short_channel_id(response, "out_channel", &cur->channel_out);
+		json_add_num(response, "in_msatoshi", cur->msatoshi_in);
+		json_add_num(response, "out_msatoshi", cur->msatoshi_out);
+		json_add_num(response, "fee", cur->fee);
+		json_add_string(response, "status", forward_status_name(cur->status));
+		json_object_end(response);
+	}
+	json_array_end(response);
+
+	tal_free(forwardings);
+}
+
+static void json_listforwards(struct command *cmd, const char *buffer,
+			       const jsmntok_t *params)
+{
+	struct json_stream *response;
+
+	if (!param(cmd, buffer, params, NULL))
+		return;
+
+	response = json_stream_success(cmd);
+	json_object_start(response, NULL);
+	listforwardings_add_forwardings(response, cmd->ld->wallet);
+	json_object_end(response);
+
+	command_success(cmd, response);
+}
+
+static const struct json_command listforwards_command = {
+	"listforwards", json_listforwards,
+	"List all forwarded payments and their information", false,
+	"List all forwarded payments and their information"
+};
+AUTODATA(json_command, &listforwards_command);

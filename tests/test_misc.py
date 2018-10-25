@@ -291,7 +291,7 @@ def test_htlc_in_timeout(node_factory, bitcoind, executor):
     # l1 will disconnect and not reconnect.
     l1.daemon.wait_for_log('dev_disconnect: -WIRE_REVOKE_AND_ACK')
 
-    # Deadline HTLC expiry minus 1/2 cltv-expiry delta (rounded up) (== cltv - 3).  ctlv is 5+1.
+    # Deadline HTLC expiry minus 1/2 cltv-expiry delta (rounded up) (== cltv - 3).  cltv is 5+1.
     bitcoind.generate_block(2)
     assert not l2.daemon.is_in_log('hit deadline')
     bitcoind.generate_block(1)
@@ -370,6 +370,8 @@ def test_withdraw(node_factory, bitcoind):
         l1.rpc.withdraw(waddr, 'not an amount')
     with pytest.raises(RpcError):
         l1.rpc.withdraw(waddr, -amount)
+    with pytest.raises(RpcError, match=r'Cannot afford transaction'):
+        l1.rpc.withdraw(waddr, amount * 100)
 
     out = l1.rpc.withdraw(waddr, 2 * amount)
 
@@ -462,9 +464,8 @@ def test_withdraw(node_factory, bitcoind):
     assert l1.db_query('SELECT COUNT(*) as c FROM outputs WHERE status=0')[0]['c'] == 0
 
     # This should fail, can't even afford fee.
-    with pytest.raises(RpcError):
+    with pytest.raises(RpcError, match=r'Cannot afford transaction'):
         l1.rpc.withdraw(waddr, 'all')
-    l1.daemon.wait_for_log('Cannot afford transaction')
 
 
 def test_addfunds_from_block(node_factory, bitcoind):

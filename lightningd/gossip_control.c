@@ -11,7 +11,6 @@
 #include <ccan/take/take.h>
 #include <ccan/tal/str/str.h>
 #include <common/features.h>
-#include <common/json_escaped.h>
 #include <common/type_to_string.h>
 #include <common/utils.h>
 #include <errno.h>
@@ -23,6 +22,7 @@
 #include <lightningd/gossip_msg.h>
 #include <lightningd/hsm_control.h>
 #include <lightningd/json.h>
+#include <lightningd/json_escaped.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/jsonrpc_errors.h>
 #include <lightningd/log.h>
@@ -177,12 +177,30 @@ void gossipd_notify_spend(struct lightningd *ld,
 	subd_send_msg(ld->gossip, msg);
 }
 
+/* Gossipd shouldn't give us bad pubkeys, but don't abort if they do */
+static void json_add_raw_pubkey(struct json_stream *response,
+			 const char *fieldname,
+			 const u8 raw_pubkey[sizeof(struct pubkey)])
+{
+	secp256k1_pubkey pubkey;
+	u8 der[PUBKEY_DER_LEN];
+	size_t outlen = PUBKEY_DER_LEN;
+
+	memcpy(&pubkey, raw_pubkey, sizeof(pubkey));
+	if (!secp256k1_ec_pubkey_serialize(secp256k1_ctx, der, &outlen,
+					   &pubkey,
+					   SECP256K1_EC_COMPRESSED))
+		json_add_string(response, fieldname, "INVALID PUBKEY");
+	else
+		json_add_hex(response, fieldname, der, sizeof(der));
+}
+
 static void json_getnodes_reply(struct subd *gossip UNUSED, const u8 *reply,
 				const int *fds UNUSED,
 				struct command *cmd)
 {
 	struct gossip_getnodes_entry **nodes;
-	struct json_result *response = new_json_result(cmd);
+	struct json_stream *response;
 	size_t i, j;
 
 	if (!fromwire_gossip_getnodes_reply(reply, reply, &nodes)) {
@@ -190,6 +208,7 @@ static void json_getnodes_reply(struct subd *gossip UNUSED, const u8 *reply,
 		return;
 	}
 
+	response = json_stream_success(cmd);
 	json_object_start(response, NULL);
 	json_array_start(response, "nodes");
 
@@ -197,7 +216,7 @@ static void json_getnodes_reply(struct subd *gossip UNUSED, const u8 *reply,
 		struct json_escaped *esc;
 
 		json_object_start(response, NULL);
-		json_add_pubkey(response, "nodeid", &nodes[i]->nodeid);
+		json_add_raw_pubkey(response, "nodeid", nodes[i]->nodeid);
 		if (nodes[i]->last_timestamp < 0) {
 			json_object_end(response);
 			continue;
@@ -254,7 +273,7 @@ AUTODATA(json_command, &listnodes_command);
 static void json_getroute_reply(struct subd *gossip UNUSED, const u8 *reply, const int *fds UNUSED,
 				struct command *cmd)
 {
-	struct json_result *response;
+	struct json_stream *response;
 	struct route_hop *hops;
 
 	fromwire_gossip_getroute_reply(reply, reply, &hops);
@@ -264,7 +283,7 @@ static void json_getroute_reply(struct subd *gossip UNUSED, const u8 *reply, con
 		return;
 	}
 
-	response = new_json_result(cmd);
+	response = json_stream_success(cmd);
 	json_object_start(response, NULL);
 	json_add_route(response, "route", hops, tal_count(hops));
 	json_object_end(response);
@@ -336,20 +355,21 @@ static void json_listchannels_reply(struct subd *gossip UNUSED, const u8 *reply,
 {
 	size_t i;
 	struct gossip_getchannels_entry *entries;
-	struct json_result *response = new_json_result(cmd);
+	struct json_stream *response;
 
 	if (!fromwire_gossip_getchannels_reply(reply, reply, &entries)) {
 		command_fail(cmd, LIGHTNINGD, "Invalid reply from gossipd");
 		return;
 	}
 
+	response = json_stream_success(cmd);
 	json_object_start(response, NULL);
 	json_array_start(response, "channels");
 	for (i = 0; i < tal_count(entries); i++) {
 		json_object_start(response, NULL);
-		json_add_pubkey(response, "source", &entries[i].source);
-		json_add_pubkey(response, "destination",
-				&entries[i].destination);
+		json_add_raw_pubkey(response, "source", entries[i].source);
+		json_add_raw_pubkey(response, "destination",
+				    entries[i].destination);
 		json_add_string(response, "short_channel_id",
 				type_to_string(reply, struct short_channel_id,
 					       &entries[i].short_channel_id));
@@ -405,7 +425,7 @@ static void json_scids_reply(struct subd *gossip UNUSED, const u8 *reply,
 			     const int *fds UNUSED, struct command *cmd)
 {
 	bool ok, complete;
-	struct json_result *response = new_json_result(cmd);
+	struct json_stream *response;
 
 	if (!fromwire_gossip_scids_reply(reply, &ok, &complete)) {
 		command_fail(cmd, LIGHTNINGD,
@@ -419,6 +439,7 @@ static void json_scids_reply(struct subd *gossip UNUSED, const u8 *reply,
 		return;
 	}
 
+	response = json_stream_success(cmd);
 	json_object_start(response, NULL);
 	json_add_bool(response, "complete", complete);
 	json_object_end(response);
@@ -500,7 +521,7 @@ AUTODATA(json_command, &dev_send_timestamp_filter);
 static void json_channel_range_reply(struct subd *gossip UNUSED, const u8 *reply,
 				     const int *fds UNUSED, struct command *cmd)
 {
-	struct json_result *response = new_json_result(cmd);
+	struct json_stream *response;
 	u32 final_first_block, final_num_blocks;
 	bool final_complete;
 	struct short_channel_id *scids;
@@ -521,6 +542,7 @@ static void json_channel_range_reply(struct subd *gossip UNUSED, const u8 *reply
 		return;
 	}
 
+	response = json_stream_success(cmd);
 	json_object_start(response, NULL);
 	/* As this is a dev interface, we don't bother saving and
 	 * returning all the replies, just the final one. */

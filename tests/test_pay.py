@@ -100,9 +100,8 @@ def test_pay_disconnect(node_factory, bitcoind):
     wait_for(lambda: [c['active'] for c in l1.rpc.listchannels()['channels']] == [False, False])
 
     # Can't pay while its offline.
-    with pytest.raises(RpcError):
+    with pytest.raises(RpcError, match=r'failed: WIRE_TEMPORARY_CHANNEL_FAILURE \(First peer not ready\)'):
         l1.rpc.sendpay(route, rhash)
-    l1.daemon.wait_for_log('failed: WIRE_TEMPORARY_CHANNEL_FAILURE \\(First peer not ready\\)')
 
     l2.start()
     l1.daemon.wait_for_log('peer_out WIRE_CHANNEL_REESTABLISH')
@@ -114,10 +113,9 @@ def test_pay_disconnect(node_factory, bitcoind):
     l1.daemon.wait_for_log(r'Peer permanent failure in CHANNELD_NORMAL: lightning_channeld: received ERROR channel .*: update_fee \d+ outside range 1875-75000')
 
     # Should fail due to permenant channel fail
-    with pytest.raises(RpcError):
+    with pytest.raises(RpcError, match=r'failed: WIRE_UNKNOWN_NEXT_PEER \(First peer not ready\)'):
         l1.rpc.sendpay(route, rhash)
 
-    l1.daemon.wait_for_log('failed: WIRE_UNKNOWN_NEXT_PEER \\(First peer not ready\\)')
     assert not l1.daemon.is_in_log('Payment is still in progress')
 
     # After it sees block, someone should close channel.
@@ -153,7 +151,7 @@ def test_pay_get_error_with_update(node_factory):
     l1.daemon.wait_for_log(r'Extracted channel_update 0102.*from onionreply 10070088[0-9a-fA-F]{88}')
 
     # And now monitor for l1 to apply the channel_update we just extracted
-    l1.daemon.wait_for_log('Received channel_update for channel {}\(.\) now DISABLED was ACTIVE \(from error\)'.format(chanid2))
+    l1.daemon.wait_for_log(r'Received channel_update for channel {}\(.\) now DISABLED was ACTIVE \(from error\)'.format(chanid2))
 
 
 def test_pay_optional_args(node_factory):
@@ -198,7 +196,7 @@ def test_payment_success_persistence(node_factory, executor):
     # Fire off a pay request, it'll get interrupted by a restart
     executor.submit(l1.rpc.pay, inv1['bolt11'])
 
-    l1.daemon.wait_for_log('dev_disconnect: \+WIRE_COMMITMENT_SIGNED')
+    l1.daemon.wait_for_log(r'dev_disconnect: \+WIRE_COMMITMENT_SIGNED')
 
     print("Killing l1 in mid HTLC")
     l1.daemon.kill()
@@ -245,7 +243,7 @@ def test_payment_failed_persistence(node_factory, executor):
     # Fire off a pay request, it'll get interrupted by a restart
     executor.submit(l1.rpc.pay, inv1['bolt11'])
 
-    l1.daemon.wait_for_log('dev_disconnect: \+WIRE_COMMITMENT_SIGNED')
+    l1.daemon.wait_for_log(r'dev_disconnect: \+WIRE_COMMITMENT_SIGNED')
 
     print("Killing l1 in mid HTLC")
     l1.daemon.kill()
@@ -976,30 +974,129 @@ def test_forward_pad_fees_and_cltv(node_factory, bitcoind):
     assert only_one(l3.rpc.listinvoices('test_forward_pad_fees_and_cltv')['invoices'])['status'] == 'paid'
 
 
-def test_forward_stats(node_factory):
-    l1, l2, l3 = node_factory.line_graph(3, announce=True)
+@unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1 for dev_ignore_htlcs")
+def test_forward_stats(node_factory, bitcoind):
+    """Check that we track forwarded payments correctly.
 
-    inv = l3.rpc.invoice(100000, "first", "desc")['bolt11']
-    l1.rpc.pay(inv)
+    We wire up the network to have l1 as payment initiator, l2 as
+    forwarded (the one we check) and l3-l5 as payment recipients. l3
+    accepts correctly, l4 refects (because it doesn't know the payment
+    hash) and l5 will keep the HTLC dangling by disconnecting.
+
+    """
+    amount = 10**5
+    l1, l2, l3 = node_factory.line_graph(3, announce=False)
+    l4 = node_factory.get_node()
+    l5 = node_factory.get_node(may_fail=True)
+    l2.openchannel(l4, 10**6, announce=False)
+    l2.openchannel(l5, 10**6, announce=True)
+
+    bitcoind.generate_block(5)
+
+    wait_for(lambda: len(l1.rpc.listchannels()['channels']) == 8)
+
+    payment_hash = l3.rpc.invoice(amount, "first", "desc")['payment_hash']
+    route = l1.rpc.getroute(l3.info['id'], amount, 1)['route']
+
+    l1.rpc.sendpay(route, payment_hash)
+    l1.rpc.waitsendpay(payment_hash)
+
+    # l4 rejects since it doesn't know the payment_hash
+    route = l1.rpc.getroute(l4.info['id'], amount, 1)['route']
+    payment_hash = "F" * 64
+    with pytest.raises(RpcError):
+        l1.rpc.sendpay(route, payment_hash)
+        l1.rpc.waitsendpay(payment_hash)
+
+    # l5 will hold the HTLC hostage.
+    l5.rpc.dev_ignore_htlcs(id=l2.info['id'], ignore=True)
+    route = l1.rpc.getroute(l5.info['id'], amount, 1)['route']
+    payment_hash = l5.rpc.invoice(amount, "first", "desc")['payment_hash']
+    l1.rpc.sendpay(route, payment_hash)
+
+    l5.daemon.wait_for_log(r'their htlc .* dev_ignore_htlcs')
+
+    # Select all forwardings, ordered by htlc_id to ensure the order
+    # matches below
+    forwardings = l2.db_query("SELECT *, in_msatoshi - out_msatoshi as fee "
+                              "FROM forwarded_payments "
+                              "ORDER BY in_htlc_id;")
+    assert(len(forwardings) == 3)
+    states = [f['state'] for f in forwardings]
+    assert(states == [1, 2, 0])  # settled, failed, offered
 
     inchan = l2.rpc.listpeers(l1.info['id'])['peers'][0]['channels'][0]
     outchan = l2.rpc.listpeers(l3.info['id'])['peers'][0]['channels'][0]
 
-    def extract_stats(c):
-        return {k: v for k, v in c.items() if 'in_' in k or 'out_' in k}
-
-    instats = extract_stats(inchan)
-    outstats = extract_stats(outchan)
-
     # Check that we correctly account channel changes
-    assert instats['in_payments_offered'] == 1
-    assert instats['in_payments_fulfilled'] == 1
-    assert instats['in_msatoshi_offered'] >= 100000
-    assert instats['in_msatoshi_offered'] == instats['in_msatoshi_fulfilled']
+    assert inchan['in_payments_offered'] == 3
+    assert inchan['in_payments_fulfilled'] == 1
+    assert inchan['in_msatoshi_offered'] >= 3 * amount
+    assert inchan['in_msatoshi_fulfilled'] >= amount
 
-    assert outstats['out_payments_offered'] == 1
-    assert outstats['out_payments_fulfilled'] == 1
-    assert outstats['out_msatoshi_offered'] >= 100000
-    assert outstats['out_msatoshi_offered'] == outstats['out_msatoshi_fulfilled']
+    assert outchan['out_payments_offered'] == 1
+    assert outchan['out_payments_fulfilled'] == 1
+    assert outchan['out_msatoshi_offered'] >= amount
+    assert outchan['out_msatoshi_offered'] == outchan['out_msatoshi_fulfilled']
 
-    assert outstats['out_msatoshi_fulfilled'] < instats['in_msatoshi_fulfilled']
+    assert outchan['out_msatoshi_fulfilled'] < inchan['in_msatoshi_fulfilled']
+
+    stats = l2.rpc.listforwards()
+
+    assert [f['status'] for f in stats['forwards']] == ['settled', 'failed', 'offered']
+    assert l2.rpc.getinfo()['msatoshi_fees_collected'] == 1 + amount // 100000
+    assert l1.rpc.getinfo()['msatoshi_fees_collected'] == 0
+    assert l3.rpc.getinfo()['msatoshi_fees_collected'] == 0
+
+
+@unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1 for dev_ignore_htlcs")
+def test_htlcs_cltv_only_difference(node_factory, bitcoind):
+    # l1 -> l2 -> l3 -> l4
+    # l4 ignores htlcs, so they stay.
+    # l3 will see a reconnect from l4 when l4 restarts.
+    l1, l2, l3, l4 = node_factory.line_graph(4, announce=True, opts=[{}] * 2 + [{'dev-no-reconnect': None, 'may_reconnect': True}] * 2)
+
+    h = l4.rpc.invoice(msatoshi=10**8, label='x', description='desc')['payment_hash']
+    l4.rpc.dev_ignore_htlcs(id=l3.info['id'], ignore=True)
+
+    # L2 tries to pay
+    r = l2.rpc.getroute(l4.info['id'], 10**8, 1)["route"]
+    l2.rpc.sendpay(r, h)
+
+    # Now increment CLTV
+    bitcoind.generate_block(1)
+    sync_blockheight(bitcoind, [l1, l2, l3, l4])
+
+    # L1 tries to pay
+    r = l1.rpc.getroute(l4.info['id'], 10**8, 1)["route"]
+    l1.rpc.sendpay(r, h)
+
+    # Now increment CLTV
+    bitcoind.generate_block(1)
+    sync_blockheight(bitcoind, [l1, l2, l3, l4])
+
+    # L3 tries to pay
+    r = l3.rpc.getroute(l4.info['id'], 10**8, 1)["route"]
+    l3.rpc.sendpay(r, h)
+
+    # Give them time to go through.
+    time.sleep(5)
+
+    # Will all be connected OK.
+    assert only_one(l1.rpc.listpeers(l2.info['id'])['peers'])['connected']
+    assert only_one(l2.rpc.listpeers(l3.info['id'])['peers'])['connected']
+    assert only_one(l3.rpc.listpeers(l4.info['id'])['peers'])['connected']
+
+    # Restarting tail node will stop it ignoring HTLCs (it will actually
+    # fail them immediately).
+    l4.restart()
+    l3.rpc.connect(l4.info['id'], 'localhost', l4.port)
+
+    wait_for(lambda: only_one(l1.rpc.listpayments()['payments'])['status'] == 'failed')
+    wait_for(lambda: only_one(l2.rpc.listpayments()['payments'])['status'] == 'failed')
+    wait_for(lambda: only_one(l3.rpc.listpayments()['payments'])['status'] == 'failed')
+
+    # Should all still be connected.
+    assert only_one(l1.rpc.listpeers(l2.info['id'])['peers'])['connected']
+    assert only_one(l2.rpc.listpeers(l3.info['id'])['peers'])['connected']
+    assert only_one(l3.rpc.listpeers(l4.info['id'])['peers'])['connected']

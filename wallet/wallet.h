@@ -118,6 +118,54 @@ static inline enum wallet_output_type wallet_output_type_in_db(enum wallet_outpu
 	fatal("%s: %u is invalid", __func__, w);
 }
 
+/**
+ * Possible states for forwards
+ *
+ */
+/* /!\ This is a DB ENUM, please do not change the numbering of any
+ * already defined elements (adding is ok) /!\ */
+enum forward_status {
+	FORWARD_OFFERED = 0,
+	FORWARD_SETTLED = 1,
+	FORWARD_FAILED = 2
+};
+
+static inline enum forward_status wallet_forward_status_in_db(enum forward_status s)
+{
+	switch (s) {
+	case FORWARD_OFFERED:
+		BUILD_ASSERT(FORWARD_OFFERED == 0);
+		return s;
+	case FORWARD_SETTLED:
+		BUILD_ASSERT(FORWARD_SETTLED == 1);
+		return s;
+	case FORWARD_FAILED:
+		BUILD_ASSERT(FORWARD_FAILED == 2);
+		return s;
+	}
+	fatal("%s: %u is invalid", __func__, s);
+}
+
+static inline const char* forward_status_name(enum forward_status status)
+{
+	switch(status) {
+	case FORWARD_OFFERED:
+		return "offered";
+	case FORWARD_SETTLED:
+		return "settled";
+	case FORWARD_FAILED:
+		return "failed";
+	}
+	abort();
+}
+
+struct forwarding {
+	struct short_channel_id channel_in, channel_out;
+	u64 msatoshi_in, msatoshi_out, fee;
+	struct sha256_double *payment_hash;
+	enum forward_status status;
+};
+
 /* A database backed shachain struct. The datastructure is
  * writethrough, reads are performed from an in-memory version, all
  * writes are passed through to the DB. */
@@ -967,4 +1015,21 @@ u32 *wallet_onchaind_channels(struct wallet *w,
 struct channeltx *wallet_channeltxs_get(struct wallet *w, const tal_t *ctx,
 					u32 channel_id);
 
+/**
+ * Add of update a forwarded_payment
+ */
+void wallet_forwarded_payment_add(struct wallet *w, const struct htlc_in *in,
+				  const struct htlc_out *out,
+				  enum forward_status state);
+
+/**
+ * Retrieve summary of successful forwarded payments' fees
+ */
+u64 wallet_total_forward_fees(struct wallet *w);
+
+/**
+ * Retrieve a list of all forwarded_payments
+ */
+const struct forwarding *wallet_forwarded_payments_get(struct wallet *w,
+						       const tal_t *ctx);
 #endif /* LIGHTNING_WALLET_WALLET_H */

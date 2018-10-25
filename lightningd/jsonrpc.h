@@ -4,8 +4,10 @@
 #include <bitcoin/chainparams.h>
 #include <ccan/autodata/autodata.h>
 #include <ccan/list/list.h>
+#include <ccan/membuf/membuf.h>
 #include <common/io_lock.h>
 #include <common/json.h>
+#include <stdarg.h>
 
 struct bitcoin_txid;
 struct wireaddr;
@@ -22,8 +24,6 @@ enum command_mode {
 /* Context for a command (from JSON, but might outlive the connection!)
  * You can allocate off this for temporary objects. */
 struct command {
-	/* Off jcon->commands */
-	struct list_node list;
 	/* The global state */
 	struct lightningd *ld;
 	/* The 'id' which we need to include in the response. */
@@ -39,11 +39,16 @@ struct command {
 	/* This is created if mode is CMD_USAGE */
 	const char *usage;
 	bool *ok;
+	/* Have we started a json stream already?  For debugging. */
+	bool have_json_stream;
 };
 
 struct json_connection {
 	/* The global state */
 	struct lightningd *ld;
+
+	/* This io_conn (and our owner!) */
+	struct io_conn *conn;
 
 	/* Logging for this json connection. */
 	struct log *log;
@@ -60,11 +65,14 @@ struct json_connection {
 	/* We've been told to stop. */
 	bool stop;
 
-	/* Current commands. */
-	struct list_head commands;
+	/* Current command. */
+	struct command *command;
 
-	struct list_head output;
-	const char *outbuf;
+	/* Current command's output. */
+	MEMBUF(char) outbuf;
+
+	/* How much we're writing right now. */
+	size_t out_amount;
 	struct io_lock *lock;
 };
 
@@ -77,18 +85,18 @@ struct json_command {
 	const char *verbose;
 };
 
-struct json_result *null_response(const tal_t *ctx);
-void command_success(struct command *cmd, struct json_result *response);
+struct json_stream *null_response(struct command *cmd);
+void command_success(struct command *cmd, struct json_stream *response);
+void command_failed(struct command *cmd, struct json_stream *result);
 void PRINTF_FMT(3, 4) command_fail(struct command *cmd, int code,
 				   const char *fmt, ...);
-void PRINTF_FMT(4, 5) command_fail_detailed(struct command *cmd,
-					     int code,
-					     const struct json_result *data,
-					     const char *fmt, ...);
 
 /* Mainly for documentation, that we plan to close this later. */
 void command_still_pending(struct command *cmd);
 
+/* Low level jcon routines. */
+void jcon_append(struct json_connection *jcon, const char *str);
+void jcon_append_vfmt(struct json_connection *jcon, const char *fmt, va_list ap);
 
 /* For initialization */
 void setup_jsonrpc(struct lightningd *ld, const char *rpc_filename);
