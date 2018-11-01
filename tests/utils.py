@@ -37,6 +37,7 @@ with open('config.vars') as configfile:
 DEVELOPER = os.getenv("DEVELOPER", config['DEVELOPER']) == "1"
 TIMEOUT = int(os.getenv("TIMEOUT", "60"))
 VALGRIND = os.getenv("VALGRIND", config['VALGRIND']) == "1"
+SLOW_MACHINE = os.getenv("SLOW_MACHINE", "0") == "1"
 
 
 def wait_for(success, timeout=TIMEOUT):
@@ -291,7 +292,7 @@ class BitcoinD(TailableProc):
 
     def generate_block(self, numblocks=1):
         # As of 0.16, generate() is removed; use generatetoaddress.
-        self.rpc.generatetoaddress(numblocks, self.rpc.getnewaddress())
+        return self.rpc.generatetoaddress(numblocks, self.rpc.getnewaddress())
 
 
 class LightningD(TailableProc):
@@ -585,9 +586,9 @@ class LightningNode(object):
     def wait_for_routes(self, channel_ids):
         # Could happen in any order...
         self.daemon.wait_for_logs(['Received channel_update for channel {}\\(0\\)'.format(c)
-                                   for c in channel_ids] +
-                                  ['Received channel_update for channel {}\\(1\\)'.format(c)
-                                   for c in channel_ids])
+                                   for c in channel_ids]
+                                  + ['Received channel_update for channel {}\\(1\\)'.format(c)
+                                     for c in channel_ids])
 
     def pay(self, dst, amt, label=None):
         if not label:

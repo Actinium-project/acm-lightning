@@ -257,7 +257,7 @@ static void handle_localpay(struct htlc_in *hin,
 	 *
 	 * 1. type: 19 (`final_incorrect_htlc_amount`)
 	 * 2. data:
-	 *    * [`4`:`incoming_htlc_amt`]
+	 *    * [`8`:`incoming_htlc_amt`]
 	 *
 	 * The amount in the HTLC doesn't match the value in the onion.
 	 */
@@ -491,7 +491,7 @@ static void forward_htlc(struct htlc_in *hin,
 	 *
 	 * The origin node:
 	 *   - SHOULD accept HTLCs that pay a fee equal to or greater than:
-	 *     - fee_base_msat + ( amount_msat * fee_proportional_millionths / 1000000 )
+	 *     - fee_base_msat + ( amount_to_forward * fee_proportional_millionths / 1000000 )
 	 */
 	if (mul_overflows_u64(amt_to_forward,
 			      ld->config.fee_per_satoshi)) {

@@ -93,9 +93,7 @@ static void peer_update_features(struct peer *peer,
 
 struct peer *new_peer(struct lightningd *ld, u64 dbid,
 		      const struct pubkey *id,
-		      const struct wireaddr_internal *addr,
-		      const u8 *globalfeatures TAKES,
-		      const u8 *localfeatures TAKES)
+		      const struct wireaddr_internal *addr)
 {
 	/* We are owned by our channels, and freed manually by destroy_channel */
 	struct peer *peer = tal(NULL, struct peer);
@@ -104,15 +102,8 @@ struct peer *new_peer(struct lightningd *ld, u64 dbid,
 	peer->dbid = dbid;
 	peer->id = *id;
 	peer->uncommitted_channel = NULL;
-	/* FIXME: This is always set, right? */
-	if (addr)
-		peer->addr = *addr;
-	else {
-		peer->addr.itype = ADDR_INTERNAL_WIREADDR;
-		peer->addr.u.wireaddr.type = ADDR_TYPE_PADDING;
-	}
+	peer->addr = *addr;
 	peer->globalfeatures = peer->localfeatures = NULL;
-	peer_update_features(peer, globalfeatures, localfeatures);
 	list_head_init(&peer->channels);
 	peer->direction = get_channel_direction(&peer->ld->id, &peer->id);
 
@@ -440,10 +431,9 @@ void peer_connected(struct lightningd *ld, const u8 *msg,
 	 * subdaemon.  Otherwise, we'll hand to openingd to wait there. */
 	peer = peer_by_id(ld, &id);
 	if (!peer)
-		peer = new_peer(ld, 0, &id, &addr,
-				globalfeatures, localfeatures);
-	else
-		peer_update_features(peer, globalfeatures, localfeatures);
+		peer = new_peer(ld, 0, &id, &addr);
+
+	peer_update_features(peer, globalfeatures, localfeatures);
 
 	/* Can't be opening, since we wouldn't have sent peer_disconnected. */
 	assert(!peer->uncommitted_channel);
@@ -671,12 +661,10 @@ static void json_add_peer(struct lightningd *ld,
 	 * their features *last* time they connected. */
 	if (connected) {
 		json_array_start(response, "netaddr");
-		if (p->addr.itype != ADDR_INTERNAL_WIREADDR
-		    || p->addr.u.wireaddr.type != ADDR_TYPE_PADDING)
-			json_add_string(response, NULL,
-					type_to_string(response,
-						       struct wireaddr_internal,
-						       &p->addr));
+		json_add_string(response, NULL,
+				type_to_string(response,
+					       struct wireaddr_internal,
+					       &p->addr));
 		json_array_end(response);
 		if (deprecated_apis) {
 			json_add_hex_talarr(response, "global_features",
@@ -946,9 +934,11 @@ static void json_close(struct command *cmd,
 	if (channel->state != CHANNELD_NORMAL &&
 	    channel->state != CHANNELD_AWAITING_LOCKIN &&
 	    channel->state != CHANNELD_SHUTTING_DOWN &&
-	    channel->state != CLOSINGD_SIGEXCHANGE)
+	    channel->state != CLOSINGD_SIGEXCHANGE) {
 		command_fail(cmd, LIGHTNINGD, "Channel is in state %s",
 			     channel_state_name(channel));
+		return;
+	}
 
 	/* If normal or locking in, transition to shutting down
 	 * state.

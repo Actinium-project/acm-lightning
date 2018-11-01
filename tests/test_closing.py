@@ -1,6 +1,6 @@
 from fixtures import *  # noqa: F401,F403
 from lightning import RpcError
-from utils import only_one, sync_blockheight, wait_for, DEVELOPER, TIMEOUT, VALGRIND
+from utils import only_one, sync_blockheight, wait_for, DEVELOPER, TIMEOUT, VALGRIND, SLOW_MACHINE
 
 
 import queue
@@ -24,7 +24,7 @@ def test_closing(node_factory, bitcoind):
     billboard = only_one(l2.rpc.listpeers(l1.info['id'])['peers'][0]['channels'])['status']
     assert billboard == ['CHANNELD_NORMAL:Funding transaction locked.']
 
-    bitcoind.rpc.generate(5)
+    bitcoind.generate_block(5)
 
     # Only wait for the channels to activate with DEVELOPER=1,
     # otherwise it's going to take too long because of the missing
@@ -62,7 +62,7 @@ def test_closing(node_factory, bitcoind):
 
     billboard = only_one(l1.rpc.listpeers(l2.info['id'])['peers'][0]['channels'])['status']
     assert billboard == ['CLOSINGD_SIGEXCHANGE:We agreed on a closing fee of 5430 satoshi']
-    bitcoind.rpc.generate(1)
+    bitcoind.generate_block(1)
 
     l1.daemon.wait_for_log(r'Owning output .* txid %s' % closetxid)
     l2.daemon.wait_for_log(r'Owning output .* txid %s' % closetxid)
@@ -77,7 +77,7 @@ def test_closing(node_factory, bitcoind):
         'ONCHAIN:All outputs resolved: waiting 99 more blocks before forgetting channel'
     ])
 
-    bitcoind.rpc.generate(9)
+    bitcoind.generate_block(9)
     wait_for(lambda: only_one(l1.rpc.listpeers(l2.info['id'])['peers'][0]['channels'])['status'] == [
         'CLOSINGD_SIGEXCHANGE:We agreed on a closing fee of 5430 satoshi',
         'ONCHAIN:Tracking mutual close transaction',
@@ -85,7 +85,7 @@ def test_closing(node_factory, bitcoind):
     ])
 
     # Make sure both have forgotten about it
-    bitcoind.rpc.generate(90)
+    bitcoind.generate_block(90)
     wait_for(lambda: len(l1.rpc.listchannels()['channels']) == 0)
     wait_for(lambda: len(l2.rpc.listchannels()['channels']) == 0)
 
@@ -110,7 +110,7 @@ def test_closing_while_disconnected(node_factory, bitcoind):
     l1.daemon.wait_for_log('sendrawtx exit 0')
     l2.daemon.wait_for_log('sendrawtx exit 0')
 
-    bitcoind.rpc.generate(101)
+    bitcoind.generate_block(101)
     wait_for(lambda: len(l1.rpc.listchannels()['channels']) == 0)
     wait_for(lambda: len(l2.rpc.listchannels()['channels']) == 0)
 
@@ -143,13 +143,21 @@ def test_closing_torture(node_factory, executor, bitcoind):
     l1, l2 = node_factory.get_nodes(2)
     amount = 10**6
 
-    # The range below of 15 is unsatisfactory.
     # Before the fix was applied, 15 would often pass.
     # However, increasing the number of tries would
     # take longer in VALGRIND mode, triggering a CI
     # failure since the test does not print any
     # output.
-    for i in range(15):
+    # On my laptop, VALGRIND is about 4x slower than native, hence
+    # the approximations below:
+
+    iterations = 50
+    if VALGRIND:
+        iterations //= 4
+    if SLOW_MACHINE:
+        iterations //= 2
+
+    for i in range(iterations):
         # Reduce probability that spurious sendrawtx error will occur
         l1.rpc.dev_rescan_outputs()
 
@@ -181,6 +189,7 @@ def test_closing_torture(node_factory, executor, bitcoind):
 
 
 @unittest.skipIf(not DEVELOPER, "needs dev-override-feerates")
+@unittest.skipIf(SLOW_MACHINE and VALGRIND, "slow test")
 def test_closing_different_fees(node_factory, bitcoind, executor):
     l1 = node_factory.get_node()
 
@@ -214,8 +223,8 @@ def test_closing_different_fees(node_factory, bitcoind, executor):
     bitcoind.generate_block(6)
 
     # Now wait for them all to hit normal state, do payments
-    l1.daemon.wait_for_logs(['update for channel .* now ACTIVE'] * num_peers +
-                            ['to CHANNELD_NORMAL'] * num_peers)
+    l1.daemon.wait_for_logs(['update for channel .* now ACTIVE'] * num_peers
+                            + ['to CHANNELD_NORMAL'] * num_peers)
     for p in peers:
         if p.amount != 0:
             l1.pay(p, 100000000)
@@ -535,7 +544,7 @@ def test_onchaind_replay(node_factory, bitcoind):
     }
     l1.rpc.sendpay([routestep], rhash)
     l1.daemon.wait_for_log('sendrawtx exit 0')
-    bitcoind.rpc.generate(1)
+    bitcoind.generate_block(1)
 
     # Wait for nodes to notice the failure, this seach needle is after the
     # DB commit so we're sure the tx entries in onchaindtxs have been added
@@ -548,7 +557,7 @@ def test_onchaind_replay(node_factory, bitcoind):
 
     # Generate some blocks so we restart the onchaind from DB (we rescan
     # last_height - 100)
-    bitcoind.rpc.generate(100)
+    bitcoind.generate_block(100)
     sync_blockheight(bitcoind, [l1, l2])
 
     # l1 should still have a running onchaind
@@ -563,7 +572,7 @@ def test_onchaind_replay(node_factory, bitcoind):
     # l1 should still notice that the funding was spent and that we should react to it
     l1.daemon.wait_for_log("Propose handling OUR_UNILATERAL/DELAYED_OUTPUT_TO_US by OUR_DELAYED_RETURN_TO_WALLET")
     sync_blockheight(bitcoind, [l1])
-    bitcoind.rpc.generate(10)
+    bitcoind.generate_block(10)
     sync_blockheight(bitcoind, [l1])
 
 
@@ -1094,6 +1103,7 @@ def setup_multihtlc_test(node_factory, bitcoind):
 
 
 @unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1 for dev_ignore_htlcs")
+@unittest.skipIf(SLOW_MACHINE and VALGRIND, "slow test")
 def test_onchain_multihtlc_our_unilateral(node_factory, bitcoind):
     """Node pushes a channel onchain with multiple HTLCs with same payment_hash """
     h, nodes = setup_multihtlc_test(node_factory, bitcoind)
@@ -1181,6 +1191,7 @@ def test_onchain_multihtlc_our_unilateral(node_factory, bitcoind):
 
 
 @unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1 for dev_ignore_htlcs")
+@unittest.skipIf(SLOW_MACHINE and VALGRIND, "slow test")
 def test_onchain_multihtlc_their_unilateral(node_factory, bitcoind):
     """Node pushes a channel onchain with multiple HTLCs with same payment_hash """
     h, nodes = setup_multihtlc_test(node_factory, bitcoind)
@@ -1413,16 +1424,16 @@ def test_permfail(node_factory, bitcoind):
     l2.daemon.wait_for_log(' to ONCHAIN')
     l2.daemon.wait_for_log('Propose handling OUR_UNILATERAL/DELAYED_OUTPUT_TO_US by OUR_DELAYED_RETURN_TO_WALLET (.*) after 5 blocks')
 
-    wait_for(lambda: only_one(l1.rpc.listpeers(l2.info['id'])['peers'][0]['channels'])['status'] ==
-             ['ONCHAIN:Tracking their unilateral close',
-              'ONCHAIN:All outputs resolved: waiting 99 more blocks before forgetting channel'])
+    wait_for(lambda: only_one(l1.rpc.listpeers(l2.info['id'])['peers'][0]['channels'])['status']
+             == ['ONCHAIN:Tracking their unilateral close',
+                 'ONCHAIN:All outputs resolved: waiting 99 more blocks before forgetting channel'])
 
     def check_billboard():
         billboard = only_one(l2.rpc.listpeers(l1.info['id'])['peers'][0]['channels'])['status']
         return (
-            len(billboard) == 2 and
-            billboard[0] == 'ONCHAIN:Tracking our own unilateral close' and
-            re.fullmatch('ONCHAIN:.* outputs unresolved: in 4 blocks will spend DELAYED_OUTPUT_TO_US \(.*:0\) using OUR_DELAYED_RETURN_TO_WALLET', billboard[1])
+            len(billboard) == 2
+            and billboard[0] == 'ONCHAIN:Tracking our own unilateral close'
+            and re.fullmatch(r'ONCHAIN:.* outputs unresolved: in 4 blocks will spend DELAYED_OUTPUT_TO_US \(.*:0\) using OUR_DELAYED_RETURN_TO_WALLET', billboard[1])
         )
     wait_for(check_billboard)
 

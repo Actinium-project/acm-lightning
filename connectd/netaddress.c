@@ -158,7 +158,7 @@ static bool IsLocal(const struct wireaddr *addr)
 
 static bool IsInternal(const struct wireaddr *addr)
 {
-    return addr->type == ADDR_TYPE_PADDING;
+    return false;
 }
 
 static bool IsValid(const struct wireaddr *addr)
@@ -260,7 +260,6 @@ bool guess_address(struct wireaddr *addr)
     }
     case ADDR_TYPE_TOR_V2:
     case ADDR_TYPE_TOR_V3:
-    case ADDR_TYPE_PADDING:
         status_broken("Cannot guess address type %u", addr->type);
         break;
     }
