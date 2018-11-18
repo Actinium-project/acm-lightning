@@ -211,6 +211,14 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->tor_service_password = NULL;
 	ld->max_funding_unconfirmed = 2016;
 
+	/*~ We run a number of plugins (subprocesses that we talk JSON-RPC with)
+	 *alongside this process. This allows us to have an easy way for users
+	 *to add their own tools without having to modify the c-lightning source
+	 *code. Here we initialize the context that will keep track and control
+	 *the plugins.
+	 */
+	ld->plugins = plugins_new(ld, ld->log_book);
+
 	return ld;
 }
 
@@ -585,8 +593,24 @@ int main(int argc, char *argv[])
 	 *  mimic this API here, even though they're on separate lines.*/
 	register_opts(ld);
 
+	/*~ Handle early options, but don't move to --lightning-dir
+	 *  just yet. Plugins may add new options, which is why we are
+	 *  splitting between early args (including --plugin
+	 *  registration) and non-early opts. */
+	handle_early_opts(ld, argc, argv);
+
+	/*~ Initialize all the plugins we just registered, so they can
+	 *  do their thing and tell us about themselves (including
+	 *  options registration). */
+	plugins_init(ld->plugins);
+
 	/*~ Handle options and config; move to .lightningd (--lightning-dir) */
 	handle_opts(ld, argc, argv);
+
+	/*~ Now that we have collected all the early options, gave
+	 *  plugins a chance to register theirs and collected all
+	 *  remaining options it's time to tell the plugins. */
+	plugins_config(ld->plugins);
 
 	/*~ Make sure we can reach the subdaemons, and versions match. */
 	test_subdaemons(ld);

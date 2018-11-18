@@ -72,6 +72,9 @@ struct log_book *get_log_book(const struct log *log UNNEEDED)
 /* Generated stub for gossip_init */
 void gossip_init(struct lightningd *ld UNNEEDED, int connectd_fd UNNEEDED)
 { fprintf(stderr, "gossip_init called!\n"); abort(); }
+/* Generated stub for handle_early_opts */
+void handle_early_opts(struct lightningd *ld UNNEEDED, int argc UNNEEDED, char *argv[])
+{ fprintf(stderr, "handle_early_opts called!\n"); abort(); }
 /* Generated stub for handle_opts */
 void handle_opts(struct lightningd *ld UNNEEDED, int argc UNNEEDED, char *argv[])
 { fprintf(stderr, "handle_opts called!\n"); abort(); }
@@ -119,6 +122,15 @@ struct chain_topology *new_topology(struct lightningd *ld UNNEEDED, struct log *
 /* Generated stub for onchaind_replay_channels */
 void onchaind_replay_channels(struct lightningd *ld UNNEEDED)
 { fprintf(stderr, "onchaind_replay_channels called!\n"); abort(); }
+/* Generated stub for plugins_config */
+void plugins_config(struct plugins *plugins UNNEEDED)
+{ fprintf(stderr, "plugins_config called!\n"); abort(); }
+/* Generated stub for plugins_init */
+void plugins_init(struct plugins *plugins UNNEEDED)
+{ fprintf(stderr, "plugins_init called!\n"); abort(); }
+/* Generated stub for plugins_new */
+struct plugins *plugins_new(const tal_t *ctx UNNEEDED, struct log_book *log_book UNNEEDED)
+{ fprintf(stderr, "plugins_new called!\n"); abort(); }
 /* Generated stub for register_opts */
 void register_opts(struct lightningd *ld UNNEEDED)
 { fprintf(stderr, "register_opts called!\n"); abort(); }
