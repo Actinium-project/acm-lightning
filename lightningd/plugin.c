@@ -7,7 +7,6 @@
 #include <ccan/pipecmd/pipecmd.h>
 #include <ccan/tal/str/str.h>
 #include <lightningd/json.h>
-#include <unistd.h>
 
 #include <signal.h>
 #include <unistd.h>
