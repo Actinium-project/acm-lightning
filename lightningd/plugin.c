@@ -9,6 +9,11 @@
 #include <lightningd/json.h>
 #include <unistd.h>
 
+#include <signal.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
 struct plugin {
 	pid_t pid;
 	char *cmd;
