@@ -652,7 +652,7 @@ static void opt_parse_from_config(struct lightningd *ld, bool early)
 	lines = tal_strsplit(contents, contents, "\r\n", STR_NO_EMPTY);
 
 	/* We have to keep all_args around, since opt will point into it */
-	all_args = tal_arr(ld, char *, tal_count(lines) - 1);
+	all_args = notleak(tal_arr(ld, char *, tal_count(lines) - 1));
 
 	for (i = 0; i < tal_count(lines) - 1; i++) {
 		if (strstarts(lines[i], "#")) {
@@ -837,6 +837,11 @@ void handle_early_opts(struct lightningd *ld, int argc, char *argv[])
 
 void handle_opts(struct lightningd *ld, int argc, char *argv[])
 {
+	/* Now look for config file, but only handle non-early
+	 * options, early ones have been parsed in
+	 * handle_early_opts */
+	opt_parse_from_config(ld, false);
+
 	/* Move to config dir, to save ourselves the hassle of path manip. */
 	if (chdir(ld->config_dir) != 0) {
 		log_unusual(ld->log, "Creating configuration directory %s",
@@ -848,11 +853,6 @@ void handle_opts(struct lightningd *ld, int argc, char *argv[])
 			fatal("Could not change directory %s: %s",
 			      ld->config_dir, strerror(errno));
 	}
-
-	/* Now look for config file, but only handle non-early
-	 * options, early ones have been parsed in
-	 * handle_early_opts */
-	opt_parse_from_config(ld, false);
 
 	opt_parse(&argc, argv, opt_log_stderr_exit);
 	if (argc != 1)

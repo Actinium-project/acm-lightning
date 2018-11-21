@@ -25,25 +25,20 @@ class UnixDomainSocketRpc(object):
         s = json.dumps(obj)
         sock.sendall(bytearray(s, 'UTF-8'))
 
-    def _readobj(self, sock):
-        buff = b''
+    def _readobj(self, sock, buff=b''):
+        """Read a JSON object, starting with buff; returns object and any buffer left over"""
         while True:
-            try:
+            parts = buff.split(b'\n\n', 1)
+            if len(parts) == 1:
+                # Didn't read enough.
                 b = sock.recv(1024)
                 buff += b
                 if len(b) == 0:
-                    return {'error': 'Connection to RPC server lost.'}
-
-                if buff[-3:] != b' }\n':
-                    continue
-
-                # Convert late to UTF-8 so glyphs split across recvs do not
-                # impact us
-                objs, _ = self.decoder.raw_decode(buff.decode("UTF-8"))
-                return objs
-            except ValueError:
-                # Probably didn't read enough
-                pass
+                    return {'error': 'Connection to RPC server lost.'}, buff
+            else:
+                buff = parts[1]
+                obj, _ = self.decoder.raw_decode(parts[0].decode("UTF-8"))
+                return obj, buff
 
     def __getattr__(self, name):
         """Intercept any call that is not explicitly defined and call @call
@@ -65,6 +60,7 @@ class UnixDomainSocketRpc(object):
         # Filter out arguments that are None
         payload = {k: v for k, v in payload.items() if v is not None}
 
+        # FIXME: we open a new socket for every readobj call...
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.connect(self.socket_path)
         self._writeobj(sock, {
@@ -72,7 +68,7 @@ class UnixDomainSocketRpc(object):
             "params": payload,
             "id": 0
         })
-        resp = self._readobj(sock)
+        resp, _ = self._readobj(sock)
         sock.close()
 
         self.logger.debug("Received response for %s call: %r", method, resp)
