@@ -12,6 +12,7 @@
 #include <common/type_to_string.h>
 #include <common/wire_error.h>
 #include <common/wireaddr.h>
+#include <gossipd/gen_gossip_peerd_wire.h>
 #include <gossipd/gen_gossip_wire.h>
 #include <inttypes.h>
 #include <wire/gen_peer_wire.h>
@@ -1706,23 +1707,23 @@ void route_prune(struct routing_state *rstate)
 	tal_free(pruned);
 }
 
-void handle_local_add_channel(struct routing_state *rstate, const u8 *msg)
+bool handle_local_add_channel(struct routing_state *rstate, const u8 *msg)
 {
 	struct short_channel_id scid;
 	struct pubkey remote_node_id;
 	u64 satoshis;
 
-	if (!fromwire_gossip_local_add_channel(msg, &scid, &remote_node_id,
-					       &satoshis)) {
+	if (!fromwire_gossipd_local_add_channel(msg, &scid, &remote_node_id,
+						&satoshis)) {
 		status_broken("Unable to parse local_add_channel message: %s",
 			      tal_hex(msg, msg));
-		return;
+		return false;
 	}
 
 	/* Can happen on channeld restart. */
 	if (get_channel(rstate, &scid)) {
 		status_trace("Attempted to local_add_channel a known channel");
-		return;
+		return true;
 	}
 
 	status_trace("local_add_channel %s",
@@ -1730,4 +1731,5 @@ void handle_local_add_channel(struct routing_state *rstate, const u8 *msg)
 
 	/* Create new (unannounced) channel */
 	new_chan(rstate, &scid, &rstate->local_id, &remote_node_id, satoshis);
+	return true;
 }

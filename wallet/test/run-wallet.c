@@ -94,6 +94,9 @@ bool fromwire_hsm_sign_commitment_tx_reply(const void *p UNNEEDED, secp256k1_ecd
 /* Generated stub for get_block_height */
 u32 get_block_height(const struct chain_topology *topo UNNEEDED)
 { fprintf(stderr, "get_block_height called!\n"); abort(); }
+/* Generated stub for get_chainparams */
+const struct chainparams *get_chainparams(const struct lightningd *ld UNNEEDED)
+{ fprintf(stderr, "get_chainparams called!\n"); abort(); }
 /* Generated stub for invoices_autoclean_set */
 void invoices_autoclean_set(struct invoices *invoices UNNEEDED,
 			    u64 cycle_seconds UNNEEDED,
@@ -172,6 +175,15 @@ void invoices_waitone(const tal_t *ctx UNNEEDED,
 		      void (*cb)(const struct invoice * UNNEEDED, void*) UNNEEDED,
 		      void *cbarg UNNEEDED)
 { fprintf(stderr, "invoices_waitone called!\n"); abort(); }
+/* Generated stub for json_add_address */
+void json_add_address(struct json_stream *response UNNEEDED, const char *fieldname UNNEEDED,
+		      const struct wireaddr *addr UNNEEDED)
+{ fprintf(stderr, "json_add_address called!\n"); abort(); }
+/* Generated stub for json_add_address_internal */
+void json_add_address_internal(struct json_stream *response UNNEEDED,
+			       const char *fieldname UNNEEDED,
+			       const struct wireaddr_internal *addr UNNEEDED)
+{ fprintf(stderr, "json_add_address_internal called!\n"); abort(); }
 /* Generated stub for json_add_bool */
 void json_add_bool(struct json_stream *result UNNEEDED, const char *fieldname UNNEEDED,
 		   bool value UNNEEDED)
@@ -219,20 +231,20 @@ void json_add_uncommitted_channel(struct json_stream *response UNNEEDED,
 				  const struct uncommitted_channel *uc UNNEEDED)
 { fprintf(stderr, "json_add_uncommitted_channel called!\n"); abort(); }
 /* Generated stub for json_array_end */
-void json_array_end(struct json_stream *ptr UNNEEDED)
+void json_array_end(struct json_stream *js UNNEEDED)
 { fprintf(stderr, "json_array_end called!\n"); abort(); }
 /* Generated stub for json_array_start */
-void json_array_start(struct json_stream *ptr UNNEEDED, const char *fieldname UNNEEDED)
+void json_array_start(struct json_stream *js UNNEEDED, const char *fieldname UNNEEDED)
 { fprintf(stderr, "json_array_start called!\n"); abort(); }
 /* Generated stub for json_escaped_string_ */
 struct json_escaped *json_escaped_string_(const tal_t *ctx UNNEEDED,
 					  const void *bytes UNNEEDED, size_t len UNNEEDED)
 { fprintf(stderr, "json_escaped_string_ called!\n"); abort(); }
 /* Generated stub for json_object_end */
-void json_object_end(struct json_stream *ptr UNNEEDED)
+void json_object_end(struct json_stream *js UNNEEDED)
 { fprintf(stderr, "json_object_end called!\n"); abort(); }
 /* Generated stub for json_object_start */
-void json_object_start(struct json_stream *ptr UNNEEDED, const char *fieldname UNNEEDED)
+void json_object_start(struct json_stream *ks UNNEEDED, const char *fieldname UNNEEDED)
 { fprintf(stderr, "json_object_start called!\n"); abort(); }
 /* Generated stub for json_stream_success */
 struct json_stream *json_stream_success(struct command *cmd UNNEEDED)
@@ -1073,6 +1085,7 @@ int main(void)
 	struct lightningd *ld;
 
 	setup_tmpctx();
+	wally_init(0);
 	secp256k1_ctx = wally_get_secp_context();
 	ld = tal(tmpctx, struct lightningd);
 

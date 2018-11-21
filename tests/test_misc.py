@@ -611,7 +611,81 @@ def test_multirpc(node_factory):
 
     sock.sendall(b'\n'.join(commands))
 
-    l1.rpc._readobj(sock)
+    buff = b''
+    for i in commands:
+        _, buff = l1.rpc._readobj(sock, buff)
+    sock.close()
+
+
+@unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1")
+def test_multiplexed_rpc(node_factory):
+    """Test that we can do multiple RPCs which exit in different orders"""
+    l1 = node_factory.get_node()
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(l1.rpc.socket_path)
+
+    # Neighbouring ones may be in or out of order.
+    commands = [
+        b'{"id":1,"jsonrpc":"2.0","method":"dev-slowcmd","params":[2000]}',
+        b'{"id":1,"jsonrpc":"2.0","method":"dev-slowcmd","params":[2000]}',
+        b'{"id":2,"jsonrpc":"2.0","method":"dev-slowcmd","params":[1500]}',
+        b'{"id":2,"jsonrpc":"2.0","method":"dev-slowcmd","params":[1500]}',
+        b'{"id":3,"jsonrpc":"2.0","method":"dev-slowcmd","params":[1000]}',
+        b'{"id":3,"jsonrpc":"2.0","method":"dev-slowcmd","params":[1000]}',
+        b'{"id":4,"jsonrpc":"2.0","method":"dev-slowcmd","params":[500]}',
+        b'{"id":4,"jsonrpc":"2.0","method":"dev-slowcmd","params":[500]}'
+    ]
+
+    sock.sendall(b'\n'.join(commands))
+
+    buff = b''
+
+    # They will return in the same order, since they start immediately
+    # (delaying completion should mean we don't see the other commands intermingled).
+    for i in commands:
+        obj, buff = l1.rpc._readobj(sock, buff)
+        assert obj['id'] == l1.rpc.decoder.decode(i.decode("UTF-8"))['id']
+    sock.close()
+
+
+def test_malformed_rpc(node_factory):
+    """Test that we get a correct response to malformed RPC commands"""
+    l1 = node_factory.get_node()
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(l1.rpc.socket_path)
+
+    # No ID
+    sock.sendall(b'{"jsonrpc":"2.0","method":"getinfo","params":[]}')
+    obj, _ = l1.rpc._readobj(sock, b'')
+    assert obj['error']['code'] == -32600
+
+    # No method
+    sock.sendall(b'{"id":1, "jsonrpc":"2.0","params":[]}')
+    obj, _ = l1.rpc._readobj(sock, b'')
+    assert obj['error']['code'] == -32600
+
+    # Complete crap
+    sock.sendall(b'[]')
+    obj, _ = l1.rpc._readobj(sock, b'')
+    assert obj['error']['code'] == -32600
+
+    # Bad ID
+    sock.sendall(b'{"id":{}, "jsonrpc":"2.0","method":"getinfo","params":[]}')
+    obj, _ = l1.rpc._readobj(sock, b'')
+    assert obj['error']['code'] == -32600
+
+    # Bad method
+    sock.sendall(b'{"id":1, "method": 12, "jsonrpc":"2.0","params":[]}')
+    obj, _ = l1.rpc._readobj(sock, b'')
+    assert obj['error']['code'] == -32600
+
+    # Unknown method
+    sock.sendall(b'{"id":1, "method": "unknown", "jsonrpc":"2.0","params":[]}')
+    obj, _ = l1.rpc._readobj(sock, b'')
+    assert obj['error']['code'] == -32601
+
     sock.close()
 
 
@@ -962,3 +1036,26 @@ def test_crashlog(node_factory):
     assert not has_crash_log(l1)
     l1.daemon.proc.send_signal(signal.SIGSEGV)
     wait_for(lambda: has_crash_log(l1))
+
+
+def test_configfile_before_chdir(node_factory):
+    """Must read config file before chdir into lightning dir"""
+    l1 = node_factory.get_node()
+    l1.stop()
+
+    olddir = os.getcwd()
+    # as lightning_dir ends in /, basename and dirname don't work as expected.
+    os.chdir(os.path.dirname(l1.daemon.lightning_dir[:-1]))
+    config = os.path.join(os.path.basename(l1.daemon.lightning_dir[:-1]), "test_configfile")
+    # Test both an early arg and a normal arg.
+    with open(config, 'wb') as f:
+        f.write(b'always-use-proxy=true\n')
+        f.write(b'proxy=127.0.0.1:100\n')
+    l1.daemon.opts['conf'] = config
+
+    # Update executable to point to right place
+    l1.daemon.executable = os.path.join(olddir, l1.daemon.executable)
+    l1.start()
+    assert l1.rpc.listconfigs()['always-use-proxy']
+    assert l1.rpc.listconfigs()['proxy'] == '127.0.0.1:100'
+    os.chdir(olddir)

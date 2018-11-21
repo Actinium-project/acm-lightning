@@ -285,10 +285,6 @@ void mark_channel_unroutable(struct routing_state *rstate,
 
 void route_prune(struct routing_state *rstate);
 
-/* Utility function that, given a source and a destination, gives us
- * the direction bit the matching channel should get */
-#define get_channel_direction(from, to) (pubkey_cmp(from, to) > 0)
-
 /**
  * Add a channel_announcement to the network view without checking it
  *
@@ -328,6 +324,6 @@ bool routing_add_node_announcement(struct routing_state *rstate,
  * is the case for private channels or channels that have not yet reached
  * `announce_depth`.
  */
-void handle_local_add_channel(struct routing_state *rstate, const u8 *msg);
+bool handle_local_add_channel(struct routing_state *rstate, const u8 *msg);
 
 #endif /* LIGHTNING_GOSSIPD_ROUTING_H */
