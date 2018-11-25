@@ -67,6 +67,9 @@ void delay_then_reconnect(struct channel *channel UNNEEDED, u32 seconds_delay UN
 /* Generated stub for fatal */
 void   fatal(const char *fmt UNNEEDED, ...)
 { fprintf(stderr, "fatal called!\n"); abort(); }
+/* Generated stub for fromwire_channel_dev_memleak_reply */
+bool fromwire_channel_dev_memleak_reply(const void *p UNNEEDED, bool *leak UNNEEDED)
+{ fprintf(stderr, "fromwire_channel_dev_memleak_reply called!\n"); abort(); }
 /* Generated stub for fromwire_connect_peer_connected */
 bool fromwire_connect_peer_connected(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, struct pubkey *id UNNEEDED, struct wireaddr_internal *addr UNNEEDED, struct crypto_state *crypto_state UNNEEDED, u8 **globalfeatures UNNEEDED, u8 **localfeatures UNNEEDED)
 { fprintf(stderr, "fromwire_connect_peer_connected called!\n"); abort(); }
@@ -82,6 +85,9 @@ bool fromwire_hsm_sign_commitment_tx_reply(const void *p UNNEEDED, secp256k1_ecd
 /* Generated stub for fromwire_hsm_sign_invoice_reply */
 bool fromwire_hsm_sign_invoice_reply(const void *p UNNEEDED, secp256k1_ecdsa_recoverable_signature *sig UNNEEDED)
 { fprintf(stderr, "fromwire_hsm_sign_invoice_reply called!\n"); abort(); }
+/* Generated stub for fromwire_onchain_dev_memleak_reply */
+bool fromwire_onchain_dev_memleak_reply(const void *p UNNEEDED, bool *leak UNNEEDED)
+{ fprintf(stderr, "fromwire_onchain_dev_memleak_reply called!\n"); abort(); }
 /* Generated stub for get_block_height */
 u32 get_block_height(const struct chain_topology *topo UNNEEDED)
 { fprintf(stderr, "get_block_height called!\n"); abort(); }
@@ -303,6 +309,9 @@ void opening_peer_no_active_channels(struct peer *peer UNNEEDED)
 bool param(struct command *cmd UNNEEDED, const char *buffer UNNEEDED,
 	   const jsmntok_t params[] UNNEEDED, ...)
 { fprintf(stderr, "param called!\n"); abort(); }
+/* Generated stub for peer_memleak_done */
+void peer_memleak_done(struct command *cmd UNNEEDED, struct subd *leaker UNNEEDED)
+{ fprintf(stderr, "peer_memleak_done called!\n"); abort(); }
 /* Generated stub for peer_start_channeld */
 void peer_start_channeld(struct channel *channel UNNEEDED,
 			 const struct crypto_state *cs UNNEEDED,
@@ -348,6 +357,9 @@ void subd_req_(const tal_t *ctx UNNEEDED,
 /* Generated stub for subd_send_msg */
 void subd_send_msg(struct subd *sd UNNEEDED, const u8 *msg_out UNNEEDED)
 { fprintf(stderr, "subd_send_msg called!\n"); abort(); }
+/* Generated stub for towire_channel_dev_memleak */
+u8 *towire_channel_dev_memleak(const tal_t *ctx UNNEEDED)
+{ fprintf(stderr, "towire_channel_dev_memleak called!\n"); abort(); }
 /* Generated stub for towire_channel_dev_reenable_commit */
 u8 *towire_channel_dev_reenable_commit(const tal_t *ctx UNNEEDED)
 { fprintf(stderr, "towire_channel_dev_reenable_commit called!\n"); abort(); }
@@ -377,6 +389,9 @@ u8 *towire_hsm_sign_commitment_tx(const tal_t *ctx UNNEEDED, const struct pubkey
 /* Generated stub for towire_hsm_sign_invoice */
 u8 *towire_hsm_sign_invoice(const tal_t *ctx UNNEEDED, const u8 *u5bytes UNNEEDED, const u8 *hrp UNNEEDED)
 { fprintf(stderr, "towire_hsm_sign_invoice called!\n"); abort(); }
+/* Generated stub for towire_onchain_dev_memleak */
+u8 *towire_onchain_dev_memleak(const tal_t *ctx UNNEEDED)
+{ fprintf(stderr, "towire_onchain_dev_memleak called!\n"); abort(); }
 /* Generated stub for txfilter_add_scriptpubkey */
 void txfilter_add_scriptpubkey(struct txfilter *filter UNNEEDED, const u8 *script TAKES UNNEEDED)
 { fprintf(stderr, "txfilter_add_scriptpubkey called!\n"); abort(); }

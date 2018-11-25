@@ -35,6 +35,7 @@
 #include <lightningd/jsonrpc.h>
 #include <lightningd/jsonrpc_errors.h>
 #include <lightningd/log.h>
+#include <lightningd/memdump.h>
 #include <lightningd/onchain_control.h>
 #include <lightningd/opening_control.h>
 #include <lightningd/options.h>
@@ -1395,5 +1396,100 @@ static const struct json_command dev_forget_channel_command = {
 	"Forget the channel with peer {id}. Checks if the channel is still active by checking its funding transaction. Check can be ignored by setting {force} to 'true'"
 };
 AUTODATA(json_command, &dev_forget_channel_command);
+
+static void subd_died_forget_memleak(struct subd *openingd, struct command *cmd)
+{
+	/* FIXME: We ignore the remaining per-peer daemons in this case. */
+	peer_memleak_done(cmd, NULL);
+}
+
+/* Mutual recursion */
+static void peer_memleak_req_next(struct command *cmd, struct channel *prev);
+static void peer_memleak_req_done(struct subd *subd, bool found_leak,
+				  struct command *cmd)
+{
+	struct channel *c = subd->channel;
+
+	if (found_leak)
+		peer_memleak_done(cmd, subd);
+	else
+		peer_memleak_req_next(cmd, c);
+}
+
+static void channeld_memleak_req_done(struct subd *channeld,
+				      const u8 *msg, const int *fds UNUSED,
+				      struct command *cmd)
+{
+	bool found_leak;
+
+	tal_del_destructor2(channeld, subd_died_forget_memleak, cmd);
+	if (!fromwire_channel_dev_memleak_reply(msg, &found_leak)) {
+		command_fail(cmd, LIGHTNINGD, "Bad channel_dev_memleak");
+		return;
+	}
+	peer_memleak_req_done(channeld, found_leak, cmd);
+}
+
+static void onchaind_memleak_req_done(struct subd *onchaind,
+				      const u8 *msg, const int *fds UNUSED,
+				      struct command *cmd)
+{
+	bool found_leak;
+
+	tal_del_destructor2(onchaind, subd_died_forget_memleak, cmd);
+	if (!fromwire_onchain_dev_memleak_reply(msg, &found_leak)) {
+		command_fail(cmd, LIGHTNINGD, "Bad onchain_dev_memleak");
+		return;
+	}
+	peer_memleak_req_done(onchaind, found_leak, cmd);
+}
+
+static void peer_memleak_req_next(struct command *cmd, struct channel *prev)
+{
+	struct peer *p;
+
+	list_for_each(&cmd->ld->peers, p, list) {
+		struct channel *c;
+
+		list_for_each(&p->channels, c, list) {
+			if (c == prev) {
+				prev = NULL;
+				continue;
+			}
+
+			if (!c->owner)
+				continue;
+
+			if (prev != NULL)
+				continue;
+
+			/* Note: closingd does its own checking automatically */
+			if (streq(c->owner->name, "lightning_channeld")) {
+				subd_req(c, c->owner,
+					 take(towire_channel_dev_memleak(NULL)),
+					 -1, 0, channeld_memleak_req_done, cmd);
+				tal_add_destructor2(c->owner,
+						    subd_died_forget_memleak,
+						    cmd);
+				return;
+			}
+			if (streq(c->owner->name, "lightning_onchaind")) {
+				subd_req(c, c->owner,
+					 take(towire_onchain_dev_memleak(NULL)),
+					 -1, 0, onchaind_memleak_req_done, cmd);
+				tal_add_destructor2(c->owner,
+						    subd_died_forget_memleak,
+						    cmd);
+				return;
+			}
+		}
+	}
+	peer_memleak_done(cmd, NULL);
+}
+
+void peer_dev_memleak(struct command *cmd)
+{
+	peer_memleak_req_next(cmd, NULL);
+}
 #endif /* DEVELOPER */
 
