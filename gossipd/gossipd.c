@@ -1,3 +1,4 @@
+#include <bitcoin/chainparams.h>
 #include <ccan/array_size/array_size.h>
 /*~ Welcome to the gossip daemon: keeper of maps!
  *
@@ -34,6 +35,7 @@
 #include <common/daemon_conn.h>
 #include <common/decode_short_channel_ids.h>
 #include <common/features.h>
+#include <common/memleak.h>
 #include <common/ping.h>
 #include <common/pseudorand.h>
 #include <common/status.h>
@@ -95,6 +97,9 @@ struct daemon {
 
 	/* Routing information */
 	struct routing_state *rstate;
+
+	/* chainhash for checking/making gossip msgs */
+	struct bitcoin_blkid chain_hash;
 
 	/* Timers: we batch gossip, and also refresh announcements */
 	struct timers timers;
@@ -340,7 +345,7 @@ static void setup_gossip_range(struct peer *peer)
 	 * should be much smarter about requesting only what we don't already
 	 * have. */
 	msg = towire_gossip_timestamp_filter(peer,
-					     &peer->daemon->rstate->chain_hash,
+					     &peer->daemon->chain_hash,
 					     0, UINT32_MAX);
 	queue_peer_msg(peer, take(msg));
 }
@@ -527,7 +532,6 @@ static u8 *handle_channel_update_msg(struct peer *peer, const u8 *msg)
  * called when there's nothing more important to send. */
 static const u8 *handle_query_short_channel_ids(struct peer *peer, const u8 *msg)
 {
-	struct routing_state *rstate = peer->daemon->rstate;
 	struct bitcoin_blkid chain;
 	u8 *encoded;
 	struct short_channel_id *scids;
@@ -538,7 +542,7 @@ static const u8 *handle_query_short_channel_ids(struct peer *peer, const u8 *msg
 				       tal_hex(tmpctx, msg));
 	}
 
-	if (!bitcoin_blkid_eq(&rstate->chain_hash, &chain)) {
+	if (!bitcoin_blkid_eq(&peer->daemon->chain_hash, &chain)) {
 		status_trace("%s sent query_short_channel_ids chainhash %s",
 			     type_to_string(tmpctx, struct pubkey, &peer->id),
 			     type_to_string(tmpctx, struct bitcoin_blkid, &chain));
@@ -598,7 +602,7 @@ static u8 *handle_gossip_timestamp_filter(struct peer *peer, const u8 *msg)
 				       tal_hex(tmpctx, msg));
 	}
 
-	if (!bitcoin_blkid_eq(&peer->daemon->rstate->chain_hash, &chain_hash)) {
+	if (!bitcoin_blkid_eq(&peer->daemon->chain_hash, &chain_hash)) {
 		status_trace("%s sent gossip_timestamp_filter chainhash %s",
 			     type_to_string(tmpctx, struct pubkey, &peer->id),
 			     type_to_string(tmpctx, struct bitcoin_blkid,
@@ -645,7 +649,7 @@ static void reply_channel_range(struct peer *peer,
 	 *     - SHOULD set `complete` to 1.
 	 */
 	u8 *msg = towire_reply_channel_range(NULL,
-					     &peer->daemon->rstate->chain_hash,
+					     &peer->daemon->chain_hash,
 					     first_blocknum,
 					     number_of_blocks,
 					     1, encoded);
@@ -739,7 +743,7 @@ static u8 *handle_query_channel_range(struct peer *peer, const u8 *msg)
 
 	/* FIXME: if they ask for the wrong chain, we should not ignore it,
 	 * but give an empty response with the `complete` flag unset? */
-	if (!bitcoin_blkid_eq(&peer->daemon->rstate->chain_hash, &chain_hash)) {
+	if (!bitcoin_blkid_eq(&peer->daemon->chain_hash, &chain_hash)) {
 		status_trace("%s sent query_channel_range chainhash %s",
 			     type_to_string(tmpctx, struct pubkey, &peer->id),
 			     type_to_string(tmpctx, struct bitcoin_blkid,
@@ -778,7 +782,7 @@ static const u8 *handle_reply_channel_range(struct peer *peer, const u8 *msg)
 				       tal_hex(tmpctx, msg));
 	}
 
-	if (!bitcoin_blkid_eq(&peer->daemon->rstate->chain_hash, &chain)) {
+	if (!bitcoin_blkid_eq(&peer->daemon->chain_hash, &chain)) {
 		return towire_errorfmt(peer, NULL,
 				       "reply_channel_range for bad chain: %s",
 				       tal_hex(tmpctx, msg));
@@ -924,7 +928,7 @@ static u8 *handle_reply_short_channel_ids_end(struct peer *peer, const u8 *msg)
 				       tal_hex(tmpctx, msg));
 	}
 
-	if (!bitcoin_blkid_eq(&peer->daemon->rstate->chain_hash, &chain)) {
+	if (!bitcoin_blkid_eq(&peer->daemon->chain_hash, &chain)) {
 		return towire_errorfmt(peer, NULL,
 				       "reply_short_channel_ids_end for bad chain: %s",
 				       tal_hex(tmpctx, msg));
@@ -1069,7 +1073,7 @@ static void maybe_create_next_scid_reply(struct peer *peer)
 		 */
 		/* FIXME: We consider ourselves to have complete knowledge. */
 		u8 *end = towire_reply_short_channel_ids_end(peer,
-							     &rstate->chain_hash,
+							     &peer->daemon->chain_hash,
 							     true);
 		queue_peer_msg(peer, take(end));
 
@@ -1205,7 +1209,7 @@ static void update_local_channel(struct daemon *daemon,
 	/* We create an update with a dummy signature, and hand to hsmd to get
 	 * it signed. */
 	update = towire_channel_update_option_channel_htlc_max(tmpctx, &dummy_sig,
-				       &daemon->rstate->chain_hash,
+				       &daemon->chain_hash,
 				       &chan->scid,
 				       timestamp,
 				       message_flags, channel_flags,
@@ -1759,9 +1763,9 @@ static void gossip_refresh_network(struct daemon *daemon)
 	struct node *n;
 
 	/* Schedule next run now (prune_timeout is 2 weeks) */
-	new_reltimer(&daemon->timers, daemon,
-		     time_from_sec(daemon->rstate->prune_timeout/4),
-		     gossip_refresh_network, daemon);
+	notleak(new_reltimer(&daemon->timers, daemon,
+			     time_from_sec(daemon->rstate->prune_timeout/4),
+			     gossip_refresh_network, daemon));
 
 	/* Find myself in the network */
 	n = get_node(daemon->rstate, &daemon->id);
@@ -1815,14 +1819,13 @@ static struct io_plan *gossip_init(struct io_conn *conn,
 				   struct daemon *daemon,
 				   const u8 *msg)
 {
-	struct bitcoin_blkid chain_hash;
 	u32 update_channel_interval;
 
 	if (!fromwire_gossipctl_init(daemon, msg,
 				     /* 60,000 ms
 				      * (unless --dev-broadcast-interval) */
 				     &daemon->broadcast_interval_msec,
-				     &chain_hash,
+				     &daemon->chain_hash,
 				     &daemon->id, &daemon->globalfeatures,
 				     daemon->rgb,
 				     daemon->alias,
@@ -1834,7 +1837,9 @@ static struct io_plan *gossip_init(struct io_conn *conn,
 	}
 
 	/* Prune time (usually 2 weeks) is twice update time */
-	daemon->rstate = new_routing_state(daemon, &chain_hash, &daemon->id,
+	daemon->rstate = new_routing_state(daemon,
+					   chainparams_by_chainhash(&daemon->chain_hash),
+					   &daemon->id,
 					   update_channel_interval * 2);
 
 	/* Load stored gossip messages */
@@ -1848,9 +1853,9 @@ static struct io_plan *gossip_init(struct io_conn *conn,
 	maybe_send_own_node_announce(daemon);
 
 	/* Start the weekly refresh timer. */
-	new_reltimer(&daemon->timers, daemon,
-		     time_from_sec(daemon->rstate->prune_timeout/4),
-		     gossip_refresh_network, daemon);
+	notleak(new_reltimer(&daemon->timers, daemon,
+			     time_from_sec(daemon->rstate->prune_timeout/4),
+			     gossip_refresh_network, daemon));
 
 	return daemon_conn_read_next(conn, daemon->master);
 }
@@ -2197,7 +2202,7 @@ static struct io_plan *query_scids_req(struct io_conn *conn,
 		goto fail;
 	}
 
-	msg = towire_query_short_channel_ids(NULL, &daemon->rstate->chain_hash,
+	msg = towire_query_short_channel_ids(NULL, &daemon->chain_hash,
 					     encoded);
 	queue_peer_msg(peer, take(msg));
 	peer->num_scid_queries_outstanding++;
@@ -2248,7 +2253,7 @@ static struct io_plan *send_timestamp_filter(struct io_conn *conn,
 		goto out;
 	}
 
-	msg = towire_gossip_timestamp_filter(NULL, &daemon->rstate->chain_hash,
+	msg = towire_gossip_timestamp_filter(NULL, &daemon->chain_hash,
 					     first, range);
 	queue_peer_msg(peer, take(msg));
 out:
@@ -2289,7 +2294,7 @@ static struct io_plan *query_channel_range(struct io_conn *conn,
 
 	status_debug("sending query_channel_range for blocks %u+%u",
 		     first_blocknum, number_of_blocks);
-	msg = towire_query_channel_range(NULL, &daemon->rstate->chain_hash,
+	msg = towire_query_channel_range(NULL, &daemon->chain_hash,
 					 first_blocknum, number_of_blocks);
 	queue_peer_msg(peer, take(msg));
 	peer->range_first_blocknum = first_blocknum;
@@ -2335,6 +2340,26 @@ static struct io_plan *dev_gossip_suppress(struct io_conn *conn,
 
 	status_unusual("Suppressing all gossip");
 	suppress_gossip = true;
+	return daemon_conn_read_next(conn, daemon->master);
+}
+
+static struct io_plan *dev_gossip_memleak(struct io_conn *conn,
+					  struct daemon *daemon,
+					  const u8 *msg)
+{
+	struct htable *memtable;
+	bool found_leak;
+
+	memtable = memleak_enter_allocations(tmpctx, msg, msg);
+
+	/* Now delete daemon and those which it has pointers to. */
+	memleak_remove_referenced(memtable, daemon);
+	memleak_remove_routing_tables(memtable, daemon->rstate);
+
+	found_leak = dump_memleak(memtable);
+	daemon_conn_send(daemon->master,
+			 take(towire_gossip_dev_memleak_reply(NULL,
+							      found_leak)));
 	return daemon_conn_read_next(conn, daemon->master);
 }
 #endif /* DEVELOPER */
@@ -2551,12 +2576,15 @@ static struct io_plan *recv_req(struct io_conn *conn,
 		return dev_set_max_scids_encode_size(conn, daemon, msg);
 	case WIRE_GOSSIP_DEV_SUPPRESS:
 		return dev_gossip_suppress(conn, daemon, msg);
+	case WIRE_GOSSIP_DEV_MEMLEAK:
+		return dev_gossip_memleak(conn, daemon, msg);
 #else
 	case WIRE_GOSSIP_QUERY_SCIDS:
 	case WIRE_GOSSIP_SEND_TIMESTAMP_FILTER:
 	case WIRE_GOSSIP_QUERY_CHANNEL_RANGE:
 	case WIRE_GOSSIP_DEV_SET_MAX_SCIDS_ENCODE_SIZE:
 	case WIRE_GOSSIP_DEV_SUPPRESS:
+	case WIRE_GOSSIP_DEV_MEMLEAK:
 		break;
 #endif /* !DEVELOPER */
 
@@ -2570,6 +2598,7 @@ static struct io_plan *recv_req(struct io_conn *conn,
 	case WIRE_GOSSIP_GET_CHANNEL_PEER_REPLY:
 	case WIRE_GOSSIP_GET_INCOMING_CHANNELS_REPLY:
 	case WIRE_GOSSIP_GET_TXOUT:
+	case WIRE_GOSSIP_DEV_MEMLEAK_REPLY:
 		break;
 	}
 

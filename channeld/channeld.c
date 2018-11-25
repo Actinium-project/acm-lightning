@@ -10,6 +10,7 @@
  *    reading and writing synchronously we could deadlock if we hit buffer
  *    limits, unlikely as that is.
  */
+#include <bitcoin/chainparams.h>
 #include <bitcoin/privkey.h>
 #include <bitcoin/script.h>
 #include <ccan/cast/cast.h>
@@ -29,6 +30,7 @@
 #include <common/dev_disconnect.h>
 #include <common/htlc_tx.h>
 #include <common/key_derive.h>
+#include <common/memleak.h>
 #include <common/msg_queue.h>
 #include <common/peer_billboard.h>
 #include <common/peer_failed.h>
@@ -60,7 +62,6 @@
 #define PEER_FD 3
 #define GOSSIP_FD 4
 #define HSM_FD 5
-#define min(x, y) ((x) < (y) ? (x) : (y))
 
 struct commit_sigs {
 	struct peer *peer;
@@ -70,7 +71,6 @@ struct commit_sigs {
 
 struct peer {
 	struct crypto_state cs;
-	struct channel_config conf[NUM_SIDES];
 	bool funding_locked[NUM_SIDES];
 	u64 next_index[NUM_SIDES];
 
@@ -237,14 +237,22 @@ static const u8 *hsm_req(const tal_t *ctx, const u8 *req TAKES)
  * capacity minus the cumulative reserve.
  * FIXME: does this need fuzz?
  */
-static const u64 advertised_htlc_max(const u64 funding_msat,
-		const struct channel_config *our_config,
-		const struct channel_config *remote_config)
+static u64 advertised_htlc_max(const struct channel *channel)
 {
-	u64 cumulative_reserve_msat = (our_config->channel_reserve_satoshis +
-		remote_config->channel_reserve_satoshis) * 1000;
-	return min(remote_config->max_htlc_value_in_flight_msat,
-			funding_msat - cumulative_reserve_msat);
+	u64 lower_bound;
+	u64 cumulative_reserve_msat;
+
+	cumulative_reserve_msat =
+		(channel->config[LOCAL].channel_reserve_satoshis +
+		 channel->config[REMOTE].channel_reserve_satoshis) * 1000;
+
+	lower_bound = channel->config[REMOTE].max_htlc_value_in_flight_msat;
+	if (channel->funding_msat - cumulative_reserve_msat < lower_bound)
+		lower_bound = channel->funding_msat - cumulative_reserve_msat;
+	/* FIXME BOLT QUOTE: https://github.com/lightningnetwork/lightning-rfc/pull/512 once merged */
+	if (channel->chainparams->max_payment_msat < lower_bound)
+		lower_bound = channel->chainparams->max_payment_msat;
+	return lower_bound;
 }
 
 /* Create and send channel_update to gossipd (and maybe peer) */
@@ -265,13 +273,10 @@ static void send_channel_update(struct peer *peer, int disable_flag)
 						  disable_flag
 						  == ROUTING_FLAGS_DISABLED,
 						  peer->cltv_delta,
-						  peer->conf[REMOTE].htlc_minimum_msat,
+						  peer->channel->config[REMOTE].htlc_minimum_msat,
 						  peer->fee_base,
 						  peer->fee_per_satoshi,
-						  advertised_htlc_max(
-							 peer->channel->funding_msat,
-							 &peer->conf[LOCAL],
-							 &peer->conf[REMOTE]));
+						  advertised_htlc_max(peer->channel));
 	wire_sync_write(GOSSIP_FD, take(msg));
 }
 
@@ -1607,7 +1612,7 @@ static void handle_peer_shutdown(struct peer *peer, const u8 *shutdown)
 	/* Disable the channel. */
 	send_channel_update(peer, ROUTING_FLAGS_DISABLED);
 
-	if (!fromwire_shutdown(peer, shutdown, &channel_id, &scriptpubkey))
+	if (!fromwire_shutdown(tmpctx, shutdown, &channel_id, &scriptpubkey))
 		peer_failed(&peer->cs,
 			    &peer->channel_id,
 			    "Bad shutdown %s", tal_hex(peer, shutdown));
@@ -1655,7 +1660,8 @@ static void peer_in(struct peer *peer, const u8 *msg)
 		if (type != WIRE_FUNDING_LOCKED
 		    && type != WIRE_PONG
 		    && type != WIRE_SHUTDOWN
-		    /* lnd sends this early; it's harmless. */
+		    /* lnd sends these early; it's harmless. */
+		    && type != WIRE_UPDATE_FEE
 		    && type != WIRE_ANNOUNCEMENT_SIGNATURES) {
 			peer_failed(&peer->cs,
 				    &peer->channel_id,
@@ -2050,12 +2056,12 @@ static void peer_reconnect(struct peer *peer,
 	 * before we've reestablished channel). */
 	do {
 		clean_tmpctx();
-		msg = sync_crypto_read(peer, &peer->cs, PEER_FD);
+		msg = sync_crypto_read(tmpctx, &peer->cs, PEER_FD);
 	} while (handle_peer_gossip_or_error(PEER_FD, GOSSIP_FD, &peer->cs,
 					     &peer->channel_id, msg));
 
-	remote_current_per_commitment_point = tal(peer, struct pubkey);
-	last_local_per_commitment_secret = tal(peer, struct secret);
+	remote_current_per_commitment_point = tal(tmpctx, struct pubkey);
+	last_local_per_commitment_secret = tal(tmpctx, struct secret);
 
 	/* We support option, so check for theirs. */
 	if (!fromwire_channel_reestablish_option_data_loss_protect(msg,
@@ -2340,7 +2346,7 @@ static void handle_offer_htlc(struct peer *peer, const u8 *inmsg)
 	case CHANNEL_ERR_HTLC_BELOW_MINIMUM:
 		failcode = WIRE_AMOUNT_BELOW_MINIMUM;
 		failmsg = tal_fmt(inmsg, "HTLC too small (%"PRIu64" minimum)",
-				  htlc_minimum_msat(peer->channel, REMOTE));
+				  peer->channel->config[REMOTE].htlc_minimum_msat);
 		goto failed;
 	case CHANNEL_ERR_TOO_MANY_HTLCS:
 		failcode = WIRE_TEMPORARY_CHANNEL_FAILURE;
@@ -2466,7 +2472,24 @@ static void handle_dev_reenable_commit(struct peer *peer)
 	wire_sync_write(MASTER_FD,
 			take(towire_channel_dev_reenable_commit_reply(NULL)));
 }
-#endif
+
+static void handle_dev_memleak(struct peer *peer, const u8 *msg)
+{
+	struct htable *memtable;
+	bool found_leak;
+
+	memtable = memleak_enter_allocations(tmpctx, msg, msg);
+
+	/* Now delete peer and things it has pointers to. */
+	memleak_remove_referenced(memtable, peer);
+	memleak_remove_htable(memtable, &peer->channel->htlcs->raw);
+
+	found_leak = dump_memleak(memtable);
+	wire_sync_write(MASTER_FD,
+			 take(towire_channel_dev_memleak_reply(NULL,
+							       found_leak)));
+}
+#endif /* DEVELOPER */
 
 static void req_in(struct peer *peer, const u8 *msg)
 {
@@ -2491,10 +2514,16 @@ static void req_in(struct peer *peer, const u8 *msg)
 	case WIRE_CHANNEL_SEND_SHUTDOWN:
 		handle_shutdown_cmd(peer, msg);
 		return;
-	case WIRE_CHANNEL_DEV_REENABLE_COMMIT:
 #if DEVELOPER
+	case WIRE_CHANNEL_DEV_REENABLE_COMMIT:
 		handle_dev_reenable_commit(peer);
 		return;
+	case WIRE_CHANNEL_DEV_MEMLEAK:
+		handle_dev_memleak(peer, msg);
+		return;
+#else
+	case WIRE_CHANNEL_DEV_REENABLE_COMMIT:
+	case WIRE_CHANNEL_DEV_MEMLEAK:
 #endif /* DEVELOPER */
 	case WIRE_CHANNEL_INIT:
 	case WIRE_CHANNEL_OFFER_HTLC_REPLY:
@@ -2509,6 +2538,7 @@ static void req_in(struct peer *peer, const u8 *msg)
 	case WIRE_CHANNEL_SHUTDOWN_COMPLETE:
 	case WIRE_CHANNEL_DEV_REENABLE_COMMIT_REPLY:
 	case WIRE_CHANNEL_FAIL_FALLEN_BEHIND:
+	case WIRE_CHANNEL_DEV_MEMLEAK_REPLY:
 		break;
 	}
 	master_badmsg(-1, msg);
@@ -2539,6 +2569,7 @@ static void init_channel(struct peer *peer)
 	u16 funding_txout;
 	u64 local_msatoshi;
 	struct pubkey funding_pubkey[NUM_SIDES];
+	struct channel_config conf[NUM_SIDES];
 	struct bitcoin_txid funding_txid;
 	enum side funder;
 	enum htlc_state *hstates;
@@ -2557,12 +2588,12 @@ static void init_channel(struct peer *peer)
 
 	status_setup_sync(MASTER_FD);
 
-	msg = wire_sync_read(peer, MASTER_FD);
+	msg = wire_sync_read(tmpctx, MASTER_FD);
 	if (!fromwire_channel_init(peer, msg,
 				   &peer->chain_hash,
 				   &funding_txid, &funding_txout,
 				   &funding_satoshi,
-				   &peer->conf[LOCAL], &peer->conf[REMOTE],
+				   &conf[LOCAL], &conf[REMOTE],
 				   feerate_per_kw,
 				   &peer->feerate_min, &peer->feerate_max,
 				   &peer->their_commit_sig,
@@ -2638,7 +2669,7 @@ static void init_channel(struct peer *peer)
 					 funding_satoshi,
 					 local_msatoshi,
 					 feerate_per_kw,
-					 &peer->conf[LOCAL], &peer->conf[REMOTE],
+					 &conf[LOCAL], &conf[REMOTE],
 					 &points[LOCAL], &points[REMOTE],
 					 &funding_pubkey[LOCAL],
 					 &funding_pubkey[REMOTE],
@@ -2655,6 +2686,14 @@ static void init_channel(struct peer *peer)
 	/* We derive shared secrets for each remote HTLC, so we can
 	 * create error packet if necessary. */
 	init_shared_secrets(peer->channel, htlcs, hstates);
+
+	/* We don't need these any more, so free them. */
+	tal_free(htlcs);
+	tal_free(hstates);
+	tal_free(fulfilled);
+	tal_free(fulfilled_sides);
+	tal_free(failed);
+	tal_free(failed_sides);
 
 	peer->channel_direction = get_channel_direction(
 	    &peer->node_ids[LOCAL], &peer->node_ids[REMOTE]);

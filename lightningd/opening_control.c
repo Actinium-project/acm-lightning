@@ -675,6 +675,9 @@ static unsigned int openingd_msg(struct subd *openingd,
 	case WIRE_OPENING_INIT:
 	case WIRE_OPENING_FUNDER:
 	case WIRE_OPENING_CAN_ACCEPT_CHANNEL:
+	case WIRE_OPENING_DEV_MEMLEAK:
+	/* Replies never get here */
+	case WIRE_OPENING_DEV_MEMLEAK_REPLY:
 		break;
 	}
 	log_broken(openingd->log, "Unexpected msg %s: %s",
@@ -855,3 +858,68 @@ static const struct json_command fund_channel_command = {
 	"Fund channel with {id} using {satoshi} (or 'all') satoshis, at optional {feerate}"
 };
 AUTODATA(json_command, &fund_channel_command);
+
+#if DEVELOPER
+ /* Indented to avoid include ordering check */
+ #include <lightningd/memdump.h>
+
+static void opening_died_forget_memleak(struct subd *openingd,
+					struct command *cmd)
+{
+	/* FIXME: We ignore the remaining openingds in this case. */
+	opening_memleak_done(cmd, NULL);
+}
+
+/* Mutual recursion */
+static void opening_memleak_req_next(struct command *cmd, struct peer *prev);
+static void opening_memleak_req_done(struct subd *openingd,
+				     const u8 *msg, const int *fds UNUSED,
+				     struct command *cmd)
+{
+	bool found_leak;
+	struct uncommitted_channel *uc = openingd->channel;
+
+	tal_del_destructor2(openingd, opening_died_forget_memleak, cmd);
+	if (!fromwire_opening_dev_memleak_reply(msg, &found_leak)) {
+		command_fail(cmd, LIGHTNINGD, "Bad opening_dev_memleak");
+		return;
+	}
+
+	if (found_leak) {
+		opening_memleak_done(cmd, openingd);
+		return;
+	}
+	opening_memleak_req_next(cmd, uc->peer);
+}
+
+static void opening_memleak_req_next(struct command *cmd, struct peer *prev)
+{
+	struct peer *p;
+
+	list_for_each(&cmd->ld->peers, p, list) {
+		if (!p->uncommitted_channel)
+			continue;
+		if (p == prev) {
+			prev = NULL;
+			continue;
+		}
+		if (prev != NULL)
+			continue;
+
+		subd_req(p,
+			 p->uncommitted_channel->openingd,
+			 take(towire_opening_dev_memleak(NULL)),
+			 -1, 0, opening_memleak_req_done, cmd);
+		/* Just in case it dies before replying! */
+		tal_add_destructor2(p->uncommitted_channel->openingd,
+				    opening_died_forget_memleak, cmd);
+		return;
+	}
+	opening_memleak_done(cmd, NULL);
+}
+
+void opening_dev_memleak(struct command *cmd)
+{
+	opening_memleak_req_next(cmd, NULL);
+}
+#endif /* DEVELOPER */

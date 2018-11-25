@@ -7,6 +7,7 @@
 #include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
 #include <common/features.h>
+#include <common/memleak.h>
 #include <common/pseudorand.h>
 #include <common/status.h>
 #include <common/type_to_string.h>
@@ -85,14 +86,14 @@ static struct node_map *empty_node_map(const tal_t *ctx)
 }
 
 struct routing_state *new_routing_state(const tal_t *ctx,
-					const struct bitcoin_blkid *chain_hash,
+					const struct chainparams *chainparams,
 					const struct pubkey *local_id,
 					u32 prune_timeout)
 {
 	struct routing_state *rstate = tal(ctx, struct routing_state);
 	rstate->nodes = empty_node_map(rstate);
 	rstate->broadcasts = new_broadcast_state(rstate);
-	rstate->chain_hash = *chain_hash;
+	rstate->chainparams = chainparams;
 	rstate->local_id = *local_id;
 	rstate->prune_timeout = prune_timeout;
 	rstate->store = gossip_store_new(rstate, rstate, rstate->broadcasts);
@@ -849,7 +850,8 @@ u8 *handle_channel_announcement(struct routing_state *rstate,
 	 *  - if the specified `chain_hash` is unknown to the receiver:
 	 *    - MUST ignore the message.
 	 */
-	if (!bitcoin_blkid_eq(&chain_hash, &rstate->chain_hash)) {
+	if (!bitcoin_blkid_eq(&chain_hash,
+			      &rstate->chainparams->genesis_blockhash)) {
 		status_trace(
 		    "Received channel_announcement %s for unknown chain %s",
 		    type_to_string(pending, struct short_channel_id,
@@ -1095,6 +1097,12 @@ bool routing_add_channel_update(struct routing_state *rstate,
 		htlc_maximum_msat = chan->satoshis * 1000;
 	}
 
+	/* FIXME: https://github.com/lightningnetwork/lightning-rfc/pull/512
+	 * says we MUST NOT exceed 2^32-1, but c-lightning did, so just trim
+	 * rather than rejecting. */
+	if (htlc_maximum_msat > rstate->chainparams->max_payment_msat)
+		htlc_maximum_msat = rstate->chainparams->max_payment_msat;
+
 	direction = channel_flags & 0x1;
 	set_connection_values(chan, direction, fee_base_msat,
 			      fee_proportional_millionths, expiry,
@@ -1167,7 +1175,8 @@ u8 *handle_channel_update(struct routing_state *rstate, const u8 *update TAKES,
 	 *    active on the specified chain):
 	 *    - MUST ignore the channel update.
 	 */
-	if (!bitcoin_blkid_eq(&chain_hash, &rstate->chain_hash)) {
+	if (!bitcoin_blkid_eq(&chain_hash,
+			      &rstate->chainparams->genesis_blockhash)) {
 		status_trace("Received channel_update for unknown chain %s",
 			     type_to_string(tmpctx, struct bitcoin_blkid,
 					    &chain_hash));
@@ -1706,6 +1715,16 @@ void route_prune(struct routing_state *rstate)
 	/* This frees all the chans and maybe even nodes. */
 	tal_free(pruned);
 }
+
+#if DEVELOPER
+void memleak_remove_routing_tables(struct htable *memtable,
+				   const struct routing_state *rstate)
+{
+	memleak_remove_htable(memtable, &rstate->nodes->raw);
+	memleak_remove_htable(memtable, &rstate->pending_node_map->raw);
+	memleak_remove_uintmap(memtable, &rstate->broadcasts->broadcasts);
+}
+#endif /* DEVELOPER */
 
 bool handle_local_add_channel(struct routing_state *rstate, const u8 *msg)
 {
