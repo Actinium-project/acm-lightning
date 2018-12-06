@@ -201,13 +201,20 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->tor_service_password = NULL;
 	ld->max_funding_unconfirmed = 2016;
 
+	/*~ In the next step we will initialize the plugins. This will
+	 *  also populate the JSON-RPC with passthrough methods, hence
+	 *  lightningd needs to have something to put those in. This
+	 *  is that :-)
+	 */
+	ld->jsonrpc = jsonrpc_new(ld, ld);
+
 	/*~ We run a number of plugins (subprocesses that we talk JSON-RPC with)
 	 *alongside this process. This allows us to have an easy way for users
 	 *to add their own tools without having to modify the c-lightning source
 	 *code. Here we initialize the context that will keep track and control
 	 *the plugins.
 	 */
-	ld->plugins = plugins_new(ld, ld->log_book);
+	ld->plugins = plugins_new(ld, ld->log_book, ld->jsonrpc);
 
 	return ld;
 }
@@ -332,7 +339,7 @@ static const char *find_my_directory(const tal_t *ctx, const char *argv0)
  *
  * TAKES is only a convention unfortunately, and ignored by the compiler.
  */
-static const char *find_my_pkglibexec_path(const tal_t *ctx,
+static const char *find_my_pkglibexec_path(struct lightningd *ld,
 					   const char *my_path TAKES)
 {
 	const char *pkglibexecdir;
@@ -345,23 +352,34 @@ static const char *find_my_pkglibexec_path(const tal_t *ctx,
 	 * So, as we promised with 'TAKES' in our own declaration, if the
 	 * caller has called `take()` the `my_path` parameter, path_join()
 	 * will free it. */
-	pkglibexecdir = path_join(ctx, my_path, BINTOPKGLIBEXECDIR);
+	pkglibexecdir = path_join(NULL, my_path, BINTOPKGLIBEXECDIR);
+
+	/*~ The plugin dir is in ../libexec/c-lightning/plugins, which (unlike
+	 * those given on the command line) does not need to exist. */
+	add_plugin_dir(ld->plugins,
+		       path_join(tmpctx, pkglibexecdir, "plugins"),
+		       true);
 
 	/*~ Sometimes take() can be more efficient, since the routine can
 	 * manipulate the string in place.  This is the case here. */
-	return path_simplify(ctx, take(pkglibexecdir));
+	return path_simplify(ld, take(pkglibexecdir));
 }
 
 /* Determine the correct daemon dir. */
-static const char *find_daemon_dir(const tal_t *ctx, const char *argv0)
+static const char *find_daemon_dir(struct lightningd *ld, const char *argv0)
 {
-	const char *my_path = find_my_directory(ctx, argv0);
+	const char *my_path = find_my_directory(ld, argv0);
 	/* If we're running in-tree, all the subdaemons are with lightningd. */
-	if (has_all_subdaemons(my_path))
+	if (has_all_subdaemons(my_path)) {
+		/* In this case, look in ../plugins */
+		add_plugin_dir(ld->plugins,
+			       path_join(tmpctx, my_path, "../plugins"),
+			       true);
 		return my_path;
+	}
 
 	/* Otherwise we assume they're in the installed dir. */
-	return find_my_pkglibexec_path(ctx, take(my_path));
+	return find_my_pkglibexec_path(ld, take(my_path));
 }
 
 /*~ We like to free everything on exit, so valgrind doesn't complain (valgrind
@@ -695,7 +713,7 @@ int main(int argc, char *argv[])
 
 	/*~ Create RPC socket: now lightning-cli can send us JSON RPC commands
 	 *  over a UNIX domain socket specified by `ld->rpc_filename`. */
-	setup_jsonrpc(ld, ld->rpc_filename);
+	jsonrpc_listen(ld->jsonrpc, ld);
 
 	/*~ We defer --daemon until we've completed most initialization: that
 	 *  way we'll exit with an error rather than silently exiting 0, then
@@ -774,11 +792,13 @@ int main(int argc, char *argv[])
 
 	shutdown_subdaemons(ld);
 
+	tal_free(ld->plugins);
+
 	/* Clean up the JSON-RPC. This needs to happen in a DB transaction since
 	 * it might actually be touching the DB in some destructors, e.g.,
 	 * unreserving UTXOs (see #1737) */
 	db_begin_transaction(ld->wallet->db);
-	tal_free(ld->rpc_listener);
+	tal_free(ld->jsonrpc);
 	db_commit_transaction(ld->wallet->db);
 
 	remove(ld->pidfile);

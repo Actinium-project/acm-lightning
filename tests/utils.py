@@ -1,3 +1,11 @@
+from bitcoin.rpc import RawProxy as BitcoinProxy
+from btcproxy import BitcoinRpcProxy
+from collections import OrderedDict
+from decimal import Decimal
+from ephemeral_port_reserve import reserve
+from lightning import LightningRpc
+
+import json
 import logging
 import os
 import random
@@ -9,12 +17,6 @@ import subprocess
 import threading
 import time
 
-from btcproxy import BitcoinRpcProxy
-from bitcoin.rpc import RawProxy as BitcoinProxy
-from decimal import Decimal
-from ephemeral_port_reserve import reserve
-from lightning import LightningRpc
-
 BITCOIND_CONFIG = {
     "regtest": 1,
     "rpcuser": "rpcuser",
@@ -22,14 +24,14 @@ BITCOIND_CONFIG = {
 }
 
 
-LIGHTNINGD_CONFIG = {
+LIGHTNINGD_CONFIG = OrderedDict({
     "log-level": "debug",
     "cltv-delta": 6,
     "cltv-final": 5,
     "watchtime-blocks": 5,
     "rescan": 1,
     'disable-dns': None,
-}
+})
 
 with open('config.vars') as configfile:
     config = dict([(line.rstrip().split('=', 1)) for line in configfile])
@@ -343,7 +345,7 @@ class LightningD(TailableProc):
     def cmd_line(self):
 
         opts = []
-        for k, v in sorted(self.opts.items()):
+        for k, v in self.opts.items():
             if v is None:
                 opts.append("--{}".format(k))
             elif isinstance(v, list):
@@ -772,7 +774,7 @@ class NodeFactory(object):
                 'valgrind',
                 '-q',
                 '--trace-children=yes',
-                '--trace-children-skip=*bitcoin-cli*',
+                '--trace-children-skip=*plugins*,*python*,*bitcoin-cli*',
                 '--error-exitcode=7',
                 '--log-file={}/valgrind-errors.%p'.format(node.daemon.lightning_dir)
             ]
@@ -864,7 +866,9 @@ class NodeFactory(object):
                     unexpected_fail = True
 
             if leaks is not None and len(leaks) != 0:
-                raise Exception("Node {} has memory leaks: {}"
-                                .format(self.nodes[i].daemon.lightning_dir, leaks))
+                raise Exception("Node {} has memory leaks: {}".format(
+                    self.nodes[i].daemon.lightning_dir,
+                    json.dumps(leaks, sort_keys=True, indent=4)
+                ))
 
         return not unexpected_fail

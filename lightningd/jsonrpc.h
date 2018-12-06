@@ -13,7 +13,9 @@ enum command_mode {
 	/* Normal command processing */
 	CMD_NORMAL,
 	/* Create command usage string, nothing else. */
-	CMD_USAGE
+	CMD_USAGE,
+	/* Check parameters, nothing else. */
+	CMD_CHECK
 };
 
 /* Context for a command (from JSON, but might outlive the connection!). */
@@ -36,6 +38,8 @@ struct command {
 	/* This is created if mode is CMD_USAGE */
 	const char *usage;
 	bool *ok;
+	/* Do not report unused parameters as errors (default false). */
+	bool allow_unused;
 	/* Have we started a json stream already?  For debugging. */
 	bool have_json_stream;
 };
@@ -92,8 +96,38 @@ void PRINTF_FMT(3, 4) command_fail(struct command *cmd, int code,
 /* Mainly for documentation, that we plan to close this later. */
 void command_still_pending(struct command *cmd);
 
-/* For initialization */
-void setup_jsonrpc(struct lightningd *ld, const char *rpc_filename);
+/**
+ * Create a new jsonrpc to wrap all related information.
+ *
+ * This doesn't setup the listener yet, see `jsonrpc_listen` for
+ * that. This just creates the container for all jsonrpc-related
+ * information so we can start gathering it before actually starting.
+ */
+struct jsonrpc *jsonrpc_new(const tal_t *ctx, struct lightningd *ld);
+
+
+/**
+ * Start listeing on ld->rpc_filename.
+ *
+ * Sets up the listener effectively starting the RPC interface.
+ */
+void jsonrpc_listen(struct jsonrpc *rpc, struct lightningd *ld);
+
+/**
+ * Add a new command/method to the JSON-RPC interface.
+ *
+ * Returns true if the command was added correctly, false if adding
+ * this would clobber a command name.
+ */
+bool jsonrpc_command_add(struct jsonrpc *rpc, struct json_command *command);
+
+/**
+ * Remove a command/method from the JSON-RPC.
+ *
+ * Used to dynamically remove a `struct json_command` from the
+ * JSON-RPC dispatch table by its name.
+ */
+void jsonrpc_command_remove(struct jsonrpc *rpc, const char *method);
 
 AUTODATA_TYPE(json_command, struct json_command);
 #endif /* LIGHTNING_LIGHTNINGD_JSONRPC_H */
