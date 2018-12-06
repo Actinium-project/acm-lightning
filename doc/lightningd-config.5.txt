@@ -42,7 +42,8 @@ file using the current settings.
 OPTIONS
 -------
 
-General options:
+General options
+~~~~~~~~~~~~~~~
 
 *allow-deprecated-apis*='BOOL'::
     Enable deprecated options, JSONRPC commands, fields, etc.  It
@@ -91,7 +92,8 @@ Bitcoin control options:
     Number of blocks to rescan from the current head, or absolute blockheight
     if negative. This is only needed if something goes badly wrong.
 
-Lightning daemon options:
+Lightning daemon options
+~~~~~~~~~~~~~~~~~~~~~~~~
 
 *lightning-dir*='DIR'::
     Sets the working directory. All files (except '--conf' on the command
@@ -124,12 +126,8 @@ Lightning daemon options:
     (we allow missing files in the default case).
     Using this inside a configuration file is meaningless.
 
-*plugin*='PATH'::
-    Specify a plugin to run as part of c-lightning. This can be specified
-    multiple times and may enable additional configuration options and JSON-RPC
-    methods, depending on the plugin.
-
-Lightning node customization options:
+Lightning node customization options
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 *rgb*='RRGGBB'::
     Your favorite color as a hex code.
@@ -160,7 +158,8 @@ Lightning node customization options:
     theory increasing this would reduce load, but your node would have to be
     extremely busy node for you to even notice.
 
-Lightning channel and HTLC options:
+Lightning channel and HTLC options
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 *watchtime-blocks*='BLOCKS'::
     How long we need to spot an outdated close attempt: on opening a channel
@@ -210,11 +209,12 @@ Invoice control options:
     Control how long invoices must have been expired before they are
     cleaned (if 'autocleaninvoice-cycle' is non-zero).
 
-Networking options:
+Networking options
+~~~~~~~~~~~~~~~~~~
 
 Note that for simple setups, the implicit 'autolisten' option does the
 right thing: it will try to bind to port 9735 on IPv4 and IPv6, and
-will announce it to peers if it's seems like a public address.
+will announce it to peers if it seems like a public address.
 
 You can instead use 'addr' to override this (eg. to change the port),
 or precisely control where to bind and what to announce with the
@@ -302,6 +302,36 @@ or precisely control where to bind and what to announce with the
 *tor-service-password*='PASSWORD'::
     Set a Tor control password, which may be needed for 'autotor:' to
     authenticate to the Tor control port.
+
+
+Lightning Plugins
+~~~~~~~~~~~~~~~~~
+
+lightningd(8) supports plugins, which offer additional configuration
+options and JSON-RPC methods, depending on the plugin.  Some are
+supplied by default (usually located in
+*libexec/c-lightning/plugins/*), but you can add your own, too.
+
+*plugin*='PATH'::
+    Specify a plugin to run as part of c-lightning. This can be specified
+    multiple times to add multiple plugins.
+
+*plugin-dir*='DIRECTORY'::
+    Specify a directory to look for plugins; all executable files
+    not containing punctuation (other than '.', '-' or '_) in 'DIRECTORY'
+    are loaded. 'DIRECTORY' must exist;
+    this can be specified multiple times to add multiple directories.
+
+*clear-plugins*::
+    This option clears all 'plugin' and 'plugin-dir' options
+    preceeding it, including the default built-in plugin directory.
+    You can still add 'plugin-dir' and 'plugin' options following
+    this and they will have the normal effect.
+
+*disable-plugin*='PLUGIN'::
+    If 'PLUGIN' contains a /, plugins with the same path as 'PLUGIN'
+    are disabled.  Otherwise, any plugin with that base name is
+    disabled, whatever directory it is in.
 
 BUGS
 ----

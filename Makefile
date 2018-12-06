@@ -38,7 +38,9 @@ ifeq ($(COMPAT),1)
 COMPAT_CFLAGS=-DCOMPAT_V052=1 -DCOMPAT_V060=1 -DCOMPAT_V061=1
 endif
 
-PYTEST_OPTS := -v
+# Timeout shortly before the 600 second travis silence timeout
+# (method=thread to support xdist)
+PYTEST_OPTS := -v --timeout=550 --timeout_method=thread
 
 # This is where we add new features as bitcoin adds them.
 FEATURES :=
@@ -399,6 +401,7 @@ exec_prefix = $(prefix)
 bindir = $(exec_prefix)/bin
 libexecdir = $(exec_prefix)/libexec
 pkglibexecdir = $(libexecdir)/$(PKGNAME)
+plugindir = $(pkglibexecdir)/plugins
 datadir = $(prefix)/share
 docdir = $(datadir)/doc/$(PKGNAME)
 mandir = $(datadir)/man
@@ -425,6 +428,7 @@ installdirs:
 	@$(NORMAL_INSTALL)
 	$(MKDIR_P) $(DESTDIR)$(bindir)
 	$(MKDIR_P) $(DESTDIR)$(pkglibexecdir)
+	$(MKDIR_P) $(DESTDIR)$(plugindir)
 	$(MKDIR_P) $(DESTDIR)$(man1dir)
 	$(MKDIR_P) $(DESTDIR)$(man5dir)
 	$(MKDIR_P) $(DESTDIR)$(man7dir)
@@ -444,11 +448,13 @@ PKGLIBEXEC_PROGRAMS = \
 	       lightningd/lightning_hsmd \
 	       lightningd/lightning_onchaind \
 	       lightningd/lightning_openingd
+PLUGINS=
 
 install-program: installdirs $(BIN_PROGRAMS) $(PKGLIBEXEC_PROGRAMS)
 	@$(NORMAL_INSTALL)
 	$(INSTALL_PROGRAM) $(BIN_PROGRAMS) $(DESTDIR)$(bindir)
 	$(INSTALL_PROGRAM) $(PKGLIBEXEC_PROGRAMS) $(DESTDIR)$(pkglibexecdir)
+	[ -z "$(PLUGINS)" ] || $(INSTALL_PROGRAM) $(PLUGINS) $(DESTDIR)$(plugindir)
 
 MAN1PAGES = $(filter %.1,$(MANPAGES))
 MAN5PAGES = $(filter %.5,$(MANPAGES))
@@ -469,6 +475,10 @@ uninstall:
 	@for f in $(BIN_PROGRAMS); do \
 	  echo rm -f $(DESTDIR)$(bindir)/`basename $$f`; \
 	  rm -f $(DESTDIR)$(bindir)/`basename $$f`; \
+	done
+	@for f in $(PLUGINS); do \
+	  echo rm -f $(DESTDIR)$(plugindir)/`basename $$f`; \
+	  rm -f $(DESTDIR)$(plugindir)/`basename $$f`; \
 	done
 	@for f in $(PKGLIBEXEC_PROGRAMS); do \
 	  echo rm -f $(DESTDIR)$(pkglibexecdir)/`basename $$f`; \
