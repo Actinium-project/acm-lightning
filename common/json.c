@@ -2,15 +2,17 @@
 #include "json.h"
 #include <assert.h>
 #include <ccan/build_assert/build_assert.h>
+#include <ccan/mem/mem.h>
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
+#include <common/utils.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
-const char *json_tok_contents(const char *buffer, const jsmntok_t *t)
+const char *json_tok_full(const char *buffer, const jsmntok_t *t)
 {
 	if (t->type == JSMN_STRING)
 		return buffer + t->start - 1;
@@ -18,7 +20,7 @@ const char *json_tok_contents(const char *buffer, const jsmntok_t *t)
 }
 
 /* Include " if it's a string. */
-int json_tok_len(const jsmntok_t *t)
+int json_tok_full_len(const jsmntok_t *t)
 {
 	if (t->type == JSMN_STRING)
 		return t->end - t->start + 2;
@@ -32,6 +34,11 @@ bool json_tok_streq(const char *buffer, const jsmntok_t *tok, const char *str)
 	if (tok->end - tok->start != strlen(str))
 		return false;
 	return strncmp(buffer + tok->start, str, tok->end - tok->start) == 0;
+}
+
+char *json_strdup(const tal_t *ctx, const char *buffer, const jsmntok_t *tok)
+{
+	return tal_strndup(ctx, buffer + tok->start, tok->end - tok->start);
 }
 
 bool json_to_u64(const char *buffer, const jsmntok_t *tok,
@@ -82,8 +89,46 @@ bool json_to_number(const char *buffer, const jsmntok_t *tok,
 	return true;
 }
 
-bool json_tok_bitcoin_amount(const char *buffer, const jsmntok_t *tok,
-			     uint64_t *satoshi)
+bool json_to_int(const char *buffer, const jsmntok_t *tok, int *num)
+{
+	char *end;
+	long l;
+
+	l = strtol(buffer + tok->start, &end, 0);
+	if (end != buffer + tok->end)
+		return false;
+
+	BUILD_ASSERT(sizeof(l) >= sizeof(*num));
+	*num = l;
+
+	/* Check for overflow/underflow */
+	if ((l == LONG_MAX || l == LONG_MIN) && errno == ERANGE)
+		return false;
+
+	/* Check for truncation */
+	if (*num != l)
+		return false;
+
+	return true;
+}
+
+bool json_to_bool(const char *buffer, const jsmntok_t *tok, bool *b)
+{
+	if (tok->type != JSMN_PRIMITIVE)
+		return false;
+	if (memeqstr(buffer + tok->start, tok->end - tok->start, "true")) {
+		*b = true;
+		return true;
+	}
+	if (memeqstr(buffer + tok->start, tok->end - tok->start, "false")) {
+		*b = false;
+		return true;
+	}
+	return false;
+}
+
+bool json_to_bitcoin_amount(const char *buffer, const jsmntok_t *tok,
+			    uint64_t *satoshi)
 {
 	char *end;
 	unsigned long btc, sat;
@@ -172,13 +217,14 @@ const jsmntok_t *json_get_arr(const jsmntok_t tok[], size_t index)
 	return NULL;
 }
 
-jsmntok_t *json_parse_input(const char *input, int len, bool *valid)
+jsmntok_t *json_parse_input(const tal_t *ctx,
+			    const char *input, int len, bool *valid)
 {
 	jsmn_parser parser;
 	jsmntok_t *toks;
 	int ret;
 
-	toks = tal_arr(input, jsmntok_t, 10);
+	toks = tal_arr(ctx, jsmntok_t, 10);
 	toks[0].type = JSMN_UNDEFINED;
 
 	jsmn_init(&parser);
@@ -250,17 +296,7 @@ void json_tok_print(const char *buffer, const jsmntok_t *tok)
 
 jsmntok_t *json_tok_copy(const tal_t *ctx, const jsmntok_t *tok)
 {
-	const jsmntok_t *first = tok;
-	const jsmntok_t *last = json_next(tok);
-
-	if (!tok)
-		return NULL;
-	jsmntok_t *arr = tal_arr(ctx, jsmntok_t, last - first);
-	jsmntok_t *dest = arr;
-	while (first != last)
-		*dest++ = *first++;
-
-	return arr;
+	return tal_dup_arr(ctx, jsmntok_t, tok, json_next(tok) - tok, 0);
 }
 
 void json_tok_remove(jsmntok_t **tokens, jsmntok_t *tok, size_t num)
@@ -281,4 +317,40 @@ void json_tok_remove(jsmntok_t **tokens, jsmntok_t *tok, size_t num)
 
 	tal_resize(tokens, tal_count(*tokens) - remove_count);
 	(*tokens)->size -= num;
+}
+
+const jsmntok_t *json_delve(const char *buffer,
+			    const jsmntok_t *tok,
+			    const char *guide)
+{
+       while (*guide) {
+               const char *key;
+               size_t len = strcspn(guide+1, ".[]");
+
+               key = tal_strndup(tmpctx, guide+1, len);
+               switch (guide[0]) {
+               case '.':
+                       if (tok->type != JSMN_OBJECT)
+                               return NULL;
+                       tok = json_get_member(buffer, tok, key);
+                       if (!tok)
+                               return NULL;
+                       break;
+               case '[':
+                       if (tok->type != JSMN_ARRAY)
+                               return NULL;
+                       tok = json_get_arr(tok, atol(key));
+                       if (!tok)
+                               return NULL;
+                       /* Must be terminated */
+                       assert(guide[1+strlen(key)] == ']');
+                       len++;
+                       break;
+               default:
+                       abort();
+               }
+               guide += len + 1;
+       }
+
+       return tok;
 }

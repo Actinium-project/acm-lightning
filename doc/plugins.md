@@ -22,15 +22,23 @@ is implemented, the other features are under active development.*
 A plugin may be written in any language, and communicates with
 `lightningd` through the plugin's `stdin` and `stdout`. JSON-RPCv2 is
 used as protocol on top of the two streams, with the plugin acting as
-server and `lightningd` acting as client.
+server and `lightningd` acting as client. The plugin file needs to be
+executable (e.g. use `chmod a+x plugin_name`)
 
 ## A day in the life of a plugin
 
 During startup of `lightningd` you can use the `--plugin=` option to
-register one or more plugins that should be started. `lightningd` will
-write JSON-RPC requests to the plugin's `stdin` and will read replies
-from its `stdout`. To initialize the plugin two RPC methods are
-required:
+register one or more plugins that should be started. In case you wish
+to start several plugins you have to use the `--plugin=` argument
+once for each plugin. An example call might look like: 
+
+```
+lightningd --plugin=/path/to/plugin1 --plugin=path/to/plugin2
+```
+
+`lightningd` will write JSON-RPC requests to the plugin's `stdin` and
+will read replies from its `stdout`. To initialize the plugin two RPC 
+methods are required:
 
  - `getmanifest` asks the plugin for command line options and JSON-RPC
    commands that should be passed through

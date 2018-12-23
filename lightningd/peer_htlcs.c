@@ -5,19 +5,20 @@
 #include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
 #include <channeld/gen_channel_wire.h>
+#include <common/json_command.h>
+#include <common/json_escaped.h>
+#include <common/jsonrpc_errors.h>
 #include <common/overflows.h>
+#include <common/param.h>
 #include <common/sphinx.h>
 #include <common/timeout.h>
 #include <gossipd/gen_gossip_wire.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/htlc_end.h>
 #include <lightningd/json.h>
-#include <lightningd/json_escaped.h>
 #include <lightningd/jsonrpc.h>
-#include <lightningd/jsonrpc_errors.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
-#include <lightningd/param.h>
 #include <lightningd/pay.h>
 #include <lightningd/peer_control.h>
 #include <lightningd/peer_htlcs.h>
@@ -984,7 +985,7 @@ static bool changed_htlc(struct channel *channel,
 
 static bool peer_save_commitsig_received(struct channel *channel, u64 commitnum,
 					 struct bitcoin_tx *tx,
-					 const secp256k1_ecdsa_signature *commit_sig)
+					 const struct bitcoin_signature *commit_sig)
 {
 	if (commitnum != channel->next_index[LOCAL]) {
 		channel_internal_error(channel,
@@ -1027,7 +1028,7 @@ void peer_sending_commitsig(struct channel *channel, const u8 *msg)
 	u32 feerate;
 	struct changed_htlc *changed_htlcs;
 	size_t i, maxid = 0, num_local_added = 0;
-	secp256k1_ecdsa_signature commit_sig;
+	struct bitcoin_signature commit_sig;
 	secp256k1_ecdsa_signature *htlc_sigs;
 	struct lightningd *ld = channel->peer->ld;
 
@@ -1175,7 +1176,7 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 {
 	u64 commitnum;
 	u32 feerate;
-	secp256k1_ecdsa_signature commit_sig;
+	struct bitcoin_signature commit_sig;
 	secp256k1_ecdsa_signature *htlc_sigs;
 	struct added_htlc *added;
 	struct secret *shared_secrets;
@@ -1791,28 +1792,29 @@ void htlcs_reconnect(struct lightningd *ld,
 
 
 #if DEVELOPER
-static void json_dev_ignore_htlcs(struct command *cmd, const char *buffer,
-				  const jsmntok_t *params)
+static struct command_result *json_dev_ignore_htlcs(struct command *cmd,
+						    const char *buffer,
+						    const jsmntok_t *obj UNNEEDED,
+						    const jsmntok_t *params)
 {
 	struct pubkey *peerid;
 	struct peer *peer;
 	bool *ignore;
 
 	if (!param(cmd, buffer, params,
-		   p_req("id", json_tok_pubkey, &peerid),
-		   p_req("ignore", json_tok_bool, &ignore),
+		   p_req("id", param_pubkey, &peerid),
+		   p_req("ignore", param_bool, &ignore),
 		   NULL))
-		return;
+		return command_param_failed();
 
 	peer = peer_by_id(cmd->ld, peerid);
 	if (!peer) {
-		command_fail(cmd, LIGHTNINGD,
-			     "Could not find channel with that peer");
-		return;
+		return command_fail(cmd, LIGHTNINGD,
+				    "Could not find channel with that peer");
 	}
 	peer->ignore_htlcs = *ignore;
 
-	command_success(cmd, null_response(cmd));
+	return command_success(cmd, null_response(cmd));
 }
 
 static const struct json_command dev_ignore_htlcs = {
@@ -1846,20 +1848,22 @@ static void listforwardings_add_forwardings(struct json_stream *response, struct
 	tal_free(forwardings);
 }
 
-static void json_listforwards(struct command *cmd, const char *buffer,
-			       const jsmntok_t *params)
+static struct command_result *json_listforwards(struct command *cmd,
+						const char *buffer,
+						const jsmntok_t *obj UNNEEDED,
+						const jsmntok_t *params)
 {
 	struct json_stream *response;
 
 	if (!param(cmd, buffer, params, NULL))
-		return;
+		return command_param_failed();
 
 	response = json_stream_success(cmd);
 	json_object_start(response, NULL);
 	listforwardings_add_forwardings(response, cmd->ld->wallet);
 	json_object_end(response);
 
-	command_success(cmd, response);
+	return command_success(cmd, response);
 }
 
 static const struct json_command listforwards_command = {

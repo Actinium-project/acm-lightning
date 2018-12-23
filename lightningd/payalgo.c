@@ -5,6 +5,9 @@
 #include <ccan/tal/str/str.h>
 #include <ccan/time/time.h>
 #include <common/bolt11.h>
+#include <common/json_command.h>
+#include <common/jsonrpc_errors.h>
+#include <common/param.h>
 #include <common/pseudorand.h>
 #include <common/timeout.h>
 #include <common/type_to_string.h>
@@ -12,10 +15,8 @@
 #include <gossipd/routing.h>
 #include <lightningd/json.h>
 #include <lightningd/jsonrpc.h>
-#include <lightningd/jsonrpc_errors.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
-#include <lightningd/param.h>
 #include <lightningd/subd.h>
 #include <sodium/randombytes.h>
 #include <wallet/wallet.h>
@@ -205,7 +206,7 @@ json_pay_success(struct pay *pay,
 		       pay->route, tal_count(pay->route));
 	json_add_failures(response, "failures", &pay->pay_failures);
 	json_object_end(response);
-	command_success(cmd, response);
+	was_pending(command_success(cmd, response));
 }
 
 static void json_pay_failure(struct pay *pay,
@@ -225,7 +226,7 @@ static void json_pay_failure(struct pay *pay,
 		json_add_payment_fields(data, r->payment);
 		json_add_failures(data, "failures", &pay->pay_failures);
 		json_object_end(data);
-		command_failed(pay->cmd, data);
+		was_pending(command_failed(pay->cmd, data));
 		return;
 
 	case PAY_RHASH_ALREADY_USED:
@@ -236,7 +237,7 @@ static void json_pay_failure(struct pay *pay,
 		json_add_num(data, "sendpay_tries", pay->sendpay_tries);
 		json_add_failures(data, "failures", &pay->pay_failures);
 		json_object_end(data);
-		command_failed(pay->cmd, data);
+		was_pending(command_failed(pay->cmd, data));
 		return;
 
 	case PAY_UNPARSEABLE_ONION:
@@ -265,7 +266,7 @@ static void json_pay_failure(struct pay *pay,
 					    fail->channel_update);
 		json_add_failures(data, "failures", &pay->pay_failures);
 		json_object_end(data);
-		command_failed(pay->cmd, data);
+		was_pending(command_failed(pay->cmd, data));
 		return;
 
 	case PAY_TRY_OTHER_ROUTE:
@@ -304,7 +305,7 @@ static const char *should_delay_retry(const tal_t *ctx,
 }
 
 /* Start a payment attempt. */
-static bool json_pay_try(struct pay *pay);
+static struct command_result *json_pay_try(struct pay *pay);
 
 /* Used when delaying. */
 static void do_pay_try(struct pay *pay)
@@ -425,7 +426,7 @@ static void json_pay_getroute_reply(struct subd *gossip UNUSED,
 		json_add_num(data, "sendpay_tries", pay->sendpay_tries);
 		json_add_failures(data, "failures", &pay->pay_failures);
 		json_object_end(data);
-		command_failed(pay->cmd, data);
+		was_pending(command_failed(pay->cmd, data));
 		return;
 	}
 
@@ -473,7 +474,7 @@ static void json_pay_getroute_reply(struct subd *gossip UNUSED,
 		json_add_failures(data, "failures", &pay->pay_failures);
 		json_object_end(data);
 
-		command_failed(pay->cmd, data);
+		was_pending(command_failed(pay->cmd, data));
 		return;
 	}
 	if (fee_too_high || delay_too_high) {
@@ -500,9 +501,9 @@ static void json_pay_getroute_reply(struct subd *gossip UNUSED,
 		     &json_pay_sendpay_resume, pay);
 }
 
-/* Start a payment attempt. Return true if deferred,
- * false if resolved now. */
-static bool json_pay_try(struct pay *pay)
+/* Start a payment attempt. Return NULL if deferred, otherwise
+ * command_failed(). */
+static struct command_result *json_pay_try(struct pay *pay)
 {
 	u8 *req;
 	struct command *cmd = pay->cmd;
@@ -523,8 +524,7 @@ static bool json_pay_try(struct pay *pay)
 		json_add_num(data, "sendpay_tries", pay->sendpay_tries);
 		json_add_failures(data, "failures", &pay->pay_failures);
 		json_object_end(data);
-		command_failed(cmd, data);
-		return false;
+		return command_failed(cmd, data);
 	}
 
 	/* Clear previous try memory. */
@@ -565,7 +565,7 @@ static bool json_pay_try(struct pay *pay)
 					     &seed);
 	subd_req(pay->try_parent, cmd->ld->gossip, req, -1, 0, json_pay_getroute_reply, pay);
 
-	return true;
+	return NULL;
 }
 
 static void json_pay_stop_retrying(struct pay *pay)
@@ -591,8 +591,10 @@ static void json_pay_stop_retrying(struct pay *pay)
 	json_pay_failure(pay, sr);
 }
 
-static void json_pay(struct command *cmd,
-		     const char *buffer, const jsmntok_t *params)
+static struct command_result *json_pay(struct command *cmd,
+				       const char *buffer,
+				       const jsmntok_t *obj UNNEEDED,
+				       const jsmntok_t *params)
 {
 	double *riskfactor;
 	double *maxfeepercent;
@@ -604,25 +606,25 @@ static void json_pay(struct command *cmd,
 	unsigned int *retryfor;
 	unsigned int *maxdelay;
 	unsigned int *exemptfee;
+	struct command_result *res;
 
 	if (!param(cmd, buffer, params,
-		   p_req("bolt11", json_tok_string, &b11str),
-		   p_opt("msatoshi", json_tok_u64, &msatoshi),
-		   p_opt("description", json_tok_string, &desc),
-		   p_opt_def("riskfactor", json_tok_double, &riskfactor, 1.0),
-		   p_opt_def("maxfeepercent", json_tok_percent, &maxfeepercent, 0.5),
-		   p_opt_def("retry_for", json_tok_number, &retryfor, 60),
-		   p_opt_def("maxdelay", json_tok_number, &maxdelay,
+		   p_req("bolt11", param_string, &b11str),
+		   p_opt("msatoshi", param_u64, &msatoshi),
+		   p_opt("description", param_string, &desc),
+		   p_opt_def("riskfactor", param_double, &riskfactor, 1.0),
+		   p_opt_def("maxfeepercent", param_percent, &maxfeepercent, 0.5),
+		   p_opt_def("retry_for", param_number, &retryfor, 60),
+		   p_opt_def("maxdelay", param_number, &maxdelay,
 			     cmd->ld->config.locktime_max),
-		   p_opt_def("exemptfee", json_tok_number, &exemptfee, 5000),
+		   p_opt_def("exemptfee", param_number, &exemptfee, 5000),
 		   NULL))
-		return;
+		return command_param_failed();
 
 	b11 = bolt11_decode(pay, b11str, desc, &fail);
 	if (!b11) {
-		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-			     "Invalid bolt11: %s", fail);
-		return;
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Invalid bolt11: %s", fail);
 	}
 
 	pay->cmd = cmd;
@@ -635,16 +637,14 @@ static void json_pay(struct command *cmd,
 
 	if (b11->msatoshi) {
 		if (msatoshi) {
-			command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				     "msatoshi parameter unnecessary");
-			return;
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "msatoshi parameter unnecessary");
 		}
 		msatoshi = b11->msatoshi;
 	} else {
 		if (!msatoshi) {
-			command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				     "msatoshi parameter required");
-			return;
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "msatoshi parameter required");
 		}
 	}
 	pay->msatoshi = *msatoshi;
@@ -652,12 +652,11 @@ static void json_pay(struct command *cmd,
 	pay->maxfeepercent = *maxfeepercent;
 
 	if (*maxdelay < pay->min_final_cltv_expiry) {
-		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-			     "maxdelay (%u) must be greater than "
-			     "min_final_cltv_expiry (%"PRIu32") of "
-			     "invoice",
-			     *maxdelay, pay->min_final_cltv_expiry);
-		return;
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "maxdelay (%u) must be greater than "
+				    "min_final_cltv_expiry (%"PRIu32") of "
+				    "invoice",
+				    *maxdelay, pay->min_final_cltv_expiry);
 	}
 	pay->maxdelay = *maxdelay;
 
@@ -682,14 +681,14 @@ static void json_pay(struct command *cmd,
 	pay->description = b11->description;
 
 	/* Initiate payment */
-	if (json_pay_try(pay))
-		command_still_pending(cmd);
-	else
-		return;
+	res = json_pay_try(pay);
+	if (res)
+		return res;
 
 	/* Set up timeout. */
 	new_reltimer(&cmd->ld->timers, pay, time_from_sec(*retryfor),
 		     &json_pay_stop_retrying, pay);
+	return command_still_pending(cmd);
 }
 
 static const struct json_command pay_command = {

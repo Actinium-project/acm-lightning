@@ -12,7 +12,7 @@
  * done, the `json_connection` needs to drain it (if it's still around).  At
  * that point, the `json_connection` becomes the owner (or it's simply freed).
  */
-/* eg: { "method" : "dev-echo", "params" : [ "hello", "Arabella!" ], "id" : "1" } */
+/* eg: { "jsonrpc":"2.0", "method" : "dev-echo", "params" : [ "hello", "Arabella!" ], "id" : "1" } */
 #include <arpa/inet.h>
 #include <bitcoin/address.h>
 #include <bitcoin/base58.h>
@@ -23,7 +23,11 @@
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
 #include <common/bech32.h>
+#include <common/json_command.h>
+#include <common/json_escaped.h>
+#include <common/jsonrpc_errors.h>
 #include <common/memleak.h>
+#include <common/param.h>
 #include <common/timeout.h>
 #include <common/version.h>
 #include <common/wallet_tx.h>
@@ -32,17 +36,32 @@
 #include <fcntl.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/json.h>
-#include <lightningd/json_escaped.h>
 #include <lightningd/jsonrpc.h>
-#include <lightningd/jsonrpc_errors.h>
 #include <lightningd/log.h>
 #include <lightningd/options.h>
-#include <lightningd/param.h>
 #include <stdio.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
+
+/* Dummy structure. */
+struct command_result {
+	char c;
+};
+
+static struct command_result param_failed, complete, pending, unknown;
+
+struct command_result *command_param_failed(void)
+{
+	return &param_failed;
+}
+
+struct command_result *command_its_complicated(const char *relationship_details
+					       UNNEEDED)
+{
+	return &unknown;
+}
 
 /* This represents a JSON RPC connection.  It can invoke multiple commands, but
  * a command can outlive the connection, which could close any time. */
@@ -109,11 +128,7 @@ static void jcon_remove_json_stream(struct json_connection *jcon,
 		if (js != jcon->js_arr[i])
 			continue;
 
-		memmove(jcon->js_arr + i,
-			jcon->js_arr + i + 1,
-			(tal_count(jcon->js_arr) - i - 1)
-			* sizeof(jcon->js_arr[i]));
-		tal_resize(&jcon->js_arr, tal_count(jcon->js_arr)-1);
+		tal_arr_remove(&jcon->js_arr, i);
 		return;
 	}
 	abort();
@@ -133,8 +148,10 @@ static void destroy_jcon(struct json_connection *jcon)
 	tal_free(jcon->log);
 }
 
-static void json_help(struct command *cmd,
-		      const char *buffer, const jsmntok_t *params);
+static struct command_result *json_help(struct command *cmd,
+					const char *buffer,
+					const jsmntok_t *obj UNNEEDED,
+					const jsmntok_t *params);
 
 static const struct json_command help_command = {
 	"help",
@@ -150,19 +167,21 @@ static const struct json_command help_command = {
 };
 AUTODATA(json_command, &help_command);
 
-static void json_stop(struct command *cmd,
-		      const char *buffer UNUSED, const jsmntok_t *params UNUSED)
+static struct command_result *json_stop(struct command *cmd,
+					const char *buffer,
+					const jsmntok_t *obj UNNEEDED,
+					const jsmntok_t *params)
 {
 	struct json_stream *response;
 
 	if (!param(cmd, buffer, params, NULL))
-		return;
+		return command_param_failed();
 
 	/* This can't have closed yet! */
 	cmd->jcon->stop = true;
 	response = json_stream_success(cmd);
 	json_add_string(response, NULL, "Shutting down");
-	command_success(cmd, response);
+	return command_success(cmd, response);
 }
 
 static const struct json_command stop_command = {
@@ -173,16 +192,18 @@ static const struct json_command stop_command = {
 AUTODATA(json_command, &stop_command);
 
 #if DEVELOPER
-static void json_rhash(struct command *cmd,
-		       const char *buffer, const jsmntok_t *params)
+static struct command_result *json_rhash(struct command *cmd,
+					 const char *buffer,
+					 const jsmntok_t *obj UNUSED,
+					 const jsmntok_t *params)
 {
 	struct json_stream *response;
 	struct sha256 *secret;
 
 	if (!param(cmd, buffer, params,
-		   p_req("secret", json_tok_sha256, &secret),
+		   p_req("secret", param_sha256, &secret),
 		   NULL))
-		return;
+		return command_param_failed();
 
 	/* Hash in place. */
 	sha256(secret, secret, sizeof(*secret));
@@ -190,7 +211,7 @@ static void json_rhash(struct command *cmd,
 	json_object_start(response, NULL);
 	json_add_hex(response, "rhash", secret, sizeof(*secret));
 	json_object_end(response);
-	command_success(cmd, response);
+	return command_success(cmd, response);
 }
 
 static const struct json_command dev_rhash_command = {
@@ -211,7 +232,7 @@ static void slowcmd_finish(struct slowcmd *sc)
 	json_object_start(sc->js, NULL);
 	json_add_num(sc->js, "msec", *sc->msec);
 	json_object_end(sc->js);
-	command_success(sc->cmd, sc->js);
+	was_pending(command_success(sc->cmd, sc->js));
 }
 
 static void slowcmd_start(struct slowcmd *sc)
@@ -221,19 +242,21 @@ static void slowcmd_start(struct slowcmd *sc)
 		     slowcmd_finish, sc);
 }
 
-static void json_slowcmd(struct command *cmd,
-			 const char *buffer, const jsmntok_t *params)
+static struct command_result *json_slowcmd(struct command *cmd,
+					   const char *buffer,
+					   const jsmntok_t *obj UNUSED,
+					   const jsmntok_t *params)
 {
 	struct slowcmd *sc = tal(cmd, struct slowcmd);
 
 	sc->cmd = cmd;
 	if (!param(cmd, buffer, params,
-		   p_opt_def("msec", json_tok_number, &sc->msec, 1000),
+		   p_opt_def("msec", param_number, &sc->msec, 1000),
 		   NULL))
-		return;
+		return command_param_failed();
 
 	new_reltimer(&cmd->ld->timers, sc, time_from_msec(0), slowcmd_start, sc);
-	command_still_pending(cmd);
+	return command_still_pending(cmd);
 }
 
 static const struct json_command dev_slowcmd_command = {
@@ -243,11 +266,13 @@ static const struct json_command dev_slowcmd_command = {
 };
 AUTODATA(json_command, &dev_slowcmd_command);
 
-static void json_crash(struct command *cmd UNUSED,
-		       const char *buffer UNUSED, const jsmntok_t *params UNUSED)
+static struct command_result *json_crash(struct command *cmd UNUSED,
+					 const char *buffer,
+					 const jsmntok_t *obj UNNEEDED,
+					 const jsmntok_t *params)
 {
 	if (!param(cmd, buffer, params, NULL))
-		return;
+		return command_param_failed();
 
 	fatal("Crash at user request");
 }
@@ -277,7 +302,7 @@ static void json_add_help_command(struct command *cmd,
 {
 	char *usage;
 	cmd->mode = CMD_USAGE;
-	json_command->dispatch(cmd, NULL, NULL);
+	json_command->dispatch(cmd, NULL, NULL, NULL);
 	usage = tal_fmt(cmd, "%s %s", json_command->name, cmd->usage);
 
 	json_object_start(response, NULL);
@@ -301,17 +326,19 @@ static void json_add_help_command(struct command *cmd,
 
 }
 
-static void json_help(struct command *cmd,
-		      const char *buffer, const jsmntok_t *params)
+static struct command_result *json_help(struct command *cmd,
+					const char *buffer,
+					const jsmntok_t *obj UNNEEDED,
+					const jsmntok_t *params)
 {
 	struct json_stream *response;
 	const jsmntok_t *cmdtok;
 	struct json_command **commands = cmd->ld->jsonrpc->commands;
 
 	if (!param(cmd, buffer, params,
-		   p_opt("command", json_tok_tok, &cmdtok),
+		   p_opt("command", param_tok, &cmdtok),
 		   NULL))
-		return;
+		return command_param_failed();
 
 	if (cmdtok) {
 		for (size_t i = 0; i < tal_count(commands); i++) {
@@ -321,11 +348,10 @@ static void json_help(struct command *cmd,
 				goto done;
 			}
 		}
-		command_fail(cmd, JSONRPC2_METHOD_NOT_FOUND,
-			     "Unknown command '%.*s'",
-			     cmdtok->end - cmdtok->start,
-			     buffer + cmdtok->start);
-		return;
+		return command_fail(cmd, JSONRPC2_METHOD_NOT_FOUND,
+				    "Unknown command '%.*s'",
+				    json_tok_full_len(cmdtok),
+				    json_tok_full(buffer, cmdtok));
 	}
 
 	response = json_stream_success(cmd);
@@ -338,7 +364,7 @@ static void json_help(struct command *cmd,
 	json_object_end(response);
 
 done:
-	command_success(cmd, response);
+	return command_success(cmd, response);
 }
 
 static const struct json_command *find_cmd(const struct jsonrpc *rpc,
@@ -374,39 +400,41 @@ static void destroy_command(struct command *cmd)
 	list_del_from(&cmd->jcon->commands, &cmd->list);
 }
 
-void command_success(struct command *cmd, struct json_stream *result)
+struct command_result *command_raw_complete(struct command *cmd,
+					    struct json_stream *result)
+{
+	json_stream_close(result, cmd);
+
+	/* If we have a jcon, it will free result for us. */
+	if (cmd->jcon)
+		tal_steal(cmd->jcon, result);
+
+	tal_free(cmd);
+	return &complete;
+}
+
+struct command_result *command_success(struct command *cmd,
+				       struct json_stream *result)
 {
 	assert(cmd);
 	assert(cmd->have_json_stream);
 	json_stream_append(result, " }\n\n");
-	json_stream_close(result, cmd);
-	if (cmd->ok)
-		*(cmd->ok) = true;
 
-	/* If we have a jcon, it will free result for us. */
-	if (cmd->jcon)
-		tal_steal(cmd->jcon, result);
-
-	tal_free(cmd);
+	return command_raw_complete(cmd, result);
 }
 
-void command_failed(struct command *cmd, struct json_stream *result)
+struct command_result *command_failed(struct command *cmd,
+				      struct json_stream *result)
 {
 	assert(cmd->have_json_stream);
 	/* Have to close error */
 	json_stream_append(result, " } }\n\n");
-	json_stream_close(result, cmd);
-	if (cmd->ok)
-		*(cmd->ok) = false;
-	/* If we have a jcon, it will free result for us. */
-	if (cmd->jcon)
-		tal_steal(cmd->jcon, result);
 
-	tal_free(cmd);
+	return command_raw_complete(cmd, result);
 }
 
-void PRINTF_FMT(3, 4) command_fail(struct command *cmd, int code,
-				   const char *fmt, ...)
+struct command_result *command_fail(struct command *cmd, int code,
+				    const char *fmt, ...)
 {
 	const char *errmsg;
 	struct json_stream *r;
@@ -417,14 +445,14 @@ void PRINTF_FMT(3, 4) command_fail(struct command *cmd, int code,
 	va_end(ap);
 	r = json_stream_fail_nodata(cmd, code, errmsg);
 
-	command_failed(cmd, r);
+	return command_failed(cmd, r);
 }
 
-void command_still_pending(struct command *cmd)
+struct command_result *command_still_pending(struct command *cmd)
 {
 	notleak_with_children(cmd);
-	notleak(cmd->jcon);
 	cmd->pending = true;
+	return &pending;
 }
 
 static void json_command_malformed(struct json_connection *jcon,
@@ -444,7 +472,7 @@ static void json_command_malformed(struct json_connection *jcon,
 	json_stream_close(js, NULL);
 }
 
-static struct json_stream *attach_json_stream(struct command *cmd)
+struct json_stream *json_stream_raw_for_cmd(struct command *cmd)
 {
 	struct json_stream *js;
 
@@ -461,7 +489,7 @@ static struct json_stream *attach_json_stream(struct command *cmd)
 
 static struct json_stream *json_start(struct command *cmd)
 {
-	struct json_stream *js = attach_json_stream(cmd);
+	struct json_stream *js = json_stream_raw_for_cmd(cmd);
 
 	json_stream_append_fmt(js, "{ \"jsonrpc\": \"2.0\", \"id\" : %s, ",
 			       cmd->id);
@@ -480,13 +508,13 @@ struct json_stream *json_stream_fail_nodata(struct command *cmd,
 					    const char *errmsg)
 {
 	struct json_stream *r = json_start(cmd);
+	struct json_escaped *e = json_partial_escape(tmpctx, errmsg);
 
 	assert(code);
-	assert(errmsg);
 
 	json_stream_append_fmt(r, " \"error\" : "
 			  "{ \"code\" : %d,"
-			  " \"message\" : \"%s\"", code, errmsg);
+			  " \"message\" : \"%s\"", code, e->s);
 	return r;
 }
 
@@ -500,15 +528,19 @@ struct json_stream *json_stream_fail(struct command *cmd,
 	return r;
 }
 
-static void parse_request(struct json_connection *jcon, const jsmntok_t tok[])
+/* We return struct command_result so command_fail return value has a natural
+ * sink; we don't actually use the result. */
+static struct command_result *
+parse_request(struct json_connection *jcon, const jsmntok_t tok[])
 {
 	const jsmntok_t *method, *id, *params;
 	struct command *c;
+	struct command_result *res;
 
 	if (tok[0].type != JSMN_OBJECT) {
 		json_command_malformed(jcon, "null",
 				       "Expected {} for json command");
-		return;
+		return NULL;
 	}
 
 	method = json_get_member(jcon->buffer, tok, "method");
@@ -517,12 +549,12 @@ static void parse_request(struct json_connection *jcon, const jsmntok_t tok[])
 
 	if (!id) {
 		json_command_malformed(jcon, "null", "No id");
-		return;
+		return NULL;
 	}
 	if (id->type != JSMN_STRING && id->type != JSMN_PRIMITIVE) {
 		json_command_malformed(jcon, "null",
 				       "Expected string/primitive for id");
-		return;
+		return NULL;
 	}
 
 	/* Allocate the command off of the `jsonrpc` object and not
@@ -533,50 +565,52 @@ static void parse_request(struct json_connection *jcon, const jsmntok_t tok[])
 	c->pending = false;
 	c->have_json_stream = false;
 	c->id = tal_strndup(c,
-			    json_tok_contents(jcon->buffer, id),
-			    json_tok_len(id));
+			    json_tok_full(jcon->buffer, id),
+			    json_tok_full_len(id));
 	c->mode = CMD_NORMAL;
-	c->ok = NULL;
-	c->allow_unused = false;
 	list_add_tail(&jcon->commands, &c->list);
 	tal_add_destructor(c, destroy_command);
 
 	if (!method || !params) {
-		command_fail(c, JSONRPC2_INVALID_REQUEST,
-			     method ? "No params" : "No method");
-		return;
+		return command_fail(c, JSONRPC2_INVALID_REQUEST,
+				    method ? "No params" : "No method");
 	}
 
 	if (method->type != JSMN_STRING) {
-		command_fail(c, JSONRPC2_INVALID_REQUEST,
-			     "Expected string for method");
-		return;
+		return command_fail(c, JSONRPC2_INVALID_REQUEST,
+				    "Expected string for method");
 	}
 
         c->json_cmd = find_cmd(jcon->ld->jsonrpc, jcon->buffer, method);
         if (!c->json_cmd) {
-		command_fail(c, JSONRPC2_METHOD_NOT_FOUND,
-			     "Unknown command '%.*s'",
-			     method->end - method->start,
-			     jcon->buffer + method->start);
-		return;
+		return command_fail(c, JSONRPC2_METHOD_NOT_FOUND,
+				    "Unknown command '%.*s'",
+				    json_tok_full_len(method),
+				    json_tok_full(jcon->buffer, method));
 	}
 	if (c->json_cmd->deprecated && !deprecated_apis) {
-		command_fail(c, JSONRPC2_METHOD_NOT_FOUND,
-			     "Command '%.*s' is deprecated",
-			      method->end - method->start,
-			      jcon->buffer + method->start);
-		return;
+		return command_fail(c, JSONRPC2_METHOD_NOT_FOUND,
+				    "Command '%.*s' is deprecated",
+				    method->end - method->start,
+				    jcon->buffer + method->start);
 	}
 
 	db_begin_transaction(jcon->ld->wallet->db);
-	c->json_cmd->dispatch(c, jcon->buffer, params);
+	res = c->json_cmd->dispatch(c, jcon->buffer, tok, params);
 	db_commit_transaction(jcon->ld->wallet->db);
+
+	assert(res == &param_failed
+	       || res == &complete
+	       || res == &pending
+	       || res == &unknown);
 
 	/* If they didn't complete it, they must call command_still_pending.
 	 * If they completed it, it's freed already. */
+	if (res == &pending)
+		assert(c->pending);
 	list_for_each(&jcon->commands, c, list)
 		assert(c->pending);
+	return res;
 }
 
 /* Mutual recursion */
@@ -605,6 +639,7 @@ static struct io_plan *stream_out_complete(struct io_conn *conn,
 					   struct json_connection *jcon)
 {
 	jcon_remove_json_stream(jcon, js);
+	tal_free(js);
 
 	if (jcon->stop) {
 		log_unusual(jcon->log, "JSON-RPC shutdown");
@@ -638,7 +673,7 @@ static struct io_plan *read_json(struct io_conn *conn,
 		return io_wait(conn, conn, read_json, jcon);
 	}
 
-	toks = json_parse_input(jcon->buffer, jcon->used, &valid);
+	toks = json_parse_input(jcon->buffer, jcon->buffer, jcon->used, &valid);
 	if (!toks) {
 		if (!valid) {
 			log_unusual(jcon->log,
@@ -688,7 +723,8 @@ static struct io_plan *jcon_connected(struct io_conn *conn,
 {
 	struct json_connection *jcon;
 
-	jcon = tal(conn, struct json_connection);
+	/* We live as long as the connection, so we're not a leak. */
+	jcon = notleak(tal(conn, struct json_connection));
 	jcon->conn = conn;
 	jcon->ld = ld;
 	jcon->used = 0;
@@ -760,6 +796,21 @@ struct jsonrpc *jsonrpc_new(const tal_t *ctx, struct lightningd *ld)
 	}
 	jsonrpc->rpc_listener = NULL;
 	return jsonrpc;
+}
+
+bool command_usage_only(const struct command *cmd)
+{
+	return cmd->mode == CMD_USAGE;
+}
+
+void command_set_usage(struct command *cmd, const char *usage)
+{
+	cmd->usage = usage;
+}
+
+bool command_check_only(const struct command *cmd)
+{
+	return cmd->mode == CMD_CHECK;
 }
 
 void jsonrpc_listen(struct jsonrpc *jsonrpc, struct lightningd *ld)
@@ -920,57 +971,67 @@ json_tok_address_scriptpubkey(const tal_t *cxt,
 	return ADDRESS_PARSE_UNRECOGNIZED;
 }
 
-bool json_tok_wtx(struct wallet_tx * tx, const char * buffer,
-                  const jsmntok_t *sattok, u64 max)
+struct command_result *param_wtx(struct wallet_tx * tx, const char * buffer,
+				 const jsmntok_t *sattok, u64 max)
 {
         if (json_tok_streq(buffer, sattok, "all")) {
                 tx->all_funds = true;
 		tx->amount = max;
         } else if (!json_to_u64(buffer, sattok, &tx->amount)) {
-                command_fail(tx->cmd, JSONRPC2_INVALID_PARAMS,
-			     "Invalid satoshis");
-                return false;
+                return command_fail(tx->cmd, JSONRPC2_INVALID_PARAMS,
+				    "Invalid satoshis");
 	} else if (tx->amount > max) {
-                command_fail(tx->cmd, FUND_MAX_EXCEEDED,
-			     "Amount exceeded %"PRIu64, max);
-                return false;
+                return command_fail(tx->cmd, FUND_MAX_EXCEEDED,
+				    "Amount exceeded %"PRIu64, max);
 	}
-        return true;
+        return NULL;
 }
 
-static bool json_tok_command(struct command *cmd, const char *name,
-			     const char *buffer, const jsmntok_t *tok,
-			     const jsmntok_t **out)
+static struct command_result *param_command(struct command *cmd,
+					    const char *name,
+					    const char *buffer,
+					    const jsmntok_t *tok,
+					    const jsmntok_t **out)
 {
 	cmd->json_cmd = find_cmd(cmd->jcon->ld->jsonrpc, buffer, tok);
-	if (cmd->json_cmd)
-		return (*out = tok);
+	if (cmd->json_cmd) {
+		*out = tok;
+		return NULL;
+	}
 
-	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-		     "'%s' of '%.*s' is invalid",
-		     name, tok->end - tok->start, buffer + tok->start);
-	return false;
+	return command_fail(cmd, JSONRPC2_METHOD_NOT_FOUND,
+			    "Unknown command '%.*s'",
+			    tok->end - tok->start, buffer + tok->start);
 }
 
-static void json_check(struct command *cmd,
-		       const char *buffer, const jsmntok_t *params)
+/* We add this destructor as a canary to detect cmd failing. */
+static void destroy_command_canary(struct command *cmd, bool *failed)
+{
+	*failed = true;
+}
+
+static struct command_result *json_check(struct command *cmd,
+					 const char *buffer,
+					 const jsmntok_t *obj UNNEEDED,
+					 const jsmntok_t *params)
 {
 	jsmntok_t *mod_params;
 	const jsmntok_t *name_tok;
-	bool ok;
+	bool failed;
 	struct json_stream *response;
+	struct command_result *res;
 
 	if (cmd->mode == CMD_USAGE) {
 		mod_params = NULL;
 	} else {
 		mod_params = json_tok_copy(cmd, params);
-		cmd->allow_unused = true;
 	}
 
 	if (!param(cmd, buffer, mod_params,
-		   p_req("command_to_check", json_tok_command, &name_tok),
+		   p_req("command_to_check", param_command, &name_tok),
+		   p_opt_any(),
 		   NULL))
-		return;
+		return command_param_failed();
 
 	/* Point name_tok to the name, not the value */
 	if (params->type == JSMN_OBJECT)
@@ -979,22 +1040,21 @@ static void json_check(struct command *cmd,
 	json_tok_remove(&mod_params, (jsmntok_t *)name_tok, 1);
 
 	cmd->mode = CMD_CHECK;
-	cmd->allow_unused = false;
-	/* FIXME(wythe): Maybe change "ok" to "failed" since that's really what
-	 * we're after and would be more clear. */
-	ok = true;
-	cmd->ok = &ok;
-	cmd->json_cmd->dispatch(cmd, buffer, mod_params);
+	failed = false;
+	tal_add_destructor2(cmd, destroy_command_canary, &failed);
+	res = cmd->json_cmd->dispatch(cmd, buffer, mod_params, mod_params);
 
-	if (!ok)
-		return;
+	/* CMD_CHECK always makes it "fail" parameter parsing. */
+	assert(res == &param_failed);
+
+	if (failed)
+		return res;
 
 	response = json_stream_success(cmd);
 	json_object_start(response, NULL);
-	json_add_string(response, "command", cmd->json_cmd->name);
-	json_add_string(response, "parameters", "ok");
+	json_add_string(response, "command_to_check", cmd->json_cmd->name);
 	json_object_end(response);
-	command_success(cmd, response);
+	return command_success(cmd, response);
 }
 
 static const struct json_command check_command = {

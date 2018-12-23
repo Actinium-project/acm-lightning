@@ -57,18 +57,19 @@
 /*~ This is common code: routines shared by one or more executables
  *  (separate daemons, or the lightning-cli program). */
 #include <common/daemon.h>
+#include <common/json_escaped.h>
 #include <common/timeout.h>
 #include <common/utils.h>
 #include <common/version.h>
 
 #include <errno.h>
 #include <fcntl.h>
+#include <gen_header_versions.h>
 #include <lightningd/bitcoind.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/channel_control.h>
 #include <lightningd/connect_control.h>
 #include <lightningd/invoice.h>
-#include <lightningd/json_escaped.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/log.h>
 #include <lightningd/onchain_control.h>
@@ -110,8 +111,8 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	 * is a nod to keeping it minimal and explicit: we need this code for
 	 * testing, but its existence means we're not actually testing the
 	 * same exact code users will be running. */
+	ld->dev_debug_subprocess = NULL;
 #if DEVELOPER
-	ld->dev_debug_subdaemon = NULL;
 	ld->dev_disconnect_fd = -1;
 	ld->dev_subdaemon_fail = false;
 	ld->dev_allow_localhost = false;
@@ -214,7 +215,7 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	 *code. Here we initialize the context that will keep track and control
 	 *the plugins.
 	 */
-	ld->plugins = plugins_new(ld, ld->log_book, ld->jsonrpc);
+	ld->plugins = plugins_new(ld, ld->log_book, ld->jsonrpc, ld);
 
 	return ld;
 }
@@ -258,10 +259,10 @@ void test_subdaemons(const struct lightningd *ld)
 		const char *dpath = path_join(tmpctx, ld->daemon_dir, subdaemons[i]);
 		const char *verstring;
 		/*~ CCAN's pipecmd module is like popen for grownups: it
-		 * takes pointers to fill in stdout, stdin and stderr file
+		 * takes pointers to fill in stdin, stdout and stderr file
 		 * descriptors if desired, and the remainder of arguments
 		 * are the command and its argument. */
-		pid_t pid = pipecmd(&outfd, NULL, &outfd,
+		pid_t pid = pipecmd(NULL, &outfd, &outfd,
 				    dpath, "--version", NULL);
 
 		/*~ Our logging system: spam goes in at log_debug level, but
@@ -573,6 +574,38 @@ void notify_new_block(struct lightningd *ld, u32 block_height)
 	channel_notify_new_block(ld, block_height);
 }
 
+static void on_sigint(int _ UNUSED)
+{
+        static const char *msg = "lightningd: SIGINT caught, exiting.\n";
+        write(STDERR_FILENO, msg, strlen(msg));
+        _exit(1);
+}
+
+static void on_sigterm(int _ UNUSED)
+{
+        static const char *msg = "lightningd: SIGTERM caught, exiting.\n";
+        write(STDERR_FILENO, msg, strlen(msg));
+        _exit(1);
+}
+
+/*~ We only need to handle SIGTERM and SIGINT for the case we are PID 1 of
+ * docker container since Linux makes special this PID and requires that
+ * some handler exist. */
+static void setup_sig_handlers(void)
+{
+	struct sigaction sigint, sigterm;
+	memset(&sigint, 0, sizeof(struct sigaction));
+	memset(&sigterm, 0, sizeof(struct sigaction));
+
+	sigint.sa_handler = on_sigint;
+	sigterm.sa_handler = on_sigterm;
+
+	if (1 == getpid()) {
+		sigaction(SIGINT, &sigint, NULL);
+		sigaction(SIGTERM, &sigterm, NULL);
+	}
+}
+
 int main(int argc, char *argv[])
 {
 	struct lightningd *ld;
@@ -581,6 +614,19 @@ int main(int argc, char *argv[])
 
 	/*~ What happens in strange locales should stay there. */
 	setup_locale();
+
+	setup_sig_handlers();
+
+	/*~ This checks that the system-installed libraries (usually
+	 * dynamically linked) actually are compatible with the ones we
+	 * compiled with.
+	 *
+	 * The header itself is auto-generated every time the version of the
+	 * installed libraries changes, as we had an sqlite3 version update
+	 * which broke people, and "make" didn't think there was any work to
+	 * do, so rebuilding didn't fix it. */
+	check_linked_library_versions();
+
 	/*~ Every daemon calls this in some form: the hooks are for dumping
 	 * backtraces when we crash (if supported on this platform). */
 	daemon_setup(argv[0], log_backtrace_print, log_backtrace_exit);
@@ -611,15 +657,10 @@ int main(int argc, char *argv[])
 	/*~ Initialize all the plugins we just registered, so they can
 	 *  do their thing and tell us about themselves (including
 	 *  options registration). */
-	plugins_init(ld->plugins);
+	plugins_init(ld->plugins, ld->dev_debug_subprocess);
 
 	/*~ Handle options and config; move to .lightningd (--lightning-dir) */
 	handle_opts(ld, argc, argv);
-
-	/*~ Now that we have collected all the early options, gave
-	 *  plugins a chance to register theirs and collected all
-	 *  remaining options it's time to tell the plugins. */
-	plugins_config(ld->plugins);
 
 	/*~ Make sure we can reach the subdaemons, and versions match. */
 	test_subdaemons(ld);
@@ -714,6 +755,10 @@ int main(int argc, char *argv[])
 	/*~ Create RPC socket: now lightning-cli can send us JSON RPC commands
 	 *  over a UNIX domain socket specified by `ld->rpc_filename`. */
 	jsonrpc_listen(ld->jsonrpc, ld);
+
+	/*~ Now that the rpc path exists, we can start the plugins and they
+	 * can start talking to us. */
+	plugins_config(ld->plugins);
 
 	/*~ We defer --daemon until we've completed most initialization: that
 	 *  way we'll exit with an error rather than silently exiting 0, then

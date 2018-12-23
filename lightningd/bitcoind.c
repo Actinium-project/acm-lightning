@@ -229,7 +229,7 @@ static void next_bcli(struct bitcoind *bitcoind, enum bitcoind_prio prio)
 	if (!bcli)
 		return;
 
-	bcli->pid = pipecmdarr(&bcli->fd, NULL, &bcli->fd,
+	bcli->pid = pipecmdarr(NULL, &bcli->fd, &bcli->fd,
 			       cast_const2(char **, bcli->args));
 	if (bcli->pid < 0)
 		fatal("%s exec failed: %s", bcli->args[0], strerror(errno));
@@ -309,7 +309,7 @@ static bool extract_feerate(struct bitcoin_cli *bcli,
 	const jsmntok_t *tokens, *feeratetok;
 	bool valid;
 
-	tokens = json_parse_input(output, output_bytes, &valid);
+	tokens = json_parse_input(output, output, output_bytes, &valid);
 	if (!tokens)
 		fatal("%s: %s response",
 		      bcli_args(tmpctx, bcli),
@@ -327,7 +327,7 @@ static bool extract_feerate(struct bitcoin_cli *bcli,
 	if (!feeratetok)
 		return false;
 
-	return json_tok_bitcoin_amount(output, feeratetok, feerate);
+	return json_to_bitcoin_amount(output, feeratetok, feerate);
 }
 
 struct estimatefee {
@@ -541,7 +541,8 @@ static bool process_gettxout(struct bitcoin_cli *bcli)
 		return true;
 	}
 
-	tokens = json_parse_input(bcli->output, bcli->output_bytes, &valid);
+	tokens = json_parse_input(bcli->output, bcli->output, bcli->output_bytes,
+				  &valid);
 	if (!tokens)
 		fatal("%s: %s response",
 		      bcli_args(tmpctx, bcli), valid ? "partial" : "invalid");
@@ -557,7 +558,7 @@ static bool process_gettxout(struct bitcoin_cli *bcli)
 		      bcli_args(tmpctx, bcli),
 		      (int)bcli->output_bytes, bcli->output);
 
-	if (!json_tok_bitcoin_amount(bcli->output, valuetok, &out.amount))
+	if (!json_to_bitcoin_amount(bcli->output, valuetok, &out.amount))
 		fatal("%s: had bad value (%.*s)?",
 		      bcli_args(tmpctx, bcli),
 		      (int)bcli->output_bytes, bcli->output);
@@ -601,7 +602,8 @@ static bool process_getblock(struct bitcoin_cli *bcli)
 	struct bitcoin_txid txid;
 	bool valid;
 
-	tokens = json_parse_input(bcli->output, bcli->output_bytes, &valid);
+	tokens = json_parse_input(bcli->output, bcli->output, bcli->output_bytes,
+				  &valid);
 	if (!tokens) {
 		/* Most likely we are running on a pruned node, call
 		 * the callback with NULL to indicate failure */
@@ -644,8 +646,8 @@ static bool process_getblock(struct bitcoin_cli *bcli)
 				   &txid))
 		fatal("%s: had bad txid (%.*s)?",
 		      bcli_args(tmpctx, bcli),
-		      txidtok->end - txidtok->start,
-		      bcli->output + txidtok->start);
+		      json_tok_full_len(txidtok),
+		      json_tok_full(bcli->output, txidtok));
 
 	go->cb = cb;
 	/* Now get the raw tx output. */
@@ -806,7 +808,7 @@ void wait_for_bitcoind(struct bitcoind *bitcoind)
 	bool printed = false;
 
 	for (;;) {
-		child = pipecmdarr(&from, NULL, &from, cast_const2(char **,cmd));
+		child = pipecmdarr(NULL, &from, &from, cast_const2(char **,cmd));
 		if (child < 0) {
 			if (errno == ENOENT) {
 				fatal_bitcoind_failure(bitcoind, "bitcoin-cli not found. Is bitcoin-cli (part of Bitcoin Core) available in your PATH?");

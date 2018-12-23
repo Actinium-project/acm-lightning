@@ -4,7 +4,10 @@
 #include <ccan/list/list.h>
 #include <ccan/tal/str/str.h>
 #include <common/features.h>
+#include <common/json_command.h>
+#include <common/jsonrpc_errors.h>
 #include <common/memleak.h>
+#include <common/param.h>
 #include <common/pseudorand.h>
 #include <common/timeout.h>
 #include <common/wireaddr.h>
@@ -18,11 +21,9 @@
 #include <lightningd/json.h>
 #include <lightningd/json_stream.h>
 #include <lightningd/jsonrpc.h>
-#include <lightningd/jsonrpc_errors.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
 #include <lightningd/opening_control.h>
-#include <lightningd/param.h>
 #include <lightningd/peer_control.h>
 #include <lightningd/subd.h>
 #include <wire/gen_peer_wire.h>
@@ -64,17 +65,20 @@ static struct connect *find_connect(struct lightningd *ld,
 	return NULL;
 }
 
-static void connect_cmd_succeed(struct command *cmd, const struct pubkey *id)
+static struct command_result *connect_cmd_succeed(struct command *cmd,
+						  const struct pubkey *id)
 {
 	struct json_stream *response = json_stream_success(cmd);
 	json_object_start(response, NULL);
 	json_add_pubkey(response, "id", id);
 	json_object_end(response);
-	command_success(cmd, response);
+	return command_success(cmd, response);
 }
 
-static void json_connect(struct command *cmd,
-			 const char *buffer, const jsmntok_t *params)
+static struct command_result *json_connect(struct command *cmd,
+					   const char *buffer,
+					   const jsmntok_t *obj UNNEEDED,
+					   const jsmntok_t *params)
 {
 	u32 *port;
 	jsmntok_t *idtok;
@@ -89,15 +93,14 @@ static void json_connect(struct command *cmd,
 	struct peer *peer;
 
 	if (!param(cmd, buffer, params,
-		   p_req("id", json_tok_tok, (const jsmntok_t **) &idtok),
-		   p_opt("host", json_tok_string, &name),
-		   p_opt("port", json_tok_number, &port),
+		   p_req("id", param_tok, (const jsmntok_t **) &idtok),
+		   p_opt("host", param_string, &name),
+		   p_opt("port", param_number, &port),
 		   NULL))
-		return;
+		return command_param_failed();
 
 	/* Check for id@addrport form */
-	id_str = tal_strndup(cmd, buffer + idtok->start,
-			     idtok->end - idtok->start);
+	id_str = json_strdup(cmd, buffer, idtok);
 	atptr = strchr(id_str, '@');
 	if (atptr) {
 		int atidx = atptr - id_str;
@@ -107,18 +110,16 @@ static void json_connect(struct command *cmd,
 	}
 
 	if (!json_to_pubkey(buffer, idtok, &id)) {
-		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-			     "id %.*s not valid",
-			     idtok->end - idtok->start,
-			     buffer + idtok->start);
-		return;
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "id %.*s not valid",
+				    json_tok_full_len(idtok),
+				    json_tok_full(buffer, idtok));
 	}
 
 	if (name && ataddr) {
-		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-			     "Can't specify host as both xxx@yyy "
-			     "and separate argument");
-		return;
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Can't specify host as both xxx@yyy "
+				    "and separate argument");
 	}
 
 	/* Get parseable host if provided somehow */
@@ -127,9 +128,8 @@ static void json_connect(struct command *cmd,
 
 	/* Port without host name? */
 	if (port && !name) {
-		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-			     "Can't specify port without host");
-		return;
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Can't specify port without host");
 	}
 
 	/* If we know about peer, see if it's already connected. */
@@ -139,8 +139,7 @@ static void json_connect(struct command *cmd,
 
 		if (peer->uncommitted_channel
 		    || (channel && channel->connected)) {
-			connect_cmd_succeed(cmd, &id);
-			return;
+			return connect_cmd_succeed(cmd, &id);
 		}
 	}
 
@@ -157,9 +156,10 @@ static void json_connect(struct command *cmd,
 					     && !cmd->ld->pure_tor_setup,
 					     true,
 					     &err_msg)) {
-			command_fail(cmd, LIGHTNINGD, "Host %s:%u not valid: %s",
-				     name, *port, err_msg ? err_msg : "port is 0");
-			return;
+			return command_fail(cmd, LIGHTNINGD,
+					    "Host %s:%u not valid: %s",
+					    name, *port,
+					    err_msg ? err_msg : "port is 0");
 		}
 	} else
 		addr = NULL;
@@ -169,7 +169,7 @@ static void json_connect(struct command *cmd,
 
 	/* Leave this here for peer_connected or connect_failed. */
 	new_connect(cmd->ld, &id, cmd);
-	command_still_pending(cmd);
+	return command_still_pending(cmd);
 }
 
 static const struct json_command connect_command = {
@@ -245,7 +245,7 @@ static void connect_failed(struct lightningd *ld, const u8 *msg)
 	/* We can have multiple connect commands: fail them all */
 	while ((c = find_connect(ld, &id)) != NULL) {
 		/* They delete themselves from list */
-		command_fail(c->cmd, LIGHTNINGD, "%s", err);
+		was_pending(command_fail(c->cmd, LIGHTNINGD, "%s", err));
 	}
 
 	/* If we have an active channel, then reconnect. */
@@ -367,8 +367,7 @@ int connectd_init(struct lightningd *ld)
 
 	msg = towire_connectctl_init(
 	    tmpctx, &ld->id,
-	    get_offered_globalfeatures(tmpctx),
-	    get_offered_localfeatures(tmpctx), wireaddrs,
+	    wireaddrs,
 	    listen_announce,
 	    ld->proxyaddr, ld->use_proxy_always || ld->pure_tor_setup,
 	    allow_localhost, ld->config.use_dns,

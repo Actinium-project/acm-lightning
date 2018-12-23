@@ -10,17 +10,18 @@
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/link/link.h>
 #include <ccan/tal/str/str.h>
+#include <common/json_command.h>
+#include <common/jsonrpc_errors.h>
 #include <common/memleak.h>
+#include <common/param.h>
 #include <common/pseudorand.h>
 #include <common/utils.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <lightningd/jsonrpc.h>
-#include <lightningd/jsonrpc_errors.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/options.h>
-#include <lightningd/param.h>
 #include <signal.h>
 #include <stdio.h>
 #include <sys/stat.h>
@@ -501,6 +502,7 @@ static void setup_log_rotation(struct lightningd *ld)
 
 char *arg_log_to_file(const char *arg, struct lightningd *ld)
 {
+	const struct log_entry *i;
 	FILE *logf;
 
 	if (ld->logfile) {
@@ -514,16 +516,24 @@ char *arg_log_to_file(const char *arg, struct lightningd *ld)
 	if (!logf)
 		return tal_fmt(NULL, "Failed to open: %s", strerror(errno));
 	set_log_outfn(ld->log->lr, log_to_file, logf);
+
+	/* Catch up */
+	list_for_each(&ld->log->lr->log, i, list)
+		maybe_print(ld->log, i, 0);
+
+	log_debug(ld->log, "Opened log file %s", arg);
 	return NULL;
 }
 
 void opt_register_logging(struct lightningd *ld)
 {
-	opt_register_arg("--log-level", arg_log_level, show_log_level, ld->log,
-			 "log level (io, debug, info, unusual, broken)");
-	opt_register_arg("--log-prefix", arg_log_prefix, show_log_prefix,
-			 ld->log,
-			 "log prefix");
+	opt_register_early_arg("--log-level",
+			       arg_log_level, show_log_level, ld->log,
+			       "log level (io, debug, info, unusual, broken)");
+	opt_register_early_arg("--log-prefix", arg_log_prefix, show_log_prefix,
+			       ld->log,
+			       "log prefix");
+	/* We want this opened later, once we have moved to lightning dir */
 	opt_register_arg("--log-file=<file>", arg_log_to_file, NULL, ld,
 			 "log to file instead of stdout");
 }
@@ -692,9 +702,11 @@ void json_add_log(struct json_stream *response,
 	json_array_end(info.response);
 }
 
-bool json_tok_loglevel(struct command *cmd, const char *name,
-		       const char *buffer, const jsmntok_t *tok,
-		       enum log_level **level)
+struct command_result *param_loglevel(struct command *cmd,
+				      const char *name,
+				      const char *buffer,
+				      const jsmntok_t *tok,
+				      enum log_level **level)
 {
 	*level = tal(cmd, enum log_level);
 	if (json_tok_streq(buffer, tok, "io"))
@@ -706,27 +718,29 @@ bool json_tok_loglevel(struct command *cmd, const char *name,
 	else if (json_tok_streq(buffer, tok, "unusual"))
 		**level = LOG_UNUSUAL;
 	else {
-		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-			     "'%s' should be 'io', 'debug', 'info', or "
-			     "'unusual', not '%.*s'",
-			     name, tok->end - tok->start, buffer + tok->start);
-		return false;
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "'%s' should be 'io', 'debug', 'info', or "
+				    "'unusual', not '%.*s'",
+				    name,
+				    json_tok_full_len(tok),
+				    json_tok_full(buffer, tok));
 	}
-	return true;
+	return NULL;
 }
 
-static void json_getlog(struct command *cmd,
-			const char *buffer, const jsmntok_t * params)
+static struct command_result *json_getlog(struct command *cmd,
+					  const char *buffer,
+					  const jsmntok_t *obj UNNEEDED,
+					  const jsmntok_t * params)
 {
 	struct json_stream *response;
 	enum log_level *minlevel;
 	struct log_book *lr = cmd->ld->log_book;
 
 	if (!param(cmd, buffer, params,
-		   p_opt_def("level", json_tok_loglevel, &minlevel,
-				 LOG_INFORM),
+		   p_opt_def("level", param_loglevel, &minlevel, LOG_INFORM),
 		   NULL))
-		return;
+		return command_param_failed();
 
 	response = json_stream_success(cmd);
 	json_object_start(response, NULL);
@@ -735,7 +749,7 @@ static void json_getlog(struct command *cmd,
 	json_add_num(response, "bytes_max", (unsigned int) log_max_mem(lr));
 	json_add_log(response, lr, *minlevel);
 	json_object_end(response);
-	command_success(cmd, response);
+	return command_success(cmd, response);
 }
 
 static const struct json_command getlog_command = {

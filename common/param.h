@@ -1,10 +1,13 @@
-#ifndef LIGHTNING_LIGHTNINGD_PARAM_H
-#define LIGHTNING_LIGHTNINGD_PARAM_H
+#ifndef LIGHTNING_COMMON_PARAM_H
+#define LIGHTNING_COMMON_PARAM_H
 #include "config.h"
+#include <common/json.h>
+#include <common/json_tok.h>
+#include <stdbool.h>
 
 /*~ Greetings adventurer!
  *
- * Do you want to automatically validate json input and unmarshall it into
+ * Do you want to automatically validate json input and unmarshal it into
  * local variables, all using typesafe callbacks?  And on error,
  * call command_fail with a proper error message? Then you've come to the
  * right place!
@@ -28,25 +31,32 @@
  *
  * All the command handlers throughout the code use this system.
  * json_invoice() is a great example.  The common callbacks can be found in
- * lightningd/json.c.  Use them directly or feel free to write your own.
+ * common/json_tok.c.  Use them directly or feel free to write your own.
  */
+struct command;
+
+/* A dummy type returned by command_ functions, to ensure you return them
+ * immediately */
+struct command_result;
 
 /*
  * Parse the json tokens.  @params can be an array of values or an object
  * of named values.
  */
 bool param(struct command *cmd, const char *buffer,
-	   const jsmntok_t params[], ...);
+	   const jsmntok_t params[], ...) LAST_ARG_NULL;
 
 /*
- * The callback signature.  Callbacks must return true on success.  On failure they
- * must call comand_fail and return false.
+ * The callback signature.
+ *
+ * Callbacks must return NULL on success.  On failure they
+ * must return command_fail(...).
  */
-typedef bool(*param_cbx)(struct command *cmd,
-			 const char *name,
-			 const char *buffer,
-			 const jsmntok_t *tok,
-			 void **arg);
+typedef struct command_result *(*param_cbx)(struct command *cmd,
+					    const char *name,
+					    const char *buffer,
+					    const jsmntok_t *tok,
+					    void **arg);
 
 /*
  * Add a required parameter.
@@ -59,7 +69,7 @@ typedef bool(*param_cbx)(struct command *cmd,
 			       (const char *)NULL,           \
 			       (const char *)NULL,           \
 			       (const jsmntok_t *)NULL,      \
-			       (arg)) == true)
+			       (arg)) == (struct command_result *)NULL)
 
 /*
  * Add an optional parameter.  *arg is set to NULL if it isn't found.
@@ -73,7 +83,7 @@ typedef bool(*param_cbx)(struct command *cmd,
 		                  (const char *)NULL,           \
 				  (const char *)NULL,           \
 				  (const jsmntok_t *)NULL,      \
-				  (arg)) == true); })
+				  (arg)) == (struct command_result *)NULL); })
 
 /*
  * Add an optional parameter.  *arg is set to @def if it isn't found.
@@ -88,6 +98,8 @@ typedef bool(*param_cbx)(struct command *cmd,
 				   (const char *)NULL,		    \
 				   (const char *)NULL,		    \
 				   (const jsmntok_t *)NULL,	    \
-				   (arg)) == true); })
+				   (arg)) == (struct command_result *)NULL); })
 
-#endif /* LIGHTNING_LIGHTNINGD_PARAM_H */
+/* Special flag for 'check' which allows any parameters. */
+#define p_opt_any() "", false, NULL, NULL
+#endif /* LIGHTNING_COMMON_PARAM_H */
