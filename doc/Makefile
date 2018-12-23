@@ -7,6 +7,7 @@ doc-wrongdir:
 MANPAGES := doc/lightning-cli.1 \
 	doc/lightningd-config.5 \
 	doc/lightning-autocleaninvoice.7 \
+	doc/lightning-check.7 \
 	doc/lightning-close.7 \
 	doc/lightning-connect.7 \
 	doc/lightning-decodepay.7 \
@@ -19,6 +20,7 @@ MANPAGES := doc/lightning-cli.1 \
 	doc/lightning-listfunds.7 \
 	doc/lightning-listinvoices.7 \
 	doc/lightning-listpayments.7 \
+	doc/lightning-listpeers.7 \
 	doc/lightning-newaddr.7 \
 	doc/lightning-pay.7 \
 	doc/lightning-sendpay.7 \

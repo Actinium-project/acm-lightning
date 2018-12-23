@@ -2,16 +2,17 @@
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
 #include <common/bolt11.h>
+#include <common/json_command.h>
+#include <common/jsonrpc_errors.h>
+#include <common/param.h>
 #include <common/timeout.h>
 #include <gossipd/gen_gossip_wire.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/json.h>
 #include <lightningd/jsonrpc.h>
-#include <lightningd/jsonrpc_errors.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
 #include <lightningd/options.h>
-#include <lightningd/param.h>
 #include <lightningd/peer_control.h>
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/subd.h>
@@ -855,7 +856,7 @@ json_sendpay_success(struct command *cmd,
 	json_object_start(response, NULL);
 	json_add_payment_fields(response, r->payment);
 	json_object_end(response);
-	command_success(cmd, response);
+	was_pending(command_success(cmd, response));
 }
 
 static void json_waitsendpay_on_resolve(const struct sendpay_result *r,
@@ -878,7 +879,8 @@ static void json_waitsendpay_on_resolve(const struct sendpay_result *r,
 		case PAY_RHASH_ALREADY_USED:
 		case PAY_UNSPECIFIED_ERROR:
 		case PAY_NO_SUCH_PAYMENT:
-			command_fail(cmd, r->errorcode, "%s", r->details);
+			was_pending(command_fail(cmd, r->errorcode, "%s",
+						 r->details));
 			return;
 
 		case PAY_UNPARSEABLE_ONION:
@@ -891,7 +893,7 @@ static void json_waitsendpay_on_resolve(const struct sendpay_result *r,
 			json_object_start(data, NULL);
 			json_add_hex_talarr(data, "onionreply", r->onionreply);
 			json_object_end(data);
-			command_failed(cmd, data);
+			was_pending(command_failed(cmd, data));
 			return;
 
 		case PAY_DESTINATION_PERM_FAIL:
@@ -915,7 +917,7 @@ static void json_waitsendpay_on_resolve(const struct sendpay_result *r,
 				json_add_hex_talarr(data, "channel_update",
 						    fail->channel_update);
 			json_object_end(data);
-			command_failed(cmd, data);
+			was_pending(command_failed(cmd, data));
 			return;
 		}
 		abort();
@@ -935,13 +937,15 @@ static void json_sendpay_on_resolve(const struct sendpay_result* r,
 				"Monitor status with listpayments or waitsendpay");
 		json_add_payment_fields(response, r->payment);
 		json_object_end(response);
-		command_success(cmd, response);
+		was_pending(command_success(cmd, response));
 	} else
 		json_waitsendpay_on_resolve(r, cmd);
 }
 
-static void json_sendpay(struct command *cmd,
-			 const char *buffer, const jsmntok_t *params)
+static struct command_result *json_sendpay(struct command *cmd,
+					   const char *buffer,
+					   const jsmntok_t *obj UNNEEDED,
+					   const jsmntok_t *params)
 {
 	const jsmntok_t *routetok;
 	const jsmntok_t *t, *end;
@@ -952,12 +956,12 @@ static void json_sendpay(struct command *cmd,
 	const char *description;
 
 	if (!param(cmd, buffer, params,
-		   p_req("route", json_tok_array, &routetok),
-		   p_req("payment_hash", json_tok_sha256, &rhash),
-		   p_opt("description", json_tok_escaped_string, &description),
-		   p_opt("msatoshi", json_tok_u64, &msatoshi),
+		   p_req("route", param_array, &routetok),
+		   p_req("payment_hash", param_sha256, &rhash),
+		   p_opt("description", param_escaped_string, &description),
+		   p_opt("msatoshi", param_u64, &msatoshi),
 		   NULL))
-		return;
+		return command_param_failed();
 
 	end = json_next(routetok);
 	n_hops = 0;
@@ -970,12 +974,12 @@ static void json_sendpay(struct command *cmd,
 		unsigned *delay;
 
 		if (!param(cmd, buffer, t,
-			   p_req("msatoshi", json_tok_u64, &amount),
-			   p_req("id", json_tok_pubkey, &id),
-			   p_req("delay", json_tok_number, &delay),
-			   p_req("channel", json_tok_short_channel_id, &channel),
+			   p_req("msatoshi", param_u64, &amount),
+			   p_req("id", param_pubkey, &id),
+			   p_req("delay", param_number, &delay),
+			   p_req("channel", param_short_channel_id, &channel),
 			   NULL))
-			return;
+			return command_param_failed();
 
 		tal_resize(&route, n_hops + 1);
 
@@ -987,8 +991,7 @@ static void json_sendpay(struct command *cmd,
 	}
 
 	if (n_hops == 0) {
-		command_fail(cmd, JSONRPC2_INVALID_PARAMS, "Empty route");
-		return;
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS, "Empty route");
 	}
 
 	/* The given msatoshi is the actual payment that the payee is
@@ -999,10 +1002,9 @@ static void json_sendpay(struct command *cmd,
 	if (msatoshi) {
 		if (!(*msatoshi <= route[n_hops-1].amount &&
 		      route[n_hops-1].amount <= 2 * *msatoshi)) {
-			command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				     "msatoshi %"PRIu64" out of range",
-				     *msatoshi);
-			return;
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "msatoshi %"PRIu64" out of range",
+					    *msatoshi);
 		}
 	}
 
@@ -1010,7 +1012,9 @@ static void json_sendpay(struct command *cmd,
 			 msatoshi ? *msatoshi : route[n_hops-1].amount,
 			 description,
 			 &json_sendpay_on_resolve, cmd))
-		command_still_pending(cmd);
+		return command_still_pending(cmd);
+	return command_its_complicated("send_payment is called in multiple paths,"
+				       " patching return value through is hard");
 }
 
 static const struct json_command sendpay_command = {
@@ -1022,28 +1026,33 @@ AUTODATA(json_command, &sendpay_command);
 
 static void waitsendpay_timeout(struct command *cmd)
 {
-	command_fail(cmd, PAY_IN_PROGRESS, "Timed out while waiting");
+	was_pending(command_fail(cmd, PAY_IN_PROGRESS,
+				 "Timed out while waiting"));
 }
 
-static void json_waitsendpay(struct command *cmd, const char *buffer,
-			     const jsmntok_t *params)
+static struct command_result *json_waitsendpay(struct command *cmd,
+					       const char *buffer,
+					       const jsmntok_t *obj UNNEEDED,
+					       const jsmntok_t *params)
 {
 	struct sha256 *rhash;
 	unsigned int *timeout;
 
 	if (!param(cmd, buffer, params,
-		   p_req("payment_hash", json_tok_sha256, &rhash),
-		   p_opt("timeout", json_tok_number, &timeout),
+		   p_req("payment_hash", param_sha256, &rhash),
+		   p_opt("timeout", param_number, &timeout),
 		   NULL))
-		return;
+		return command_param_failed();
 
 	if (!wait_payment(cmd, cmd->ld, rhash, &json_waitsendpay_on_resolve, cmd))
-		return;
+		return command_its_complicated("wait_payment called in multiple"
+					       " paths, patching return value"
+					       " through is hard");
 
 	if (timeout)
 		new_reltimer(&cmd->ld->timers, cmd, time_from_sec(*timeout),
 			     &waitsendpay_timeout, cmd);
-	command_still_pending(cmd);
+	return command_still_pending(cmd);
 }
 
 static const struct json_command waitsendpay_command = {
@@ -1054,8 +1063,10 @@ static const struct json_command waitsendpay_command = {
 };
 AUTODATA(json_command, &waitsendpay_command);
 
-static void json_listpayments(struct command *cmd, const char *buffer,
-			       const jsmntok_t *params)
+static struct command_result *json_listpayments(struct command *cmd,
+						const char *buffer,
+						const jsmntok_t *obj UNNEEDED,
+						const jsmntok_t *params)
 {
 	const struct wallet_payment **payments;
 	struct json_stream *response;
@@ -1063,16 +1074,15 @@ static void json_listpayments(struct command *cmd, const char *buffer,
 	const char *b11str;
 
 	if (!param(cmd, buffer, params,
-		   p_opt("bolt11", json_tok_string, &b11str),
-		   p_opt("payment_hash", json_tok_sha256, &rhash),
+		   p_opt("bolt11", param_string, &b11str),
+		   p_opt("payment_hash", param_sha256, &rhash),
 		   NULL))
-		return;
+		return command_param_failed();
 
 	if (rhash && b11str) {
-		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-			     "Can only specify one of"
-			     " {bolt11} or {payment_hash}");
-		return;
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Can only specify one of"
+				    " {bolt11} or {payment_hash}");
 	}
 
 	if (b11str) {
@@ -1081,9 +1091,8 @@ static void json_listpayments(struct command *cmd, const char *buffer,
 
 		b11 = bolt11_decode(cmd, b11str, NULL, &fail);
 		if (!b11) {
-			command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				     "Invalid bolt11: %s", fail);
-			return;
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "Invalid bolt11: %s", fail);
 		}
 		rhash = &b11->payment_hash;
 	}
@@ -1102,7 +1111,7 @@ static void json_listpayments(struct command *cmd, const char *buffer,
 	json_array_end(response);
 
 	json_object_end(response);
-	command_success(cmd, response);
+	return command_success(cmd, response);
 }
 
 static const struct json_command listpayments_command = {

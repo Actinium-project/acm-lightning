@@ -13,14 +13,15 @@
 #include <ccan/build_assert/build_assert.h>
 #include <ccan/io/io.h>
 #include <ccan/tal/str/str.h>
+#include <common/json_command.h>
+#include <common/jsonrpc_errors.h>
 #include <common/memleak.h>
+#include <common/param.h>
 #include <common/timeout.h>
 #include <common/utils.h>
 #include <inttypes.h>
 #include <lightningd/channel_control.h>
 #include <lightningd/gossip_control.h>
-#include <lightningd/jsonrpc_errors.h>
-#include <lightningd/param.h>
 
 /* Mutual recursion via timer. */
 static void try_extend_tip(struct chain_topology *topo);
@@ -138,7 +139,8 @@ static void broadcast_remainder(struct bitcoind *bitcoind,
 	txs->cursor++;
 	if (txs->cursor == tal_count(txs->txs)) {
 		if (txs->cmd)
-			command_success(txs->cmd, null_response(txs->cmd));
+			was_pending(command_success(txs->cmd,
+						    null_response(txs->cmd)));
 		tal_free(txs);
 		return;
 	}
@@ -285,16 +287,16 @@ const char *feerate_name(enum feerate feerate)
 	abort();
 }
 
-bool json_feerate_estimate(struct command *cmd,
-			   u32 **feerate_per_kw, enum feerate feerate)
+struct command_result *param_feerate_estimate(struct command *cmd,
+					      u32 **feerate_per_kw,
+					      enum feerate feerate)
 {
 	*feerate_per_kw = tal(cmd, u32);
 	**feerate_per_kw = try_get_feerate(cmd->ld->topology, feerate);
-	if (!**feerate_per_kw) {
-		command_fail(cmd, LIGHTNINGD, "Cannot estimate fees");
-		return false;
-	}
-	return true;
+	if (!**feerate_per_kw)
+		return command_fail(cmd, LIGHTNINGD, "Cannot estimate fees");
+
+	return NULL;
 }
 
 /* Mutual recursion via timer. */
@@ -462,8 +464,10 @@ u32 feerate_to_style(u32 feerate_perkw, enum feerate_style style)
 	abort();
 }
 
-static void json_feerates(struct command *cmd,
-			    const char *buffer, const jsmntok_t *params)
+static struct command_result *json_feerates(struct command *cmd,
+					    const char *buffer,
+					    const jsmntok_t *obj UNNEEDED,
+					    const jsmntok_t *params)
 {
 	struct chain_topology *topo = cmd->ld->topology;
 	struct json_stream *response;
@@ -472,9 +476,9 @@ static void json_feerates(struct command *cmd,
 	enum feerate_style *style;
 
 	if (!param(cmd, buffer, params,
-		   p_req("style", json_tok_feerate_style, &style),
+		   p_req("style", param_feerate_style, &style),
 		   NULL))
-		return;
+		return command_param_failed();
 
 	missing = false;
 	for (size_t i = 0; i < ARRAY_SIZE(feerates); i++) {
@@ -517,7 +521,7 @@ static void json_feerates(struct command *cmd,
 
 	json_object_end(response);
 
-	command_success(cmd, response);
+	return command_success(cmd, response);
 }
 
 static const struct json_command feerates_command = {

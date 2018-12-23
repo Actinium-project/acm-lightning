@@ -110,13 +110,11 @@ static void add_push_key(u8 **scriptp, const struct pubkey *key)
 	add_push_bytes(scriptp, der, sizeof(der));
 }
 
-static void add_push_sig(u8 **scriptp, const secp256k1_ecdsa_signature *sig)
+static void add_push_sig(u8 **scriptp, const struct bitcoin_signature *sig)
 {
 	u8 der[73];
 	size_t len = signature_to_der(der, sig);
 
-	/* Append sighash type */
-	der[len++] = SIGHASH_ALL;
 	add_push_bytes(scriptp, der, len);
 }
 
@@ -129,13 +127,11 @@ static u8 *stack_key(const tal_t *ctx, const struct pubkey *key)
 }
 
 /* Bitcoin wants DER encoding. */
-static u8 *stack_sig(const tal_t *ctx, const secp256k1_ecdsa_signature *sig)
+static u8 *stack_sig(const tal_t *ctx, const struct bitcoin_signature *sig)
 {
 	u8 der[73];
 	size_t len = signature_to_der(der, sig);
 
-	/* Append sighash type */
-	der[len++] = SIGHASH_ALL;
 	return tal_dup_arr(ctx, u8, der, len, 0);
 }
 
@@ -188,6 +184,7 @@ u8 *scriptpubkey_p2sh_hash(const tal_t *ctx, const struct ripemd160 *redeemhash)
 	add_op(&script, OP_HASH160);
 	add_push_bytes(&script, redeemhash->u.u8, sizeof(redeemhash->u.u8));
 	add_op(&script, OP_EQUAL);
+	assert(tal_count(script) == BITCOIN_SCRIPTPUBKEY_P2SH_LEN);
 	return script;
 }
 
@@ -210,6 +207,7 @@ u8 *scriptpubkey_p2pkh(const tal_t *ctx, const struct bitcoin_address *addr)
 	add_push_bytes(&script, &addr->addr, sizeof(addr->addr));
 	add_op(&script, OP_EQUALVERIFY);
 	add_op(&script, OP_CHECKSIG);
+	assert(tal_count(script) == BITCOIN_SCRIPTPUBKEY_P2PKH_LEN);
 	return script;
 }
 
@@ -223,7 +221,7 @@ u8 *scriptpubkey_opreturn(const tal_t *ctx)
 
 /* Create an input script which spends p2pkh */
 u8 *bitcoin_redeem_p2pkh(const tal_t *ctx, const struct pubkey *pubkey,
-			 const secp256k1_ecdsa_signature *sig)
+			 const struct bitcoin_signature *sig)
 {
 	u8 *script = tal_arr(ctx, u8, 0);
 
@@ -244,6 +242,8 @@ u8 *bitcoin_redeem_p2sh_p2wpkh(const tal_t *ctx, const struct pubkey *key)
 	add_number(&script, 0);
 	pubkey_to_hash160(key, &keyhash);
 	add_push_bytes(&script, &keyhash, sizeof(keyhash));
+
+	assert(tal_count(script) == BITCOIN_SCRIPTPUBKEY_P2WPKH_LEN);
 	return script;
 }
 
@@ -260,7 +260,7 @@ u8 *bitcoin_scriptsig_p2sh_p2wpkh(const tal_t *ctx, const struct pubkey *key)
 }
 
 u8 **bitcoin_witness_p2wpkh(const tal_t *ctx,
-			    const secp256k1_ecdsa_signature *sig,
+			    const struct bitcoin_signature *sig,
 			    const struct pubkey *key)
 {
 	u8 **witness;
@@ -283,6 +283,7 @@ u8 *scriptpubkey_p2wsh(const tal_t *ctx, const u8 *witnessscript)
 	add_op(&script, OP_0);
 	sha256(&h, witnessscript, tal_count(witnessscript));
 	add_push_bytes(&script, h.u.u8, sizeof(h.u.u8));
+	assert(tal_count(script) == BITCOIN_SCRIPTPUBKEY_P2WSH_LEN);
 	return script;
 }
 
@@ -320,8 +321,8 @@ u8 *scriptpubkey_witness_raw(const tal_t *ctx, u8 version,
 
 /* Create a witness which spends the 2of2. */
 u8 **bitcoin_witness_2of2(const tal_t *ctx,
-			  const secp256k1_ecdsa_signature *sig1,
-			  const secp256k1_ecdsa_signature *sig2,
+			  const struct bitcoin_signature *sig1,
+			  const struct bitcoin_signature *sig2,
 			  const struct pubkey *key1,
 			  const struct pubkey *key2)
 {
@@ -436,7 +437,7 @@ bool is_p2wpkh(const u8 *script, struct bitcoin_address *addr)
 }
 
 u8 **bitcoin_witness_sig_and_element(const tal_t *ctx,
-				     const secp256k1_ecdsa_signature *sig,
+				     const struct bitcoin_signature *sig,
 				     const void *elem, size_t elemsize,
 				     const u8 *witnessscript)
 {
@@ -658,8 +659,8 @@ u8 *bitcoin_wscript_htlc_receive(const tal_t *ctx,
  *   * `txin[0]` witness stack: `0 <remotehtlcsig> <localhtlcsig>  <payment_preimage>` for HTLC-success, `0 <remotehtlcsig> <localhtlcsig> 0` for HTLC-timeout
  */
 u8 **bitcoin_witness_htlc_timeout_tx(const tal_t *ctx,
-				     const secp256k1_ecdsa_signature *localhtlcsig,
-				     const secp256k1_ecdsa_signature *remotehtlcsig,
+				     const struct bitcoin_signature *localhtlcsig,
+				     const struct bitcoin_signature *remotehtlcsig,
 				     const u8 *wscript)
 {
 	u8 **witness = tal_arr(ctx, u8 *, 5);
@@ -674,8 +675,8 @@ u8 **bitcoin_witness_htlc_timeout_tx(const tal_t *ctx,
 }
 
 u8 **bitcoin_witness_htlc_success_tx(const tal_t *ctx,
-				     const secp256k1_ecdsa_signature *localhtlcsig,
-				     const secp256k1_ecdsa_signature *remotesig,
+				     const struct bitcoin_signature *localhtlcsig,
+				     const struct bitcoin_signature *remotesig,
 				     const struct preimage *preimage,
 				     const u8 *wscript)
 {

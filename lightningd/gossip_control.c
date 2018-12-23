@@ -11,6 +11,10 @@
 #include <ccan/take/take.h>
 #include <ccan/tal/str/str.h>
 #include <common/features.h>
+#include <common/json_command.h>
+#include <common/json_escaped.h>
+#include <common/jsonrpc_errors.h>
+#include <common/param.h>
 #include <common/type_to_string.h>
 #include <common/utils.h>
 #include <errno.h>
@@ -22,12 +26,9 @@
 #include <lightningd/gossip_msg.h>
 #include <lightningd/hsm_control.h>
 #include <lightningd/json.h>
-#include <lightningd/json_escaped.h>
 #include <lightningd/jsonrpc.h>
-#include <lightningd/jsonrpc_errors.h>
 #include <lightningd/log.h>
 #include <lightningd/options.h>
-#include <lightningd/param.h>
 #include <lightningd/ping.h>
 #include <sodium/randombytes.h>
 #include <string.h>
@@ -200,7 +201,8 @@ static void json_getnodes_reply(struct subd *gossip UNUSED, const u8 *reply,
 	size_t i, j;
 
 	if (!fromwire_gossip_getnodes_reply(reply, reply, &nodes)) {
-		command_fail(cmd, LIGHTNINGD, "Malformed gossip_getnodes response");
+		was_pending(command_fail(cmd, LIGHTNINGD,
+					 "Malformed gossip_getnodes response"));
 		return;
 	}
 
@@ -240,23 +242,25 @@ static void json_getnodes_reply(struct subd *gossip UNUSED, const u8 *reply,
 	}
 	json_array_end(response);
 	json_object_end(response);
-	command_success(cmd, response);
+	was_pending(command_success(cmd, response));
 }
 
-static void json_listnodes(struct command *cmd, const char *buffer,
-			  const jsmntok_t *params)
+static struct command_result *json_listnodes(struct command *cmd,
+					     const char *buffer,
+					     const jsmntok_t *obj UNNEEDED,
+					     const jsmntok_t *params)
 {
 	u8 *req;
 	struct pubkey *id;
 
 	if (!param(cmd, buffer, params,
-		   p_opt("id", json_tok_pubkey, &id),
+		   p_opt("id", param_pubkey, &id),
 		   NULL))
-		return;
+		return command_param_failed();
 
 	req = towire_gossip_getnodes_request(cmd, id);
 	subd_req(cmd, cmd->ld->gossip, req, -1, 0, json_getnodes_reply, cmd);
-	command_still_pending(cmd);
+	return command_still_pending(cmd);
 }
 
 static const struct json_command listnodes_command = {
@@ -275,7 +279,8 @@ static void json_getroute_reply(struct subd *gossip UNUSED, const u8 *reply, con
 	fromwire_gossip_getroute_reply(reply, reply, &hops);
 
 	if (tal_count(hops) == 0) {
-		command_fail(cmd, LIGHTNINGD, "Could not find a route");
+		was_pending(command_fail(cmd, LIGHTNINGD,
+					 "Could not find a route"));
 		return;
 	}
 
@@ -283,10 +288,13 @@ static void json_getroute_reply(struct subd *gossip UNUSED, const u8 *reply, con
 	json_object_start(response, NULL);
 	json_add_route(response, "route", hops, tal_count(hops));
 	json_object_end(response);
-	command_success(cmd, response);
+	was_pending(command_success(cmd, response));
 }
 
-static void json_getroute(struct command *cmd, const char *buffer, const jsmntok_t *params)
+static struct command_result *json_getroute(struct command *cmd,
+					    const char *buffer,
+					    const jsmntok_t *obj UNNEEDED,
+					    const jsmntok_t *params)
 {
 	struct lightningd *ld = cmd->ld;
 	struct pubkey *destination;
@@ -304,23 +312,24 @@ static void json_getroute(struct command *cmd, const char *buffer, const jsmntok
 	struct siphash_seed seed;
 
 	if (!param(cmd, buffer, params,
-		   p_req("id", json_tok_pubkey, &destination),
-		   p_req("msatoshi", json_tok_u64, &msatoshi),
-		   p_req("riskfactor", json_tok_double, &riskfactor),
-		   p_opt_def("cltv", json_tok_number, &cltv, 9),
-		   p_opt_def("fromid", json_tok_pubkey, &source, ld->id),
-		   p_opt("seed", json_tok_tok, &seedtok),
-		   p_opt_def("fuzzpercent", json_tok_percent, &fuzz, 75.0),
+		   p_req("id", param_pubkey, &destination),
+		   p_req("msatoshi", param_u64, &msatoshi),
+		   p_req("riskfactor", param_double, &riskfactor),
+		   p_opt_def("cltv", param_number, &cltv, 9),
+		   p_opt_def("fromid", param_pubkey, &source, ld->id),
+		   p_opt("seed", param_tok, &seedtok),
+		   p_opt_def("fuzzpercent", param_percent, &fuzz, 75.0),
 		   NULL))
-		return;
+		return command_param_failed();
 
 	/* Convert from percentage */
 	*fuzz = *fuzz / 100.0;
 
 	if (seedtok) {
 		if (seedtok->end - seedtok->start > sizeof(seed))
-			command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				     "seed must be < %zu bytes", sizeof(seed));
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "seed must be < %zu bytes",
+					    sizeof(seed));
 
 		memset(&seed, 0, sizeof(seed));
 		memcpy(&seed, buffer + seedtok->start,
@@ -332,7 +341,7 @@ static void json_getroute(struct command *cmd, const char *buffer, const jsmntok
 						 *msatoshi, *riskfactor * 1000,
 						 *cltv, fuzz, &seed);
 	subd_req(ld->gossip, ld->gossip, req, -1, 0, json_getroute_reply, cmd);
-	command_still_pending(cmd);
+	return command_still_pending(cmd);
 }
 
 static const struct json_command getroute_command = {
@@ -354,7 +363,8 @@ static void json_listchannels_reply(struct subd *gossip UNUSED, const u8 *reply,
 	struct json_stream *response;
 
 	if (!fromwire_gossip_getchannels_reply(reply, reply, &entries)) {
-		command_fail(cmd, LIGHTNINGD, "Invalid reply from gossipd");
+		was_pending(command_fail(cmd, LIGHTNINGD,
+					 "Invalid reply from gossipd"));
 		return;
 	}
 
@@ -390,23 +400,25 @@ static void json_listchannels_reply(struct subd *gossip UNUSED, const u8 *reply,
 	}
 	json_array_end(response);
 	json_object_end(response);
-	command_success(cmd, response);
+	was_pending(command_success(cmd, response));
 }
 
-static void json_listchannels(struct command *cmd, const char *buffer,
-			     const jsmntok_t *params)
+static struct command_result *json_listchannels(struct command *cmd,
+						const char *buffer,
+						const jsmntok_t *obj UNNEEDED,
+						const jsmntok_t *params)
 {
 	u8 *req;
 	struct short_channel_id *id;
 	if (!param(cmd, buffer, params,
-		   p_opt("short_channel_id", json_tok_short_channel_id, &id),
+		   p_opt("short_channel_id", param_short_channel_id, &id),
 		   NULL))
-		return;
+		return command_param_failed();
 
 	req = towire_gossip_getchannels_request(cmd, id);
 	subd_req(cmd->ld->gossip, cmd->ld->gossip,
 		 req, -1, 0, json_listchannels_reply, cmd);
-	command_still_pending(cmd);
+	return command_still_pending(cmd);
 }
 
 static const struct json_command listchannels_command = {
@@ -424,14 +436,14 @@ static void json_scids_reply(struct subd *gossip UNUSED, const u8 *reply,
 	struct json_stream *response;
 
 	if (!fromwire_gossip_scids_reply(reply, &ok, &complete)) {
-		command_fail(cmd, LIGHTNINGD,
-			     "Gossip gave bad gossip_scids_reply");
+		was_pending(command_fail(cmd, LIGHTNINGD,
+					 "Gossip gave bad gossip_scids_reply"));
 		return;
 	}
 
 	if (!ok) {
-		command_fail(cmd, LIGHTNINGD,
-			     "Gossip refused to query peer");
+		was_pending(command_fail(cmd, LIGHTNINGD,
+					 "Gossip refused to query peer"));
 		return;
 	}
 
@@ -439,11 +451,13 @@ static void json_scids_reply(struct subd *gossip UNUSED, const u8 *reply,
 	json_object_start(response, NULL);
 	json_add_bool(response, "complete", complete);
 	json_object_end(response);
-	command_success(cmd, response);
+	was_pending(command_success(cmd, response));
 }
 
-static void json_dev_query_scids(struct command *cmd,
-				 const char *buffer, const jsmntok_t *params)
+static struct command_result *json_dev_query_scids(struct command *cmd,
+						   const char *buffer,
+						   const jsmntok_t *obj UNNEEDED,
+						   const jsmntok_t *params)
 {
 	u8 *msg;
 	const jsmntok_t *scidstok;
@@ -453,20 +467,19 @@ static void json_dev_query_scids(struct command *cmd,
 	size_t i;
 
 	if (!param(cmd, buffer, params,
-		   p_req("id", json_tok_pubkey, &id),
-		   p_req("scids", json_tok_array, &scidstok),
+		   p_req("id", param_pubkey, &id),
+		   p_req("scids", param_array, &scidstok),
 		   NULL))
-		return;
+		return command_param_failed();
 
 	scids = tal_arr(cmd, struct short_channel_id, scidstok->size);
 	end = json_next(scidstok);
 	for (i = 0, t = scidstok + 1; t < end; t = json_next(t), i++) {
 		if (!json_to_short_channel_id(buffer, t, &scids[i])) {
-			command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				     "scid %zu '%.*s' is not an scid",
-				     i, t->end - t->start,
-				     buffer + t->start);
-			return;
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "scid %zu '%.*s' is not an scid",
+					    i, json_tok_full_len(t),
+					    json_tok_full(buffer, t));
 		}
 	}
 
@@ -474,7 +487,7 @@ static void json_dev_query_scids(struct command *cmd,
 	msg = towire_gossip_query_scids(cmd, id, scids);
 	subd_req(cmd->ld->gossip, cmd->ld->gossip,
 		 take(msg), -1, 0, json_scids_reply, cmd);
-	command_still_pending(cmd);
+	return command_still_pending(cmd);
 }
 
 static const struct json_command dev_query_scids_command = {
@@ -484,27 +497,29 @@ static const struct json_command dev_query_scids_command = {
 };
 AUTODATA(json_command, &dev_query_scids_command);
 
-static void json_dev_send_timestamp_filter(struct command *cmd,
-					   const char *buffer,
-					   const jsmntok_t *params)
+static struct command_result *
+json_dev_send_timestamp_filter(struct command *cmd,
+			       const char *buffer,
+			       const jsmntok_t *obj UNNEEDED,
+			       const jsmntok_t *params)
 {
 	u8 *msg;
 	struct pubkey *id;
 	u32 *first, *range;
 
 	if (!param(cmd, buffer, params,
-		   p_req("id", json_tok_pubkey, &id),
-		   p_req("first", json_tok_number, &first),
-		   p_req("range", json_tok_number, &range),
+		   p_req("id", param_pubkey, &id),
+		   p_req("first", param_number, &first),
+		   p_req("range", param_number, &range),
 		   NULL))
-		return;
+		return command_param_failed();
 
 	log_debug(cmd->ld->log, "Setting timestamp range %u+%u", *first, *range);
 	/* Tell gossipd, since this is a gossip query. */
 	msg = towire_gossip_send_timestamp_filter(NULL, id, *first, *range);
 	subd_send_msg(cmd->ld->gossip, take(msg));
 
-	command_success(cmd, null_response(cmd));
+	return command_success(cmd, null_response(cmd));
 }
 
 static const struct json_command dev_send_timestamp_filter = {
@@ -527,14 +542,14 @@ static void json_channel_range_reply(struct subd *gossip UNUSED, const u8 *reply
 						       &final_num_blocks,
 						       &final_complete,
 						       &scids)) {
-		command_fail(cmd, LIGHTNINGD,
-			     "Gossip gave bad gossip_query_channel_range_reply");
+		was_pending(command_fail(cmd, LIGHTNINGD,
+					 "Gossip gave bad gossip_query_channel_range_reply"));
 		return;
 	}
 
 	if (final_num_blocks == 0 && final_num_blocks == 0 && !final_complete) {
-		command_fail(cmd, LIGHTNINGD,
-			     "Gossip refused to query peer");
+		was_pending(command_fail(cmd, LIGHTNINGD,
+					 "Gossip refused to query peer"));
 		return;
 	}
 
@@ -550,11 +565,12 @@ static void json_channel_range_reply(struct subd *gossip UNUSED, const u8 *reply
 		json_add_short_channel_id(response, NULL, &scids[i]);
 	json_array_end(response);
 	json_object_end(response);
-	command_success(cmd, response);
+	was_pending(command_success(cmd, response));
 }
 
-static void json_dev_query_channel_range(struct command *cmd,
+static struct command_result *json_dev_query_channel_range(struct command *cmd,
 					 const char *buffer,
+					 const jsmntok_t *obj UNNEEDED,
 					 const jsmntok_t *params)
 {
 	u8 *msg;
@@ -562,17 +578,17 @@ static void json_dev_query_channel_range(struct command *cmd,
 	u32 *first, *num;
 
 	if (!param(cmd, buffer, params,
-		   p_req("id", json_tok_pubkey, &id),
-		   p_req("first", json_tok_number, &first),
-		   p_req("num", json_tok_number, &num),
+		   p_req("id", param_pubkey, &id),
+		   p_req("first", param_number, &first),
+		   p_req("num", param_number, &num),
 		   NULL))
-		return;
+		return command_param_failed();
 
 	/* Tell gossipd, since this is a gossip query. */
 	msg = towire_gossip_query_channel_range(cmd, id, *first, *num);
 	subd_req(cmd->ld->gossip, cmd->ld->gossip,
 		 take(msg), -1, 0, json_channel_range_reply, cmd);
-	command_still_pending(cmd);
+	return command_still_pending(cmd);
 }
 
 static const struct json_command dev_query_channel_range_command = {
@@ -582,22 +598,24 @@ static const struct json_command dev_query_channel_range_command = {
 };
 AUTODATA(json_command, &dev_query_channel_range_command);
 
-static void json_dev_set_max_scids_encode_size(struct command *cmd,
-					       const char *buffer,
-					       const jsmntok_t *params)
+static struct command_result *
+json_dev_set_max_scids_encode_size(struct command *cmd,
+				   const char *buffer,
+				   const jsmntok_t *obj UNNEEDED,
+				   const jsmntok_t *params)
 {
 	u8 *msg;
 	u32 *max;
 
 	if (!param(cmd, buffer, params,
-		   p_req("max", json_tok_number, &max),
+		   p_req("max", param_number, &max),
 		   NULL))
-		return;
+		return command_param_failed();
 
 	msg = towire_gossip_dev_set_max_scids_encode_size(NULL, *max);
 	subd_send_msg(cmd->ld->gossip, take(msg));
 
-	command_success(cmd, null_response(cmd));
+	return command_success(cmd, null_response(cmd));
 }
 
 static const struct json_command dev_set_max_scids_encode_size = {
@@ -607,16 +625,17 @@ static const struct json_command dev_set_max_scids_encode_size = {
 };
 AUTODATA(json_command, &dev_set_max_scids_encode_size);
 
-static void json_dev_suppress_gossip(struct command *cmd,
-				     const char *buffer,
-				     const jsmntok_t *params)
+static struct command_result *json_dev_suppress_gossip(struct command *cmd,
+						       const char *buffer,
+						       const jsmntok_t *obj UNNEEDED,
+						       const jsmntok_t *params)
 {
 	if (!param(cmd, buffer, params, NULL))
-		return;
+		return command_param_failed();
 
 	subd_send_msg(cmd->ld->gossip, take(towire_gossip_dev_suppress(NULL)));
 
-	command_success(cmd, null_response(cmd));
+	return command_success(cmd, null_response(cmd));
 }
 
 static const struct json_command dev_suppress_gossip = {

@@ -20,10 +20,37 @@ class UnixDomainSocketRpc(object):
         self.executor = executor
         self.logger = logger
 
+        # Do we require the compatibility mode?
+        self._compat = True
+
     @staticmethod
     def _writeobj(sock, obj):
         s = json.dumps(obj)
         sock.sendall(bytearray(s, 'UTF-8'))
+
+    def _readobj_compat(self, sock, buff=b''):
+        if not self._compat:
+            return self._readobj(sock, buff)
+        while True:
+            try:
+                b = sock.recv(1024)
+                buff += b
+
+                if b'\n\n' in buff:
+                    # The next read will use the non-compatible read instead
+                    self._compat = False
+
+                if len(b) == 0:
+                    return {'error': 'Connection to RPC server lost.'}
+                if b' }\n' not in buff:
+                    continue
+                # Convert late to UTF-8 so glyphs split across recvs do not
+                # impact us
+                objs, len_used = self.decoder.raw_decode(buff.decode("UTF-8"))
+                return objs, buff[len_used:].lstrip()
+            except ValueError:
+                # Probably didn't read enough
+                pass
 
     def _readobj(self, sock, buff=b''):
         """Read a JSON object, starting with buff; returns object and any buffer left over"""
@@ -48,8 +75,13 @@ class UnixDomainSocketRpc(object):
         """
         name = name.replace('_', '-')
 
-        def wrapper(**kwargs):
-            return self.call(name, payload=kwargs)
+        def wrapper(*args, **kwargs):
+            if len(args) != 0 and len(kwargs) != 0:
+                raise RpcError("Cannot mix positional and non-positional arguments")
+            elif len(args) != 0:
+                return self.call(name, payload=args)
+            else:
+                return self.call(name, payload=kwargs)
         return wrapper
 
     def call(self, method, payload=None):
@@ -58,7 +90,8 @@ class UnixDomainSocketRpc(object):
         if payload is None:
             payload = {}
         # Filter out arguments that are None
-        payload = {k: v for k, v in payload.items() if v is not None}
+        if isinstance(payload, dict):
+            payload = {k: v for k, v in payload.items() if v is not None}
 
         # FIXME: we open a new socket for every readobj call...
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -68,7 +101,7 @@ class UnixDomainSocketRpc(object):
             "params": payload,
             "id": 0
         })
-        resp, _ = self._readobj(sock)
+        resp, _ = self._readobj_compat(sock)
         sock.close()
 
         self.logger.debug("Received response for %s call: %r", method, resp)
@@ -328,14 +361,17 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("listpeers", payload)
 
-    def fundchannel(self, node_id, satoshi, feerate=None):
+    def fundchannel(self, node_id, satoshi, feerate=None, announce=True):
         """
-        Fund channel with {id} using {satoshi} satoshis"
+        Fund channel with {id} using {satoshi} satoshis
+        with feerate of {feerate} (uses default feerate if unset).
+        If {announce} is False, don't send channel announcements.
         """
         payload = {
             "id": node_id,
             "satoshi": satoshi,
-            "feerate": feerate
+            "feerate": feerate,
+            "announce": announce
         }
         return self.call("fundchannel", payload)
 
@@ -444,12 +480,13 @@ class LightningRpc(UnixDomainSocketRpc):
             payload={"id": peerid, "force": force}
         )
 
-    def disconnect(self, peer_id):
+    def disconnect(self, peer_id, force=False):
         """
-        Disconnect from peer with {peer_id}
+        Disconnect from peer with {peer_id}, optional {force} even if has active channel
         """
         payload = {
             "id": peer_id,
+            "force": force,
         }
         return self.call("disconnect", payload)
 

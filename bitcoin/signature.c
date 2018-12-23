@@ -6,6 +6,7 @@
 #include "tx.h"
 #include <assert.h>
 #include <ccan/cast/cast.h>
+#include <ccan/mem/mem.h>
 #include <common/type_to_string.h>
 #include <common/utils.h>
 
@@ -87,42 +88,35 @@ void sign_hash(const struct privkey *privkey,
 	assert(ok);
 }
 
-/* Only does SIGHASH_ALL */
-static void sha256_tx_one_input(struct bitcoin_tx *tx,
+static void sha256_tx_one_input(const struct bitcoin_tx *tx,
 				size_t input_num,
 				const u8 *script,
 				const u8 *witness_script,
+				enum sighash_type sighash_type,
 				struct sha256_double *hash)
 {
-	size_t i;
-
 	assert(input_num < tal_count(tx->input));
 
-	/* You must have all inputs zeroed to start. */
-	for (i = 0; i < tal_count(tx->input); i++)
-		assert(!tx->input[i].script);
-
-	tx->input[input_num].script = cast_const(u8 *, script);
-
-	sha256_tx_for_sig(hash, tx, input_num, witness_script);
-
-	/* Reset it for next time. */
-	tx->input[input_num].script = NULL;
+	sha256_tx_for_sig(hash, tx, input_num, script, witness_script,
+			  sighash_type);
 }
 
-/* Only does SIGHASH_ALL */
-void sign_tx_input(struct bitcoin_tx *tx,
+void sign_tx_input(const struct bitcoin_tx *tx,
 		   unsigned int in,
 		   const u8 *subscript,
 		   const u8 *witness_script,
 		   const struct privkey *privkey, const struct pubkey *key,
-		   secp256k1_ecdsa_signature *sig)
+		   enum sighash_type sighash_type,
+		   struct bitcoin_signature *sig)
 {
 	struct sha256_double hash;
 
-	sha256_tx_one_input(tx, in, subscript, witness_script, &hash);
+	assert(sighash_type_valid(sighash_type));
+	sig->sighash_type = sighash_type;
+	sha256_tx_one_input(tx, in, subscript, witness_script,
+			    sighash_type, &hash);
 	dump_tx("Signing", tx, in, subscript, key, &hash);
-	sign_hash(privkey, &hash, sig);
+	sign_hash(privkey, &hash, &sig->s);
 }
 
 bool check_signed_hash(const struct sha256_double *hash,
@@ -137,20 +131,28 @@ bool check_signed_hash(const struct sha256_double *hash,
 	return ret == 1;
 }
 
-bool check_tx_sig(struct bitcoin_tx *tx, size_t input_num,
+bool check_tx_sig(const struct bitcoin_tx *tx, size_t input_num,
 		  const u8 *redeemscript,
 		  const u8 *witness_script,
 		  const struct pubkey *key,
-		  const secp256k1_ecdsa_signature *sig)
+		  const struct bitcoin_signature *sig)
 {
 	struct sha256_double hash;
 	bool ret;
 
+	/* We only support a limited subset of sighash types. */
+	if (sig->sighash_type != SIGHASH_ALL) {
+		if (!witness_script)
+			return false;
+		if (sig->sighash_type != (SIGHASH_SINGLE|SIGHASH_ANYONECANPAY))
+			return false;
+	}
 	assert(input_num < tal_count(tx->input));
 
-	sha256_tx_one_input(tx, input_num, redeemscript, witness_script, &hash);
+	sha256_tx_one_input(tx, input_num, redeemscript, witness_script,
+			    sig->sighash_type, &hash);
 
-	ret = check_signed_hash(&hash, sig, key);
+	ret = check_signed_hash(&hash, &sig->s, key);
 	if (!ret)
 		dump_tx("Sig failed", tx, input_num, redeemscript, key, &hash);
 	return ret;
@@ -228,30 +230,55 @@ static bool IsValidSignatureEncoding(const unsigned char sig[], size_t len)
     return true;
 }
 
-size_t signature_to_der(u8 der[72], const secp256k1_ecdsa_signature *sig)
+size_t signature_to_der(u8 der[73], const struct bitcoin_signature *sig)
 {
 	size_t len = 72;
 
 	secp256k1_ecdsa_signature_serialize_der(secp256k1_ctx,
-						der, &len, sig);
+						der, &len, &sig->s);
+
+	/* Append sighash type */
+	der[len++] = sig->sighash_type;
 
 	/* IsValidSignatureEncoding() expect extra byte for sighash */
-	assert(IsValidSignatureEncoding(der, len + 1));
+	assert(IsValidSignatureEncoding(memcheck(der, len), len));
 	return len;
 }
 
-bool signature_from_der(const u8 *der, size_t len, secp256k1_ecdsa_signature *sig)
+bool signature_from_der(const u8 *der, size_t len, struct bitcoin_signature *sig)
 {
-	return secp256k1_ecdsa_signature_parse_der(secp256k1_ctx,
-						   sig, der, len);
+	if (len < 1)
+		return false;
+	if (!secp256k1_ecdsa_signature_parse_der(secp256k1_ctx,
+						 &sig->s, der, len-1))
+		return false;
+	sig->sighash_type = der[len-1];
+
+	if (!sighash_type_valid(sig->sighash_type))
+		return false;
+
+	return true;
 }
 
 static char *signature_to_hexstr(const tal_t *ctx,
 				 const secp256k1_ecdsa_signature *sig)
 {
 	u8 der[72];
-	size_t len = signature_to_der(der, sig);
+	size_t len = 72;
+
+	secp256k1_ecdsa_signature_serialize_der(secp256k1_ctx,
+						der, &len, sig);
 
 	return tal_hexstr(ctx, der, len);
 }
 REGISTER_TYPE_TO_STRING(secp256k1_ecdsa_signature, signature_to_hexstr);
+
+static char *bitcoin_signature_to_hexstr(const tal_t *ctx,
+					 const struct bitcoin_signature *sig)
+{
+	u8 der[73];
+	size_t len = signature_to_der(der, sig);
+
+	return tal_hexstr(ctx, der, len);
+}
+REGISTER_TYPE_TO_STRING(bitcoin_signature, bitcoin_signature_to_hexstr);

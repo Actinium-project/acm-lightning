@@ -10,7 +10,11 @@
 #include <ccan/tal/path/path.h>
 #include <ccan/tal/str/str.h>
 #include <common/configdir.h>
+#include <common/json_command.h>
+#include <common/json_escaped.h>
+#include <common/jsonrpc_errors.h>
 #include <common/memleak.h>
+#include <common/param.h>
 #include <common/version.h>
 #include <common/wireaddr.h>
 #include <errno.h>
@@ -19,13 +23,10 @@
 #include <lightningd/bitcoind.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/json.h>
-#include <lightningd/json_escaped.h>
 #include <lightningd/jsonrpc.h>
-#include <lightningd/jsonrpc_errors.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
 #include <lightningd/options.h>
-#include <lightningd/param.h>
 #include <lightningd/plugin.h>
 #include <lightningd/subd.h>
 #include <stdio.h>
@@ -408,7 +409,7 @@ static void config_register_opts(struct lightningd *ld)
 			 "Perform cleanup of expired invoices every given seconds, or do not autoclean if 0");
 	opt_register_arg("--autocleaninvoice-expired-by",
 			 opt_set_u64, opt_show_u64,
-			 &ld->ini_autocleaninvoice_cycle,
+			 &ld->ini_autocleaninvoice_expiredby,
 			 "If expired invoice autoclean enabled, invoices that have expired for at least this given seconds are cleaned");
 	opt_register_arg("--proxy", opt_add_proxy_addr, NULL,
 			ld,"Set a socks v5 proxy IP address and port");
@@ -435,6 +436,12 @@ static void config_register_opts(struct lightningd *ld)
 }
 
 #if DEVELOPER
+static char *opt_subprocess_debug(const char *optarg, struct lightningd *ld)
+{
+	ld->dev_debug_subprocess = optarg;
+	return NULL;
+}
+
 static void dev_register_opts(struct lightningd *ld)
 {
 	opt_register_noarg("--dev-no-reconnect", opt_set_invbool,
@@ -442,8 +449,8 @@ static void dev_register_opts(struct lightningd *ld)
 			   "Disable automatic reconnect attempts");
 	opt_register_noarg("--dev-fail-on-subdaemon-fail", opt_set_bool,
 			   &ld->dev_subdaemon_fail, opt_hidden);
-	opt_register_arg("--dev-debugger=<subdaemon>", opt_subd_debug, NULL,
-			 ld, "Invoke gdb at start of <subdaemon>");
+	opt_register_early_arg("--dev-debugger=<subprocess>", opt_subprocess_debug, NULL,
+			 ld, "Invoke gdb at start of <subprocess>");
 	opt_register_arg("--dev-broadcast-interval=<ms>", opt_set_uintval,
 			 opt_show_uintval, &ld->config.broadcast_interval_msec,
 			 "Time between gossip broadcasts in milliseconds");
@@ -1039,17 +1046,19 @@ static void add_config(struct lightningd *ld,
 	tal_free(name0);
 }
 
-static void json_listconfigs(struct command *cmd,
-			     const char *buffer, const jsmntok_t *params)
+static struct command_result *json_listconfigs(struct command *cmd,
+					       const char *buffer,
+					       const jsmntok_t *obj UNNEEDED,
+					       const jsmntok_t *params)
 {
 	size_t i;
 	struct json_stream *response = NULL;
 	const jsmntok_t *configtok;
 
 	if (!param(cmd, buffer, params,
-		   p_opt("config", json_tok_tok, &configtok),
+		   p_opt("config", param_tok, &configtok),
 		   NULL))
-		return;
+		return command_param_failed();
 
 	if (!configtok) {
 		response = json_stream_success(cmd);
@@ -1088,14 +1097,13 @@ static void json_listconfigs(struct command *cmd,
 	}
 
 	if (configtok && !response) {
-		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-			     "Unknown config option '%.*s'",
-			     configtok->end - configtok->start,
-			     buffer + configtok->start);
-		return;
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Unknown config option '%.*s'",
+				    json_tok_full_len(configtok),
+				    json_tok_full(buffer, configtok));
 	}
 	json_object_end(response);
-	command_success(cmd, response);
+	return command_success(cmd, response);
 }
 
 static const struct json_command listconfigs_command = {

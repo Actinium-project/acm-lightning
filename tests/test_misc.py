@@ -1060,3 +1060,78 @@ def test_configfile_before_chdir(node_factory):
     assert l1.rpc.listconfigs()['always-use-proxy']
     assert l1.rpc.listconfigs()['proxy'] == '127.0.0.1:100'
     os.chdir(olddir)
+
+
+def test_json_error(node_factory):
+    """Must return valid json even if it quotes our weirdness"""
+    l1 = node_factory.get_node()
+    with pytest.raises(RpcError, match=r'Given id is not a channel ID or short channel ID'):
+        l1.rpc.close({"tx": "020000000001011490f737edd2ea2175a032b58ea7cd426dfc244c339cd044792096da3349b18a0100000000ffffffff021c900300000000001600140e64868e2f752314bc82a154c8c5bf32f3691bb74da00b00000000002200205b8cd3b914cf67cdd8fa6273c930353dd36476734fbd962102c2df53b90880cd0247304402202b2e3195a35dc694bbbc58942dc9ba59cc01d71ba55c9b0ad0610ccd6a65633702201a849254453d160205accc00843efb0ad1fe0e186efa6a7cee1fb6a1d36c736a012103d745445c9362665f22e0d96e9e766f273f3260dea39c8a76bfa05dd2684ddccf00000000", "txid": "2128c10f0355354479514f4a23eaa880d94e099406d419bbb0d800143accddbb", "channel_id": "bbddcc3a1400d8b0bb19d40694094ed980a8ea234a4f5179443555030fc12820"})
+
+    # Should not corrupt following RPC
+    l1.rpc.getinfo()
+
+
+def test_check_command(node_factory):
+    l1 = node_factory.get_node()
+
+    l1.rpc.check(command_to_check='help')
+    l1.rpc.check(command_to_check='help', command='check')
+    # Note: this just checks form, not whether it's valid!
+    l1.rpc.check(command_to_check='help', command='badcommand')
+    with pytest.raises(RpcError, match=r'Unknown command'):
+        l1.rpc.check(command_to_check='badcommand')
+    with pytest.raises(RpcError, match=r'unknown parameter'):
+        l1.rpc.check(command_to_check='help', badarg='x')
+
+    # Ensures we have compulsory parameters.
+    with pytest.raises(RpcError, match=r'missing required parameter'):
+        l1.rpc.check(command_to_check='connect')
+    # Even with optional parameters.
+    with pytest.raises(RpcError, match=r'missing required parameter'):
+        l1.rpc.check(command_to_check='connect', host='x', port=77)
+    # Makes sure parameter types are correct.
+    with pytest.raises(RpcError, match=r'should be an integer'):
+        l1.rpc.check(command_to_check='connect', id='test', host='x', port="abcd")
+
+    # FIXME: python wrapper doesn't let us test array params.
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(l1.rpc.socket_path)
+
+    sock.sendall(b'{"id":1, "jsonrpc":"2.0","method":"check","params":["help"]}')
+    obj, _ = l1.rpc._readobj(sock, b'')
+    assert obj['id'] == 1
+    assert 'result' in obj
+    assert 'error' not in obj
+
+    sock.sendall(b'{"id":1, "jsonrpc":"2.0","method":"check","params":["help", "check"]}')
+    obj, _ = l1.rpc._readobj(sock, b'')
+    assert obj['id'] == 1
+    assert 'result' in obj
+    assert 'error' not in obj
+
+    sock.sendall(b'{"id":1, "jsonrpc":"2.0","method":"check","params":["help", "a", "b"]}')
+    obj, _ = l1.rpc._readobj(sock, b'')
+    assert obj['id'] == 1
+    assert 'result' not in obj
+    assert 'error' in obj
+
+    sock.sendall(b'{"id":1, "jsonrpc":"2.0","method":"check","params":["badcommand"]}')
+    obj, _ = l1.rpc._readobj(sock, b'')
+    assert obj['id'] == 1
+    assert 'result' not in obj
+    assert 'error' in obj
+
+    sock.sendall(b'{"id":1, "jsonrpc":"2.0","method":"check","params":["connect"]}')
+    obj, _ = l1.rpc._readobj(sock, b'')
+    assert obj['id'] == 1
+    assert 'result' not in obj
+    assert 'error' in obj
+
+    sock.sendall(b'{"id":1, "jsonrpc":"2.0","method":"check","params":["connect", "test", "x", "abcd"]}')
+    obj, _ = l1.rpc._readobj(sock, b'')
+    assert obj['id'] == 1
+    assert 'result' not in obj
+    assert 'error' in obj
+
+    sock.close()

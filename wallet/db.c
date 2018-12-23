@@ -1,9 +1,9 @@
 #include "db.h"
 
 #include <ccan/tal/str/str.h>
+#include <common/json_escaped.h>
 #include <common/version.h>
 #include <inttypes.h>
-#include <lightningd/json_escaped.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
 
@@ -545,10 +545,6 @@ static struct db *db_open(const tal_t *ctx, char *filename)
 	int err;
 	struct db *db;
 	sqlite3 *sql;
-
-	if (SQLITE_VERSION_NUMBER != sqlite3_libversion_number())
-		db_fatal("SQLITE version mismatch: compiled %u, now %u",
-			 SQLITE_VERSION_NUMBER, sqlite3_libversion_number());
 
 	int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
 	err = sqlite3_open_v2(filename, &sql, flags, NULL);

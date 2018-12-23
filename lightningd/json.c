@@ -3,15 +3,17 @@
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
 #include <common/json.h>
+#include <common/json_command.h>
+#include <common/json_escaped.h>
+#include <common/jsonrpc_errors.h>
 #include <common/memleak.h>
+#include <common/param.h>
 #include <common/type_to_string.h>
 #include <common/wireaddr.h>
 #include <gossipd/routing.h>
 #include <lightningd/json.h>
-#include <lightningd/json_escaped.h>
 #include <lightningd/json_stream.h>
 #include <lightningd/jsonrpc.h>
-#include <lightningd/jsonrpc_errors.h>
 #include <lightningd/options.h>
 #include <sys/socket.h>
 #include <wallet/wallet.h>
@@ -95,175 +97,6 @@ void json_add_txid(struct json_stream *result, const char *fieldname,
 	json_add_string(result, fieldname, hex);
 }
 
-bool json_tok_array(struct command *cmd, const char *name,
-		    const char *buffer, const jsmntok_t *tok,
-		    const jsmntok_t **arr)
-{
-	if (tok->type == JSMN_ARRAY)
-		return (*arr = tok);
-
-	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-		     "'%s' should be an array, not '%.*s'",
-		     name, tok->end - tok->start, buffer + tok->start);
-	return false;
-}
-
-bool json_tok_bool(struct command *cmd, const char *name,
-		   const char *buffer, const jsmntok_t *tok,
-		   bool **b)
-{
-	*b = tal(cmd, bool);
-	if (tok->type == JSMN_PRIMITIVE) {
-		if (memeqstr(buffer + tok->start, tok->end - tok->start, "true")) {
-			**b = true;
-			return true;
-		}
-		if (memeqstr(buffer + tok->start, tok->end - tok->start, "false")) {
-			**b = false;
-			return true;
-		}
-	}
-	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-		     "'%s' should be 'true' or 'false', not '%.*s'",
-		     name, tok->end - tok->start, buffer + tok->start);
-	return false;
-}
-
-bool json_tok_double(struct command *cmd, const char *name,
-		     const char *buffer, const jsmntok_t *tok,
-		     double **num)
-{
-	*num = tal(cmd, double);
-	if (json_to_double(buffer, tok, *num))
-		return true;
-
-	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-		     "'%s' should be a double, not '%.*s'",
-		     name, tok->end - tok->start, buffer + tok->start);
-	return false;
-}
-
-bool json_tok_escaped_string(struct command *cmd, const char *name,
-			     const char * buffer, const jsmntok_t *tok,
-			     const char **str)
-{
-	struct json_escaped *esc = json_to_escaped_string(cmd, buffer, tok);
-	if (esc) {
-		*str = json_escaped_unescape(cmd, esc);
-		if (*str)
-			return true;
-	}
-	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-		     "'%s' should be a string, not '%.*s'"
-		     " (note, we don't allow \\u)",
-		     name,
-		     tok->end - tok->start, buffer + tok->start);
-	return false;
-}
-
-bool json_tok_string(struct command *cmd, const char *name,
-		     const char * buffer, const jsmntok_t *tok,
-		     const char **str)
-{
-	*str = tal_strndup(cmd, buffer + tok->start,
-			   tok->end - tok->start);
-	return true;
-}
-
-bool json_tok_label(struct command *cmd, const char *name,
-		    const char * buffer, const jsmntok_t *tok,
-		    struct json_escaped **label)
-{
-	/* We accept both strings and number literals here. */
-	*label = json_escaped_string_(cmd, buffer + tok->start, tok->end - tok->start);
-	if (*label && (tok->type == JSMN_STRING || json_tok_is_num(buffer, tok)))
-		    return true;
-
-	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-		     "'%s' should be a string or number, not '%.*s'",
-		     name, tok->end - tok->start, buffer + tok->start);
-	return false;
-}
-
-bool json_tok_number(struct command *cmd, const char *name,
-		     const char *buffer, const jsmntok_t *tok,
-		     unsigned int **num)
-{
-	*num = tal(cmd, unsigned int);
-	if (json_to_number(buffer, tok, *num))
-		return true;
-
-	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-		     "'%s' should be an integer, not '%.*s'",
-		     name, tok->end - tok->start, buffer + tok->start);
-	return false;
-}
-
-bool json_tok_sha256(struct command *cmd, const char *name,
-		     const char *buffer, const jsmntok_t *tok,
-		     struct sha256 **hash)
-{
-	*hash = tal(cmd, struct sha256);
-	if (hex_decode(buffer + tok->start,
-		       tok->end - tok->start,
-		       *hash, sizeof(**hash)))
-		return true;
-
-	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-		     "'%s' should be a 32 byte hex value, not '%.*s'",
-		     name, tok->end - tok->start, buffer + tok->start);
-	return false;
-}
-
-bool json_tok_msat(struct command *cmd, const char *name,
-		   const char *buffer, const jsmntok_t * tok,
-		   u64 **msatoshi_val)
-{
-	if (json_tok_streq(buffer, tok, "any")) {
-		*msatoshi_val = NULL;
-		return true;
-	}
-	*msatoshi_val = tal(cmd, u64);
-
-	if (json_to_u64(buffer, tok, *msatoshi_val) && *msatoshi_val != 0)
-		return true;
-
-	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-		     "'%s' should be a positive number or 'any', not '%.*s'",
-		     name,
-		     tok->end - tok->start,
-		     buffer + tok->start);
-	return false;
-}
-
-bool json_tok_percent(struct command *cmd, const char *name,
-		      const char *buffer, const jsmntok_t *tok,
-		      double **num)
-{
-	*num = tal(cmd, double);
-	if (json_to_double(buffer, tok, *num) && **num >= 0.0)
-		return true;
-
-	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-		     "'%s' should be a positive double, not '%.*s'",
-		     name, tok->end - tok->start, buffer + tok->start);
-	return false;
-}
-
-bool json_tok_u64(struct command *cmd, const char *name,
-		  const char *buffer, const jsmntok_t *tok,
-		  uint64_t **num)
-{
-	*num = tal(cmd, uint64_t);
-	if (json_to_u64(buffer, tok, *num))
-		return true;
-
-	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-		     "'%s' should be an unsigned 64 bit integer, not '%.*s'",
-		     name, tok->end - tok->start, buffer + tok->start);
-	return false;
-}
-
 bool json_to_pubkey(const char *buffer, const jsmntok_t *tok,
 		    struct pubkey *pubkey)
 {
@@ -271,18 +104,18 @@ bool json_to_pubkey(const char *buffer, const jsmntok_t *tok,
 				  tok->end - tok->start, pubkey);
 }
 
-bool json_tok_pubkey(struct command *cmd, const char *name,
-		     const char *buffer, const jsmntok_t *tok,
-		     struct pubkey **pubkey)
+struct command_result *param_pubkey(struct command *cmd, const char *name,
+				    const char *buffer, const jsmntok_t *tok,
+				    struct pubkey **pubkey)
 {
 	*pubkey = tal(cmd, struct pubkey);
 	if (json_to_pubkey(buffer, tok, *pubkey))
-		return true;
+		return NULL;
 
-	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-		     "'%s' should be a pubkey, not '%.*s'",
-		     name, tok->end - tok->start, buffer + tok->start);
-	return false;
+	return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			    "'%s' should be a pubkey, not '%.*s'",
+			    name, json_tok_full_len(tok),
+			    json_tok_full(buffer, tok));
 }
 
 void json_add_short_channel_id(struct json_stream *response,
@@ -300,18 +133,20 @@ bool json_to_short_channel_id(const char *buffer, const jsmntok_t *tok,
 					  tok->end - tok->start, scid));
 }
 
-bool json_tok_short_channel_id(struct command *cmd, const char *name,
-			       const char *buffer, const jsmntok_t *tok,
-			       struct short_channel_id **scid)
+struct command_result *param_short_channel_id(struct command *cmd,
+					      const char *name,
+					      const char *buffer,
+					      const jsmntok_t *tok,
+					      struct short_channel_id **scid)
 {
 	*scid = tal(cmd, struct short_channel_id);
 	if (json_to_short_channel_id(buffer, tok, *scid))
-		return true;
+		return NULL;
 
-	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-		     "'%s' should be a short channel id, not '%.*s'",
-		     name, tok->end - tok->start, buffer + tok->start);
-	return false;
+	return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			    "'%s' should be a short channel id, not '%.*s'",
+			    name, json_tok_full_len(tok),
+			    json_tok_full(buffer, tok));
 }
 
 const char *json_feerate_style_name(enum feerate_style style)
@@ -325,33 +160,34 @@ const char *json_feerate_style_name(enum feerate_style style)
 	abort();
 }
 
-bool json_tok_feerate_style(struct command *cmd, const char *name,
-			    const char *buffer, const jsmntok_t *tok,
-			    enum feerate_style **style)
+struct command_result *param_feerate_style(struct command *cmd,
+					   const char *name,
+					   const char *buffer,
+					   const jsmntok_t *tok,
+					   enum feerate_style **style)
 {
 	*style = tal(cmd, enum feerate_style);
 	if (json_tok_streq(buffer, tok,
 			   json_feerate_style_name(FEERATE_PER_KSIPA))) {
 		**style = FEERATE_PER_KSIPA;
-		return true;
+		return NULL;
 	} else if (json_tok_streq(buffer, tok,
 				  json_feerate_style_name(FEERATE_PER_KBYTE))) {
 		**style = FEERATE_PER_KBYTE;
-		return true;
+		return NULL;
 	}
 
-	command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-		     "'%s' should be '%s' or '%s', not '%.*s'",
-		     name,
-		     json_feerate_style_name(FEERATE_PER_KSIPA),
-		     json_feerate_style_name(FEERATE_PER_KBYTE),
-		     tok->end - tok->start, buffer + tok->start);
-	return false;
+	return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			    "'%s' should be '%s' or '%s', not '%.*s'",
+			    name,
+			    json_feerate_style_name(FEERATE_PER_KSIPA),
+			    json_feerate_style_name(FEERATE_PER_KBYTE),
+			    json_tok_full_len(tok), json_tok_full(buffer, tok));
 }
 
-bool json_tok_feerate(struct command *cmd, const char *name,
-		      const char *buffer, const jsmntok_t *tok,
-		      u32 **feerate)
+struct command_result *param_feerate(struct command *cmd, const char *name,
+				     const char *buffer, const jsmntok_t *tok,
+				     u32 **feerate)
 {
 	jsmntok_t base = *tok, suffix = *tok;
 	enum feerate_style style;
@@ -359,7 +195,7 @@ bool json_tok_feerate(struct command *cmd, const char *name,
 
 	for (size_t i = 0; i < NUM_FEERATES; i++) {
 		if (json_tok_streq(buffer, tok, feerate_name(i)))
-			return json_feerate_estimate(cmd, feerate, i);
+			return param_feerate_estimate(cmd, feerate, i);
 	}
 
 	/* We have to split the number and suffix. */
@@ -370,10 +206,10 @@ bool json_tok_feerate(struct command *cmd, const char *name,
 	}
 
 	if (!json_to_number(buffer, &base, &num)) {
-		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-			     "'%s' prefix should be an integer, not '%.*s'",
-			     name, base.end - base.start, buffer + base.start);
-		return false;
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "'%s' prefix should be an integer, not '%.*s'",
+				    name, base.end - base.start,
+				    buffer + base.start);
 	}
 
 	if (json_tok_streq(buffer, &suffix, "")
@@ -384,18 +220,18 @@ bool json_tok_feerate(struct command *cmd, const char *name,
 				json_feerate_style_name(FEERATE_PER_KSIPA))) {
 		style = FEERATE_PER_KSIPA;
 	} else {
-		command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-			     "'%s' suffix should be '%s' or '%s', not '%.*s'",
-			     name,
-			     json_feerate_style_name(FEERATE_PER_KSIPA),
-			     json_feerate_style_name(FEERATE_PER_KBYTE),
-			     suffix.end - suffix.start, buffer + suffix.start);
-		return false;
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "'%s' suffix should be '%s' or '%s', not '%.*s'",
+				    name,
+				    json_feerate_style_name(FEERATE_PER_KSIPA),
+				    json_feerate_style_name(FEERATE_PER_KBYTE),
+				    suffix.end - suffix.start,
+				    buffer + suffix.start);
 	}
 
 	*feerate = tal(cmd, u32);
 	**feerate = feerate_from_style(num, style);
-	return true;
+	return NULL;
 }
 
 bool
@@ -468,13 +304,6 @@ void json_add_address_internal(struct json_stream *response,
 		return;
 	}
 	abort();
-}
-
-bool json_tok_tok(struct command *cmd, const char *name,
-		  const char *buffer, const jsmntok_t * tok,
-		  const jsmntok_t **out)
-{
-	return (*out = tok);
 }
 
 void json_add_num(struct json_stream *result, const char *fieldname, unsigned int value)

@@ -13,12 +13,15 @@
 
 #define SEGREGATED_WITNESS_FLAG 0x1
 
+static struct sha256_double all_zeroes;
+
 static void push_tx_input(const struct bitcoin_tx_input *input,
-			 void (*push)(const void *, size_t, void *), void *pushp)
+			  const u8 *input_script,
+			  void (*push)(const void *, size_t, void *), void *pushp)
 {
 	push(&input->txid, sizeof(input->txid), pushp);
 	push_le32(input->index, push, pushp);
-	push_varint_blob(input->script, push, pushp);
+	push_varint_blob(input_script, push, pushp);
 	push_le32(input->sequence_number, push, pushp);
 }
 
@@ -78,9 +81,19 @@ static void push_witnesses(const struct bitcoin_tx *tx,
 	}
 }
 
+/* For signing, we ignore input scripts on other inputs, and pretend
+ * the current input has a certain script: this is indicated by a
+ * non-NULL override_script.
+ *
+ * For this (and other signing weirdness like SIGHASH_SINGLE), we
+ * also need the current input being signed; that's in input_num.
+ * We also need sighash_type.
+ */
 static void push_tx(const struct bitcoin_tx *tx,
-		   void (*push)(const void *, size_t, void *), void *pushp,
-		   bool bip144)
+		    const u8 *override_script,
+		    size_t input_num,
+		    void (*push)(const void *, size_t, void *), void *pushp,
+		    bool bip144)
 {
 	varint_t i;
 	u8 flag = 0;
@@ -102,8 +115,16 @@ static void push_tx(const struct bitcoin_tx *tx,
 	}
 
 	push_varint(tal_count(tx->input), push, pushp);
-	for (i = 0; i < tal_count(tx->input); i++)
-		push_tx_input(&tx->input[i], push, pushp);
+	for (i = 0; i < tal_count(tx->input); i++) {
+		const u8 *input_script = tx->input[i].script;
+		if (override_script) {
+			if (input_num == i)
+				input_script = override_script;
+			else
+				input_script = NULL;
+		}
+		push_tx_input(&tx->input[i], input_script, push, pushp);
+	}
 
 	push_varint(tal_count(tx->output), push, pushp);
 	for (i = 0; i < tal_count(tx->output); i++)
@@ -121,14 +142,21 @@ static void push_sha(const void *data, size_t len, void *shactx_)
 	sha256_update(ctx, memcheck(data, len), len);
 }
 
-static void hash_prevouts(struct sha256_double *h, const struct bitcoin_tx *tx)
+static void hash_prevouts(struct sha256_double *h, const struct bitcoin_tx *tx,
+			  enum sighash_type sighash_type)
 {
 	struct sha256_ctx ctx;
 	size_t i;
 
 	/* BIP143: If the ANYONECANPAY flag is not set, hashPrevouts is the
 	 * double SHA256 of the serialization of all input
-	 * outpoints */
+	 * outpoints; Otherwise, hashPrevouts is a uint256 of 0x0000......0000.
+	 */
+	if (sighash_anyonecanpay(sighash_type)) {
+		*h = all_zeroes;
+		return;
+	}
+
 	sha256_init(&ctx);
 	for (i = 0; i < tal_count(tx->input); i++) {
 		push_sha(&tx->input[i].txid, sizeof(tx->input[i].txid), &ctx);
@@ -137,14 +165,21 @@ static void hash_prevouts(struct sha256_double *h, const struct bitcoin_tx *tx)
 	sha256_double_done(&ctx, h);
 }
 
-static void hash_sequence(struct sha256_double *h, const struct bitcoin_tx *tx)
+static void hash_sequence(struct sha256_double *h, const struct bitcoin_tx *tx,
+			  enum sighash_type sighash_type)
 {
 	struct sha256_ctx ctx;
 	size_t i;
 
-	/* BIP143: If none of the ANYONECANPAY, SINGLE, NONE sighash type
-	 * is set, hashSequence is the double SHA256 of the serialization
-	 * of nSequence of all inputs */
+	/* BIP143: If none of the ANYONECANPAY, SINGLE, NONE sighash type is
+	 * set, hashSequence is the double SHA256 of the serialization of
+	 * nSequence of all inputs; Otherwise, hashSequence is a uint256 of
+	 * 0x0000......0000. */
+	if (sighash_anyonecanpay(sighash_type) || sighash_single(sighash_type)) {
+		*h = all_zeroes;
+		return;
+	}
+
 	sha256_init(&ctx);
 	for (i = 0; i < tal_count(tx->input); i++)
 		push_le32(tx->input[i].sequence_number, push_sha, &ctx);
@@ -152,17 +187,23 @@ static void hash_sequence(struct sha256_double *h, const struct bitcoin_tx *tx)
 	sha256_double_done(&ctx, h);
 }
 
-/* If the sighash type is neither SINGLE nor NONE, hashOutputs is the
- * double SHA256 of the serialization of all output value (8-byte
- * little endian) with scriptPubKey (varInt for the length +
- * script); */
-static void hash_outputs(struct sha256_double *h, const struct bitcoin_tx *tx)
+/* If the sighash type is neither SINGLE nor NONE, hashOutputs is the double
+ * SHA256 of the serialization of all output value (8-byte little endian) with
+ * scriptPubKey (varInt for the length + script); If sighash type is SINGLE
+ * and the input index is smaller than the number of outputs, hashOutputs is
+ * the double SHA256 of the output amount with scriptPubKey of the same index
+ * as the input; */
+static void hash_outputs(struct sha256_double *h, const struct bitcoin_tx *tx,
+			 enum sighash_type sighash_type, unsigned int input_num)
 {
 	struct sha256_ctx ctx;
 	size_t i;
 
 	sha256_init(&ctx);
 	for (i = 0; i < tal_count(tx->output); i++) {
+		if (sighash_single(sighash_type) && i != input_num)
+			continue;
+
 		push_le64(tx->output[i].amount, push_sha, &ctx);
 		push_varint_blob(tx->output[i].script, push_sha, &ctx);
 	}
@@ -173,7 +214,8 @@ static void hash_outputs(struct sha256_double *h, const struct bitcoin_tx *tx)
 static void hash_for_segwit(struct sha256_ctx *ctx,
 			    const struct bitcoin_tx *tx,
 			    unsigned int input_num,
-			    const u8 *witness_script)
+			    const u8 *witness_script,
+			    enum sighash_type sighash_type)
 {
 	struct sha256_double h;
 
@@ -185,11 +227,11 @@ static void hash_for_segwit(struct sha256_ctx *ctx,
 	push_le32(tx->version, push_sha, ctx);
 
 	/*     2. hashPrevouts (32-byte hash) */
-	hash_prevouts(&h, tx);
+	hash_prevouts(&h, tx, sighash_type);
 	push_sha(&h, sizeof(h), ctx);
 
 	/*     3. hashSequence (32-byte hash) */
-	hash_sequence(&h, tx);
+	hash_sequence(&h, tx, sighash_type);
 	push_sha(&h, sizeof(h), ctx);
 
 	/*     4. outpoint (32-byte hash + 4-byte little endian)  */
@@ -207,7 +249,7 @@ static void hash_for_segwit(struct sha256_ctx *ctx,
 	push_le32(tx->input[input_num].sequence_number, push_sha, ctx);
 
 	/*     8. hashOutputs (32-byte hash) */
-	hash_outputs(&h, tx);
+	hash_outputs(&h, tx, sighash_type, input_num);
 	push_sha(&h, sizeof(h), ctx);
 
 	/*     9. nLocktime of the transaction (4-byte little endian) */
@@ -216,26 +258,29 @@ static void hash_for_segwit(struct sha256_ctx *ctx,
 
 void sha256_tx_for_sig(struct sha256_double *h, const struct bitcoin_tx *tx,
 		       unsigned int input_num,
-		       const u8 *witness_script)
+		       const u8 *script,
+		       const u8 *witness_script,
+		       enum sighash_type sighash_type)
 {
-	size_t i;
 	struct sha256_ctx ctx = SHA256_INIT;
 
-	/* Caller should zero-out other scripts for signing! */
 	assert(input_num < tal_count(tx->input));
-	for (i = 0; i < tal_count(tx->input); i++)
-		if (i != input_num)
-			assert(!tx->input[i].script);
 
 	if (witness_script) {
+		/* Only implemented and tested these two! */
+		assert(sighash_type == SIGHASH_ALL
+		       || sighash_type == (SIGHASH_SINGLE|SIGHASH_ANYONECANPAY));
 		/* BIP143 hashing if OP_CHECKSIG is inside witness. */
-		hash_for_segwit(&ctx, tx, input_num, witness_script);
+		hash_for_segwit(&ctx, tx, input_num, witness_script,
+				sighash_type);
 	} else {
+		/* Never implemented anything else for old scheme. */
+		assert(sighash_type == SIGHASH_ALL);
 		/* Otherwise signature hashing never includes witness. */
-		push_tx(tx, push_sha, &ctx, false);
+		push_tx(tx, script, input_num, push_sha, &ctx, false);
 	}
 
-	sha256_le32(&ctx, SIGHASH_ALL);
+	sha256_le32(&ctx, sighash_type);
 	sha256_double_done(&ctx, h);
 }
 
@@ -251,7 +296,7 @@ static void push_linearize(const void *data, size_t len, void *pptr_)
 u8 *linearize_tx(const tal_t *ctx, const struct bitcoin_tx *tx)
 {
 	u8 *arr = tal_arr(ctx, u8, 0);
-	push_tx(tx, push_linearize, &arr, true);
+	push_tx(tx, NULL, 0, push_linearize, &arr, true);
 	return arr;
 }
 
@@ -263,7 +308,7 @@ static void push_measure(const void *data UNUSED, size_t len, void *lenp)
 size_t measure_tx_weight(const struct bitcoin_tx *tx)
 {
 	size_t non_witness_len = 0, witness_len = 0;
-	push_tx(tx, push_measure, &non_witness_len, false);
+	push_tx(tx, NULL, 0, push_measure, &non_witness_len, false);
 	if (uses_witness(tx)) {
 		push_witnesses(tx, push_measure, &witness_len);
 		/* Include BIP 144 marker and flag bytes in witness length */
@@ -279,7 +324,7 @@ void bitcoin_txid(const struct bitcoin_tx *tx, struct bitcoin_txid *txid)
 	struct sha256_ctx ctx = SHA256_INIT;
 
 	/* For TXID, we never use extended form. */
-	push_tx(tx, push_sha, &ctx, false);
+	push_tx(tx, NULL, 0, push_sha, &ctx, false);
 	sha256_double_done(&ctx, &txid->shad);
 }
 

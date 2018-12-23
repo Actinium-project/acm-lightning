@@ -180,11 +180,15 @@ CFLAGS = $(CPPFLAGS) $(CWARNFLAGS) $(CDEBUGFLAGS) -I $(CCANDIR) $(EXTERNAL_INCLU
 CONFIGURATOR_CC := $(CC)
 
 LDFLAGS = $(PIE_LDFLAGS)
+ifeq ($(STATIC),1)
+LDLIBS = -L/usr/local/lib -Wl,-dn -lgmp -lsqlite3 -lz -Wl,-dy -lm -lpthread -ldl $(COVFLAGS)
+else
 LDLIBS = -L/usr/local/lib -lm -lgmp -lsqlite3 -lz $(COVFLAGS)
+endif
 
 default: all-programs all-test-programs
 
-config.vars ccan/config.h: configure
+config.vars ccan/config.h: configure ccan/tools/configurator/configurator.c
 	@if [ ! -f config.vars ]; then echo 'The 1990s are calling: use ./configure!' >&2; exit 1; fi
 	./configure --reconfigure
 
@@ -226,7 +230,7 @@ check:
 	$(MAKE) pytest
 
 pytest: $(ALL_PROGRAMS)
-ifndef PYTEST
+ifeq ($(PYTEST),)
 	@echo "py.test is required to run the integration tests, please install using 'pip3 install -r tests/requirements.txt', and rerun 'configure'."
 	exit 1
 else
@@ -334,7 +338,18 @@ gen_version.h: FORCE
 	@(echo "#define VERSION \"$(VERSION)\"" && echo "#define BUILD_FEATURES \"$(FEATURES)\"") > $@.new
 	@if cmp $@.new $@ >/dev/null 2>&2; then rm -f $@.new; else mv $@.new $@; echo Version updated; fi
 
-# All binaries require the external libs, ccan
+# We force make to relink this every time, to detect version changes.
+tools/headerversions: FORCE tools/headerversions.o $(CCAN_OBJS)
+	@$(LINK.o) tools/headerversions.o $(CCAN_OBJS) $(LOADLIBES) $(LDLIBS) -o $@
+
+# That forces this rule to be run every time, too.
+gen_header_versions.h: tools/headerversions
+	@tools/headerversions $@
+
+# Rebuild the world if this changes.
+ALL_GEN_HEADERS += gen_header_versions.h
+
+# All binaries require the external libs, ccan and system library versions.
 $(ALL_PROGRAMS) $(ALL_TEST_PROGRAMS): $(EXTERNAL_LIBS) $(CCAN_OBJS)
 
 # Each test program depends on its own object.
