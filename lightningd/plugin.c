@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <lightningd/json.h>
 #include <lightningd/lightningd.h>
+#include <lightningd/notification.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -60,6 +61,9 @@ struct plugin {
 	/* Timer to add a timeout to some plugin RPC calls. Used to
 	 * guarantee that `getmanifest` doesn't block indefinitely. */
 	const struct oneshot *timeout_timer;
+
+	/* An array of subscribed topics */
+	char **subscriptions;
 };
 
 struct plugin_request {
@@ -225,12 +229,12 @@ plugin_request_new_(struct plugin *plugin,
 	    (arg))
 
 /**
- * Given a request, send it to the plugin.
+ * Send a JSON-RPC message (request or notification) to the plugin.
  */
-static void plugin_request_queue(struct plugin *plugin,
-				 struct plugin_request *req)
+static void plugin_send(struct plugin *plugin, struct json_stream *stream)
 {
-	*tal_arr_expand(&plugin->js_arr) = req->stream;
+	tal_steal(plugin->js_arr, stream);
+	*tal_arr_expand(&plugin->js_arr) = stream;
 	io_wake(plugin);
 }
 
@@ -458,6 +462,9 @@ static struct io_plan *plugin_stream_complete(struct io_conn *conn, struct json_
 	/* Remove js and shift all remainig over */
 	tal_arr_remove(&plugin->js_arr, 0);
 
+	/* It got dropped off the queue, free it. */
+	tal_free(js);
+
 	return plugin_write_json(conn, plugin);
 }
 
@@ -682,7 +689,8 @@ static struct command_result *plugin_rpcmethod_dispatch(struct command *cmd,
 	snprintf(id, ARRAY_SIZE(id), "%"PRIu64, req->id);
 
 	json_stream_forward_change_id(req->stream, buffer, toks, idtok, id);
-	plugin_request_queue(plugin, req);
+	plugin_send(plugin, req->stream);
+	req->stream = NULL;
 
 	return command_still_pending(cmd);
 }
@@ -765,6 +773,46 @@ static bool plugin_rpcmethods_add(struct plugin *plugin,
 	return true;
 }
 
+static bool plugin_subscriptions_add(struct plugin *plugin, const char *buffer,
+				     const jsmntok_t *resulttok)
+{
+	const jsmntok_t *subscriptions =
+	    json_get_member(buffer, resulttok, "subscriptions");
+
+	if (!subscriptions) {
+		plugin->subscriptions = NULL;
+		return true;
+	}
+	plugin->subscriptions = tal_arr(plugin, char *, 0);
+	if (subscriptions->type != JSMN_ARRAY) {
+		plugin_kill(plugin, "\"result.subscriptions\" is not an array");
+		return false;
+	}
+
+	for (int i = 0; i < subscriptions->size; i++) {
+		char *topic;
+		const jsmntok_t *s = json_get_arr(subscriptions, i);
+		if (s->type != JSMN_STRING) {
+			plugin_kill(
+			    plugin,
+			    "result.subscriptions[%d] is not a string: %s", i,
+			    plugin->buffer);
+			return false;
+		}
+		topic = json_strdup(plugin, plugin->buffer, s);
+
+		if (!notifications_have_topic(topic)) {
+			plugin_kill(
+			    plugin,
+			    "topic '%s' is not a known notification topic", topic);
+			return false;
+		}
+
+		*tal_arr_expand(&plugin->subscriptions) = topic;
+	}
+	return true;
+}
+
 static void plugin_manifest_timeout(struct plugin *plugin)
 {
 	log_broken(plugin->log, "The plugin failed to respond to \"getmanifest\" in time, terminating.");
@@ -796,8 +844,11 @@ static void plugin_manifest_cb(const struct plugin_request *req,
 	}
 
 	if (!plugin_opts_add(plugin, buffer, resulttok)
-	    || !plugin_rpcmethods_add(plugin, buffer, resulttok))
-		plugin_kill(plugin, "Failed to register options or methods");
+	    || !plugin_rpcmethods_add(plugin, buffer, resulttok)
+	    || !plugin_subscriptions_add(plugin, buffer, resulttok))
+		plugin_kill(
+		    plugin,
+		    "Failed to register options, methods, or subscriptions.");
 	/* Reset timer, it'd kill us otherwise. */
 	tal_free(plugin->timeout_timer);
 }
@@ -881,7 +932,8 @@ static void end_simple_request(struct plugin *plugin, struct plugin_request *req
 {
 	json_object_end(req->stream);
 	json_stream_append(req->stream, "\n\n");
-	plugin_request_queue(plugin, req);
+	plugin_send(plugin, req->stream);
+	req->stream = NULL;
 }
 
 void plugins_init(struct plugins *plugins, const char *dev_plugin_debug)
@@ -1001,4 +1053,29 @@ void json_add_opt_plugins(struct json_stream *response,
 	list_for_each(&plugins->plugins, p, list) {
 		json_add_string(response, "plugin", p->cmd);
 	}
+}
+
+/**
+ * Determine whether a plugin is subscribed to a given topic/method.
+ */
+static bool plugin_subscriptions_contains(struct plugin *plugin,
+					  const char *method)
+{
+	for (size_t i = 0; i < tal_count(plugin->subscriptions); i++)
+		if (streq(method, plugin->subscriptions[i]))
+			return true;
+
+	return false;
+}
+
+void plugins_notify(struct plugins *plugins,
+		    const struct jsonrpc_notification *n TAKES)
+{
+	struct plugin *p;
+	list_for_each(&plugins->plugins, p, list) {
+		if (plugin_subscriptions_contains(p, n->method))
+			plugin_send(p, json_stream_dup(p, n->stream));
+	}
+	if (taken(n))
+		tal_free(n);
 }
