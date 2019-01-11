@@ -1,6 +1,11 @@
 #! /usr/bin/make
 VERSION_NAME=Principled Opposition to SegWit
 VERSION=$(shell git describe --always --dirty=-modded --abbrev=7)
+
+ifeq ($(VERSION),)
+$(error "ERROR: git is required for generating version information")
+endif
+
 DISTRO=$(shell lsb_release -is 2>/dev/null || echo unknown)-$(shell lsb_release -rs 2>/dev/null || echo unknown)
 PKGNAME = c-lightning
 
@@ -35,7 +40,7 @@ endif
 
 ifeq ($(COMPAT),1)
 # We support compatibility with pre-0.6.
-COMPAT_CFLAGS=-DCOMPAT_V052=1 -DCOMPAT_V060=1 -DCOMPAT_V061=1
+COMPAT_CFLAGS=-DCOMPAT_V052=1 -DCOMPAT_V060=1 -DCOMPAT_V061=1 -DCOMPAT_V062=1
 endif
 
 # Timeout shortly before the 600 second travis silence timeout

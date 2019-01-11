@@ -640,35 +640,36 @@ static bool peer_accepted_htlc(struct channel *channel,
 	 * a subset of the cltv check done in handle_localpay and
 	 * forward_htlc. */
 
-	/* channeld tests this, so it should have set ss to zeroes. */
-	op = parse_onionpacket(tmpctx, hin->onion_routing_packet,
-			       sizeof(hin->onion_routing_packet));
-	if (!op) {
-		if (!memeqzero(&hin->shared_secret, sizeof(hin->shared_secret))){
-			channel_internal_error(channel,
-				   "bad onion in got_revoke: %s",
-				   tal_hexstr(channel, hin->onion_routing_packet,
-					     sizeof(hin->onion_routing_packet)));
-			return false;
-		}
-		/* FIXME: could be bad version, bad key. */
-		*failcode = WIRE_INVALID_ONION_VERSION;
-		goto out;
-	}
-
-	/* Channeld sets this to zero if HSM won't ecdh it */
-	if (memeqzero(&hin->shared_secret, sizeof(hin->shared_secret))) {
+	/* Channeld sets this to NULL if couldn't parse onion */
+	if (!hin->shared_secret) {
 		*failcode = WIRE_INVALID_ONION_KEY;
 		goto out;
 	}
 
+	/* FIXME: Have channeld hand through just the route_step! */
+
+	/* channeld tests this, so it should pass. */
+	op = parse_onionpacket(tmpctx, hin->onion_routing_packet,
+			       sizeof(hin->onion_routing_packet),
+			       failcode);
+	if (!op) {
+		channel_internal_error(channel,
+				       "bad onion in got_revoke: %s",
+				       tal_hexstr(channel, hin->onion_routing_packet,
+						  sizeof(hin->onion_routing_packet)));
+		return false;
+	}
+
 	/* If it's crap, not channeld's fault, just fail it */
-	rs = process_onionpacket(tmpctx, op, hin->shared_secret.data,
+	rs = process_onionpacket(tmpctx, op, hin->shared_secret->data,
 				 hin->payment_hash.u.u8,
 				 sizeof(hin->payment_hash));
 	if (!rs) {
-		*failcode = WIRE_INVALID_ONION_HMAC;
-		goto out;
+		channel_internal_error(channel,
+				       "bad process_onionpacket in got_revoke: %s",
+				       tal_hexstr(channel, hin->onion_routing_packet,
+						  sizeof(hin->onion_routing_packet)));
+		return false;
 	}
 
 	/* Unknown realm isn't a bad onion, it's a normal failure. */
@@ -1114,6 +1115,11 @@ static bool channel_added_their_htlc(struct channel *channel,
 				    channel->our_config.htlc_minimum_msat);
 		return false;
 	}
+
+	/* FIXME: Our wire generator can't handle optional elems in arrays,
+	 * so we translate all-zero-shared-secret to NULL. */
+	if (memeqzero(shared_secret, sizeof(&shared_secret)))
+		shared_secret = NULL;
 
 	/* This stays around even if we fail it immediately: it *is*
 	 * part of the current commitment. */

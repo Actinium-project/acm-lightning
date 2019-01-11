@@ -8,6 +8,7 @@ from ephemeral_port_reserve import reserve
 import json
 import os
 import pytest
+import re
 import shutil
 import signal
 import socket
@@ -1135,3 +1136,55 @@ def test_check_command(node_factory):
     assert 'error' in obj
 
     sock.close()
+
+
+@unittest.skipIf(not DEVELOPER, "need log_all_io")
+def test_bad_onion(node_factory, bitcoind):
+    """Test that we get a reasonable error from sendpay when an onion is bad"""
+    l1, l2, l3, l4 = node_factory.line_graph(4, wait_for_announce=True,
+                                             opts={'log_all_io': True})
+
+    h = l4.rpc.invoice(123000, 'test_bad_onion', 'description')['payment_hash']
+    route = l1.rpc.getroute(l4.info['id'], 123000, 1)['route']
+
+    assert len(route) == 3
+
+    mangled_nodeid = '0265b6ab5ec860cd257865d61ef0bbf5b3339c36cbda8b26b74e7f1dca490b6518'
+
+    # Replace id with a different pubkey, so onion encoded badly at third hop.
+    route[2]['id'] = mangled_nodeid
+    l1.rpc.sendpay(route, h)
+    with pytest.raises(RpcError) as err:
+        l1.rpc.waitsendpay(h)
+
+    # FIXME: #define PAY_TRY_OTHER_ROUTE		204
+    PAY_TRY_OTHER_ROUTE = 204
+    assert err.value.error['code'] == PAY_TRY_OTHER_ROUTE
+    # FIXME: WIRE_INVALID_ONION_HMAC = BADONION|PERM|5
+    WIRE_INVALID_ONION_HMAC = 0x8000 | 0x4000 | 5
+    assert err.value.error['data']['failcode'] == WIRE_INVALID_ONION_HMAC
+    assert err.value.error['data']['erring_node'] == mangled_nodeid
+    assert err.value.error['data']['erring_channel'] == route[2]['channel']
+
+    # We should see a WIRE_UPDATE_FAIL_MALFORMED_HTLC from l4.
+    line = l4.daemon.is_in_log(r'\[OUT\] 0087')
+    # 008739d3149a5c37e95f9dae718ce46efc60248e110e10117d384870a6762e8e33030000000000000000d7fc52f6c32773aabca55628fe616058aecc44a384e0abfa85c0c48b449dd38dc005
+    # type<--------------channelid---------------------------------------><--htlc-id-----><--------------------------------------------- sha_of_onion --->code
+    sha = re.search(r' 0087.{64}.{16}(.{64})', line).group(1)
+
+    # Should see same sha in onionreply
+    line = l1.daemon.is_in_log(r'failcode .* from onionreply .*')
+    assert re.search(r'onionreply .*{}'.format(sha), line)
+
+    # Replace id with a different pubkey, so onion encoded badly at second hop.
+    route[1]['id'] = mangled_nodeid
+    l1.rpc.sendpay(route, h)
+    with pytest.raises(RpcError) as err:
+        l1.rpc.waitsendpay(h)
+
+    # FIXME: #define PAY_TRY_OTHER_ROUTE		204
+    PAY_TRY_OTHER_ROUTE = 204
+    assert err.value.error['code'] == PAY_TRY_OTHER_ROUTE
+    assert err.value.error['data']['failcode'] == WIRE_INVALID_ONION_HMAC
+    assert err.value.error['data']['erring_node'] == mangled_nodeid
+    assert err.value.error['data']['erring_channel'] == route[1]['channel']

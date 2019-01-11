@@ -4,7 +4,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.3] - 2019-01-09: "The Smallblock Conspiracy"
+
+This release named by @molxyz and [@ctrlbreak](https://twitter.com/ctrlbreak).
 
 ### Added
 
@@ -14,7 +16,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - JSON API: use `\n\n` to terminate responses, for simplified parsing (pylightning now relies on this)
 - JSON API: `fundchannel` now includes an `announce` option, when false it will keep channel private. Defaults to true.
 - JSON API: `listpeers`'s `channels` now includes a `private` flag to indicate if channel is announced or not.
-- Plugins: Added plugins to `lightningd`, including option passthrough and JSON-RPC passthrough.
+- Plugins: experimental plugin support for `lightningd`, including option passthrough and JSON-RPC passthrough.
 
 ### Changed
 
@@ -40,6 +42,8 @@ changes.
 - JSON API: commands are once again read even if one hasn't responded yet (broken in 0.6.2).
 - Protocol: allow lnd to send `update_fee` before `funding_locked`.
 - Protocol: fix limit on how much funder can send (fee was 1000x too small)
+- Protocol: don't send invalid onion errors if peer says onion was bad.
+- Protocol: don't crash when peer sends a 0-block-expiry HTLC.
 - pylightning: handle multiple simultanous RPC replies reliably.
 
 
@@ -228,6 +232,7 @@ There predate the BOLT specifications, and are only of vague historic interest:
 7. [0.5.2] - 2016-11-21: "Bitcoin Savings & Trust Daily Interest II"
 
 [Unreleased]: https://github.com/ElementsProject/lightning/compare/v0.6.2...HEAD
+[0.6.3]: https://github.com/ElementsProject/lightning/compare/v0.6.3...HEAD
 [0.6.2]: https://github.com/ElementsProject/lightning/releases/tag/v0.6.2
 [0.6.1]: https://github.com/ElementsProject/lightning/releases/tag/v0.6.1
 [0.6]: https://github.com/ElementsProject/lightning/releases/tag/v0.6
