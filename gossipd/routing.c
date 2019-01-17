@@ -314,8 +314,8 @@ struct chan *new_chan(struct routing_state *rstate,
 	chan->satoshis = satoshis;
 	chan->local_disabled = false;
 
-	*tal_arr_expand(&n2->chans) = chan;
-	*tal_arr_expand(&n1->chans) = chan;
+	tal_arr_expand(&n2->chans, chan);
+	tal_arr_expand(&n1->chans, chan);
 
 	/* Populate with (inactive) connections */
 	init_half_chan(rstate, chan, n1idx);
@@ -377,7 +377,8 @@ static bool hc_can_carry(const struct half_chan *hc, u64 requiredcap)
 static void bfg_one_edge(struct node *node,
 			 struct chan *chan, int idx,
 			 double riskfactor,
-			 double fuzz, const struct siphash_seed *base_seed)
+			 double fuzz, const struct siphash_seed *base_seed,
+			 size_t max_hops)
 {
 	size_t h;
 	double fee_scale = 1.0;
@@ -394,7 +395,7 @@ static void bfg_one_edge(struct node *node,
 		fee_scale = 1.0 + (2.0 * fuzz * h / UINT64_MAX) - fuzz;
 	}
 
-	for (h = 0; h < ROUTING_MAX_HOPS; h++) {
+	for (h = 0; h < max_hops; h++) {
 		struct node *src;
 		/* FIXME: Bias against smaller channels. */
 		u64 fee;
@@ -450,6 +451,7 @@ find_route(const tal_t *ctx, struct routing_state *rstate,
 	   const struct pubkey *from, const struct pubkey *to, u64 msatoshi,
 	   double riskfactor,
 	   double fuzz, const struct siphash_seed *base_seed,
+	   size_t max_hops,
 	   u64 *fee)
 {
 	struct chan **route;
@@ -486,6 +488,12 @@ find_route(const tal_t *ctx, struct routing_state *rstate,
 		return NULL;
 	}
 
+	if (max_hops > ROUTING_MAX_HOPS) {
+		status_info("find_route: max_hops huge amount %zu > %u",
+			    max_hops, ROUTING_MAX_HOPS);
+		return NULL;
+	}
+
 	/* Reset all the information. */
 	clear_bfg(rstate->nodes);
 
@@ -494,7 +502,7 @@ find_route(const tal_t *ctx, struct routing_state *rstate,
 	src->bfg[0].total = msatoshi;
 	src->bfg[0].risk = 0;
 
-	for (runs = 0; runs < ROUTING_MAX_HOPS; runs++) {
+	for (runs = 0; runs < max_hops; runs++) {
 		SUPERVERBOSE("Run %i", runs);
 		/* Run through every edge. */
 		for (n = node_map_first(rstate->nodes, &it);
@@ -518,14 +526,15 @@ find_route(const tal_t *ctx, struct routing_state *rstate,
 					continue;
 				}
 				bfg_one_edge(n, chan, idx,
-					     riskfactor, fuzz, base_seed);
+					     riskfactor, fuzz, base_seed,
+					     max_hops);
 				SUPERVERBOSE("...done");
 			}
 		}
 	}
 
 	best = 0;
-	for (i = 1; i <= ROUTING_MAX_HOPS; i++) {
+	for (i = 1; i <= max_hops; i++) {
 		if (dst->bfg[i].total < dst->bfg[best].total)
 			best = i;
 	}
@@ -844,8 +853,7 @@ u8 *handle_channel_announcement(struct routing_state *rstate,
 	}
 
 	/* BOLT #7:
-	 *
-	 * The final node:
+	 * The receiving node:
 	 *...
 	 *  - if the specified `chain_hash` is unknown to the receiver:
 	 *    - MUST ignore the message.
@@ -941,7 +949,7 @@ void handle_pending_cannouncement(struct routing_state *rstate,
 
 	/* BOLT #7:
 	 *
-	 * The final node:
+	 * The receiving node:
 	 *...
 	 *   - if the `short_channel_id`'s output... is spent:
 	 *    - MUST ignore the message.
@@ -956,7 +964,7 @@ void handle_pending_cannouncement(struct routing_state *rstate,
 
 	/* BOLT #7:
 	 *
-	 * The final node:
+	 * The receiving node:
 	 *...
 	 *   - if the `short_channel_id`'s output does NOT correspond to a P2WSH
 	 *     (using `bitcoin_key_1` and `bitcoin_key_2`, as specified in
@@ -995,7 +1003,7 @@ static void update_pending(struct pending_cannouncement *pending,
 			   u32 timestamp, const u8 *update,
 			   const u8 direction)
 {
-	SUPERVERBOSE("Deferring update for pending channel %s(%d)",
+	SUPERVERBOSE("Deferring update for pending channel %s/%d",
 		     type_to_string(tmpctx, struct short_channel_id,
 				    &pending->short_channel_id), direction);
 
@@ -1035,12 +1043,12 @@ static void set_connection_values(struct chan *chan,
 	/* If it was temporarily unroutable, re-enable */
 	c->unroutable_until = 0;
 
-	SUPERVERBOSE("Channel %s(%d) was updated.",
+	SUPERVERBOSE("Channel %s/%d was updated.",
 		     type_to_string(tmpctx, struct short_channel_id, &chan->scid),
 		     idx);
 
 	if (c->proportional_fee >= MAX_PROPORTIONAL_FEE) {
-		status_trace("Channel %s(%d) massive proportional fee %u:"
+		status_trace("Channel %s/%d massive proportional fee %u:"
 			     " disabling.",
 			     type_to_string(tmpctx, struct short_channel_id,
 					    &chan->scid),
@@ -1169,7 +1177,7 @@ u8 *handle_channel_update(struct routing_state *rstate, const u8 *update TAKES,
 
 	/* BOLT #7:
 	 *
-	 * The final node:
+	 * The receiving node:
 	 *...
 	 *  - if the specified `chain_hash` value is unknown (meaning it isn't
 	 *    active on the specified chain):
@@ -1211,7 +1219,7 @@ u8 *handle_channel_update(struct routing_state *rstate, const u8 *update TAKES,
 	/* BOLT #7:
 	 *
 	 *  - if the `timestamp` is unreasonably far in the future:
-	 *    - MAY discard the `channel_announcement`.
+	 *    - MAY discard the `channel_update`.
 	 */
 	if (timestamp > time_now().ts.tv_sec + rstate->prune_timeout) {
 		status_debug("Received channel_update for %s with far time %u",
@@ -1264,7 +1272,7 @@ u8 *handle_channel_update(struct routing_state *rstate, const u8 *update TAKES,
 		return err;
 	}
 
-	status_trace("Received channel_update for channel %s(%d) now %s was %s (from %s)",
+	status_trace("Received channel_update for channel %s/%d now %s was %s (from %s)",
 		     type_to_string(tmpctx, struct short_channel_id,
 				    &short_channel_id),
 		     channel_flags & 0x01,
@@ -1292,7 +1300,7 @@ static struct wireaddr *read_addresses(const tal_t *ctx, const u8 *ser)
 
 		/* BOLT #7:
 		 *
-		 * The final node:
+		 * The receiving node:
 		 *...
 		 *   - SHOULD ignore the first `address descriptor` that does
 		 *     NOT match the types defined above.
@@ -1307,7 +1315,7 @@ static struct wireaddr *read_addresses(const tal_t *ctx, const u8 *ser)
 			break;
 		}
 
-		*tal_arr_expand(&wireaddrs) = wireaddr;
+		tal_arr_expand(&wireaddrs, wireaddr);
 	}
 	return wireaddrs;
 }
@@ -1392,7 +1400,7 @@ u8 *handle_node_announcement(struct routing_state *rstate, const u8 *node_ann)
 
 	/* BOLT #7:
 	 *
-	 * The final node:
+	 * The receiving node:
 	 *...
 	 *  - if `features` field contains _unknown even bits_:
 	 *    - MUST NOT parse the remainder of the message.
@@ -1410,12 +1418,13 @@ u8 *handle_node_announcement(struct routing_state *rstate, const u8 *node_ann)
 	if (!check_signed_hash(&hash, &signature, &node_id)) {
 		/* BOLT #7:
 		 *
-		 * - if `signature` is NOT a valid signature (using `node_id`
-		 *  of the double-SHA256 of the entire message following the
-		 *  `signature` field, including unknown fields following
-		 *  `alias`):
-		 *    - SHOULD fail the connection.
+		 * - if `signature` is not a valid signature, using
+                 *   `node_id` of the double-SHA256 of the entire
+                 *   message following the `signature` field
+                 *   (including unknown fields following
+                 *   `fee_proportional_millionths`):
 		 *    - MUST NOT process the message further.
+		 *    - SHOULD fail the connection.
 		 */
 		u8 *err = towire_errorfmt(rstate, NULL,
 					  "Bad signature for %s hash %s"
@@ -1496,19 +1505,42 @@ struct route_hop *get_route(const tal_t *ctx, struct routing_state *rstate,
 			    const struct pubkey *destination,
 			    const u64 msatoshi, double riskfactor,
 			    u32 final_cltv,
-			    double fuzz, const struct siphash_seed *base_seed)
+			    double fuzz, const struct siphash_seed *base_seed,
+			    const struct short_channel_id_dir *excluded,
+			    size_t max_hops)
 {
 	struct chan **route;
 	u64 total_amount;
 	unsigned int total_delay;
 	u64 fee;
 	struct route_hop *hops;
-	int i;
 	struct node *n;
+	u64 *saved_capacity;
+
+	saved_capacity = tal_arr(tmpctx, u64, tal_count(excluded));
+
+	/* Temporarily set excluded channels' capacity to zero. */
+	for (size_t i = 0; i < tal_count(excluded); i++) {
+		struct chan *chan = get_channel(rstate, &excluded[i].scid);
+		if (!chan)
+			continue;
+		saved_capacity[i]
+			= chan->half[excluded[i].dir].htlc_maximum_msat;
+		chan->half[excluded[i].dir].htlc_maximum_msat = 0;
+	}
 
 	route = find_route(ctx, rstate, source, destination, msatoshi,
 			   riskfactor / BLOCKS_PER_YEAR / 10000,
-			   fuzz, base_seed, &fee);
+			   fuzz, base_seed, max_hops, &fee);
+
+	/* Now restore the capacity. */
+	for (size_t i = 0; i < tal_count(excluded); i++) {
+		struct chan *chan = get_channel(rstate, &excluded[i].scid);
+		if (!chan)
+			continue;
+		chan->half[excluded[i].dir].htlc_maximum_msat
+			= saved_capacity[i];
+	}
 
 	if (!route) {
 		return NULL;
@@ -1521,7 +1553,7 @@ struct route_hop *get_route(const tal_t *ctx, struct routing_state *rstate,
 
 	/* Start at destination node. */
 	n = get_node(rstate, destination);
-	for (i = tal_count(route) - 1; i >= 0; i--) {
+	for (int i = tal_count(route) - 1; i >= 0; i--) {
 		const struct half_chan *c;
 		int idx = half_chan_to(n, route[i]);
 		c = &route[i]->half[idx];
@@ -1529,6 +1561,7 @@ struct route_hop *get_route(const tal_t *ctx, struct routing_state *rstate,
 		hops[i].nodeid = n->id;
 		hops[i].amount = total_amount;
 		hops[i].delay = total_delay;
+		hops[i].direction = idx;
 		total_amount += connection_fee(c, total_amount);
 		total_delay += c->delay;
 		n = other_node(n, route[i]);

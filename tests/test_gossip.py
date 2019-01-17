@@ -1,9 +1,11 @@
 from fixtures import *  # noqa: F401,F403
+from lightning import RpcError
 from utils import wait_for, TIMEOUT, only_one
 
 import json
 import logging
 import os
+import pytest
 import struct
 import subprocess
 import time
@@ -274,6 +276,15 @@ def test_gossip_jsonrpc(node_factory):
     # outgoing only
     assert len([c for c in channels1 if not c['public']]) == 2
     assert len([c for c in channels2 if not c['public']]) == 2
+
+    # Test listchannels-by-source
+    channels1 = l1.rpc.listchannels(source=l1.info['id'])['channels']
+    channels2 = l2.rpc.listchannels(source=l1.info['id'])['channels']
+    assert only_one(channels1)['source'] == l1.info['id']
+    assert only_one(channels1)['destination'] == l2.info['id']
+    assert channels1 == channels2
+
+    l2.rpc.listchannels()['channels']
 
     # Now proceed to funding-depth and do a full gossip round
     l1.bitcoin.generate_block(5)
@@ -551,16 +562,33 @@ def test_gossip_query_channel_range(node_factory, bitcoind):
     l1, l2, l3, l4 = node_factory.line_graph(4, opts={'log-level': 'io'},
                                              fundchannel=False)
 
-    # Make public channels.
-    scid12 = l1.fund_channel(l2, 10**5)
-    block12 = int(scid12.split(':')[0])
-    scid23 = l2.fund_channel(l3, 10**5)
-    block23 = int(scid23.split(':')[0])
+    # Make public channels on consecutive blocks
+    l1.fundwallet(10**6)
+    l2.fundwallet(10**6)
+
+    num_tx = len(bitcoind.rpc.getrawmempool())
+    l1.rpc.fundchannel(l2.info['id'], 10**5)['tx']
+    wait_for(lambda: len(bitcoind.rpc.getrawmempool()) == num_tx + 1)
+    bitcoind.generate_block(1)
+
+    num_tx = len(bitcoind.rpc.getrawmempool())
+    l2.rpc.fundchannel(l3.info['id'], 10**5)['tx']
+    wait_for(lambda: len(bitcoind.rpc.getrawmempool()) == num_tx + 1)
+    bitcoind.generate_block(1)
+
+    # Get them both to gossip depth.
     bitcoind.generate_block(5)
 
     # Make sure l2 has received all the gossip.
     l2.daemon.wait_for_logs(['Received node_announcement for node ' + l1.info['id'],
                              'Received node_announcement for node ' + l3.info['id']])
+
+    scid12 = only_one(l1.rpc.listpeers(l2.info['id'])['peers'])['channels'][0]['short_channel_id']
+    scid23 = only_one(l3.rpc.listpeers(l2.info['id'])['peers'])['channels'][0]['short_channel_id']
+    block12 = int(scid12.split('x')[0])
+    block23 = int(scid23.split('x')[0])
+
+    assert block23 == block12 + 1
 
     # l1 asks for all channels, gets both.
     ret = l1.rpc.dev_query_channel_range(id=l2.info['id'],
@@ -633,12 +661,18 @@ def test_gossip_query_channel_range(node_factory, bitcoind):
     assert ret['final_complete']
     assert len(ret['short_channel_ids']) == 0
 
+    # Turn on IO logging in l1 channeld.
+    subprocess.run(['kill', '-USR1', l1.subd_pid('channeld')])
+
     # Make l2 split reply into two (technically async)
     l2.rpc.dev_set_max_scids_encode_size(max=9)
     l2.daemon.wait_for_log('Set max_scids_encode_bytes to 9')
     ret = l1.rpc.dev_query_channel_range(id=l2.info['id'],
                                          first=0,
                                          num=1000000)
+
+    # Turns out it sends: 0+53, 53+26, 79+13, 92+7, 99+3, 102+2, 104+1, 105+999895
+    l1.daemon.wait_for_logs([r'\[IN\] 0108'] * 8)
 
     # It should definitely have split
     assert ret['final_first_block'] != 0 or ret['final_num_blocks'] != 1000000
@@ -648,13 +682,20 @@ def test_gossip_query_channel_range(node_factory, bitcoind):
     assert ret['short_channel_ids'][1] == scid23
     l2.daemon.wait_for_log('queue_channel_ranges full: splitting')
 
+    # Test overflow case doesn't split forever; should still only get 8 for this
+    ret = l1.rpc.dev_query_channel_range(id=l2.info['id'],
+                                         first=1,
+                                         num=429496000)
+    l1.daemon.wait_for_logs([r'\[IN\] 0108'] * 8)
+
+    # And no more!
+    time.sleep(1)
+    assert not l1.daemon.is_in_log(r'\[IN\] 0108', start=l1.daemon.logsearch_start)
+
     # This should actually be large enough for zlib to kick in!
     l3.fund_channel(l4, 10**5)
     bitcoind.generate_block(5)
     l2.daemon.wait_for_log('Received node_announcement for node ' + l4.info['id'])
-
-    # Turn on IO logging in l1 channeld.
-    subprocess.run(['kill', '-USR1', l1.subd_pid('channeld')])
 
     # Restore infinite encode size.
     l2.rpc.dev_set_max_scids_encode_size(max=(2**32 - 1))
@@ -747,7 +788,7 @@ def test_query_short_channel_id(node_factory, bitcoind):
     subprocess.run(['kill', '-USR1', l1.subd_pid('openingd')])
 
     # Empty result tests.
-    reply = l1.rpc.dev_query_scids(l2.info['id'], ['1:1:1', '2:2:2'])
+    reply = l1.rpc.dev_query_scids(l2.info['id'], ['1x1x1', '2x2x2'])
     # 0x0105 = query_short_channel_ids
     l1.daemon.wait_for_log(r'\[OUT\] 0105.*0000000100000100010000020000020002')
     assert reply['complete']
@@ -941,3 +982,51 @@ def test_gossip_notices_close(node_factory, bitcoind):
     l1.start()
     assert(l1.rpc.listchannels()['channels'] == [])
     assert(l1.rpc.listnodes()['nodes'] == [])
+
+
+def test_getroute_exclude(node_factory, bitcoind):
+    """Test getroute's exclude argument"""
+    l1, l2, l3, l4 = node_factory.line_graph(4, wait_for_announce=True)
+
+    # This should work
+    route = l1.rpc.getroute(l4.info['id'], 1, 1)['route']
+
+    # l1 id is > l2 id, so 1 means l1->l2
+    chan_l1l2 = route[0]['channel'] + '/1'
+    chan_l2l1 = route[0]['channel'] + '/0'
+
+    # This should not
+    with pytest.raises(RpcError):
+        l1.rpc.getroute(l4.info['id'], 1, 1, exclude=[chan_l1l2])
+
+    # Blocking the wrong way should be fine.
+    l1.rpc.getroute(l4.info['id'], 1, 1, exclude=[chan_l2l1])
+
+    # Now, create an alternate (better) route.
+    l2.rpc.connect(l4.info['id'], 'localhost', l4.port)
+    scid = l2.fund_channel(l4, 1000000, wait_for_active=False)
+    bitcoind.generate_block(5)
+
+    # We don't wait above, because we care about it hitting l1.
+    l1.daemon.wait_for_logs([r'update for channel {}/0 now ACTIVE'
+                             .format(scid),
+                             r'update for channel {}/1 now ACTIVE'
+                             .format(scid)])
+
+    # l3 id is > l2 id, so 1 means l3->l2
+    # chan_l3l2 = route[1]['channel'] + '/1'
+    chan_l2l3 = route[1]['channel'] + '/0'
+
+    # l4 is > l2
+    # chan_l4l2 = scid + '/1'
+    chan_l2l4 = scid + '/0'
+
+    # This works
+    l1.rpc.getroute(l4.info['id'], 1, 1, exclude=[chan_l2l3])
+
+    # This works
+    l1.rpc.getroute(l4.info['id'], 1, 1, exclude=[chan_l2l4])
+
+    # This doesn't
+    with pytest.raises(RpcError):
+        l1.rpc.getroute(l4.info['id'], 1, 1, exclude=[chan_l2l3, chan_l2l4])

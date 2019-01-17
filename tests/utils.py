@@ -41,7 +41,6 @@ EXPERIMENTAL_FEATURES = os.getenv("EXPERIMENTAL_FEATURES", config['EXPERIMENTAL_
 TIMEOUT = int(os.getenv("TIMEOUT", "60"))
 VALGRIND = os.getenv("VALGRIND", config['VALGRIND']) == "1"
 SLOW_MACHINE = os.getenv("SLOW_MACHINE", "0") == "1"
-PLUGINS = os.getenv("PLUGINS", config['PLUGINS']) == "1"
 
 
 def wait_for(success, timeout=TIMEOUT):
@@ -82,6 +81,18 @@ def sync_blockheight(bitcoind, nodes):
 def wait_channel_quiescent(n1, n2):
     wait_for(lambda: only_one(only_one(n1.rpc.listpeers(n2.info['id'])['peers'])['channels'])['htlcs'] == [])
     wait_for(lambda: only_one(only_one(n2.rpc.listpeers(n1.info['id'])['peers'])['channels'])['htlcs'] == [])
+
+
+def get_tx_p2wsh_outnum(bitcoind, tx, amount):
+    """Get output number of this tx which is p2wsh of amount"""
+    decoded = bitcoind.rpc.decoderawtransaction(tx, True)
+
+    for out in decoded['vout']:
+        if out['scriptPubKey']['type'] == 'witness_v0_scripthash':
+            if out['value'] == Decimal(amount) / 10**8:
+                    return out['n']
+
+    return None
 
 
 class TailableProc(object):
@@ -520,31 +531,20 @@ class LightningNode(object):
         self.bitcoin.generate_block(1)
 
         # Hacky way to find our output.
-        scid = None
-        decoded = self.bitcoin.rpc.decoderawtransaction(tx, True)
-
-        for out in decoded['vout']:
-            if out['scriptPubKey']['type'] == 'witness_v0_scripthash':
-                if out['value'] == Decimal(amount) / 10**8:
-                    scid = "{}:1:{}".format(self.bitcoin.rpc.getblockcount(), out['n'])
-                    break
-
-        if not scid:
-            # Intermittent decoding failure.  See if it decodes badly twice?
-            decoded2 = self.bitcoin.rpc.decoderawtransaction(tx)
-            raise ValueError("Can't find {} payment in {} (1={} 2={})".format(amount, tx, decoded, decoded2))
+        scid = "{}x1x{}".format(self.bitcoin.rpc.getblockcount(),
+                                get_tx_p2wsh_outnum(self.bitcoin, tx, amount))
 
         if wait_for_active:
             # We wait until gossipd sees both local updates, as well as status NORMAL,
             # so it can definitely route through.
-            self.daemon.wait_for_logs([r'update for channel {}\(0\) now ACTIVE'
+            self.daemon.wait_for_logs([r'update for channel {}/0 now ACTIVE'
                                        .format(scid),
-                                       r'update for channel {}\(1\) now ACTIVE'
+                                       r'update for channel {}/1 now ACTIVE'
                                        .format(scid),
                                        'to CHANNELD_NORMAL'])
-            l2.daemon.wait_for_logs([r'update for channel {}\(0\) now ACTIVE'
+            l2.daemon.wait_for_logs([r'update for channel {}/0 now ACTIVE'
                                      .format(scid),
-                                     r'update for channel {}\(1\) now ACTIVE'
+                                     r'update for channel {}/1 now ACTIVE'
                                      .format(scid),
                                      'to CHANNELD_NORMAL'])
         return scid
@@ -597,9 +597,9 @@ class LightningNode(object):
     # (or for local channels, at least a local announcement)
     def wait_for_routes(self, channel_ids):
         # Could happen in any order...
-        self.daemon.wait_for_logs(['Received channel_update for channel {}\\(0\\)'.format(c)
+        self.daemon.wait_for_logs(['Received channel_update for channel {}/0'.format(c)
                                    for c in channel_ids]
-                                  + ['Received channel_update for channel {}\\(1\\)'.format(c)
+                                  + ['Received channel_update for channel {}/1'.format(c)
                                      for c in channel_ids])
 
     def pay(self, dst, amt, label=None):
@@ -614,7 +614,7 @@ class LightningNode(object):
             'msatoshi': amt,
             'id': dst.info['id'],
             'delay': 5,
-            'channel': '1:1:1'
+            'channel': '1x1x1'
         }
 
         def wait_pay():
@@ -698,6 +698,7 @@ class NodeFactory(object):
             'may_reconnect',
             'random_hsm',
             'log_all_io',
+            'feerates',
         ]
         node_opts = {k: v for k, v in opts.items() if k in node_opt_keys}
         cli_opts = {k: v for k, v in opts.items() if k not in node_opt_keys}
@@ -782,7 +783,7 @@ class NodeFactory(object):
                 'valgrind',
                 '-q',
                 '--trace-children=yes',
-                '--trace-children-skip=*plugins*,*python*,*bitcoin-cli*',
+                '--trace-children-skip=*python*,*bitcoin-cli*',
                 '--error-exitcode=7',
                 '--log-file={}/valgrind-errors.%p'.format(node.daemon.lightning_dir)
             ]
@@ -830,7 +831,7 @@ class NodeFactory(object):
         for src, dst in connections:
             wait_for(lambda: src.channel_state(dst) == 'CHANNELD_NORMAL')
             scid = src.get_channel_scid(dst)
-            src.daemon.wait_for_log(r'Received channel_update for channel {scid}\(.\) now ACTIVE'.format(scid=scid))
+            src.daemon.wait_for_log(r'Received channel_update for channel {scid}/. now ACTIVE'.format(scid=scid))
             scids.append(scid)
 
         if not wait_for_announce:

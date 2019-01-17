@@ -1,6 +1,7 @@
 /* JSON core and helpers */
 #include "json.h"
 #include <assert.h>
+#include <bitcoin/pubkey.h>
 #include <ccan/build_assert/build_assert.h>
 #include <ccan/mem/mem.h>
 #include <ccan/str/hex/hex.h>
@@ -127,32 +128,24 @@ bool json_to_bool(const char *buffer, const jsmntok_t *tok, bool *b)
 	return false;
 }
 
-bool json_to_bitcoin_amount(const char *buffer, const jsmntok_t *tok,
-			    uint64_t *satoshi)
+u8 *json_tok_bin_from_hex(const tal_t *ctx, const char *buffer, const jsmntok_t *tok)
 {
-	char *end;
-	unsigned long btc, sat;
+	u8 *result;
+	size_t hexlen, rawlen;
+	hexlen = tok->end - tok->start;
+	rawlen = hex_data_size(hexlen);
 
-	btc = strtoul(buffer + tok->start, &end, 10);
-	if (btc == ULONG_MAX && errno == ERANGE)
-		return false;
-	if (end != buffer + tok->end) {
-		/* Expect always 8 decimal places. */
-		if (*end != '.' || buffer + tok->end - end != 9)
-			return false;
-		sat = strtoul(end+1, &end, 10);
-		if (sat == ULONG_MAX && errno == ERANGE)
-			return false;
-		if (end != buffer + tok->end)
-			return false;
-	} else
-		sat = 0;
+	result = tal_arr(ctx, u8, rawlen);
+	if (!hex_decode(buffer + tok->start, hexlen, result, rawlen))
+		return tal_free(result);
 
-	*satoshi = btc * (uint64_t)100000000 + sat;
-	if (*satoshi != btc * (uint64_t)100000000 + sat)
-		return false;
+	return result;
+}
 
-	return true;
+bool json_to_preimage(const char *buffer, const jsmntok_t *tok, struct preimage *preimage)
+{
+	size_t hexlen = tok->end - tok->start;
+	return hex_decode(buffer + tok->start, hexlen, preimage->r, sizeof(preimage->r));
 }
 
 bool json_tok_is_num(const char *buffer, const jsmntok_t *tok)

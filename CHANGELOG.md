@@ -9,9 +9,18 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Added
 
+- plugins: fully enabled, and ready for you to write some!
+- plugins: `pay` is now a plugin.
 - lightning-cli: `help <cmd>` finds man pages even if `make install` not run.
+- JSON API: `waitsendpay` now has an `erring_direction` field.
+- JSON API: `listpeers` now has a `direction` field in `channels`.
+- JSON API: `listchannels` now takes a `source` option to filter by node id.
+- JSON API: New command `paystatus` gives detailed information on `pay` commands.
 
 ### Changed
+
+- The `short_channel_id` separator has been changed to be `x` to match the specification.
+- JSON API: `listpeers` now includes `funding_allocation_msat`, which returns a map of the amounts initially funded to the channel by each peer, indexed by channel id.
 
 ### Deprecated
 
@@ -22,6 +31,8 @@ changes.
 
 ### Fixed
 
+- Protocol: handling `query_channel_range` for large numbers of blocks
+  (eg. 4 billion) was slow due to a bug.
 
 ### Security
 
@@ -37,6 +48,7 @@ This release named by @molxyz and [@ctrlbreak](https://twitter.com/ctrlbreak).
 - JSON API: use `\n\n` to terminate responses, for simplified parsing (pylightning now relies on this)
 - JSON API: `fundchannel` now includes an `announce` option, when false it will keep channel private. Defaults to true.
 - JSON API: `listpeers`'s `channels` now includes a `private` flag to indicate if channel is announced or not.
+- JSON API: `invoice` route hints may now include private channels if you have no public ones, unless new option `exposeprivatechannels` is false.
 - Plugins: experimental plugin support for `lightningd`, including option passthrough and JSON-RPC passthrough.
 
 ### Changed
@@ -105,6 +117,8 @@ changes.
 - JSON RPC: `global_features` and `local_features` fields: use `globalfeatures` and `localfeatures` as per BOLT #1.
 
 ### Removed
+
+- JSON API: the optional 'seed' parameter to `getroute` was removed.
 
 ### Fixed
 

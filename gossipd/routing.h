@@ -136,12 +136,6 @@ HTABLE_DEFINE_TYPE(struct node, node_map_keyof_node, node_map_hash_key, node_map
 struct pending_node_map;
 struct pending_cannouncement;
 
-/* If the two nodes[] are id1 and id2, which index would id1 be? */
-static inline int pubkey_idx(const struct pubkey *id1, const struct pubkey *id2)
-{
-	return pubkey_cmp(id1, id2) > 0;
-}
-
 /* Fast versions: if you know n is one end of the channel */
 static inline struct node *other_node(const struct node *n,
 				      const struct chan *chan)
@@ -213,6 +207,7 @@ get_channel(const struct routing_state *rstate,
 
 struct route_hop {
 	struct short_channel_id channel_id;
+	int direction;
 	struct pubkey nodeid;
 	u64 amount;
 	u32 delay;
@@ -273,7 +268,9 @@ struct route_hop *get_route(const tal_t *ctx, struct routing_state *rstate,
 			    const u64 msatoshi, double riskfactor,
 			    u32 final_cltv,
 			    double fuzz,
-			    const struct siphash_seed *base_seed);
+			    const struct siphash_seed *base_seed,
+			    const struct short_channel_id_dir *excluded,
+			    size_t max_hops);
 /* Disable channel(s) based on the given routing failure. */
 void routing_failure(struct routing_state *rstate,
 		     const struct pubkey *erring_node,

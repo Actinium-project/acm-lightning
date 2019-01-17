@@ -1,6 +1,7 @@
 #! /usr/bin/make
-VERSION_NAME=Principled Opposition to SegWit
-VERSION=$(shell git describe --always --dirty=-modded --abbrev=7)
+
+# Extract version from git, or if we're from a zipfile, use dirname
+VERSION=$(shell git describe --always --dirty=-modded --abbrev=7 2>/dev/null || pwd | sed -n 's,.*/clightning-\(v[0-9.rc]*\)$$,\1,p')
 
 ifeq ($(VERSION),)
 $(error "ERROR: git is required for generating version information")
@@ -14,7 +15,7 @@ CCANDIR := ccan
 
 # Where we keep the BOLT RFCs
 BOLTDIR := ../lightning-rfc/
-BOLTVERSION := bca814e270dcbee2fea51c0a26ca99efef261f2b
+BOLTVERSION := 3fef98d10695462edecc63cba05e4a96374f4664
 
 -include config.vars
 
@@ -215,6 +216,7 @@ include lightningd/Makefile
 include cli/Makefile
 include doc/Makefile
 include devtools/Makefile
+include plugins/Makefile
 
 # Git doesn't maintain timestamps, so we only regen if git says we should.
 CHANGED_FROM_GIT = [ x"`git log $@ | head -n1`" != x"`git log $< | head -n1`" -o x"`git diff $<`" != x"" ]

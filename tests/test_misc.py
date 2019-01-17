@@ -234,7 +234,15 @@ def test_htlc_out_timeout(node_factory, bitcoind, executor):
     l1.daemon.wait_for_log('dev_disconnect: @WIRE_REVOKE_AND_ACK')
 
     # Takes 6 blocks to timeout (cltv-final + 1), but we also give grace period of 1 block.
-    bitcoind.generate_block(5 + 1)
+    # shadow route can add extra blocks!
+    status = only_one(l1.rpc.call('paystatus')['pay'])
+    if 'shadow' in status:
+        shadowlen = 6 * status['shadow'].count('Added 6 cltv delay for shadow')
+    else:
+        shadowlen = 0
+
+    bitcoind.generate_block(5 + 1 + shadowlen)
+    time.sleep(3)
     assert not l1.daemon.is_in_log('hit deadline')
     bitcoind.generate_block(1)
 
@@ -293,7 +301,13 @@ def test_htlc_in_timeout(node_factory, bitcoind, executor):
     l1.daemon.wait_for_log('dev_disconnect: -WIRE_REVOKE_AND_ACK')
 
     # Deadline HTLC expiry minus 1/2 cltv-expiry delta (rounded up) (== cltv - 3).  cltv is 5+1.
-    bitcoind.generate_block(2)
+    # shadow route can add extra blocks!
+    status = only_one(l1.rpc.call('paystatus')['pay'])
+    if 'shadow' in status:
+        shadowlen = 6 * status['shadow'].count('Added 6 cltv delay for shadow')
+    else:
+        shadowlen = 0
+    bitcoind.generate_block(2 + shadowlen)
     assert not l2.daemon.is_in_log('hit deadline')
     bitcoind.generate_block(1)
 
@@ -303,7 +317,7 @@ def test_htlc_in_timeout(node_factory, bitcoind, executor):
     l2.daemon.wait_for_log(' to ONCHAIN')
     l1.daemon.wait_for_log(' to ONCHAIN')
 
-    # L2 will collect HTLC
+    # L2 will collect HTLC (iff no shadow route)
     l2.daemon.wait_for_log('Propose handling OUR_UNILATERAL/THEIR_HTLC by OUR_HTLC_SUCCESS_TX .* after 0 blocks')
     l2.daemon.wait_for_log('sendrawtx exit 0')
     bitcoind.generate_block(1)
@@ -905,11 +919,16 @@ def test_htlc_send_timeout(node_factory, bitcoind):
 
     err = excinfo.value
     # Complaints it couldn't find route.
-    assert err.error['code'] == 205
+    # FIXME: include in pylightning
+    PAY_ROUTE_NOT_FOUND = 205
+    assert err.error['code'] == PAY_ROUTE_NOT_FOUND
+
+    status = only_one(l1.rpc.call('paystatus')['pay'])
+
     # Temporary channel failure
-    assert only_one(err.error['data']['failures'])['failcode'] == 0x1007
-    assert only_one(err.error['data']['failures'])['erring_node'] == l2.info['id']
-    assert only_one(err.error['data']['failures'])['erring_channel'] == chanid2
+    assert status['attempts'][0]['failure']['data']['failcode'] == 0x1007
+    assert status['attempts'][0]['failure']['data']['erring_node'] == l2.info['id']
+    assert status['attempts'][0]['failure']['data']['erring_channel'] == chanid2
 
     # L2 should send ping, but never receive pong so never send commitment.
     l2.daemon.wait_for_log(r'channeld.*:\[OUT\] 0012')

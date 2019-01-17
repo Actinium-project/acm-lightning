@@ -13,6 +13,7 @@
 #include <common/features.h>
 #include <common/json_command.h>
 #include <common/json_escaped.h>
+#include <common/json_helpers.h>
 #include <common/jsonrpc_errors.h>
 #include <common/param.h>
 #include <common/type_to_string.h>
@@ -279,7 +280,7 @@ static void json_getroute_reply(struct subd *gossip UNUSED, const u8 *reply, con
 	fromwire_gossip_getroute_reply(reply, reply, &hops);
 
 	if (tal_count(hops) == 0) {
-		was_pending(command_fail(cmd, LIGHTNINGD,
+		was_pending(command_fail(cmd, PAY_ROUTE_NOT_FOUND,
 					 "Could not find a route"));
 		return;
 	}
@@ -299,17 +300,19 @@ static struct command_result *json_getroute(struct command *cmd,
 	struct lightningd *ld = cmd->ld;
 	struct pubkey *destination;
 	struct pubkey *source;
-	const jsmntok_t *seedtok;
+	const jsmntok_t *excludetok;
 	u64 *msatoshi;
 	unsigned *cltv;
 	double *riskfactor;
+	struct short_channel_id_dir *excluded;
+	u32 *max_hops;
+
 	/* Higher fuzz means that some high-fee paths can be discounted
 	 * for an even larger value, increasing the scope for route
 	 * randomization (the higher-fee paths become more likely to
 	 * be selected) at the cost of increasing the probability of
 	 * selecting the higher-fee paths. */
 	double *fuzz;
-	struct siphash_seed seed;
 
 	if (!param(cmd, buffer, params,
 		   p_req("id", param_pubkey, &destination),
@@ -317,29 +320,45 @@ static struct command_result *json_getroute(struct command *cmd,
 		   p_req("riskfactor", param_double, &riskfactor),
 		   p_opt_def("cltv", param_number, &cltv, 9),
 		   p_opt_def("fromid", param_pubkey, &source, ld->id),
-		   p_opt("seed", param_tok, &seedtok),
-		   p_opt_def("fuzzpercent", param_percent, &fuzz, 75.0),
+		   p_opt_def("fuzzpercent", param_percent, &fuzz, 5.0),
+		   p_opt("exclude", param_array, &excludetok),
+		   p_opt_def("maxhops", param_number, &max_hops,
+			     ROUTING_MAX_HOPS),
 		   NULL))
 		return command_param_failed();
 
 	/* Convert from percentage */
 	*fuzz = *fuzz / 100.0;
 
-	if (seedtok) {
-		if (seedtok->end - seedtok->start > sizeof(seed))
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "seed must be < %zu bytes",
-					    sizeof(seed));
+	if (excludetok) {
+		const jsmntok_t *t, *end = json_next(excludetok);
+		size_t i;
 
-		memset(&seed, 0, sizeof(seed));
-		memcpy(&seed, buffer + seedtok->start,
-		       seedtok->end - seedtok->start);
-	} else
-		randombytes_buf(&seed, sizeof(seed));
+		excluded = tal_arr(cmd, struct short_channel_id_dir,
+				   excludetok->size);
+
+		for (i = 0, t = excludetok + 1;
+		     t < end;
+		     t = json_next(t), i++) {
+			if (!short_channel_id_dir_from_str(buffer + t->start,
+							   t->end - t->start,
+							   &excluded[i])) {
+				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+						    "%.*s is not a valid"
+						    " short_channel_id/direction",
+						    t->end - t->start,
+						    buffer + t->start);
+			}
+		}
+	} else {
+		excluded = NULL;
+	}
 
 	u8 *req = towire_gossip_getroute_request(cmd, source, destination,
 						 *msatoshi, *riskfactor * 1000,
-						 *cltv, fuzz, &seed);
+						 *cltv, fuzz,
+						 excluded,
+						 *max_hops);
 	subd_req(ld->gossip, ld->gossip, req, -1, 0, json_getroute_reply, cmd);
 	return command_still_pending(cmd);
 }
@@ -410,12 +429,18 @@ static struct command_result *json_listchannels(struct command *cmd,
 {
 	u8 *req;
 	struct short_channel_id *id;
+	struct pubkey *source;
+
 	if (!param(cmd, buffer, params,
 		   p_opt("short_channel_id", param_short_channel_id, &id),
+		   p_opt("source", param_pubkey, &source),
 		   NULL))
 		return command_param_failed();
 
-	req = towire_gossip_getchannels_request(cmd, id);
+	if (id && source)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Cannot specify both source and short_channel_id");
+	req = towire_gossip_getchannels_request(cmd, id, source);
 	subd_req(cmd->ld->gossip, cmd->ld->gossip,
 		 req, -1, 0, json_listchannels_reply, cmd);
 	return command_still_pending(cmd);
@@ -424,7 +449,7 @@ static struct command_result *json_listchannels(struct command *cmd,
 static const struct json_command listchannels_command = {
 	"listchannels",
 	json_listchannels,
-	"Show channel {short_channel_id} (or all known channels, if no {short_channel_id})"
+	"Show channel {short_channel_id} or {source} (or all known channels, if not specified)"
 };
 AUTODATA(json_command, &listchannels_command);
 

@@ -14,6 +14,11 @@
 struct plugins;
 
 /**
+ * A plugin, exposed as a stub so we can pass it as an argument.
+ */
+struct plugin;
+
+/**
  * Create a new plugins context.
  */
 struct plugins *plugins_new(const tal_t *ctx, struct log_book *log_book,
@@ -81,5 +86,11 @@ void clear_plugins(struct plugins *plugins);
 
 void plugins_notify(struct plugins *plugins,
 		    const struct jsonrpc_notification *n TAKES);
+
+/**
+ * Send a jsonrpc_request to the specified plugin
+ */
+void plugin_request_send(struct plugin *plugin,
+			 struct jsonrpc_request *req TAKES);
 
 #endif /* LIGHTNING_LIGHTNINGD_PLUGIN_H */

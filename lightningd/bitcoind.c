@@ -14,7 +14,7 @@
 #include <ccan/tal/grab_file/grab_file.h>
 #include <ccan/tal/path/path.h>
 #include <ccan/tal/str/str.h>
-#include <common/json.h>
+#include <common/json_helpers.h>
 #include <common/memleak.h>
 #include <common/timeout.h>
 #include <common/utils.h>
@@ -32,7 +32,7 @@
 /* Add the n'th arg to *args, incrementing n and keeping args of size n+1 */
 static void add_arg(const char ***args, const char *arg)
 {
-	*tal_arr_expand(args) = arg;
+	tal_arr_expand(args, arg);
 }
 
 static const char **gather_args(const struct bitcoind *bitcoind,
@@ -675,7 +675,7 @@ static bool process_getblockhash_for_txout(struct bitcoin_cli *bcli)
 	/* Strip the newline at the end of the previous output */
 	blockhash = tal_strndup(NULL, bcli->output, bcli->output_bytes-1);
 
-	start_bitcoin_cli(bcli->bitcoind, NULL, process_getblock, false,
+	start_bitcoin_cli(bcli->bitcoind, NULL, process_getblock, true,
 			  BITCOIND_LOW_PRIO,
 			  cb, go,
 			  "getblock", take(blockhash), NULL);

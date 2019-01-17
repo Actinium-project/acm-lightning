@@ -397,7 +397,7 @@ u8 *towire_errorfmt(const tal_t *ctx UNNEEDED,
 		    const char *fmt UNNEEDED, ...)
 { fprintf(stderr, "towire_errorfmt called!\n"); abort(); }
 /* Generated stub for towire_gossip_get_incoming_channels */
-u8 *towire_gossip_get_incoming_channels(const tal_t *ctx UNNEEDED)
+u8 *towire_gossip_get_incoming_channels(const tal_t *ctx UNNEEDED, const bool *private_too UNNEEDED)
 { fprintf(stderr, "towire_gossip_get_incoming_channels called!\n"); abort(); }
 /* Generated stub for towire_hsm_get_channel_basepoints */
 u8 *towire_hsm_get_channel_basepoints(const tal_t *ctx UNNEEDED, const struct pubkey *peerid UNNEEDED, u64 dbid UNNEEDED)
@@ -543,11 +543,12 @@ bool dev_disconnect_permanent(struct lightningd *ld UNNEEDED)
 
 static void add_inchan(struct route_info **inchans, int n)
 {
-	struct route_info *r = tal_arr_expand(inchans);
-	memset(&r->pubkey, n, sizeof(r->pubkey));
-	memset(&r->short_channel_id, n, sizeof(r->short_channel_id));
-	r->fee_base_msat = r->fee_proportional_millionths = r->cltv_expiry_delta
+	struct route_info r;
+	memset(&r.pubkey, n, sizeof(r.pubkey));
+	memset(&r.short_channel_id, n, sizeof(r.short_channel_id));
+	r.fee_base_msat = r.fee_proportional_millionths = r.cltv_expiry_delta
 		= n;
+	tal_arr_expand(inchans, r);
 }
 
 static void add_peer(struct lightningd *ld, int n, enum channel_state state,

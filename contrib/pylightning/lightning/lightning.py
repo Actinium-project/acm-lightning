@@ -147,13 +147,13 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("listnodes", payload)
 
-    def getroute(self, peer_id, msatoshi, riskfactor, cltv=9, fromid=None, fuzzpercent=None, seed=None):
+    def getroute(self, peer_id, msatoshi, riskfactor, cltv=9, fromid=None, fuzzpercent=None, seed=None, exclude=[]):
         """
         Show route to {id} for {msatoshi}, using {riskfactor} and optional
         {cltv} (default 9). If specified search from {fromid} otherwise use
         this node as source. Randomize the route with up to {fuzzpercent}
         (0.0 -> 100.0, default 5.0) using {seed} as an arbitrary-size string
-        seed.
+        seed. {exclude} is an optional array of scid/direction to exclude.
         """
         payload = {
             "id": peer_id,
@@ -162,20 +162,22 @@ class LightningRpc(UnixDomainSocketRpc):
             "cltv": cltv,
             "fromid": fromid,
             "fuzzpercent": fuzzpercent,
-            "seed": seed
+            "seed": seed,
+            "exclude": exclude
         }
         return self.call("getroute", payload)
 
-    def listchannels(self, short_channel_id=None):
+    def listchannels(self, short_channel_id=None, source=None):
         """
-        Show all known channels, accept optional {short_channel_id}
+        Show all known channels, accept optional {short_channel_id} or {source}
         """
         payload = {
-            "short_channel_id": short_channel_id
+            "short_channel_id": short_channel_id,
+            "source": source
         }
         return self.call("listchannels", payload)
 
-    def invoice(self, msatoshi, label, description, expiry=None, fallbacks=None, preimage=None):
+    def invoice(self, msatoshi, label, description, expiry=None, fallbacks=None, preimage=None, exposeprivatechannels=None):
         """
         Create an invoice for {msatoshi} with {label} and {description} with
         optional {expiry} seconds (default 1 hour)
@@ -186,7 +188,8 @@ class LightningRpc(UnixDomainSocketRpc):
             "description": description,
             "expiry": expiry,
             "fallbacks": fallbacks,
-            "preimage": preimage
+            "preimage": preimage,
+            "exposeprivatechannels": exposeprivatechannels
         }
         return self.call("invoice", payload)
 

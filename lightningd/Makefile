@@ -35,6 +35,7 @@ LIGHTNINGD_COMMON_OBJS :=			\
 	common/io_lock.o			\
 	common/json.o				\
 	common/json_escaped.o			\
+	common/json_helpers.o			\
 	common/json_tok.o			\
 	common/memleak.o			\
 	common/msg_queue.o			\
@@ -78,11 +79,11 @@ LIGHTNINGD_SRC :=				\
 	lightningd/opening_control.c		\
 	lightningd/options.c			\
 	lightningd/pay.c			\
-	lightningd/payalgo.c			\
 	lightningd/peer_control.c		\
 	lightningd/peer_htlcs.c			\
 	lightningd/ping.c			\
 	lightningd/plugin.c			\
+	lightningd/plugin_hook.c		\
 	lightningd/subd.c			\
 	lightningd/watch.c
 

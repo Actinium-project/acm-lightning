@@ -389,7 +389,7 @@ def test_reconnect_sender_add1(node_factory):
     rhash = l2.rpc.invoice(amt, 'test_reconnect_sender_add1', 'desc')['payment_hash']
     assert only_one(l2.rpc.listinvoices('test_reconnect_sender_add1')['invoices'])['status'] == 'unpaid'
 
-    route = [{'msatoshi': amt, 'id': l2.info['id'], 'delay': 5, 'channel': '1:1:1'}]
+    route = [{'msatoshi': amt, 'id': l2.info['id'], 'delay': 5, 'channel': '1x1x1'}]
 
     for i in range(0, len(disconnects)):
         l1.rpc.sendpay(route, rhash)
@@ -424,7 +424,7 @@ def test_reconnect_sender_add(node_factory):
     rhash = l2.rpc.invoice(amt, 'testpayment', 'desc')['payment_hash']
     assert only_one(l2.rpc.listinvoices('testpayment')['invoices'])['status'] == 'unpaid'
 
-    route = [{'msatoshi': amt, 'id': l2.info['id'], 'delay': 5, 'channel': '1:1:1'}]
+    route = [{'msatoshi': amt, 'id': l2.info['id'], 'delay': 5, 'channel': '1x1x1'}]
 
     # This will send commit, so will reconnect as required.
     l1.rpc.sendpay(route, rhash)
@@ -453,7 +453,7 @@ def test_reconnect_receiver_add(node_factory):
     rhash = l2.rpc.invoice(amt, 'testpayment2', 'desc')['payment_hash']
     assert only_one(l2.rpc.listinvoices('testpayment2')['invoices'])['status'] == 'unpaid'
 
-    route = [{'msatoshi': amt, 'id': l2.info['id'], 'delay': 5, 'channel': '1:1:1'}]
+    route = [{'msatoshi': amt, 'id': l2.info['id'], 'delay': 5, 'channel': '1x1x1'}]
     l1.rpc.sendpay(route, rhash)
     for i in range(len(disconnects)):
         l1.daemon.wait_for_log('Already have funding locked in')
@@ -485,7 +485,7 @@ def test_reconnect_receiver_fulfill(node_factory):
     rhash = l2.rpc.invoice(amt, 'testpayment2', 'desc')['payment_hash']
     assert only_one(l2.rpc.listinvoices('testpayment2')['invoices'])['status'] == 'unpaid'
 
-    route = [{'msatoshi': amt, 'id': l2.info['id'], 'delay': 5, 'channel': '1:1:1'}]
+    route = [{'msatoshi': amt, 'id': l2.info['id'], 'delay': 5, 'channel': '1x1x1'}]
     l1.rpc.sendpay(route, rhash)
     for i in range(len(disconnects)):
         l1.daemon.wait_for_log('Already have funding locked in')
@@ -1446,23 +1446,23 @@ def test_restart_many_payments(node_factory):
     l1_logs = []
     for i in range(len(innodes)):
         scid = inchans[i]
-        l1_logs += [r'update for channel {}\(0\) now ACTIVE'.format(scid),
-                    r'update for channel {}\(1\) now ACTIVE'.format(scid),
+        l1_logs += [r'update for channel {}/0 now ACTIVE'.format(scid),
+                    r'update for channel {}/1 now ACTIVE'.format(scid),
                     'to CHANNELD_NORMAL']
-        innodes[i].daemon.wait_for_logs([r'update for channel {}\(0\) now ACTIVE'
+        innodes[i].daemon.wait_for_logs([r'update for channel {}/0 now ACTIVE'
                                          .format(scid),
-                                         r'update for channel {}\(1\) now ACTIVE'
+                                         r'update for channel {}/1 now ACTIVE'
                                          .format(scid),
                                          'to CHANNELD_NORMAL'])
 
     for i in range(len(outnodes)):
         scid = outchans[i]
-        l1_logs += [r'update for channel {}\(0\) now ACTIVE'.format(scid),
-                    r'update for channel {}\(1\) now ACTIVE'.format(scid),
+        l1_logs += [r'update for channel {}/0 now ACTIVE'.format(scid),
+                    r'update for channel {}/1 now ACTIVE'.format(scid),
                     'to CHANNELD_NORMAL']
-        outnodes[i].daemon.wait_for_logs([r'update for channel {}\(0\) now ACTIVE'
+        outnodes[i].daemon.wait_for_logs([r'update for channel {}/0 now ACTIVE'
                                           .format(scid),
-                                          r'update for channel {}\(1\) now ACTIVE'
+                                          r'update for channel {}/1 now ACTIVE'
                                           .format(scid),
                                           'to CHANNELD_NORMAL'])
 

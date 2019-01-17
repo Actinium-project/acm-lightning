@@ -129,17 +129,18 @@ static char *opt_add_addr_withtype(const char *arg,
 				   bool wildcard_ok)
 {
 	char const *err_msg;
+	struct wireaddr_internal wi;
 
 	assert(arg != NULL);
 
-	*tal_arr_expand(&ld->proposed_listen_announce) = ala;
-	if (!parse_wireaddr_internal(arg, tal_arr_expand(&ld->proposed_wireaddr),
+	tal_arr_expand(&ld->proposed_listen_announce, ala);
+	if (!parse_wireaddr_internal(arg, &wi,
 				     ld->portnum,
 				     wildcard_ok, !ld->use_proxy_always, false,
 				     &err_msg)) {
 		return tal_fmt(NULL, "Unable to parse address '%s': %s", arg, err_msg);
 	}
-
+	tal_arr_expand(&ld->proposed_wireaddr, wi);
 	return NULL;
 
 }
@@ -318,7 +319,6 @@ static void config_register_opts(struct lightningd *ld)
 		&ld->config_filename,
 		"Specify configuration file. Relative paths will be prefixed by lightning-dir location. (default: config)");
 
-#ifdef PLUGINS
 	/* Register plugins as an early args, so we can initialize them and have
 	 * them register more command line options */
 	opt_register_early_arg("--plugin", opt_add_plugin, NULL, ld,
@@ -332,7 +332,7 @@ static void config_register_opts(struct lightningd *ld)
 	opt_register_early_arg("--disable-plugin", opt_disable_plugin,
 			       NULL, ld,
 			       "Disable a particular plugin by filename/name");
-#endif
+
 	opt_register_noarg("--daemon", opt_set_bool, &ld->daemon,
 			 "Run in the background, suppress stdout/stderr");
 	opt_register_arg("--ignore-fee-limits", opt_set_bool_arg, opt_show_bool,
