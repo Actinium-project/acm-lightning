@@ -47,16 +47,17 @@ static inline u16 short_channel_id_outnum(const struct short_channel_id *scid)
 	return scid->u64 & 0xFFFF;
 }
 
-void mk_short_channel_id(struct short_channel_id *scid,
-			 u32 blocknum, u32 txnum, u16 outnum);
+/* Returns false if blocknum, txnum or outnum require too many bits */
+bool WARN_UNUSED_RESULT mk_short_channel_id(struct short_channel_id *scid,
+					    u64 blocknum, u64 txnum, u64 outnum);
 
-bool short_channel_id_from_str(const char *str, size_t strlen,
-			       struct short_channel_id *dst);
+bool WARN_UNUSED_RESULT short_channel_id_from_str(const char *str, size_t strlen,
+						  struct short_channel_id *dst);
 
 char *short_channel_id_to_str(const tal_t *ctx, const struct short_channel_id *scid);
 
-bool short_channel_id_dir_from_str(const char *str, size_t strlen,
-				   struct short_channel_id_dir *scidd);
+bool WARN_UNUSED_RESULT short_channel_id_dir_from_str(const char *str, size_t strlen,
+						      struct short_channel_id_dir *scidd);
 
 char *short_channel_id_dir_to_str(const tal_t *ctx,
 				  const struct short_channel_id_dir *scidd);

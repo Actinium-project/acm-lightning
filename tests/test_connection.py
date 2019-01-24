@@ -1,7 +1,7 @@
 from collections import namedtuple
 from fixtures import *  # noqa: F401,F403
 from lightning import RpcError
-from utils import DEVELOPER, only_one, wait_for, sync_blockheight, VALGRIND, EXPERIMENTAL_FEATURES
+from utils import DEVELOPER, only_one, wait_for, sync_blockheight, VALGRIND
 
 
 import os
@@ -1009,10 +1009,7 @@ def test_forget_channel(node_factory):
 
 def test_peerinfo(node_factory, bitcoind):
     l1, l2 = node_factory.line_graph(2, fundchannel=False, opts={'may_reconnect': True})
-    if EXPERIMENTAL_FEATURES:
-        lfeatures = '8a'
-    else:
-        lfeatures = '88'
+    lfeatures = '8a'
     # Gossiping but no node announcement yet
     assert l1.rpc.getpeer(l2.info['id'])['connected']
     assert len(l1.rpc.getpeer(l2.info['id'])['channels']) == 0
@@ -1255,10 +1252,11 @@ def test_funder_simple_reconnect(node_factory, bitcoind):
 
 
 @unittest.skipIf(not DEVELOPER, "needs LIGHTNINGD_DEV_LOG_IO")
-@unittest.skipIf(not EXPERIMENTAL_FEATURES, "needs option_dataloss_protect")
 def test_dataloss_protection(node_factory, bitcoind):
-    l1 = node_factory.get_node(may_reconnect=True, log_all_io=True)
-    l2 = node_factory.get_node(may_reconnect=True, log_all_io=True)
+    l1 = node_factory.get_node(may_reconnect=True, log_all_io=True,
+                               feerates=(7500, 7500, 7500))
+    l2 = node_factory.get_node(may_reconnect=True, log_all_io=True,
+                               feerates=(7500, 7500, 7500))
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     # l1 should send out WIRE_INIT (0010)
@@ -1283,9 +1281,9 @@ def test_dataloss_protection(node_factory, bitcoind):
                            # channel_id
                            "[0-9a-f]{64}"
                            # next_local_commitment_number
-                           "000000000000000[1-9]"
+                           "0000000000000001"
                            # next_remote_revocation_number
-                           "000000000000000[0-9]"
+                           "0000000000000000"
                            # your_last_per_commitment_secret (funding_depth may
                            # trigger a fee-update and commit, hence this may not
                            # be zero)

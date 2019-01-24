@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 - The `short_channel_id` separator has been changed to be `x` to match the specification.
 - JSON API: `listpeers` now includes `funding_allocation_msat`, which returns a map of the amounts initially funded to the channel by each peer, indexed by channel id.
+- `option_data_loss_protect` is now enabled by default.
 
 ### Deprecated
 
@@ -28,6 +29,8 @@ Note: You should always set `allow-deprecated-apis=false` to test for
 changes.
 
 ### Removed
+
+- JSON API: the `waitsendpay` command error return no longer includes `channel_update`
 
 ### Fixed
 

@@ -594,7 +594,8 @@ static struct channel *wallet_stmt2channel(const tal_t *ctx, struct wallet *w, s
 
 	if (sqlite3_column_type(stmt, 2) != SQLITE_NULL) {
 		scid = tal(tmpctx, struct short_channel_id);
-		sqlite3_column_short_channel_id(stmt, 2, scid);
+		if (!sqlite3_column_short_channel_id(stmt, 2, scid))
+			return NULL;
 	} else {
 		scid = NULL;
 	}
@@ -2165,8 +2166,11 @@ wallet_outpoint_spend(struct wallet *w, const tal_t *ctx, const u32 blockheight,
 		assert(res == SQLITE_ROW);
 
 		scid = tal(ctx, struct short_channel_id);
-		mk_short_channel_id(scid, sqlite3_column_int(stmt, 0),
-				    sqlite3_column_int(stmt, 1), outnum);
+		if (!mk_short_channel_id(scid, sqlite3_column_int(stmt, 0),
+					 sqlite3_column_int(stmt, 1), outnum))
+			fatal("wallet_outpoint_spend: invalid scid %u:%u:%u",
+			      sqlite3_column_int(stmt, 0),
+			      sqlite3_column_int(stmt, 1), outnum);
 		db_stmt_done(stmt);
 		return scid;
 	}

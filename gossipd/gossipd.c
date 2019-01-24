@@ -664,13 +664,14 @@ static void reply_channel_range(struct peer *peer,
  * tail_blocks is the empty blocks at the end, in case they asked for all
  * blocks to 4 billion.
  */
-static void queue_channel_ranges(struct peer *peer,
+static bool queue_channel_ranges(struct peer *peer,
 				 u32 first_blocknum, u32 number_of_blocks,
 				 u32 tail_blocks)
 {
 	struct routing_state *rstate = peer->daemon->rstate;
 	u8 *encoded = encode_short_channel_ids_start(tmpctx);
 	struct short_channel_id scid;
+	bool scid_ok;
 
 	/* BOLT #7:
 	 *
@@ -688,10 +689,12 @@ static void queue_channel_ranges(struct peer *peer,
 
 	/* Avoid underflow: we don't use block 0 anyway */
 	if (first_blocknum == 0)
-		mk_short_channel_id(&scid, 1, 0, 0);
+		scid_ok = mk_short_channel_id(&scid, 1, 0, 0);
 	else
-		mk_short_channel_id(&scid, first_blocknum, 0, 0);
+		scid_ok = mk_short_channel_id(&scid, first_blocknum, 0, 0);
 	scid.u64--;
+	if (!scid_ok)
+		return false;
 
 	/* We keep a `uintmap` of `short_channel_id` to `struct chan *`.
 	 * Unlike a htable, it's efficient to iterate through, but it only
@@ -712,7 +715,7 @@ static void queue_channel_ranges(struct peer *peer,
 		reply_channel_range(peer, first_blocknum,
 				    number_of_blocks + tail_blocks,
 				    encoded);
-		return;
+		return true;
 	}
 
 	/* It wouldn't all fit: divide in half */
@@ -721,7 +724,7 @@ static void queue_channel_ranges(struct peer *peer,
 		/* We always assume we can send 1 blocks worth */
 		status_broken("Could not fit scids for single block %u",
 			      first_blocknum);
-		return;
+		return false;
 	}
 	status_debug("queue_channel_ranges full: splitting %u+%u and %u+%u(+%u)",
 		     first_blocknum,
@@ -729,10 +732,10 @@ static void queue_channel_ranges(struct peer *peer,
 		     first_blocknum + number_of_blocks / 2,
 		     number_of_blocks - number_of_blocks / 2,
 		     tail_blocks);
-	queue_channel_ranges(peer, first_blocknum, number_of_blocks / 2, 0);
-	queue_channel_ranges(peer, first_blocknum + number_of_blocks / 2,
-			     number_of_blocks - number_of_blocks / 2,
-			     tail_blocks);
+	return queue_channel_ranges(peer, first_blocknum, number_of_blocks / 2, 0)
+		&& queue_channel_ranges(peer, first_blocknum + number_of_blocks / 2,
+					number_of_blocks - number_of_blocks / 2,
+					tail_blocks);
 }
 
 /*~ The peer can ask for all channels is a series of blocks.  We reply with one
@@ -778,8 +781,12 @@ static u8 *handle_query_channel_range(struct peer *peer, const u8 *msg)
 	} else
 		tail_blocks = 0;
 
-	queue_channel_ranges(peer, first_blocknum, number_of_blocks,
-			     tail_blocks);
+	if (!queue_channel_ranges(peer, first_blocknum, number_of_blocks,
+				  tail_blocks))
+		return towire_errorfmt(peer, NULL,
+				       "Invalid query_channel_range %u+%u",
+				       first_blocknum, number_of_blocks + tail_blocks);
+
 	return NULL;
 }
 
@@ -2504,49 +2511,95 @@ static struct io_plan *handle_txout_reply(struct io_conn *conn,
 	return daemon_conn_read_next(conn, daemon->master);
 }
 
+/* Fix up the channel_update to include the type if it doesn't currently have
+ * one. See ElementsProject/lightning#1730 and lightningnetwork/lnd#1599 for the
+ * in-depth discussion on why we break message parsing here... */
+static u8 *patch_channel_update(const tal_t *ctx, u8 *channel_update TAKES)
+{
+	u8 *fixed;
+	if (channel_update != NULL &&
+	    fromwire_peektype(channel_update) != WIRE_CHANNEL_UPDATE) {
+		/* This should be a channel_update, prefix with the
+		 * WIRE_CHANNEL_UPDATE type, but isn't. Let's prefix it. */
+		fixed = tal_arr(ctx, u8, 0);
+		towire_u16(&fixed, WIRE_CHANNEL_UPDATE);
+		towire(&fixed, channel_update, tal_bytelen(channel_update));
+		if (taken(channel_update))
+			tal_free(channel_update);
+		return fixed;
+	} else {
+		return tal_dup_arr(ctx, u8,
+				   channel_update, tal_count(channel_update), 0);
+	}
+}
+
+/* Return NULL if the wrapped onion error message has no channel_update field,
+ * or return the embedded channel_update message otherwise. */
+static u8 *channel_update_from_onion_error(const tal_t *ctx,
+					   const u8 *onion_message)
+{
+	u8 *channel_update = NULL;
+	u64 unused64;
+	u32 unused32;
+
+	/* Identify failcodes that have some channel_update.
+	 *
+	 * TODO > BOLT 1.0: Add new failcodes when updating to a
+	 * new BOLT version. */
+	if (!fromwire_temporary_channel_failure(ctx,
+						onion_message,
+						&channel_update) &&
+	    !fromwire_amount_below_minimum(ctx,
+					   onion_message, &unused64,
+					   &channel_update) &&
+	    !fromwire_fee_insufficient(ctx,
+		    		       onion_message, &unused64,
+				       &channel_update) &&
+	    !fromwire_incorrect_cltv_expiry(ctx,
+		    			    onion_message, &unused32,
+					    &channel_update) &&
+	    !fromwire_expiry_too_soon(ctx,
+		    		      onion_message,
+				      &channel_update))
+		/* No channel update. */
+		return NULL;
+
+	return patch_channel_update(ctx, take(channel_update));
+}
+
 /*~ lightningd tells us when a payment has failed; we mark the channel (or
- * node) unusable here (maybe temporarily), and unpack and channel_update
- * contained in the error. */
-static struct io_plan *handle_routing_failure(struct io_conn *conn,
+ * node) unusable here if it's a permanent failure, and unpack any
+ * channel_update contained in the error. */
+static struct io_plan *handle_payment_failure(struct io_conn *conn,
 					      struct daemon *daemon,
 					      const u8 *msg)
 {
 	struct pubkey erring_node;
 	struct short_channel_id erring_channel;
-	u16 failcode;
+	u8 erring_channel_direction;
+	u8 *error;
+	enum onion_type failcode;
 	u8 *channel_update;
 
-	if (!fromwire_gossip_routing_failure(msg,
-					     msg,
+	if (!fromwire_gossip_payment_failure(msg, msg,
 					     &erring_node,
 					     &erring_channel,
-					     &failcode,
-					     &channel_update))
-		master_badmsg(WIRE_GOSSIP_ROUTING_FAILURE, msg);
+					     &erring_channel_direction,
+					     &error))
+		master_badmsg(WIRE_GOSSIP_PAYMENT_FAILURE, msg);
 
+	failcode = fromwire_peektype(error);
+	channel_update = channel_update_from_onion_error(tmpctx, error);
+	if (channel_update)
+		status_debug("Extracted channel_update %s from onionreply %s",
+			     tal_hex(tmpctx, channel_update),
+			     tal_hex(tmpctx, error));
 	routing_failure(daemon->rstate,
 			&erring_node,
 			&erring_channel,
-			(enum onion_type) failcode,
+			erring_channel_direction,
+			failcode,
 			channel_update);
-
-	return daemon_conn_read_next(conn, daemon->master);
-}
-
-/*~ This allows lightningd to explicitly mark a channel temporarily unroutable.
- * This is used when we get an unparsable error, and we don't know who to blame;
- * lightningd uses this to marking routes unroutable at random... */
-static struct io_plan *
-handle_mark_channel_unroutable(struct io_conn *conn,
-			       struct daemon *daemon,
-			       const u8 *msg)
-{
-	struct short_channel_id channel;
-
-	if (!fromwire_gossip_mark_channel_unroutable(msg, &channel))
-		master_badmsg(WIRE_GOSSIP_MARK_CHANNEL_UNROUTABLE, msg);
-
-	mark_channel_unroutable(daemon->rstate, &channel);
 
 	return daemon_conn_read_next(conn, daemon->master);
 }
@@ -2561,7 +2614,7 @@ static struct io_plan *handle_outpoint_spent(struct io_conn *conn,
 	struct chan *chan;
 	struct routing_state *rstate = daemon->rstate;
 	if (!fromwire_gossip_outpoint_spent(msg, &scid))
-		master_badmsg(WIRE_GOSSIP_ROUTING_FAILURE, msg);
+		master_badmsg(WIRE_GOSSIP_OUTPOINT_SPENT, msg);
 
 	chan = get_channel(rstate, &scid);
 	if (chan) {
@@ -2598,7 +2651,7 @@ static struct io_plan *handle_local_channel_close(struct io_conn *conn,
 	struct chan *chan;
 	struct routing_state *rstate = daemon->rstate;
 	if (!fromwire_gossip_local_channel_close(msg, &scid))
-		master_badmsg(WIRE_GOSSIP_ROUTING_FAILURE, msg);
+		master_badmsg(WIRE_GOSSIP_LOCAL_CHANNEL_CLOSE, msg);
 
 	chan = get_channel(rstate, &scid);
 	if (chan)
@@ -2632,11 +2685,8 @@ static struct io_plan *recv_req(struct io_conn *conn,
 	case WIRE_GOSSIP_GET_TXOUT_REPLY:
 		return handle_txout_reply(conn, daemon, msg);
 
-	case WIRE_GOSSIP_ROUTING_FAILURE:
-		return handle_routing_failure(conn, daemon, msg);
-
-	case WIRE_GOSSIP_MARK_CHANNEL_UNROUTABLE:
-		return handle_mark_channel_unroutable(conn, daemon, msg);
+	case WIRE_GOSSIP_PAYMENT_FAILURE:
+		return handle_payment_failure(conn, daemon, msg);
 
 	case WIRE_GOSSIP_OUTPOINT_SPENT:
 		return handle_outpoint_spent(conn, daemon, msg);
