@@ -11,11 +11,13 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 - plugins: fully enabled, and ready for you to write some!
 - plugins: `pay` is now a plugin.
+- protocol: `pay` will now use routehints in invoices if it needs to.
 - lightning-cli: `help <cmd>` finds man pages even if `make install` not run.
 - JSON API: `waitsendpay` now has an `erring_direction` field.
 - JSON API: `listpeers` now has a `direction` field in `channels`.
 - JSON API: `listchannels` now takes a `source` option to filter by node id.
 - JSON API: New command `paystatus` gives detailed information on `pay` commands.
+- JSON API: `getroute` `riskfactor` argument is simplified; `pay` now defaults to setting it to 10.
 
 ### Changed
 
@@ -38,6 +40,8 @@ changes.
   (eg. 4 billion) was slow due to a bug.
 - Fixed occasional deadlock with peers when exchanging huge amounts of gossip.
 - You can no longer make giant unpayable "wumbo" invoices.
+- CLTV of total route now correctly evaluated when finding best route.
+- `riskfactor` arguments to `pay` and `getroute` now have an effect.
 
 ### Security
 

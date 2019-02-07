@@ -529,9 +529,13 @@ find_route(const tal_t *ctx, struct routing_state *rstate,
 
 	best = 0;
 	for (i = 1; i <= max_hops; i++) {
-		if (dst->bfg[i].total < dst->bfg[best].total)
+		status_trace("%i hop solution: %"PRIu64" + %"PRIu64,
+			     i, dst->bfg[i].total, dst->bfg[i].risk);
+		if (dst->bfg[i].total + dst->bfg[i].risk
+		    < dst->bfg[best].total + dst->bfg[best].risk)
 			best = i;
 	}
+	status_trace("=> chose %i hop solution", best);
 
 	/* No route? */
 	if (dst->bfg[best].total >= INFINITE) {
@@ -1496,7 +1500,7 @@ struct route_hop *get_route(const tal_t *ctx, struct routing_state *rstate,
 			    const struct pubkey *destination,
 			    const u64 msatoshi, double riskfactor,
 			    u32 final_cltv,
-			    double fuzz, const struct siphash_seed *base_seed,
+			    double fuzz, u64 seed,
 			    const struct short_channel_id_dir *excluded,
 			    size_t max_hops)
 {
@@ -1507,8 +1511,11 @@ struct route_hop *get_route(const tal_t *ctx, struct routing_state *rstate,
 	struct route_hop *hops;
 	struct node *n;
 	u64 *saved_capacity;
+	struct siphash_seed base_seed;
 
 	saved_capacity = tal_arr(tmpctx, u64, tal_count(excluded));
+
+	base_seed.u.u64[0] = base_seed.u.u64[1] = seed;
 
 	/* Temporarily set excluded channels' capacity to zero. */
 	for (size_t i = 0; i < tal_count(excluded); i++) {
@@ -1521,8 +1528,8 @@ struct route_hop *get_route(const tal_t *ctx, struct routing_state *rstate,
 	}
 
 	route = find_route(ctx, rstate, source, destination, msatoshi,
-			   riskfactor / BLOCKS_PER_YEAR / 10000,
-			   fuzz, base_seed, max_hops, &fee);
+			   riskfactor / BLOCKS_PER_YEAR / 100,
+			   fuzz, &base_seed, max_hops, &fee);
 
 	/* Now restore the capacity. */
 	for (size_t i = 0; i < tal_count(excluded); i++) {
