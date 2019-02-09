@@ -8,6 +8,8 @@
 #include <lightningd/json_stream.h>
 #include <stdarg.h>
 
+struct jsonrpc;
+
 /* The command mode tells param() how to process. */
 enum command_mode {
 	/* Normal command processing */
@@ -35,8 +37,6 @@ struct command {
 	bool pending;
 	/* Tell param() how to process the command */
 	enum command_mode mode;
-	/* This is created if mode is CMD_USAGE */
-	const char *usage;
 	/* Have we started a json stream already?  For debugging. */
 	bool have_json_stream;
 };
@@ -152,8 +152,10 @@ struct command_result *command_its_complicated(const char *why);
  * This doesn't setup the listener yet, see `jsonrpc_listen` for
  * that. This just creates the container for all jsonrpc-related
  * information so we can start gathering it before actually starting.
+ *
+ * It initializes ld->jsonrpc.
  */
-struct jsonrpc *jsonrpc_new(const tal_t *ctx, struct lightningd *ld);
+void jsonrpc_setup(struct lightningd *ld);
 
 
 /**
@@ -168,16 +170,11 @@ void jsonrpc_listen(struct jsonrpc *rpc, struct lightningd *ld);
  *
  * Returns true if the command was added correctly, false if adding
  * this would clobber a command name.
- */
-bool jsonrpc_command_add(struct jsonrpc *rpc, struct json_command *command);
-
-/**
- * Remove a command/method from the JSON-RPC.
  *
- * Used to dynamically remove a `struct json_command` from the
- * JSON-RPC dispatch table by its name.
+ * Free @command to remove it.
  */
-void jsonrpc_command_remove(struct jsonrpc *rpc, const char *method);
+bool jsonrpc_command_add(struct jsonrpc *rpc, struct json_command *command,
+			 const char *usage TAKES);
 
 /**
  * Begin a JSON-RPC notification with the specified topic.
@@ -210,4 +207,13 @@ struct jsonrpc_request *jsonrpc_request_start_(
 void jsonrpc_request_end(struct jsonrpc_request *request);
 
 AUTODATA_TYPE(json_command, struct json_command);
+
+#if DEVELOPER
+struct htable;
+struct jsonrpc;
+
+void jsonrpc_remove_memleak(struct htable *memtable,
+			    const struct jsonrpc *jsonrpc);
+#endif /* DEVELOPER */
+
 #endif /* LIGHTNING_LIGHTNINGD_JSONRPC_H */

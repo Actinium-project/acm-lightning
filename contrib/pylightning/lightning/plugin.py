@@ -25,7 +25,7 @@ class Plugin(object):
     """
 
     def __init__(self, stdout=None, stdin=None, autopatch=True):
-        self.methods = {}
+        self.methods = {'init': (self._init, MethodType.RPCMETHOD)}
         self.options = {}
 
         # A dict from topics to handler functions
@@ -43,7 +43,7 @@ class Plugin(object):
         self.rpc_filename = None
         self.lightning_dir = None
         self.rpc = None
-        self.init = None
+        self.child_init = None
 
     def add_method(self, name, func):
         """Add a plugin method to the dispatch table.
@@ -158,6 +158,16 @@ class Plugin(object):
             return f
         return decorator
 
+    def init(self, *args, **kwargs):
+        """Decorator to add a function called after plugin initialization
+        """
+        def decorator(f):
+            if self.child_init is not None:
+                raise ValueError('The @plugin.init decorator should only be used once')
+            self.child_init = f
+            return f
+        return decorator
+
     def _exec_func(self, func, request):
         params = request['params']
         sig = inspect.signature(func)
@@ -265,12 +275,6 @@ class Plugin(object):
         return msgs[-1]
 
     def run(self):
-        # Stash the init method handler, we'll handle opts first and
-        # then unstash this and call it.
-        if 'init' in self.methods:
-            self.init = self.methods['init']
-        self.methods['init'] = (self._init, MethodType.RPCMETHOD)
-
         partial = ""
         for l in self.stdin:
             partial += l
@@ -302,9 +306,27 @@ class Plugin(object):
                 doc = "Undocumented RPC method from a plugin."
             doc = re.sub('\n+', ' ', doc)
 
+            # Handles out-of-order use of parameters like:
+            # def hello_obfus(arg1, arg2, plugin, thing3, request=None, thing5='at', thing6=21)
+            argspec = inspect.getargspec(func)
+            defaults = argspec.defaults
+            num_defaults = len(defaults) if defaults else 0
+            start_kwargs_idx = len(argspec.args) - num_defaults
+            args = []
+            for idx, arg in enumerate(argspec.args):
+                if arg in ('plugin', 'request'):
+                    continue
+                # Positional arg
+                if idx < start_kwargs_idx:
+                    args.append("%s" % arg)
+                # Keyword arg
+                else:
+                    args.append("[%s]" % arg)
+
             methods.append({
                 'name': name,
-                'description': doc,
+                'usage': " ".join(args),
+                'description': doc
             })
 
         return {
@@ -322,12 +344,9 @@ class Plugin(object):
         for name, value in options.items():
             self.options[name]['value'] = value
 
-        # Swap the registered `init` method handler back in and
-        # re-dispatch
-        if self.init:
-            self.methods['init'], _ = self.init
-            self.init = None
-            return self._exec_func(self.methods['init'], request)
+        # Dispatch the plugin's init handler if any
+        if self.child_init:
+            return self._exec_func(self.child_init, request)
         return None
 
 

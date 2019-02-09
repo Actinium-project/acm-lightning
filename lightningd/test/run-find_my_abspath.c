@@ -94,9 +94,9 @@ void htlcs_notify_new_block(struct lightningd *ld UNNEEDED, u32 height UNNEEDED)
 /* Generated stub for jsonrpc_listen */
 void jsonrpc_listen(struct jsonrpc *rpc UNNEEDED, struct lightningd *ld UNNEEDED)
 { fprintf(stderr, "jsonrpc_listen called!\n"); abort(); }
-/* Generated stub for jsonrpc_new */
-struct jsonrpc *jsonrpc_new(const tal_t *ctx UNNEEDED, struct lightningd *ld UNNEEDED)
-{ fprintf(stderr, "jsonrpc_new called!\n"); abort(); }
+/* Generated stub for jsonrpc_setup */
+void jsonrpc_setup(struct lightningd *ld UNNEEDED)
+{ fprintf(stderr, "jsonrpc_setup called!\n"); abort(); }
 /* Generated stub for load_channels_from_wallet */
 void load_channels_from_wallet(struct lightningd *ld UNNEEDED)
 { fprintf(stderr, "load_channels_from_wallet called!\n"); abort(); }
@@ -137,7 +137,7 @@ void plugins_init(struct plugins *plugins UNNEEDED, const char *dev_plugin_debug
 { fprintf(stderr, "plugins_init called!\n"); abort(); }
 /* Generated stub for plugins_new */
 struct plugins *plugins_new(const tal_t *ctx UNNEEDED, struct log_book *log_book UNNEEDED,
-			    struct jsonrpc *rpc UNNEEDED, struct lightningd *ld UNNEEDED)
+			    struct lightningd *ld UNNEEDED)
 { fprintf(stderr, "plugins_new called!\n"); abort(); }
 /* Generated stub for register_opts */
 void register_opts(struct lightningd *ld UNNEEDED)

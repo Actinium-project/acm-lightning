@@ -2,6 +2,7 @@
 #include <ccan/intmap/intmap.h>
 #include <ccan/membuf/membuf.h>
 #include <ccan/read_write_all/read_write_all.h>
+#include <ccan/strmap/strmap.h>
 #include <ccan/tal/str/str.h>
 #include <common/daemon.h>
 #include <common/utils.h>
@@ -20,6 +21,10 @@
 static UINTMAP(struct out_req *) out_reqs;
 static u64 next_outreq_id;
 
+/* Map from json command names to usage strings: we don't put this inside
+ * struct json_command as it's good practice to have those const. */
+static STRMAP(const char *) usagemap;
+
 struct plugin_conn {
 	int fd;
 	MEMBUF(char) mb;
@@ -27,6 +32,7 @@ struct plugin_conn {
 
 struct command {
 	u64 id;
+	const char *methodname;
 	struct plugin_conn *rpc;
 };
 
@@ -110,11 +116,10 @@ static int read_json(struct plugin_conn *conn)
 static struct command *read_json_request(const tal_t *ctx,
 					 struct plugin_conn *conn,
 					 struct plugin_conn *rpc,
-					 const jsmntok_t **method,
 					 const jsmntok_t **params,
 					 int *reqlen)
 {
-	const jsmntok_t *toks, *id;
+	const jsmntok_t *toks, *id, *method;
 	bool valid;
 	struct command *cmd = tal(ctx, struct command);
 
@@ -128,7 +133,7 @@ static struct command *read_json_request(const tal_t *ctx,
 		plugin_err("Malformed JSON command '%*.s' is not an object",
 			   *reqlen, membuf_elems(&conn->mb));
 
-	*method = json_get_member(membuf_elems(&conn->mb), toks, "method");
+	method = json_get_member(membuf_elems(&conn->mb), toks, "method");
 	*params = json_get_member(membuf_elems(&conn->mb), toks, "params");
 	/* FIXME: Notifications don't have id! */
 	id = json_get_member(membuf_elems(&conn->mb), toks, "id");
@@ -138,6 +143,7 @@ static struct command *read_json_request(const tal_t *ctx,
 			   membuf_elems(&conn->mb) + id->start);
 	/* Putting this in cmd avoids a global, or direct exposure to users */
 	cmd->rpc = rpc;
+	cmd->methodname = json_strdup(cmd, membuf_elems(&conn->mb), method);
 
 	return cmd;
 }
@@ -259,20 +265,23 @@ struct command_result *command_fail(struct command *cmd,
 	return res;
 }
 
-/* We never invoke param for usage. */
+/* We invoke param for usage at registration time. */
 bool command_usage_only(const struct command *cmd)
 {
-	return false;
+	return cmd->rpc == NULL;
 }
 
+/* FIXME: would be good to support this! */
 bool command_check_only(const struct command *cmd)
 {
 	return false;
 }
 
-void command_set_usage(struct command *cmd, const char *usage)
+void command_set_usage(struct command *cmd, const char *usage TAKES)
 {
-	abort();
+	usage = tal_strdup(NULL, usage);
+	if (!strmap_add(&usagemap, cmd->methodname, usage))
+		plugin_err("Two usages for command %s?", cmd->methodname);
 }
 
 /* Reads rpc reply and returns tokens, setting contents to 'error' or
@@ -417,8 +426,10 @@ handle_getmanifest(struct command *getmanifest_cmd,
 				   "'rpcmethods': [ ");
 	for (size_t i = 0; i < num_commands; i++) {
 		tal_append_fmt(&params, "{ 'name': '%s',"
+			       "    'usage': '%s',"
 			       "    'description': '%s'",
 			       commands[i].name,
+			       strmap_get(&usagemap, commands[i].name),
 			       commands[i].description);
 		if (commands[i].long_description)
 			tal_append_fmt(&params,
@@ -474,14 +485,12 @@ static void handle_new_command(const tal_t *ctx,
 			       size_t num_commands)
 {
 	struct command *cmd;
-	const jsmntok_t *method, *params;
+	const jsmntok_t *params;
 	int reqlen;
 
-	cmd = read_json_request(ctx, request_conn, rpc_conn,
-				&method, &params, &reqlen);
+	cmd = read_json_request(ctx, request_conn, rpc_conn, &params, &reqlen);
 	for (size_t i = 0; i < num_commands; i++) {
-		if (json_tok_streq(membuf_elems(&request_conn->mb), method,
-				   commands[i].name)) {
+		if (streq(cmd->methodname, commands[i].name)) {
 			commands[i].handle(cmd, membuf_elems(&request_conn->mb),
 					   params);
 			membuf_consume(&request_conn->mb, reqlen);
@@ -489,9 +498,24 @@ static void handle_new_command(const tal_t *ctx,
 		}
 	}
 
-	plugin_err("Unknown command '%.*s'",
-		   method->end - method->start,
-		   membuf_elems(&request_conn->mb) + method->start);
+	plugin_err("Unknown command '%s'", cmd->methodname);
+}
+
+static void setup_command_usage(const struct plugin_command *commands,
+				size_t num_commands)
+{
+	struct command *usage_cmd = tal(tmpctx, struct command);
+
+	/* This is how common/param can tell it's just a usage request */
+	usage_cmd->rpc = NULL;
+	for (size_t i = 0; i < num_commands; i++) {
+		struct command_result *res;
+
+		usage_cmd->methodname = commands[i].name;
+		res = commands[i].handle(usage_cmd, NULL, NULL);
+		assert(res == NULL);
+		assert(strmap_get(&usagemap, commands[i].name));
+	}
 }
 
 void plugin_main(char *argv[],
@@ -502,7 +526,7 @@ void plugin_main(char *argv[],
 	struct plugin_conn request_conn, rpc_conn;
 	const tal_t *ctx = tal(NULL, char);
 	struct command *cmd;
-	const jsmntok_t *method, *params;
+	const jsmntok_t *params;
 	int reqlen;
 	struct pollfd fds[2];
 
@@ -512,6 +536,8 @@ void plugin_main(char *argv[],
 
 	/* Note this already prints to stderr, which is enough for now */
 	daemon_setup(argv[0], NULL, NULL);
+
+	setup_command_usage(commands, num_commands);
 
 	membuf_init(&rpc_conn.mb,
 		    tal_arr(ctx, char, READ_CHUNKSIZE), READ_CHUNKSIZE,
@@ -523,23 +549,18 @@ void plugin_main(char *argv[],
 	uintmap_init(&out_reqs);
 
 	cmd = read_json_request(tmpctx, &request_conn, NULL,
-				&method, &params, &reqlen);
-	if (!json_tok_streq(membuf_elems(&request_conn.mb), method,
-			    "getmanifest")) {
-		plugin_err("Expected getmanifest not '%.*s'",
-			   method->end - method->start,
-			   membuf_elems(&request_conn.mb) + method->start);
-	}
+				&params, &reqlen);
+	if (!streq(cmd->methodname, "getmanifest"))
+		plugin_err("Expected getmanifest not %s", cmd->methodname);
+
 	membuf_consume(&request_conn.mb, reqlen);
 	handle_getmanifest(cmd, commands, num_commands);
 
 	cmd = read_json_request(tmpctx, &request_conn, &rpc_conn,
-				&method, &params, &reqlen);
-	if (!json_tok_streq(membuf_elems(&request_conn.mb), method, "init")) {
-		plugin_err("Expected init not '%.*s'",
-			   method->end - method->start,
-			   membuf_elems(&request_conn.mb) + method->start);
-	}
+				&params, &reqlen);
+	if (!streq(cmd->methodname, "init"))
+		plugin_err("Expected init not %s", cmd->methodname);
+
 	handle_init(cmd, membuf_elems(&request_conn.mb),
 		    params, init);
 	membuf_consume(&request_conn.mb, reqlen);

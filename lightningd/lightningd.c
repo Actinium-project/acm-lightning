@@ -207,7 +207,7 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	 *  lightningd needs to have something to put those in. This
 	 *  is that :-)
 	 */
-	ld->jsonrpc = jsonrpc_new(ld, ld);
+	jsonrpc_setup(ld);
 
 	/*~ We run a number of plugins (subprocesses that we talk JSON-RPC with)
 	 *alongside this process. This allows us to have an easy way for users
@@ -215,7 +215,7 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	 *code. Here we initialize the context that will keep track and control
 	 *the plugins.
 	 */
-	ld->plugins = plugins_new(ld, ld->log_book, ld->jsonrpc, ld);
+	ld->plugins = plugins_new(ld, ld->log_book, ld);
 
 	return ld;
 }
