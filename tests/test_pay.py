@@ -1167,6 +1167,7 @@ def test_pay_variants(node_factory):
     l1.rpc.pay(b11)
 
 
+@unittest.skipIf(not DEVELOPER, "gossip without DEVELOPER=1 is slow")
 def test_pay_retry(node_factory, bitcoind):
     """Make sure pay command retries properly. """
     def exhaust_channel(funder, fundee, scid, already_spent=0):
@@ -1341,6 +1342,7 @@ def test_pay_routeboost(node_factory, bitcoind):
         assert [h['channel'] for h in attempts[2]['routehint']] == [r['short_channel_id'] for r in routel3l5]
 
 
+@unittest.skipIf(not DEVELOPER, "gossip without DEVELOPER=1 is slow")
 def test_pay_direct(node_factory, bitcoind):
     """Check that we prefer the direct route.
     """
@@ -1372,6 +1374,9 @@ def test_pay_direct(node_factory, bitcoind):
     # Let channels lock in.
     bitcoind.generate_block(5)
 
+    # Make l1 sees it, so it doesn't produce bad CLTVs.
+    sync_blockheight(bitcoind, [l1])
+
     # Make sure l0 knows the l2->l3 channel.
     # Without DEVELOPER, channel lockin can take 30 seconds to detect,
     # and gossip 2 minutes to propagate
@@ -1383,7 +1388,7 @@ def test_pay_direct(node_factory, bitcoind):
     # Try multiple times to ensure that route randomization
     # will not override our preference for direct route.
     for i in range(8):
-        inv = l3.rpc.invoice(15000000, 'pay{}'.format(i), 'desc')['bolt11']
+        inv = l3.rpc.invoice(20000000, 'pay{}'.format(i), 'desc')['bolt11']
 
         l0.rpc.pay(inv)
 

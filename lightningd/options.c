@@ -373,7 +373,7 @@ static void config_register_opts(struct lightningd *ld)
 			 &ld->config.rescan,
 			 "Number of blocks to rescan from the current head, or "
 			 "absolute blockheight if negative");
-	opt_register_arg("--fee-per-satoshi", opt_set_s32, opt_show_s32,
+	opt_register_arg("--fee-per-satoshi", opt_set_u32, opt_show_u32,
 			 &ld->config.fee_per_satoshi,
 			 "Microsatoshi fee for every satoshi in HTLC");
 	opt_register_arg("--addr", opt_add_addr, NULL,
@@ -1027,7 +1027,8 @@ static void add_config(struct lightningd *ld,
 		} else if (opt->cb_arg == (void *)opt_add_plugin) {
 			json_add_opt_plugins(response, ld->plugins);
 		} else if (opt->cb_arg == (void *)opt_add_plugin_dir
-			   || opt->cb_arg == (void *)opt_disable_plugin) {
+			   || opt->cb_arg == (void *)opt_disable_plugin
+			   || opt->cb_arg == (void *)plugin_opt_set) {
 			/* FIXME: We actually treat it as if they specified
 			 * --plugin for each one, so ignore these */
 #if DEVELOPER
