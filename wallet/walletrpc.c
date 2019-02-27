@@ -48,7 +48,7 @@ static void wallet_withdrawal_broadcast(struct bitcoind *bitcoind UNUSED,
 {
 	struct command *cmd = withdraw->cmd;
 	struct lightningd *ld = withdraw->cmd->ld;
-	u64 change_satoshi = 0;
+	struct amount_sat change = AMOUNT_SAT(0);
 
 	/* Massage output into shape so it doesn't kill the JSON serialization */
 	char *output = tal_strjoin(cmd, tal_strsplit(cmd, msg, "\n", STR_NO_EMPTY), " ", STR_NO_TRAIL);
@@ -62,11 +62,11 @@ static void wallet_withdrawal_broadcast(struct bitcoind *bitcoind UNUSED,
 		assert(tx != NULL);
 
 		/* Extract the change output and add it to the DB */
-		wallet_extract_owned_outputs(ld->wallet, tx, NULL, &change_satoshi);
+		wallet_extract_owned_outputs(ld->wallet, tx, NULL, &change);
 
 		/* Note normally, change_satoshi == withdraw->wtx.change, but
 		 * not if we're actually making a payment to ourselves! */
-		assert(change_satoshi >= withdraw->wtx.change);
+		assert(amount_sat_greater_eq(change, withdraw->wtx.change));
 
 		struct json_stream *response = json_stream_success(cmd);
 		json_object_start(response, NULL);
@@ -93,7 +93,7 @@ static struct command_result *json_withdraw(struct command *cmd,
 					    const jsmntok_t *obj UNNEEDED,
 					    const jsmntok_t *params)
 {
-	const jsmntok_t *desttok, *sattok;
+	const jsmntok_t *desttok;
 	struct withdrawal *withdraw = tal(cmd, struct withdrawal);
 	u32 *feerate_per_kw;
 	struct bitcoin_tx *tx;
@@ -101,20 +101,18 @@ static struct command_result *json_withdraw(struct command *cmd,
 	struct pubkey pubkey;
 	enum address_parse_result addr_parse;
 	struct command_result *res;
+	u32 *minconf, maxheight;
 
 	withdraw->cmd = cmd;
-	wtx_init(cmd, &withdraw->wtx);
+	wtx_init(cmd, &withdraw->wtx, AMOUNT_SAT(-1ULL));
 
 	if (!param(cmd, buffer, params,
 		   p_req("destination", param_tok, &desttok),
-		   p_req("satoshi", param_tok, &sattok),
+		   p_req("satoshi", param_wtx, &withdraw->wtx),
 		   p_opt("feerate", param_feerate, &feerate_per_kw),
+		   p_opt_def("minconf", param_number, &minconf, 1),
 		   NULL))
 		return command_param_failed();
-
-	res = param_wtx(&withdraw->wtx, buffer, sattok, -1ULL);
-	if (res)
-		return res;
 
 	if (!feerate_per_kw) {
 		res = param_feerate_estimate(cmd, &feerate_per_kw,
@@ -142,8 +140,9 @@ static struct command_result *json_withdraw(struct command *cmd,
 				    get_chainparams(cmd->ld)->network_name);
 	}
 
+	maxheight = minconf_to_maxheight(*minconf, cmd->ld);
 	res = wtx_select_utxos(&withdraw->wtx, *feerate_per_kw,
-			       tal_count(withdraw->destination));
+			       tal_count(withdraw->destination), maxheight);
 	if (res)
 		return res;
 
@@ -184,10 +183,14 @@ static struct command_result *json_withdraw(struct command *cmd,
 }
 
 static const struct json_command withdraw_command = {
-	"withdraw",
-	json_withdraw,
-	"Send to {destination} address {satoshi} (or 'all') amount via Bitcoin transaction, at optional {feerate}",
-	false, "Send funds from the internal wallet to the specified address. Either specify a number of satoshis to send or 'all' to sweep all funds in the internal wallet to the address."
+    "withdraw", json_withdraw,
+    "Send to {destination} address {satoshi} (or 'all') amount via Bitcoin "
+    "transaction, at optional {feerate}",
+    false,
+    "Send funds from the internal wallet to the specified address. Either "
+    "specify a number of satoshis to send or 'all' to sweep all funds in the "
+    "internal wallet to the address. Only use outputs that have at least "
+    "{minconf} confirmations."
 };
 AUTODATA(json_command, &withdraw_command);
 
@@ -240,6 +243,26 @@ encode_pubkey_to_addr(const tal_t *ctx,
 	else
 		tal_free(redeemscript);
 
+	return out;
+}
+
+/* Returns NULL if the script is not a P2WPKH */
+static char *
+encode_scriptpubkey_to_addr(const tal_t *ctx,
+			    const struct lightningd *ld,
+			    const u8 *scriptPubkey)
+{
+	char *out;
+	const char *hrp;
+	size_t scriptLen = tal_bytelen(scriptPubkey);
+	bool ok;
+	if (scriptLen != 22 || scriptPubkey[0] != 0x00 || scriptPubkey[1] != 0x14)
+		return NULL;
+	hrp = get_chainparams(ld)->bip173_name;
+	out = tal_arr(ctx, char, 73 + strlen(hrp));
+	ok = segwit_addr_encode(out, hrp, 0, scriptPubkey + 2, scriptLen - 2);
+	if (!ok)
+		return tal_free(out);
 	return out;
 }
 
@@ -426,7 +449,8 @@ static struct command_result *json_listfunds(struct command *cmd,
 		json_object_start(response, NULL);
 		json_add_txid(response, "txid", &utxos[i]->txid);
 		json_add_num(response, "output", utxos[i]->outnum);
-		json_add_u64(response, "value", utxos[i]->amount);
+		json_add_amount_sat(response, utxos[i]->amount,
+				    "value", "amount_msat");
 
 		/* @close_info is for outputs that are not yet claimable */
 		if (utxos[i]->close_info == NULL) {
@@ -441,7 +465,13 @@ static struct command_result *json_listfunds(struct command *cmd,
 						    "p2wpkh address encoding failure.");
 			}
 		        json_add_string(response, "address", out);
+		} else if (utxos[i]->scriptPubkey != NULL) {
+			out = encode_scriptpubkey_to_addr(
+			    cmd, cmd->ld, utxos[i]->scriptPubkey);
+			if (out)
+				json_add_string(response, "address", out);
 		}
+
 		if (utxos[i]->spendheight)
 			json_add_string(response, "status", "spent");
 		else if (utxos[i]->blockheight)
@@ -465,11 +495,11 @@ static struct command_result *json_listfunds(struct command *cmd,
 							  "short_channel_id",
 							  c->scid);
 
-			/* Poor man's rounding to satoshis to match the unit for outputs */
-			json_add_u64(response, "channel_sat",
-				     (c->our_msatoshi + 500)/1000);
-			json_add_u64(response, "channel_total_sat",
-				     c->funding_satoshi);
+			json_add_amount_sat(response,
+					    amount_msat_to_sat_round_down(c->our_msat),
+					    "channel_sat", "our_amount_msat");
+			json_add_amount_sat(response, c->funding,
+					    "channel_total_sat", "amount_msat");
 			json_add_txid(response, "funding_txid",
 				      &c->funding_txid);
 			json_object_end(response);

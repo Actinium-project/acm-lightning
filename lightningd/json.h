@@ -7,6 +7,7 @@
 #include "config.h"
 #include <ccan/short_types/short_types.h>
 #include <ccan/tal/tal.h>
+#include <common/amount.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -115,6 +116,10 @@ void json_add_u64(struct json_stream *result, const char *fieldname,
 /* '"fieldname" : true|false' or 'true|false' if fieldname is NULL */
 void json_add_bool(struct json_stream *result, const char *fieldname,
 		   bool value);
+
+/* '"fieldname" : null' or 'null' if fieldname is NULL */
+void json_add_null(struct json_stream *stream, const char *fieldname);
+
 /* '"fieldname" : "0189abcdef..."' or "0189abcdef..." if fieldname is NULL */
 void json_add_hex(struct json_stream *result, const char *fieldname,
 		  const void *data, size_t len);
@@ -122,6 +127,20 @@ void json_add_hex(struct json_stream *result, const char *fieldname,
 void json_add_hex_talarr(struct json_stream *result,
 			 const char *fieldname,
 			 const tal_t *data);
+
+/* Adds both a 'raw' number field and an 'amount_msat' field */
+void json_add_amount_msat(struct json_stream *result,
+			  struct amount_msat msat,
+			  const char *rawfieldname,
+			  const char *msatfieldname)
+	NO_NULL_ARGS;
+
+/* Adds both a 'raw' number field and an 'amount_msat' field */
+void json_add_amount_sat(struct json_stream *result,
+			 struct amount_sat sat,
+			 const char *rawfieldname,
+			 const char *msatfieldname)
+	NO_NULL_ARGS;
 
 enum address_parse_result {
 	/* Not recognized as an onchain address */
@@ -138,9 +157,4 @@ enum address_parse_result json_tok_address_scriptpubkey(const tal_t *ctx,
 			     const struct chainparams *chainparams,
 			     const char *buffer,
 			     const jsmntok_t *tok, const u8 **scriptpubkey);
-
-/* Parse the satoshi token in wallet_tx. */
-struct command_result *param_wtx(struct wallet_tx * tx, const char * buffer,
-				 const jsmntok_t * sattok, u64 max);
-
 #endif /* LIGHTNING_LIGHTNINGD_JSON_H */

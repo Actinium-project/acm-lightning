@@ -22,6 +22,8 @@ type2size = {
     'struct bitcoin_blkid': 32,
     'struct bitcoin_txid': 32,
     'struct secret': 32,
+    'struct amount_msat': 8,
+    'struct amount_sat': 8,
     'u64': 8,
     'u32': 4,
     'u16': 2,
@@ -45,7 +47,7 @@ class FieldType(object):
         self.name = name
 
     def is_assignable(self):
-        return self.name in ['u8', 'u16', 'u32', 'u64', 'bool'] or self.name.startswith('enum ')
+        return self.name in ['u8', 'u16', 'u32', 'u64', 'bool', 'struct amount_msat', 'struct amount_sat'] or self.name.startswith('enum ')
 
     # We only accelerate the u8 case: it's common and trivial.
     def has_array_helper(self):
@@ -79,7 +81,9 @@ typemap = {
     ('channel_announcement', 'short_channel_id'): FieldType('struct short_channel_id'),
     ('channel_update', 'short_channel_id'): FieldType('struct short_channel_id'),
     ('revoke_and_ack', 'per_commitment_secret'): FieldType('struct secret'),
-    ('channel_reestablish_option_data_loss_protect', 'your_last_per_commitment_secret'): FieldType('struct secret')
+    ('channel_reestablish_option_data_loss_protect', 'your_last_per_commitment_secret'): FieldType('struct secret'),
+    ('channel_update', 'fee_base_msat'): FieldType('u32'),
+    ('final_incorrect_htlc_amount', 'incoming_htlc_amt'): FieldType('struct amount_msat'),
 }
 
 # Partial names that map to a datatype
@@ -90,6 +94,8 @@ partialtypemap = {
     'chain_hash': FieldType('struct bitcoin_blkid'),
     'funding_txid': FieldType('struct bitcoin_txid'),
     'pad': FieldType('pad'),
+    'msat': FieldType('struct amount_msat'),
+    'satoshis': FieldType('struct amount_sat'),
 }
 
 # Size to typename match

@@ -10,6 +10,7 @@
 #include <common/memleak.h>
 #include <common/param.h>
 #include <common/type_to_string.h>
+#include <common/wallet_tx.h>
 #include <common/wireaddr.h>
 #include <gossipd/routing.h>
 #include <lightningd/json.h>
@@ -31,7 +32,7 @@ json_add_route_hop(struct json_stream *r, char const *n,
 	json_add_short_channel_id(r, "channel",
 				  &h->channel_id);
 	json_add_num(r, "direction", h->direction);
-	json_add_u64(r, "msatoshi", h->amount);
+	json_add_amount_msat(r, h->amount, "msatoshi", "amount_msat");
 	json_add_num(r, "delay", h->delay);
 	json_object_end(r);
 }
@@ -286,7 +287,7 @@ void json_add_literal(struct json_stream *result, const char *fieldname,
 	json_add_member(result, fieldname, "%.*s", len, literal);
 }
 
-void json_add_string(struct json_stream *result, const char *fieldname, const char *value)
+void json_add_string(struct json_stream *result, const char *fieldname, const char *value TAKES)
 {
 	struct json_escaped *esc = json_partial_escape(NULL, value);
 
@@ -297,6 +298,11 @@ void json_add_string(struct json_stream *result, const char *fieldname, const ch
 void json_add_bool(struct json_stream *result, const char *fieldname, bool value)
 {
 	json_add_member(result, fieldname, value ? "true" : "false");
+}
+
+void json_add_null(struct json_stream *stream, const char *fieldname)
+{
+	json_add_member(stream, fieldname, "null");
 }
 
 void json_add_hex(struct json_stream *result, const char *fieldname,
@@ -322,4 +328,26 @@ void json_add_escaped_string(struct json_stream *result, const char *fieldname,
 	json_add_member(result, fieldname, "\"%s\"", esc->s);
 	if (taken(esc))
 		tal_free(esc);
+}
+
+void json_add_amount_msat(struct json_stream *result,
+			  struct amount_msat msat,
+			  const char *rawfieldname,
+			  const char *msatfieldname)
+{
+	json_add_u64(result, rawfieldname, msat.millisatoshis); /* Raw: low-level helper */
+	json_add_member(result, msatfieldname, "\"%s\"",
+			type_to_string(tmpctx, struct amount_msat, &msat));
+}
+
+void json_add_amount_sat(struct json_stream *result,
+			 struct amount_sat sat,
+			 const char *rawfieldname,
+			 const char *msatfieldname)
+{
+	struct amount_msat msat;
+	json_add_u64(result, rawfieldname, sat.satoshis); /* Raw: low-level helper */
+	if (amount_sat_to_msat(&msat, sat))
+		json_add_member(result, msatfieldname, "\"%s\"",
+				type_to_string(tmpctx, struct amount_msat, &msat));
 }

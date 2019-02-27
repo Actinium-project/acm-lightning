@@ -78,8 +78,10 @@ json_add_payment_fields(struct json_stream *response,
 	json_add_u64(response, "id", t->id);
 	json_add_hex(response, "payment_hash", &t->payment_hash, sizeof(t->payment_hash));
 	json_add_pubkey(response, "destination", &t->destination);
-	json_add_u64(response, "msatoshi", t->msatoshi);
-	json_add_u64(response, "msatoshi_sent", t->msatoshi_sent);
+	json_add_amount_msat(response, t->msatoshi,
+			     "msatoshi", "amount_msat");
+	json_add_amount_msat(response, t->msatoshi_sent,
+			     "msatoshi_sent", "amount_sent_msat");
 	json_add_u64(response, "created_at", t->timestamp);
 
 	switch (t->status) {
@@ -97,8 +99,13 @@ json_add_payment_fields(struct json_stream *response,
 		json_add_hex(response, "payment_preimage",
 			     t->payment_preimage,
 			     sizeof(*t->payment_preimage));
-	if (t->description)
-		json_add_string(response, "description", t->description);
+	if (t->label) {
+		if (deprecated_apis)
+			json_add_string(response, "description", t->label);
+		json_add_string(response, "label", t->label);
+	}
+	if (t->bolt11)
+		json_add_string(response, "bolt11", t->bolt11);
 }
 
 static struct command_result *sendpay_success(struct command *cmd,
@@ -577,8 +584,9 @@ send_payment(struct lightningd *ld,
 	     struct command *cmd,
 	     const struct sha256 *rhash,
 	     const struct route_hop *route,
-	     u64 msatoshi,
-	     const char *description TAKES)
+	     struct amount_msat msat,
+	     const char *label TAKES,
+	     const char *b11str TAKES)
 {
 	const u8 *onion;
 	u8 sessionkey[32];
@@ -629,11 +637,13 @@ send_payment(struct lightningd *ld,
 		if (payment->status == PAYMENT_COMPLETE) {
 			log_add(ld->log, "... succeeded");
 			/* Must match successful payment parameters. */
-			if (payment->msatoshi != msatoshi) {
+			if (!amount_msat_eq(payment->msatoshi, msat)) {
 				return command_fail(cmd, PAY_RHASH_ALREADY_USED,
 						    "Already succeeded "
-						    "with amount %"PRIu64,
-						    payment->msatoshi);
+						    "with amount %s",
+						    type_to_string(tmpctx,
+								   struct amount_msat,
+								   &payment->msatoshi));
 			}
 			if (!pubkey_eq(&payment->destination, &ids[n_hops-1])) {
 				return command_fail(cmd, PAY_RHASH_ALREADY_USED,
@@ -667,8 +677,9 @@ send_payment(struct lightningd *ld,
 				    sizeof(struct sha256), &path_secrets);
 	onion = serialize_onionpacket(tmpctx, packet);
 
-	log_info(ld->log, "Sending %"PRIu64" over %zu hops to deliver %"PRIu64"",
-		 route[0].amount, n_hops, msatoshi);
+	log_info(ld->log, "Sending %s over %zu hops to deliver %s",
+		 type_to_string(tmpctx, struct amount_msat, &route[0].amount),
+		 n_hops, type_to_string(tmpctx, struct amount_msat, &msat));
 
 	failcode = send_htlc_out(channel, route[0].amount,
 				 base_expiry + route[0].delay,
@@ -704,17 +715,21 @@ send_payment(struct lightningd *ld,
 	payment->payment_hash = *rhash;
 	payment->destination = ids[n_hops - 1];
 	payment->status = PAYMENT_PENDING;
-	payment->msatoshi = msatoshi;
+	payment->msatoshi = msat;
 	payment->msatoshi_sent = route[0].amount;
 	payment->timestamp = time_now().ts.tv_sec;
 	payment->payment_preimage = NULL;
 	payment->path_secrets = tal_steal(payment, path_secrets);
 	payment->route_nodes = tal_steal(payment, ids);
 	payment->route_channels = tal_steal(payment, channels);
-	if (description != NULL)
-		payment->description = tal_strdup(payment, description);
+	if (label != NULL)
+		payment->label = tal_strdup(payment, label);
 	else
-		payment->description = NULL;
+		payment->label = NULL;
+	if (b11str != NULL)
+		payment->bolt11 = tal_strdup(payment, b11str);
+	else
+		payment->bolt11 = NULL;
 
 	/* We write this into db when HTLC is actually sent. */
 	wallet_payment_setup(ld->wallet, payment);
@@ -737,38 +752,91 @@ static struct command_result *json_sendpay(struct command *cmd,
 	size_t i;
 	struct sha256 *rhash;
 	struct route_hop *route;
-	u64 *msatoshi;
-	const char *description;
+	struct amount_msat *msat;
+	const char *b11str, *label;
 	struct command_result *res;
 
-	if (!param(cmd, buffer, params,
-		   p_req("route", param_array, &routetok),
-		   p_req("payment_hash", param_sha256, &rhash),
-		   p_opt("description", param_escaped_string, &description),
-		   p_opt("msatoshi", param_u64, &msatoshi),
-		   NULL))
-		return command_param_failed();
+	/* If by array, or 'check' command, use 'label' as param name */
+	if (!params || params->type == JSMN_ARRAY) {
+		if (!param(cmd, buffer, params,
+			   p_req("route", param_array, &routetok),
+			   p_req("payment_hash", param_sha256, &rhash),
+			   p_opt("label", param_escaped_string, &label),
+			   p_opt("msatoshi", param_msat, &msat),
+			   p_opt("bolt11", param_string, &b11str),
+			   NULL))
+			return command_param_failed();
+	} else {
+		const char *description_deprecated;
+
+		/* If by keyword, treat description and label as
+		 * separate parameters. */
+		if (!param(cmd, buffer, params,
+			   p_req("route", param_array, &routetok),
+			   p_req("payment_hash", param_sha256, &rhash),
+			   p_opt("label", param_escaped_string, &label),
+			   p_opt("description", param_escaped_string,
+				 &description_deprecated),
+			   p_opt("msatoshi", param_msat, &msat),
+			   p_opt("bolt11", param_string, &b11str),
+			   NULL))
+			return command_param_failed();
+
+		if (description_deprecated) {
+			if (!deprecated_apis)
+				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+						    "Deprecated parameter description, use label");
+			if (label)
+				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+						    "Cannot specify both description and label");
+			label = description_deprecated;
+		}
+	}
 
 	if (routetok->size == 0)
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS, "Empty route");
 
 	route = tal_arr(cmd, struct route_hop, routetok->size);
 	json_for_each_arr(i, t, routetok) {
-		u64 *amount;
+		struct amount_msat *msat, *amount_msat;
 		struct pubkey *id;
 		struct short_channel_id *channel;
 		unsigned *delay, *direction;
 
 		if (!param(cmd, buffer, t,
-			   p_req("msatoshi", param_u64, &amount),
-			   p_req("id", param_pubkey, &id),
-			   p_req("delay", param_number, &delay),
-			   p_req("channel", param_short_channel_id, &channel),
+			   /* Only *one* of these is required */
+			   p_opt("msatoshi", param_msat, &msat),
+			   p_opt("amount_msat", param_msat, &amount_msat),
+			   /* These three actually required */
+			   p_opt("id", param_pubkey, &id),
+			   p_opt("delay", param_number, &delay),
+			   p_opt("channel", param_short_channel_id, &channel),
 			   p_opt("direction", param_number, &direction),
 			   NULL))
 			return command_param_failed();
 
-		route[i].amount = *amount;
+		if (!msat && !amount_msat)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "route[%zi]: must have msatoshi"
+					    " or amount_msat", i);
+		if (!id || !channel || !delay)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "route[%zi]: must have id, channel"
+					    " and delay", i);
+		if (msat && amount_msat && !amount_msat_eq(*msat, *amount_msat))
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "route[%zi]: msatoshi %s != amount_msat %s",
+					    i,
+					    type_to_string(tmpctx,
+							   struct amount_msat,
+							   msat),
+					    type_to_string(tmpctx,
+							   struct amount_msat,
+							   amount_msat));
+		if (!msat)
+			msat = amount_msat;
+
+		route[i].amount = *msat;
 		route[i].nodeid = *id;
 		route[i].delay = *delay;
 		route[i].channel_id = *channel;
@@ -781,18 +849,33 @@ static struct command_result *json_sendpay(struct command *cmd,
 	 * be from the msatoshi to twice msatoshi. */
 
 	/* if not: msatoshi <= finalhop.amount <= 2 * msatoshi, fail. */
-	if (msatoshi) {
-		if (!(*msatoshi <= route[routetok->size-1].amount &&
-		      route[routetok->size-1].amount <= 2 * *msatoshi)) {
+	if (msat) {
+		struct amount_msat limit = route[routetok->size-1].amount;
+
+		if (amount_msat_less(*msat, limit))
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "msatoshi %"PRIu64" out of range",
-					    *msatoshi);
-		}
+					    "msatoshi %s less than final %s",
+					    type_to_string(tmpctx,
+							   struct amount_msat,
+							   msat),
+					    type_to_string(tmpctx,
+							   struct amount_msat,
+							   &route[routetok->size-1].amount));
+		limit.millisatoshis *= 2; /* Raw: sanity check */
+		if (amount_msat_greater(*msat, limit))
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "msatoshi %s more than twice final %s",
+					    type_to_string(tmpctx,
+							   struct amount_msat,
+							   msat),
+					    type_to_string(tmpctx,
+							   struct amount_msat,
+							   &route[routetok->size-1].amount));
 	}
 
 	res = send_payment(cmd->ld, cmd, rhash, route,
-			   msatoshi ? *msatoshi : route[routetok->size-1].amount,
-			   description);
+			   msat ? *msat : route[routetok->size-1].amount,
+			   label, b11str);
 	if (res)
 		return res;
 	return command_still_pending(cmd);
@@ -844,7 +927,7 @@ static const struct json_command waitsendpay_command = {
 };
 AUTODATA(json_command, &waitsendpay_command);
 
-static struct command_result *json_listpayments(struct command *cmd,
+static struct command_result *json_listsendpays(struct command *cmd,
 						const char *buffer,
 						const jsmntok_t *obj UNNEEDED,
 						const jsmntok_t *params)
@@ -897,7 +980,15 @@ static struct command_result *json_listpayments(struct command *cmd,
 
 static const struct json_command listpayments_command = {
 	"listpayments",
-	json_listpayments,
-	"Show outgoing payments"
+	json_listsendpays,
+	"Show outgoing payments",
+	true /* deprecated, use new name */
 };
 AUTODATA(json_command, &listpayments_command);
+
+static const struct json_command listsendpays_command = {
+	"listsendpays",
+	json_listsendpays,
+	"Show sendpay, old and current, optionally limiting to {bolt11} or {payment_hash}."
+};
+AUTODATA(json_command, &listsendpays_command);

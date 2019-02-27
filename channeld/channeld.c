@@ -232,22 +232,45 @@ static const u8 *hsm_req(const tal_t *ctx, const u8 *req TAKES)
  * capacity minus the cumulative reserve.
  * FIXME: does this need fuzz?
  */
-static u64 advertised_htlc_max(const struct channel *channel)
+static struct amount_msat advertised_htlc_max(const struct channel *channel)
 {
-	u64 lower_bound;
-	u64 cumulative_reserve_msat;
+	struct amount_sat cumulative_reserve, lower_bound;
+	struct amount_msat lower_bound_msat;
 
-	cumulative_reserve_msat =
-		(channel->config[LOCAL].channel_reserve_satoshis +
-		 channel->config[REMOTE].channel_reserve_satoshis) * 1000;
+	/* This shouldn't fail */
+	if (!amount_sat_add(&cumulative_reserve,
+			    channel->config[LOCAL].channel_reserve,
+			    channel->config[REMOTE].channel_reserve)) {
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "reserve overflow: local %s + remote %s",
+			      type_to_string(tmpctx, struct amount_sat,
+					     &channel->config[LOCAL].channel_reserve),
+			      type_to_string(tmpctx, struct amount_sat,
+					     &channel->config[REMOTE].channel_reserve));
+	}
 
-	lower_bound = channel->config[REMOTE].max_htlc_value_in_flight_msat;
-	if (channel->funding_msat - cumulative_reserve_msat < lower_bound)
-		lower_bound = channel->funding_msat - cumulative_reserve_msat;
+	/* This shouldn't fail either */
+	if (!amount_sat_sub(&lower_bound, channel->funding, cumulative_reserve)) {
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "funding %s - cumulative_reserve %s?",
+			      type_to_string(tmpctx, struct amount_sat,
+					     &channel->funding),
+			      type_to_string(tmpctx, struct amount_sat,
+					     &cumulative_reserve));
+	}
+
+	if (!amount_sat_to_msat(&lower_bound_msat, lower_bound)) {
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "lower_bound %s invalid?",
+			      type_to_string(tmpctx, struct amount_sat,
+					     &lower_bound));
+	}
 	/* FIXME BOLT QUOTE: https://github.com/lightningnetwork/lightning-rfc/pull/512 once merged */
-	if (channel->chainparams->max_payment_msat < lower_bound)
-		lower_bound = channel->chainparams->max_payment_msat;
-	return lower_bound;
+	if (amount_msat_greater(lower_bound_msat,
+				channel->chainparams->max_payment))
+		lower_bound_msat = channel->chainparams->max_payment;
+
+	return lower_bound_msat;
 }
 
 /* Create and send channel_update to gossipd (and maybe peer) */
@@ -268,7 +291,7 @@ static void send_channel_update(struct peer *peer, int disable_flag)
 						  disable_flag
 						  == ROUTING_FLAGS_DISABLED,
 						  peer->cltv_delta,
-						  peer->channel->config[REMOTE].htlc_minimum_msat,
+						  peer->channel->config[REMOTE].htlc_minimum,
 						  peer->fee_base,
 						  peer->fee_per_satoshi,
 						  advertised_htlc_max(peer->channel));
@@ -293,7 +316,7 @@ static void make_channel_local_active(struct peer *peer)
 	msg = towire_gossipd_local_add_channel(NULL,
 					       &peer->short_channel_ids[LOCAL],
 					       &peer->node_ids[REMOTE],
-					       peer->channel->funding_msat / 1000);
+					       peer->channel->funding);
  	wire_sync_write(GOSSIP_FD, take(msg));
 
 	/* Tell gossipd and the other side what parameters we expect should
@@ -566,21 +589,21 @@ static void handle_peer_add_htlc(struct peer *peer, const u8 *msg)
 {
 	struct channel_id channel_id;
 	u64 id;
-	u64 amount_msat;
+	struct amount_msat amount;
 	u32 cltv_expiry;
 	struct sha256 payment_hash;
 	u8 onion_routing_packet[TOTAL_PACKET_SIZE];
 	enum channel_add_err add_err;
 	struct htlc *htlc;
 
-	if (!fromwire_update_add_htlc(msg, &channel_id, &id, &amount_msat,
+	if (!fromwire_update_add_htlc(msg, &channel_id, &id, &amount,
 				      &payment_hash, &cltv_expiry,
 				      onion_routing_packet))
 		peer_failed(&peer->cs,
 			    &peer->channel_id,
 			    "Bad peer_add_htlc %s", tal_hex(msg, msg));
 
-	add_err = channel_add_htlc(peer->channel, REMOTE, id, amount_msat,
+	add_err = channel_add_htlc(peer->channel, REMOTE, id, amount,
 				   cltv_expiry, &payment_hash,
 				   onion_routing_packet, &htlc);
 	if (add_err != CHANNEL_ERR_ADD_OK)
@@ -843,12 +866,12 @@ static u8 *make_failmsg(const tal_t *ctx,
 		goto done;
 	case WIRE_AMOUNT_BELOW_MINIMUM:
 		channel_update = foreign_channel_update(ctx, peer, scid);
-		msg = towire_amount_below_minimum(ctx, htlc->msatoshi,
+		msg = towire_amount_below_minimum(ctx, htlc->amount,
 						  channel_update);
 		goto done;
 	case WIRE_FEE_INSUFFICIENT:
 		channel_update = foreign_channel_update(ctx, peer, scid);
-		msg = towire_fee_insufficient(ctx, htlc->msatoshi,
+		msg = towire_fee_insufficient(ctx, htlc->amount,
 					      channel_update);
 		goto done;
 	case WIRE_INCORRECT_CLTV_EXPIRY:
@@ -865,7 +888,7 @@ static u8 *make_failmsg(const tal_t *ctx,
 		goto done;
 	case WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS:
 		msg = towire_incorrect_or_unknown_payment_details(
-		    ctx, htlc->msatoshi);
+		    ctx, htlc->amount);
 		goto done;
 	case WIRE_FINAL_EXPIRY_TOO_SOON:
 		msg = towire_final_expiry_too_soon(ctx);
@@ -874,7 +897,7 @@ static u8 *make_failmsg(const tal_t *ctx,
 		msg = towire_final_incorrect_cltv_expiry(ctx, cltv_expiry);
 		goto done;
 	case WIRE_FINAL_INCORRECT_HTLC_AMOUNT:
-		msg = towire_final_incorrect_htlc_amount(ctx, htlc->msatoshi);
+		msg = towire_final_incorrect_htlc_amount(ctx, htlc->amount);
 		goto done;
 	case WIRE_INVALID_ONION_VERSION:
 		msg = towire_invalid_onion_version(ctx, sha256);
@@ -1228,7 +1251,7 @@ static u8 *got_commitsig_msg(const tal_t *ctx,
 			struct secret s;
 
 			a.id = htlc->id;
-			a.amount_msat = htlc->msatoshi;
+			a.amount = htlc->amount;
 			a.payment_hash = htlc->rhash;
 			a.cltv_expiry = abs_locktime_to_blocks(&htlc->expiry);
 			memcpy(a.onion_routing_packet,
@@ -1876,7 +1899,7 @@ static void resend_commitment(struct peer *peer, const struct changed_htlc *last
 
 		if (h->state == SENT_ADD_COMMIT) {
 			u8 *msg = towire_update_add_htlc(NULL, &peer->channel_id,
-							 h->id, h->msatoshi,
+							 h->id, h->amount,
 							 &h->rhash,
 							 abs_locktime_to_blocks(
 								 &h->expiry),
@@ -2087,6 +2110,7 @@ static void peer_reconnect(struct peer *peer,
 		remote_current_per_commitment_point;
 	struct secret last_local_per_commitment_secret;
 	bool dataloss_protect;
+	const u8 *premature_funding_locked = NULL;
 
 	dataloss_protect = local_feature_negotiated(peer->localfeatures,
 						    LOCAL_DATA_LOSS_PROTECT);
@@ -2143,8 +2167,16 @@ static void peer_reconnect(struct peer *peer,
 	do {
 		clean_tmpctx();
 		msg = sync_crypto_read(tmpctx, &peer->cs, PEER_FD);
-	} while (handle_peer_gossip_or_error(PEER_FD, GOSSIP_FD, &peer->cs,
-					     &peer->channel_id, msg));
+
+		/* Older LND sometimes sends funding_locked before reestablish! */
+		if (fromwire_peektype(msg) == WIRE_FUNDING_LOCKED
+		    && !premature_funding_locked) {
+			status_trace("Stashing early funding_locked msg!");
+			premature_funding_locked = tal_steal(peer, msg);
+			msg = NULL;
+		}
+	} while (!msg || handle_peer_gossip_or_error(PEER_FD, GOSSIP_FD, &peer->cs,
+						     &peer->channel_id, msg));
 
 	if (dataloss_protect) {
 		if (!fromwire_channel_reestablish_option_data_loss_protect(msg,
@@ -2342,6 +2374,11 @@ static void peer_reconnect(struct peer *peer,
 		peer->channel->changes_pending[LOCAL] = true;
 
 	peer_billboard(true, "Reconnected, and reestablished.");
+
+	if (premature_funding_locked) {
+		handle_peer_funding_locked(peer, premature_funding_locked);
+		tal_free(premature_funding_locked);
+	}
 }
 
 /* Funding has locked in, and reached depth. */
@@ -2382,7 +2419,7 @@ static void handle_offer_htlc(struct peer *peer, const u8 *inmsg)
 {
 	u8 *msg;
 	u32 cltv_expiry;
-	u64 amount_msat;
+	struct amount_msat amount;
 	struct sha256 payment_hash;
 	u8 onion_routing_packet[TOTAL_PACKET_SIZE];
 	enum channel_add_err e;
@@ -2394,23 +2431,25 @@ static void handle_offer_htlc(struct peer *peer, const u8 *inmsg)
 		status_failed(STATUS_FAIL_MASTER_IO,
 			      "funding not locked for offer_htlc");
 
-	if (!fromwire_channel_offer_htlc(inmsg, &amount_msat,
+	if (!fromwire_channel_offer_htlc(inmsg, &amount,
 					 &cltv_expiry, &payment_hash,
 					 onion_routing_packet))
 		master_badmsg(WIRE_CHANNEL_OFFER_HTLC, inmsg);
 
 	e = channel_add_htlc(peer->channel, LOCAL, peer->htlc_id,
-			     amount_msat, cltv_expiry, &payment_hash,
+			     amount, cltv_expiry, &payment_hash,
 			     onion_routing_packet, NULL);
-	status_trace("Adding HTLC %"PRIu64" msat=%"PRIu64" cltv=%u gave %s",
-		     peer->htlc_id, amount_msat, cltv_expiry,
+	status_trace("Adding HTLC %"PRIu64" amount=%s cltv=%u gave %s",
+		     peer->htlc_id,
+		     type_to_string(tmpctx, struct amount_msat, &amount),
+		     cltv_expiry,
 		     channel_add_err_name(e));
 
 	switch (e) {
 	case CHANNEL_ERR_ADD_OK:
 		/* Tell the peer. */
 		msg = towire_update_add_htlc(NULL, &peer->channel_id,
-					     peer->htlc_id, amount_msat,
+					     peer->htlc_id, amount,
 					     &payment_hash, cltv_expiry,
 					     onion_routing_packet);
 		sync_crypto_write(&peer->cs, PEER_FD, take(msg));
@@ -2441,8 +2480,10 @@ static void handle_offer_htlc(struct peer *peer, const u8 *inmsg)
 		goto failed;
 	case CHANNEL_ERR_HTLC_BELOW_MINIMUM:
 		failcode = WIRE_AMOUNT_BELOW_MINIMUM;
-		failmsg = tal_fmt(inmsg, "HTLC too small (%"PRIu64" minimum)",
-				  peer->channel->config[REMOTE].htlc_minimum_msat);
+		failmsg = tal_fmt(inmsg, "HTLC too small (%s minimum)",
+				  type_to_string(tmpctx,
+						 struct amount_msat,
+						 &peer->channel->config[REMOTE].htlc_minimum));
 		goto failed;
 	case CHANNEL_ERR_TOO_MANY_HTLCS:
 		failcode = WIRE_TEMPORARY_CHANNEL_FAILURE;
@@ -2662,9 +2703,9 @@ static void init_shared_secrets(struct channel *channel,
 static void init_channel(struct peer *peer)
 {
 	struct basepoints points[NUM_SIDES];
-	u64 funding_satoshi;
+	struct amount_sat funding;
 	u16 funding_txout;
-	u64 local_msatoshi;
+	struct amount_msat local_msat;
 	struct pubkey funding_pubkey[NUM_SIDES];
 	struct channel_config conf[NUM_SIDES];
 	struct bitcoin_txid funding_txid;
@@ -2689,7 +2730,7 @@ static void init_channel(struct peer *peer)
 	if (!fromwire_channel_init(peer, msg,
 				   &peer->chain_hash,
 				   &funding_txid, &funding_txout,
-				   &funding_satoshi,
+				   &funding,
 				   &conf[LOCAL], &conf[REMOTE],
 				   feerate_per_kw,
 				   &peer->feerate_min, &peer->feerate_max,
@@ -2702,7 +2743,7 @@ static void init_channel(struct peer *peer)
 				   &funder,
 				   &peer->fee_base,
 				   &peer->fee_per_satoshi,
-				   &local_msatoshi,
+				   &local_msat,
 				   &points[LOCAL],
 				   &funding_pubkey[LOCAL],
 				   &peer->node_ids[LOCAL],
@@ -2764,8 +2805,8 @@ static void init_channel(struct peer *peer)
 	peer->channel = new_full_channel(peer,
 					 &peer->chain_hash,
 					 &funding_txid, funding_txout,
-					 funding_satoshi,
-					 local_msatoshi,
+					 funding,
+					 local_msat,
 					 feerate_per_kw,
 					 &conf[LOCAL], &conf[REMOTE],
 					 &points[LOCAL], &points[REMOTE],

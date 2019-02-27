@@ -6,6 +6,7 @@
 #include <ccan/tal/str/str.h>
 #include <ccan/time/time.h>
 #include <ccan/timer/timer.h>
+#include <common/amount.h>
 #include <common/timeout.h>
 #include <common/utils.h>
 #include <lightningd/invoice.h>
@@ -102,17 +103,17 @@ static struct invoice_details *wallet_stmt2invoice_details(const tal_t *ctx,
 	dtl->label = sqlite3_column_json_escaped(dtl, stmt, 3);
 
 	if (sqlite3_column_type(stmt, 4) != SQLITE_NULL) {
-		dtl->msatoshi = tal(dtl, u64);
-		*dtl->msatoshi = sqlite3_column_int64(stmt, 4);
+		dtl->msat = tal(dtl, struct amount_msat);
+		*dtl->msat = sqlite3_column_amount_msat(stmt, 4);
 	} else {
-		dtl->msatoshi = NULL;
+		dtl->msat = NULL;
 	}
 
 	dtl->expiry_time = sqlite3_column_int64(stmt, 5);
 
 	if (dtl->state == PAID) {
 		dtl->pay_index = sqlite3_column_int64(stmt, 6);
-		dtl->msatoshi_received = sqlite3_column_int64(stmt, 7);
+		dtl->received = sqlite3_column_amount_msat(stmt, 7);
 		dtl->paid_timestamp = sqlite3_column_int64(stmt, 8);
 	}
 
@@ -259,7 +260,7 @@ static void install_expiration_timer(struct invoices *invoices)
 
 bool invoices_create(struct invoices *invoices,
 		     struct invoice *pinvoice,
-		     u64 *msatoshi TAKES,
+		     const struct amount_msat *msat TAKES,
 		     const struct json_escaped *label TAKES,
 		     u64 expiry,
 		     const char *b11enc,
@@ -273,8 +274,8 @@ bool invoices_create(struct invoices *invoices,
 	u64 now = time_now().ts.tv_sec;
 
 	if (invoices_find_by_label(invoices, &dummy, label)) {
-		if (taken(msatoshi))
-			tal_free(msatoshi);
+		if (taken(msat))
+			tal_free(msat);
 		if (taken(label))
 			tal_free(label);
 		return false;
@@ -301,8 +302,8 @@ bool invoices_create(struct invoices *invoices,
 	sqlite3_bind_blob(stmt, 1, rhash, sizeof(struct sha256), SQLITE_TRANSIENT);
 	sqlite3_bind_blob(stmt, 2, r, sizeof(struct preimage), SQLITE_TRANSIENT);
 	sqlite3_bind_int(stmt, 3, UNPAID);
-	if (msatoshi)
-		sqlite3_bind_int64(stmt, 4, *msatoshi);
+	if (msat)
+		sqlite3_bind_amount_msat(stmt, 4, *msat);
 	else
 		sqlite3_bind_null(stmt, 4);
 	sqlite3_bind_json_escaped(stmt, 5, label);
@@ -322,8 +323,8 @@ bool invoices_create(struct invoices *invoices,
 		install_expiration_timer(invoices);
 	}
 
-	if (taken(msatoshi))
-		tal_free(msatoshi);
+	if (taken(msat))
+		tal_free(msat);
 	if (taken(label))
 		tal_free(label);
 	return true;
@@ -507,7 +508,7 @@ static s64 get_next_pay_index(struct db *db)
 
 void invoices_resolve(struct invoices *invoices,
 		      struct invoice invoice,
-		      u64 msatoshi_received)
+		      struct amount_msat received)
 {
 	sqlite3_stmt *stmt;
 	s64 pay_index;
@@ -527,7 +528,7 @@ void invoices_resolve(struct invoices *invoices,
 			  " WHERE id=?;");
 	sqlite3_bind_int(stmt, 1, PAID);
 	sqlite3_bind_int64(stmt, 2, pay_index);
-	sqlite3_bind_int64(stmt, 3, msatoshi_received);
+	sqlite3_bind_amount_msat(stmt, 3, received);
 	sqlite3_bind_int64(stmt, 4, paid_timestamp);
 	sqlite3_bind_int64(stmt, 5, invoice.id);
 	db_exec_prepared(invoices->db, stmt);

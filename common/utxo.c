@@ -10,7 +10,7 @@ void towire_utxo(u8 **pptr, const struct utxo *utxo)
 	bool is_unilateral_close = utxo->close_info != NULL;
 	towire_bitcoin_txid(pptr, &utxo->txid);
 	towire_u32(pptr, utxo->outnum);
-	towire_u64(pptr, utxo->amount);
+	towire_amount_sat(pptr, utxo->amount);
 	towire_u32(pptr, utxo->keyindex);
 	towire_bool(pptr, utxo->is_p2sh);
 
@@ -28,9 +28,14 @@ struct utxo *fromwire_utxo(const tal_t *ctx, const u8 **ptr, size_t *max)
 
 	fromwire_bitcoin_txid(ptr, max, &utxo->txid);
 	utxo->outnum = fromwire_u32(ptr, max);
-	utxo->amount = fromwire_u64(ptr, max);
+	utxo->amount = fromwire_amount_sat(ptr, max);
 	utxo->keyindex = fromwire_u32(ptr, max);
 	utxo->is_p2sh = fromwire_bool(ptr, max);
+
+	/* No need to tell hsmd about the scriptPubkey, it has all the info to
+	 * derive it from the rest. */
+	utxo->scriptPubkey = NULL;
+
 	if (fromwire_bool(ptr, max)) {
 		utxo->close_info = tal(utxo, struct unilateral_close_info);
 		utxo->close_info->channel_id = fromwire_u64(ptr, max);
@@ -53,7 +58,8 @@ struct bitcoin_tx *tx_spending_utxos(const tal_t *ctx,
 	for (size_t i = 0; i < tal_count(utxos); i++) {
 		tx->input[i].txid = utxos[i]->txid;
 		tx->input[i].index = utxos[i]->outnum;
-		tx->input[i].amount = tal_dup(tx, u64, &utxos[i]->amount);
+		tx->input[i].amount = tal_dup(tx, struct amount_sat,
+					      &utxos[i]->amount);
 		if (utxos[i]->is_p2sh && bip32_base) {
 			struct pubkey key;
 			bip32_pubkey(bip32_base, &key, utxos[i]->keyindex);

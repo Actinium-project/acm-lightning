@@ -46,7 +46,7 @@ static u32 feerate_per_kw;
 static u32 min_possible_feerate, max_possible_feerate;
 
 /* The dust limit to use when we generate transactions. */
-static u64 dust_limit_satoshis;
+static struct amount_sat dust_limit;
 
 /* The CSV delays for each side. */
 static u32 to_self_delay[NUM_SIDES];
@@ -89,7 +89,7 @@ struct tracked_output {
 	/* FIXME: Convert all depths to blocknums, then just get new blk msgs */
 	u32 depth;
 	u32 outnum;
-	u64 satoshi;
+	struct amount_sat sat;
 	enum output_type output_type;
 
 	/* If it is an HTLC, this is set, wscript is non-NULL. */
@@ -107,13 +107,13 @@ struct tracked_output {
 };
 
 /* We vary feerate until signature they offered matches. */
-static u64 grind_htlc_tx_fee(struct bitcoin_tx *tx,
-			     const struct bitcoin_signature *remotesig,
-			     const u8 *wscript,
-			     u64 multiplier)
+static bool grind_htlc_tx_fee(struct amount_sat *fee,
+			      struct bitcoin_tx *tx,
+			      const struct bitcoin_signature *remotesig,
+			      const u8 *wscript,
+			      u64 weight)
 {
-	u64 prev_fee = UINT64_MAX;
-	u64 input_amount = *tx->input[0].amount;
+	struct amount_sat prev_fee = AMOUNT_SAT(UINT64_MAX);
 
 	for (u64 i = min_possible_feerate; i <= max_possible_feerate; i++) {
 		/* BOLT #3:
@@ -128,31 +128,35 @@ static u64 grind_htlc_tx_fee(struct bitcoin_tx *tx,
 		 *     1. Multiply `feerate_per_kw` by 703 and divide by 1000
 		 *     (rounding down).
 		 */
-		u64 fee = i * multiplier / 1000;
+		struct amount_sat out;
 
-		if (fee > input_amount)
-			break;
+		*fee = amount_tx_fee(i, weight);
 
 		/* Minor optimization: don't check same fee twice */
-		if (fee == prev_fee)
+		if (amount_sat_eq(*fee, prev_fee))
 			continue;
 
-		prev_fee = fee;
-		tx->output[0].amount = input_amount - fee;
+		prev_fee = *fee;
+		if (!amount_sat_sub(&out, *tx->input[0].amount, *fee))
+			break;
+
+		tx->output[0].amount = out;
 		if (!check_tx_sig(tx, 0, NULL, wscript,
 				  &keyset->other_htlc_key, remotesig))
 			continue;
 
-		return fee;
+		status_trace("grind feerate_per_kw for %"PRIu64" = %"PRIu64,
+			     weight, i);
+		return true;
 	}
-	return UINT64_MAX;
+	return false;
 }
 
 static bool set_htlc_timeout_fee(struct bitcoin_tx *tx,
 				 const struct bitcoin_signature *remotesig,
 				 const u8 *wscript)
 {
-	static u64 fee = UINT64_MAX;
+	static struct amount_sat fee = AMOUNT_SAT(UINT64_MAX);
 
 	/* BOLT #3:
 	 *
@@ -161,12 +165,14 @@ static bool set_htlc_timeout_fee(struct bitcoin_tx *tx,
 	 *    1. Multiply `feerate_per_kw` by 663 and divide by 1000 (rounding
 	 *    down).
 	 */
-	if (fee == UINT64_MAX) {
-		fee = grind_htlc_tx_fee(tx, remotesig, wscript, 663);
-		return fee != UINT64_MAX;
-	}
+	if (amount_sat_eq(fee, AMOUNT_SAT(UINT64_MAX)))
+		return grind_htlc_tx_fee(&fee, tx, remotesig, wscript, 663);
 
-	tx->output[0].amount = *tx->input[0].amount - fee;
+	if (!amount_sat_sub(&tx->output[0].amount, tx->output[0].amount, fee))
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Cannot deduct htlc-timeout fee %s from tx %s",
+			      type_to_string(tmpctx, struct amount_sat, &fee),
+			      type_to_string(tmpctx, struct bitcoin_tx, tx));
 	return check_tx_sig(tx, 0, NULL, wscript,
 			    &keyset->other_htlc_key, remotesig);
 }
@@ -175,7 +181,7 @@ static void set_htlc_success_fee(struct bitcoin_tx *tx,
 				 const struct bitcoin_signature *remotesig,
 				 const u8 *wscript)
 {
-	static u64 fee = UINT64_MAX;
+	static struct amount_sat fee = AMOUNT_SAT(UINT64_MAX);
 
 	/* BOLT #3:
 	 *
@@ -184,20 +190,34 @@ static void set_htlc_success_fee(struct bitcoin_tx *tx,
 	 *    1. Multiply `feerate_per_kw` by 703 and divide by 1000
 	 *    (rounding down).
 	 */
-	if (fee == UINT64_MAX) {
-		fee = grind_htlc_tx_fee(tx, remotesig, wscript, 703);
+	if (amount_sat_eq(fee, AMOUNT_SAT(UINT64_MAX))) {
+		if (!grind_htlc_tx_fee(&fee, tx, remotesig, wscript, 703))
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				      "htlc_success_fee can't be found "
+				      " for tx %s, signature %s, wscript %s",
+				      type_to_string(tmpctx, struct bitcoin_tx,
+						     tx),
+				      type_to_string(tmpctx,
+						     struct bitcoin_signature,
+						     remotesig),
+				      tal_hex(tmpctx, wscript));
 		return;
 	}
 
-	tx->output[0].amount = *tx->input[0].amount - fee;
+	if (!amount_sat_sub(&tx->output[0].amount, tx->output[0].amount, fee))
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Cannot deduct htlc-success fee %s from tx %s",
+			      type_to_string(tmpctx, struct amount_sat, &fee),
+			      type_to_string(tmpctx, struct bitcoin_tx, tx));
+
 	if (check_tx_sig(tx, 0, NULL, wscript,
 			 &keyset->other_htlc_key, remotesig))
 		return;
 
 	status_failed(STATUS_FAIL_INTERNAL_ERROR,
-		      "htlc_success_fee %"PRIu64" failed sigcheck "
+		      "htlc_success_fee %s failed sigcheck "
 		      " for tx %s, signature %s, wscript %s",
-		      fee,
+		      type_to_string(tmpctx, struct amount_sat, &fee),
 		      type_to_string(tmpctx, struct bitcoin_tx, tx),
 		      type_to_string(tmpctx, struct bitcoin_signature, remotesig),
 		      tal_hex(tmpctx, wscript));
@@ -272,8 +292,9 @@ static struct bitcoin_tx *tx_to_us(const tal_t *ctx,
 				   enum tx_type *tx_type)
 {
 	struct bitcoin_tx *tx;
-	u64 fee;
+	struct amount_sat fee, min_out;
 	struct bitcoin_signature sig;
+	size_t weight;
 	u8 *msg;
 
 	tx = bitcoin_tx(ctx, 1, 1);
@@ -281,42 +302,45 @@ static struct bitcoin_tx *tx_to_us(const tal_t *ctx,
 	tx->input[0].sequence_number = to_self_delay;
 	tx->input[0].txid = out->txid;
 	tx->input[0].index = out->outnum;
-	tx->input[0].amount = tal_dup(tx->input, u64, &out->satoshi);
+	tx->input[0].amount = tal_dup(tx->input, struct amount_sat, &out->sat);
 
-	tx->output[0].amount = out->satoshi;
+	tx->output[0].amount = out->sat;
 	tx->output[0].script = scriptpubkey_p2wpkh(tx->output,
 						   &our_wallet_pubkey);
 
 	/* Worst-case sig is 73 bytes */
-	fee = feerate_per_kw * (measure_tx_weight(tx)
-			 + 1 + 3 + 73 + 0 + tal_count(wscript))
-		/ 1000;
+	weight = measure_tx_weight(tx) + 1 + 3 + 73 + 0 + tal_count(wscript);
+	fee = amount_tx_fee(feerate_per_kw, weight);
 
 	/* Result is trivial?  Spend with small feerate, but don't wait
 	 * around for it as it might not confirm. */
-	if (tx->output[0].amount < dust_limit_satoshis + fee) {
-		/* FIXME: We should use SIGHASH_NONE so others can take it */
-		fee = feerate_floor() * (measure_tx_weight(tx)
-				       + 1 + 3 + 73 + 0 + tal_count(wscript))
-			/ 1000;
-		/* This shouldn't happen (we don't set feerate below floor!),
-		 * but just in case. */
-		if (tx->output[0].amount < dust_limit_satoshis + fee) {
-			fee = tx->output[0].amount - dust_limit_satoshis;
-			status_broken("TX %s can't afford minimal feerate"
-				      "; setting fee to %"PRIu64,
-				      tx_type_name(*tx_type),
-				      fee);
-		} else
-			status_unusual("TX %s amount %"PRIu64" too small to"
-				       " pay reasonable fee, using minimal fee"
-				       " and ignoring",
-				       tx_type_name(*tx_type),
-				       out->satoshi);
+	if (!amount_sat_add(&min_out, dust_limit, fee))
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Cannot add dust_limit %s and fee %s",
+			      type_to_string(tmpctx, struct amount_sat, &dust_limit),
+			      type_to_string(tmpctx, struct amount_sat, &fee));
 
+	if (amount_sat_less(out->sat, min_out)) {
+		/* FIXME: We should use SIGHASH_NONE so others can take it */
+		fee = amount_tx_fee(feerate_floor(), weight);
+		status_unusual("TX %s amount %s too small to"
+			       " pay reasonable fee, using minimal fee"
+			       " and ignoring",
+			       tx_type_name(*tx_type),
+			       type_to_string(tmpctx, struct amount_sat, &out->sat));
 		*tx_type = IGNORING_TINY_PAYMENT;
 	}
-	tx->output[0].amount -= fee;
+
+	/* This can only happen if feerate_floor() is still too high; shouldn't
+	 * happen! */
+	if (!amount_sat_sub(&tx->output[0].amount, out->sat, fee)) {
+		tx->output[0].amount = dust_limit;
+		status_broken("TX %s can't afford minimal feerate"
+			      "; setting output to %s",
+			      tx_type_name(*tx_type),
+			      type_to_string(tmpctx, struct amount_sat,
+					     &tx->output[0].amount));
+	}
 
 	if (!wire_sync_write(HSM_FD, take(hsm_sign_msg(NULL, tx, wscript))))
 		status_failed(STATUS_FAIL_HSM_IO, "Writing sign request to hsm");
@@ -375,7 +399,7 @@ static struct tracked_output *
 			   u32 tx_blockheight,
 			   enum tx_type tx_type,
 			   u32 outnum,
-			   u64 satoshi,
+			   struct amount_sat sat,
 			   enum output_type output_type,
 			   const struct htlc_stub *htlc,
 			   const u8 *wscript,
@@ -394,7 +418,7 @@ static struct tracked_output *
 	out->tx_blockheight = tx_blockheight;
 	out->depth = 0;
 	out->outnum = outnum;
-	out->satoshi = satoshi;
+	out->sat = sat;
 	out->output_type = output_type;
 	out->proposal = NULL;
 	out->resolved = NULL;
@@ -1150,9 +1174,17 @@ static void handle_preimage(struct tracked_output **outs,
 		 *      HTLC-success transaction.
 		 */
 		if (outs[i]->remote_htlc_sig) {
+			struct amount_msat htlc_amount;
+			if (!amount_sat_to_msat(&htlc_amount, outs[i]->sat))
+				status_failed(STATUS_FAIL_INTERNAL_ERROR,
+					      "Overflow in output %zu %s",
+					      i,
+					      type_to_string(tmpctx,
+							     struct amount_sat,
+							     &outs[i]->sat));
 			tx = htlc_success_tx(outs[i], &outs[i]->txid,
 					     outs[i]->outnum,
-					     outs[i]->satoshi * 1000,
+					     htlc_amount,
 					     to_self_delay[LOCAL],
 					     0,
 					     keyset);
@@ -1342,6 +1374,13 @@ static size_t resolve_our_htlc_ourcommit(struct tracked_output *out,
 	struct bitcoin_tx *tx = NULL;
 	struct bitcoin_signature localsig;
 	size_t i;
+	struct amount_msat htlc_amount;
+
+	if (!amount_sat_to_msat(&htlc_amount, out->sat))
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Overflow in our_htlc output %s",
+			      type_to_string(tmpctx, struct amount_sat,
+					     &out->sat));
 
 	assert(tal_count(matches));
 
@@ -1358,7 +1397,7 @@ static size_t resolve_our_htlc_ourcommit(struct tracked_output *out,
 		 *    HTLC-timeout transaction.
 		 */
 		tx = htlc_timeout_tx(tmpctx, &out->txid, out->outnum,
-				     out->satoshi * 1000,
+				     htlc_amount,
 				     htlcs[matches[i]].cltv_expiry,
 				     to_self_delay[LOCAL], 0, keyset);
 
@@ -1385,12 +1424,13 @@ static size_t resolve_our_htlc_ourcommit(struct tracked_output *out,
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "No valid signature found for %zu htlc_timeout_txs"
 			      " feerate %u-%u,"
-			      " last tx %s, inputamount %"PRIu64", signature %s,"
+			      " last tx %s, input %s, signature %s,"
 			      " cltvs %s wscripts %s",
 			      tal_count(matches),
 			      min_possible_feerate, max_possible_feerate,
 			      type_to_string(tmpctx, struct bitcoin_tx, tx),
-			      out->satoshi,
+			      type_to_string(tmpctx, struct amount_sat,
+					     &out->sat),
 			      type_to_string(tmpctx, struct bitcoin_signature,
 					     out->remote_htlc_sig),
 			      cltvs, wscripts);
@@ -1974,7 +2014,6 @@ static void handle_their_cheat(const struct bitcoin_tx *tx,
 						 i, tx->output[i].amount,
 						 OUTPUT_TO_US, NULL, NULL, NULL);
 			ignore_output(out);
-			script[LOCAL] = NULL;
 
 			/* Tell the master that it will want to add
 			 * this UTXO to its outputs */
@@ -1982,7 +2021,9 @@ static void handle_their_cheat(const struct bitcoin_tx *tx,
 						    tmpctx, txid, i,
 						    remote_per_commitment_point,
 						    tx->output[i].amount,
-						    tx_blockheight));
+						    tx_blockheight,
+						    script[LOCAL]));
+			script[LOCAL] = NULL;
 			continue;
 		}
 		if (script[REMOTE]
@@ -2186,7 +2227,6 @@ static void handle_their_unilateral(const struct bitcoin_tx *tx,
 						 i, tx->output[i].amount,
 						 OUTPUT_TO_US, NULL, NULL, NULL);
 			ignore_output(out);
-			script[LOCAL] = NULL;
 
 			/* Tell the master that it will want to add
 			 * this UTXO to its outputs */
@@ -2194,7 +2234,9 @@ static void handle_their_unilateral(const struct bitcoin_tx *tx,
 						    tmpctx, txid, i,
 						    remote_per_commitment_point,
 						    tx->output[i].amount,
-						    tx_blockheight));
+						    tx_blockheight,
+						    script[LOCAL]));
+			script[LOCAL] = NULL;
 			continue;
 		}
 		if (script[REMOTE]
@@ -2315,7 +2357,6 @@ static void handle_unknown_commitment(const struct bitcoin_tx *tx,
 						 i, tx->output[i].amount,
 						 OUTPUT_TO_US, NULL, NULL, NULL);
 			ignore_output(out);
-			local_script = NULL;
 
 			/* Tell the master that it will want to add
 			 * this UTXO to its outputs */
@@ -2323,7 +2364,9 @@ static void handle_unknown_commitment(const struct bitcoin_tx *tx,
 						    tmpctx, txid, i,
 						    possible_remote_per_commitment_point,
 						    tx->output[i].amount,
-						    tx_blockheight));
+						    tx_blockheight,
+						    local_script));
+			local_script = NULL;
 			to_us_output = i;
 		}
 	}
@@ -2368,7 +2411,8 @@ int main(int argc, char *argv[])
 	struct tracked_output **outs;
 	struct bitcoin_txid our_broadcast_txid, txid;
 	secp256k1_ecdsa_signature *remote_htlc_sigs;
-	u64 funding_amount_satoshi, num_htlcs;
+	struct amount_sat funding;
+	u64 num_htlcs;
 	u8 *scriptpubkey[NUM_SIDES];
 	struct htlc_stub *htlcs;
 	bool *tell_if_missing, *tell_immediately;
@@ -2384,13 +2428,13 @@ int main(int argc, char *argv[])
 	msg = wire_sync_read(tmpctx, REQ_FD);
 	if (!fromwire_onchain_init(tmpctx, msg,
 				   &shachain,
-				   &funding_amount_satoshi,
+				   &funding,
 				   &old_remote_per_commit_point,
 				   &remote_per_commit_point,
 				   &to_self_delay[LOCAL],
 				   &to_self_delay[REMOTE],
 				   &feerate_per_kw,
-				   &dust_limit_satoshis,
+				   &dust_limit,
 				   &our_broadcast_txid,
 				   &scriptpubkey[LOCAL],
 				   &scriptpubkey[REMOTE],
@@ -2409,6 +2453,7 @@ int main(int argc, char *argv[])
 		master_badmsg(WIRE_ONCHAIN_INIT, msg);
 	}
 
+	status_trace("feerate_per_kw = %u", feerate_per_kw);
 	bitcoin_txid(tx, &txid);
 	/* We need to keep tx around, but there's only one: not really a leak */
 	tal_steal(ctx, notleak(tx));
@@ -2434,7 +2479,7 @@ int main(int argc, char *argv[])
 			   0, /* We don't care about funding blockheight */
 			   FUNDING_TRANSACTION,
 			   tx->input[0].index,
-			   funding_amount_satoshi,
+			   funding,
 			   FUNDING_OUTPUT, NULL, NULL, NULL);
 
 	status_trace("Remote per-commit point: %s",

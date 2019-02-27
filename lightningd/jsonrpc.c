@@ -31,7 +31,6 @@
 #include <common/param.h>
 #include <common/timeout.h>
 #include <common/version.h>
-#include <common/wallet_tx.h>
 #include <common/wireaddr.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -120,7 +119,7 @@ static struct json_stream *jcon_new_json_stream(const tal_t *ctx,
 						struct json_connection *jcon,
 						struct command *writer)
 {
-	struct json_stream *js = new_json_stream(ctx, writer);
+	struct json_stream *js = new_json_stream(ctx, writer, jcon->log);
 
 	/* Wake writer to start streaming, in case it's not already. */
 	io_wake(jcon);
@@ -499,7 +498,7 @@ struct json_stream *json_stream_raw_for_cmd(struct command *cmd)
 	if (cmd->jcon)
 		js = jcon_new_json_stream(cmd, cmd->jcon, cmd);
 	else
-		js = new_json_stream(cmd, cmd);
+		js = new_json_stream(cmd, cmd, NULL);
 
 	assert(!cmd->have_json_stream);
 	cmd->have_json_stream = true;
@@ -1031,22 +1030,6 @@ json_tok_address_scriptpubkey(const tal_t *cxt,
 	return ADDRESS_PARSE_UNRECOGNIZED;
 }
 
-struct command_result *param_wtx(struct wallet_tx * tx, const char * buffer,
-				 const jsmntok_t *sattok, u64 max)
-{
-        if (json_tok_streq(buffer, sattok, "all")) {
-                tx->all_funds = true;
-		tx->amount = max;
-        } else if (!json_to_u64(buffer, sattok, &tx->amount)) {
-                return command_fail(tx->cmd, JSONRPC2_INVALID_PARAMS,
-				    "Invalid satoshis");
-	} else if (tx->amount > max) {
-                return command_fail(tx->cmd, FUND_MAX_EXCEEDED,
-				    "Amount exceeded %"PRIu64, max);
-	}
-        return NULL;
-}
-
 static struct command_result *param_command(struct command *cmd,
 					    const char *name,
 					    const char *buffer,
@@ -1068,7 +1051,7 @@ struct jsonrpc_notification *jsonrpc_notification_start(const tal_t *ctx, const 
 {
 	struct jsonrpc_notification *n = tal(ctx, struct jsonrpc_notification);
 	n->method = tal_strdup(n, method);
-	n->stream = new_json_stream(n, NULL);
+	n->stream = new_json_stream(n, NULL, NULL);
 	json_object_start(n->stream, NULL);
 	json_add_string(n->stream, "jsonrpc", "2.0");
 	json_add_string(n->stream, "method", method);
@@ -1085,7 +1068,7 @@ void jsonrpc_notification_end(struct jsonrpc_notification *n)
 }
 
 struct jsonrpc_request *jsonrpc_request_start_(
-    const tal_t *ctx, const char *method,
+    const tal_t *ctx, const char *method, struct log *log,
     void (*response_cb)(const char *buffer, const jsmntok_t *toks,
 			const jsmntok_t *idtok, void *),
     void *response_cb_arg)
@@ -1096,7 +1079,7 @@ struct jsonrpc_request *jsonrpc_request_start_(
 	r->response_cb = response_cb;
 	r->response_cb_arg = response_cb_arg;
 	r->method = NULL;
-	r->stream = new_json_stream(r, NULL);
+	r->stream = new_json_stream(r, NULL, log);
 
 	/* If no method is specified we don't prefill the JSON-RPC
 	 * request with the header. This serves as an escape hatch to

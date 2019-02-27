@@ -8,16 +8,22 @@ lightning-pay - Command for sending a payment to a BOLT11 invoice
 
 SYNOPSIS
 --------
-*pay* 'bolt11' ['msatoshi'] ['description'] ['riskfactor'] ['maxfeepercent'] ['retry_for'] ['maxdelay'] ['exemptfee']
+*pay* 'bolt11' ['msatoshi'] ['label'] ['riskfactor'] ['maxfeepercent'] ['retry_for'] ['maxdelay'] ['exemptfee']
 
 DESCRIPTION
 -----------
 
 The *pay* RPC command attempts to find a route to the given destination,
 and send the funds it asks for.  If the 'bolt11' does not contain an amount,
-'msatoshi' is required, otherwise if it is specified it must be 'null'.  If
-'bolt11' contains a description hash ('h' field) 'description' is
-required, otherwise it is unused.  The 'riskfactor' is described in detail
+'msatoshi' is required, otherwise if it is specified it must be 'null'.
+'msatoshi' is in millisatoshi precision; it can be a whole number, or
+a whole number with suffix 'msat' or 'sat', or a three decimal
+point number with suffix 'sat', or an 1 to 11 decimal point number
+suffixed by 'btc'.
+
+The 'label' field is used to attach a label to payments, and is returned
+in lightning-listpays(7) and lightning-listsendpays(7).
+The 'riskfactor' is described in detail
 in lightning-getroute(7), and defaults to 10.
 The 'maxfeepercent' limits the money paid in fees, and defaults to 0.5.
 The `maxfeepercent' is a percentage of the amount that is to be
@@ -34,7 +40,7 @@ succeed immediately.
 The command will keep finding routes and retrying the payment until
 it succeeds, or the given 'retry_for' seconds passes.
 Note that the command may stop retrying while a pending payment is
-ongoing, which you need to monitor with *listpayments* or *waitsendpay*.
+ongoing, which you need to monitor with *listpays*.
 'retry_for' defaults to 60 seconds and can only be an integer.
 
 When using 'lightning-cli', you may skip optional parameters by using
@@ -85,8 +91,7 @@ The following error codes may occur:
 
 * -1. Catchall nonspecific error.
 * 200. Payment timed out while a payment is in progress. Monitor
-  the status of that payment with 'listpayments' command, or
-  wait for that payment to complete with 'pay' command.
+  the status of that payment with 'listpays' command.
 * 201. Already paid with this 'hash' using different amount or
   destination.
 * 203. Permanent failure at destination. The 'data' field of
@@ -139,7 +144,7 @@ Rusty Russell <rusty@rustcorp.com.au> is mainly responsible.
 
 SEE ALSO
 --------
-lightning-listpayments(7), lightning-decodepay(7),
+lightning-listpays(7), lightning-decodepay(7),
 lightning-listinvoice(7), lightning-delinvoice(7),
 lightning-getroute(7), lightning-invoice(7).
 

@@ -654,8 +654,7 @@ static struct io_plan *handle_channel_update_sig(struct io_conn *conn,
 	secp256k1_ecdsa_signature sig;
 	struct short_channel_id scid;
 	u32 timestamp, fee_base_msat, fee_proportional_mill;
-	u64 htlc_minimum_msat;
-	u64 htlc_maximum_msat;
+	struct amount_msat htlc_minimum, htlc_maximum;
 	u8 message_flags, channel_flags;
 	u16 cltv_expiry_delta;
 	struct bitcoin_blkid chain_hash;
@@ -667,8 +666,8 @@ static struct io_plan *handle_channel_update_sig(struct io_conn *conn,
 	if (!fromwire_channel_update_option_channel_htlc_max(cu, &sig,
 			&chain_hash, &scid, &timestamp, &message_flags,
 			&channel_flags, &cltv_expiry_delta,
-			&htlc_minimum_msat, &fee_base_msat,
-			&fee_proportional_mill, &htlc_maximum_msat)) {
+			&htlc_minimum, &fee_base_msat,
+			&fee_proportional_mill, &htlc_maximum)) {
 		return bad_req_fmt(conn, c, msg_in, "Bad inner channel_update");
 	}
 	if (tal_count(cu) < offset)
@@ -682,9 +681,9 @@ static struct io_plan *handle_channel_update_sig(struct io_conn *conn,
 
 	cu = towire_channel_update_option_channel_htlc_max(tmpctx, &sig, &chain_hash,
 				   &scid, timestamp, message_flags, channel_flags,
-				   cltv_expiry_delta, htlc_minimum_msat,
+				   cltv_expiry_delta, htlc_minimum,
 				   fee_base_msat, fee_proportional_mill,
-				   htlc_maximum_msat);
+				   htlc_maximum);
 	return req_reply(conn, c, take(towire_hsm_cupdate_sig_reply(NULL, cu)));
 }
 
@@ -728,7 +727,8 @@ static struct io_plan *handle_sign_commitment_tx(struct io_conn *conn,
 						 const u8 *msg_in)
 {
 	struct pubkey peer_id, remote_funding_pubkey, local_funding_pubkey;
-	u64 dbid, funding_amount;
+	u64 dbid;
+	struct amount_sat funding;
 	struct secret channel_seed;
 	struct bitcoin_tx *tx;
 	struct bitcoin_signature sig;
@@ -739,7 +739,7 @@ static struct io_plan *handle_sign_commitment_tx(struct io_conn *conn,
 					     &peer_id, &dbid,
 					     &tx,
 					     &remote_funding_pubkey,
-					     &funding_amount))
+					     &funding))
 		return bad_req(conn, c, msg_in);
 
 	get_channel_seed(&peer_id, dbid, &channel_seed);
@@ -758,7 +758,7 @@ static struct io_plan *handle_sign_commitment_tx(struct io_conn *conn,
 	 * pointer, as we don't always know it (and zero is a valid amount, so
 	 * NULL is better to mean 'unknown' and has the nice property that
 	 * you'll crash if you assume it's there and you're wrong. */
-	tx->input[0].amount = tal_dup(tx->input, u64, &funding_amount);
+	tx->input[0].amount = tal_dup(tx->input, struct amount_sat, &funding);
 	sign_tx_input(tx, 0, NULL, funding_wscript,
 		      &secrets.funding_privkey,
 		      &local_funding_pubkey,
@@ -782,7 +782,7 @@ static struct io_plan *handle_sign_remote_commitment_tx(struct io_conn *conn,
 							const u8 *msg_in)
 {
 	struct pubkey remote_funding_pubkey, local_funding_pubkey;
-	u64 funding_amount;
+	struct amount_sat funding;
 	struct secret channel_seed;
 	struct bitcoin_tx *tx;
 	struct bitcoin_signature sig;
@@ -792,7 +792,7 @@ static struct io_plan *handle_sign_remote_commitment_tx(struct io_conn *conn,
 	if (!fromwire_hsm_sign_remote_commitment_tx(tmpctx, msg_in,
 						    &tx,
 						    &remote_funding_pubkey,
-						    &funding_amount))
+						    &funding))
 		bad_req(conn, c, msg_in);
 
 	get_channel_seed(&c->id, c->dbid, &channel_seed);
@@ -803,7 +803,7 @@ static struct io_plan *handle_sign_remote_commitment_tx(struct io_conn *conn,
 					      &local_funding_pubkey,
 					      &remote_funding_pubkey);
 	/* Need input amount for signing */
-	tx->input[0].amount = tal_dup(tx->input, u64, &funding_amount);
+	tx->input[0].amount = tal_dup(tx->input, struct amount_sat, &funding);
 	sign_tx_input(tx, 0, NULL, funding_wscript,
 		      &secrets.funding_privkey,
 		      &local_funding_pubkey,
@@ -825,7 +825,7 @@ static struct io_plan *handle_sign_remote_htlc_tx(struct io_conn *conn,
 	struct secrets secrets;
 	struct basepoints basepoints;
 	struct pubkey remote_per_commit_point;
-	u64 amount;
+	struct amount_sat amount;
 	u8 *wscript;
 	struct privkey htlc_privkey;
 	struct pubkey htlc_pubkey;
@@ -852,7 +852,7 @@ static struct io_plan *handle_sign_remote_htlc_tx(struct io_conn *conn,
 				   "Failed deriving htlc pubkey");
 
 	/* Need input amount for signing */
-	tx->input[0].amount = tal_dup(tx->input, u64, &amount);
+	tx->input[0].amount = tal_dup(tx->input, struct amount_sat, &amount);
 	sign_tx_input(tx, 0, NULL, wscript, &htlc_privkey, &htlc_pubkey,
 		      SIGHASH_ALL, &sig);
 
@@ -868,7 +868,7 @@ static struct io_plan *handle_sign_to_us_tx(struct io_conn *conn,
 					    struct bitcoin_tx *tx,
 					    const struct privkey *privkey,
 					    const u8 *wscript,
-					    u64 input_amount)
+					    struct amount_sat input_sat)
 {
 	struct bitcoin_signature sig;
 	struct pubkey pubkey;
@@ -879,7 +879,7 @@ static struct io_plan *handle_sign_to_us_tx(struct io_conn *conn,
 	if (tal_count(tx->input) != 1)
 		return bad_req_fmt(conn, c, msg_in, "bad txinput count");
 
-	tx->input[0].amount = tal_dup(tx->input, u64, &input_amount);
+	tx->input[0].amount = tal_dup(tx->input, struct amount_sat, &input_sat);
 	sign_tx_input(tx, 0, NULL, wscript, privkey, &pubkey, SIGHASH_ALL, &sig);
 
 	return req_reply(conn, c, take(towire_hsm_sign_tx_reply(NULL, &sig)));
@@ -893,7 +893,8 @@ static struct io_plan *handle_sign_delayed_payment_to_us(struct io_conn *conn,
 							 struct client *c,
 							 const u8 *msg_in)
 {
-	u64 commit_num, input_amount;
+	u64 commit_num;
+	struct amount_sat input_sat;
 	struct secret channel_seed, basepoint_secret;
 	struct pubkey basepoint;
 	struct bitcoin_tx *tx;
@@ -906,7 +907,7 @@ static struct io_plan *handle_sign_delayed_payment_to_us(struct io_conn *conn,
 	if (!fromwire_hsm_sign_delayed_payment_to_us(tmpctx, msg_in,
 						     &commit_num,
 						     &tx, &wscript,
-						     &input_amount))
+						     &input_sat))
 		return bad_req(conn, c, msg_in);
 
 	get_channel_seed(&c->id, c->dbid, &channel_seed);
@@ -939,7 +940,7 @@ static struct io_plan *handle_sign_delayed_payment_to_us(struct io_conn *conn,
 		return bad_req_fmt(conn, c, msg_in, "failed deriving privkey");
 
 	return handle_sign_to_us_tx(conn, c, msg_in,
-				    tx, &privkey, wscript, input_amount);
+				    tx, &privkey, wscript, input_sat);
 }
 
 /*~ This is used when the a commitment transaction is onchain, and has an HTLC
@@ -949,7 +950,7 @@ static struct io_plan *handle_sign_remote_htlc_to_us(struct io_conn *conn,
 						     struct client *c,
 						     const u8 *msg_in)
 {
-	u64 input_amount;
+	struct amount_sat input_sat;
 	struct secret channel_seed, htlc_basepoint_secret;
 	struct pubkey htlc_basepoint;
 	struct bitcoin_tx *tx;
@@ -960,7 +961,7 @@ static struct io_plan *handle_sign_remote_htlc_to_us(struct io_conn *conn,
 	if (!fromwire_hsm_sign_remote_htlc_to_us(tmpctx, msg_in,
 						 &remote_per_commitment_point,
 						 &tx, &wscript,
-						 &input_amount))
+						 &input_sat))
 		return bad_req(conn, c, msg_in);
 
 	get_channel_seed(&c->id, c->dbid, &channel_seed);
@@ -978,7 +979,7 @@ static struct io_plan *handle_sign_remote_htlc_to_us(struct io_conn *conn,
 				   "Failed deriving htlc privkey");
 
 	return handle_sign_to_us_tx(conn, c, msg_in,
-				    tx, &privkey, wscript, input_amount);
+				    tx, &privkey, wscript, input_sat);
 }
 
 /*~ This is used when the remote peer's commitment transaction is revoked;
@@ -988,7 +989,7 @@ static struct io_plan *handle_sign_penalty_to_us(struct io_conn *conn,
 						 struct client *c,
 						 const u8 *msg_in)
 {
-	u64 input_amount;
+	struct amount_sat input_sat;
 	struct secret channel_seed, revocation_secret, revocation_basepoint_secret;
 	struct pubkey revocation_basepoint;
 	struct bitcoin_tx *tx;
@@ -999,7 +1000,7 @@ static struct io_plan *handle_sign_penalty_to_us(struct io_conn *conn,
 	if (!fromwire_hsm_sign_penalty_to_us(tmpctx, msg_in,
 					     &revocation_secret,
 					     &tx, &wscript,
-					     &input_amount))
+					     &input_sat))
 		return bad_req(conn, c, msg_in);
 
 	if (!pubkey_from_secret(&revocation_secret, &point))
@@ -1021,7 +1022,7 @@ static struct io_plan *handle_sign_penalty_to_us(struct io_conn *conn,
 				   "Failed deriving revocation privkey");
 
 	return handle_sign_to_us_tx(conn, c, msg_in,
-				    tx, &privkey, wscript, input_amount);
+				    tx, &privkey, wscript, input_sat);
 }
 
 /*~ This is used when the a commitment transaction is onchain, and has an HTLC
@@ -1031,7 +1032,8 @@ static struct io_plan *handle_sign_local_htlc_tx(struct io_conn *conn,
 						 struct client *c,
 						 const u8 *msg_in)
 {
-	u64 commit_num, input_amount;
+	u64 commit_num;
+	struct amount_sat input_sat;
 	struct secret channel_seed, htlc_basepoint_secret;
 	struct sha256 shaseed;
 	struct pubkey per_commitment_point, htlc_basepoint;
@@ -1043,7 +1045,7 @@ static struct io_plan *handle_sign_local_htlc_tx(struct io_conn *conn,
 
 	if (!fromwire_hsm_sign_local_htlc_tx(tmpctx, msg_in,
 					     &commit_num, &tx, &wscript,
-					     &input_amount))
+					     &input_sat))
 		return bad_req(conn, c, msg_in);
 
 	get_channel_seed(&c->id, c->dbid, &channel_seed);
@@ -1076,7 +1078,7 @@ static struct io_plan *handle_sign_local_htlc_tx(struct io_conn *conn,
 		return bad_req_fmt(conn, c, msg_in, "bad txinput count");
 
 	/* FIXME: Check that output script is correct! */
-	tx->input[0].amount = tal_dup(tx->input, u64, &input_amount);
+	tx->input[0].amount = tal_dup(tx->input, struct amount_sat, &input_sat);
 	sign_tx_input(tx, 0, NULL, wscript, &htlc_privkey, &htlc_pubkey,
 		      SIGHASH_ALL, &sig);
 
@@ -1171,13 +1173,13 @@ static struct io_plan *handle_sign_mutual_close_tx(struct io_conn *conn,
 	struct pubkey remote_funding_pubkey, local_funding_pubkey;
 	struct bitcoin_signature sig;
 	struct secrets secrets;
-	u64 funding_amount;
+	struct amount_sat funding;
 	const u8 *funding_wscript;
 
 	if (!fromwire_hsm_sign_mutual_close_tx(tmpctx, msg_in,
 					       &tx,
 					       &remote_funding_pubkey,
-					       &funding_amount))
+					       &funding))
 		return bad_req(conn, c, msg_in);
 
 	/* FIXME: We should know dust level, decent fee range and
@@ -1191,7 +1193,7 @@ static struct io_plan *handle_sign_mutual_close_tx(struct io_conn *conn,
 					      &local_funding_pubkey,
 					      &remote_funding_pubkey);
 	/* Need input amount for signing */
-	tx->input[0].amount = tal_dup(tx->input, u64, &funding_amount);
+	tx->input[0].amount = tal_dup(tx->input, struct amount_sat, &funding);
 	sign_tx_input(tx, 0, NULL, funding_wscript,
 		      &secrets.funding_privkey,
 		      &local_funding_pubkey,
@@ -1363,7 +1365,7 @@ static struct io_plan *handle_sign_funding_tx(struct io_conn *conn,
 					      struct client *c,
 					      const u8 *msg_in)
 {
-	u64 satoshi_out, change_out;
+	struct amount_sat satoshi_out, change_out;
 	u32 change_keyindex;
 	struct pubkey local_pubkey, remote_pubkey;
 	struct utxo **utxos;
@@ -1378,7 +1380,7 @@ static struct io_plan *handle_sign_funding_tx(struct io_conn *conn,
 				       &remote_pubkey, &utxos))
 		return bad_req(conn, c, msg_in);
 
-	if (change_out) {
+	if (amount_sat_greater(change_out, AMOUNT_SAT(0))) {
 		changekey = tal(tmpctx, struct pubkey);
 		bitcoin_key(NULL, changekey, change_keyindex);
 	} else
@@ -1405,7 +1407,7 @@ static struct io_plan *handle_sign_withdrawal_tx(struct io_conn *conn,
 						 struct client *c,
 						 const u8 *msg_in)
 {
-	u64 satoshi_out, change_out;
+	struct amount_sat satoshi_out, change_out;
 	u32 change_keyindex;
 	struct utxo **utxos;
 	struct bitcoin_tx *tx;

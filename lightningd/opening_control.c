@@ -69,7 +69,7 @@ struct funding_channel {
 	struct command *cmd; /* Which initially owns us until openingd request */
 
 	struct wallet_tx wtx;
-	u64 push_msat;
+	struct amount_msat push;
 	u8 channel_flags;
 
 	/* Variables we need to compose fields in cmd's response */
@@ -110,7 +110,7 @@ void kill_uncommitted_channel(struct uncommitted_channel *uc,
 void json_add_uncommitted_channel(struct json_stream *response,
 				  const struct uncommitted_channel *uc)
 {
-	u64 msatoshi_total, our_msatoshi;
+	struct amount_msat total, ours;
 	if (!uc)
 		return;
 
@@ -128,10 +128,14 @@ void json_add_uncommitted_channel(struct json_stream *response,
 		json_array_end(response);
 	}
 
-	msatoshi_total = uc->fc->wtx.amount * 1000;
-	our_msatoshi = msatoshi_total - uc->fc->push_msat;
-	json_add_u64(response, "msatoshi_to_us", our_msatoshi);
-	json_add_u64(response, "msatoshi_total", msatoshi_total);
+	/* These should never fail. */
+	if (amount_sat_to_msat(&total, uc->fc->wtx.amount)
+	    && amount_msat_sub(&ours, total, uc->fc->push)) {
+		json_add_amount_msat(response, ours,
+			     "msatoshi_to_us", "to_us_msat");
+		json_add_amount_msat(response, total,
+				     "msatoshi_total", "total_msat");
+	}
 	json_object_end(response);
 }
 
@@ -144,14 +148,14 @@ wallet_commit_channel(struct lightningd *ld,
 		      struct bitcoin_signature *remote_commit_sig,
 		      const struct bitcoin_txid *funding_txid,
 		      u16 funding_outnum,
-		      u64 funding_satoshi,
-		      u64 push_msat,
+		      struct amount_sat funding,
+		      struct amount_msat push,
 		      u8 channel_flags,
 		      struct channel_info *channel_info,
 		      u32 feerate)
 {
 	struct channel *channel;
-	u64 our_msatoshi;
+	struct amount_msat our_msat;
 	s64 final_key_idx;
 
 	/* Get a key to use for closing outputs from this tx */
@@ -161,10 +165,17 @@ wallet_commit_channel(struct lightningd *ld,
 		return NULL;
 	}
 
-	if (uc->fc)
-		our_msatoshi = funding_satoshi * 1000 - push_msat;
-	else
-		our_msatoshi = push_msat;
+	if (uc->fc) {
+		if (!amount_sat_sub_msat(&our_msat, funding, push)) {
+			log_broken(uc->log, "push %s exceeds funding %s",
+				   type_to_string(tmpctx, struct amount_msat,
+						  &push),
+				   type_to_string(tmpctx, struct amount_sat,
+						  &funding));
+			return NULL;
+		}
+	} else
+		our_msat = push;
 
 	/* Feerates begin identical. */
 	channel_info->feerate_per_kw[LOCAL]
@@ -186,17 +197,17 @@ wallet_commit_channel(struct lightningd *ld,
 			      1, 1, 0,
 			      funding_txid,
 			      funding_outnum,
-			      funding_satoshi,
-			      push_msat,
+			      funding,
+			      push,
 			      false, /* !remote_funding_locked */
 			      NULL, /* no scid yet */
 			      /* The three arguments below are msatoshi_to_us,
 			       * msatoshi_to_us_min, and msatoshi_to_us_max.
 			       * Because, this is a newly-funded channel,
 			       * all three are same value. */
-			      our_msatoshi,
-			      our_msatoshi, /* msatoshi_to_us_min */
-			      our_msatoshi, /* msatoshi_to_us_max */
+			      our_msat,
+			      our_msat, /* msat_to_us_min */
+			      our_msat, /* msat_to_us_max */
 			      remote_commit,
 			      remote_commit_sig,
 			      NULL, /* No HTLC sigs yet */
@@ -280,7 +291,7 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 	struct bitcoin_tx *remote_commit;
 	u16 funding_outnum;
 	u32 feerate;
-	u64 change_satoshi;
+	struct amount_sat change;
 	struct channel *channel;
 	struct lightningd *ld = openingd->ld;
 
@@ -303,7 +314,7 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 					   &channel_info.remote_fundingkey,
 					   &expected_txid,
 					   &feerate,
-					   &fc->uc->our_config.channel_reserve_satoshis)) {
+					   &fc->uc->our_config.channel_reserve)) {
 		log_broken(fc->uc->log,
 			   "bad OPENING_FUNDER_REPLY %s",
 			   tal_hex(resp, resp));
@@ -317,7 +328,7 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 				       &channel_info.remote_per_commit));
 
 	/* Generate the funding tx. */
-	if (fc->wtx.change
+	if (!amount_sat_eq(fc->wtx.change, AMOUNT_SAT(0))
 	    && !bip32_pubkey(ld->wallet->bip32_base,
 			     &changekey, fc->wtx.change_key_index))
 		fatal("Error deriving change key %u", fc->wtx.change_key_index);
@@ -334,8 +345,10 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 		  tal_count(fundingtx->output));
 
 	for (size_t i = 0; i < tal_count(fundingtx->input); i++) {
-		log_debug(fc->uc->log, "%zi: %"PRIu64" satoshi (%s) %s\n",
-			  i, fc->wtx.utxos[i]->amount,
+		log_debug(fc->uc->log, "%zi: %s (%s) %s\n",
+			  i,
+			  type_to_string(tmpctx, struct amount_sat,
+					 &fc->wtx.utxos[i]->amount),
 			  fc->wtx.utxos[i]->is_p2sh ? "P2SH" : "SEGWIT",
 			  type_to_string(tmpctx, struct bitcoin_txid,
 					 &fundingtx->input[i].txid));
@@ -346,22 +359,29 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 	if (!bitcoin_txid_eq(&funding_txid, &expected_txid)) {
 		log_broken(fc->uc->log,
 			   "Funding txid mismatch:"
-			   " satoshi %"PRIu64" change %"PRIu64
+			   " amount %s change %s"
 			   " changeidx %u"
 			   " localkey %s remotekey %s",
-			   fc->wtx.amount,
-			   fc->wtx.change, fc->wtx.change_key_index,
+			   type_to_string(tmpctx, struct amount_sat,
+					  &fc->wtx.amount),
+			   type_to_string(tmpctx, struct amount_sat,
+					  &fc->wtx.change),
+			   fc->wtx.change_key_index,
 			   type_to_string(fc, struct pubkey,
 					  &fc->uc->local_funding_pubkey),
 			   type_to_string(fc, struct pubkey,
 					  &channel_info.remote_fundingkey));
 		was_pending(command_fail(fc->cmd, JSONRPC2_INVALID_PARAMS,
 					 "Funding txid mismatch:"
-					 " satoshi %"PRIu64" change %"PRIu64
+					 " amount %s change %s"
 					 " changeidx %u"
 					 " localkey %s remotekey %s",
-					 fc->wtx.amount,
-					 fc->wtx.change,
+					 type_to_string(tmpctx,
+							struct amount_sat,
+							&fc->wtx.amount),
+					 type_to_string(tmpctx,
+							struct amount_sat,
+							&fc->wtx.change),
 					 fc->wtx.change_key_index,
 					 type_to_string(fc, struct pubkey,
 							&fc->uc->local_funding_pubkey),
@@ -377,7 +397,7 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 					&funding_txid,
 					funding_outnum,
 					fc->wtx.amount,
-					fc->push_msat,
+					fc->push,
 					fc->channel_flags,
 					&channel_info,
 					feerate);
@@ -390,8 +410,9 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 	/* Get HSM to sign the funding tx. */
 	log_debug(channel->log, "Getting HSM to sign funding tx");
 
-	msg = towire_hsm_sign_funding(tmpctx, channel->funding_satoshi,
-				      fc->wtx.change, fc->wtx.change_key_index,
+	msg = towire_hsm_sign_funding(tmpctx, channel->funding,
+				      fc->wtx.change,
+				      fc->wtx.change_key_index,
 				      &fc->uc->local_funding_pubkey,
 				      &channel_info.remote_fundingkey,
 				      fc->wtx.utxos);
@@ -405,7 +426,7 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 		      tal_hex(msg, resp));
 
 	/* Extract the change output and add it to the DB */
-	wallet_extract_owned_outputs(ld->wallet, fundingtx, NULL, &change_satoshi);
+	wallet_extract_owned_outputs(ld->wallet, fundingtx, NULL, &change);
 
 	/* Make sure we recognize our change output by its scriptpubkey in
 	 * future. This assumes that we have only two outputs, may not be true
@@ -454,7 +475,8 @@ static void opening_fundee_finished(struct subd *openingd,
 	struct lightningd *ld = openingd->ld;
 	struct bitcoin_txid funding_txid;
 	u16 funding_outnum;
-	u64 funding_satoshi, push_msat;
+	struct amount_sat funding;
+	struct amount_msat push;
 	u32 feerate;
 	u8 channel_flags;
 	struct channel *channel;
@@ -478,12 +500,12 @@ static void opening_fundee_finished(struct subd *openingd,
 					   &channel_info.remote_fundingkey,
 					   &funding_txid,
 					   &funding_outnum,
-					   &funding_satoshi,
-					   &push_msat,
+					   &funding,
+					   &push,
 					   &channel_flags,
 					   &feerate,
 					   &funding_signed,
-					   &uc->our_config.channel_reserve_satoshis)) {
+					   &uc->our_config.channel_reserve)) {
 		log_broken(uc->log, "bad OPENING_FUNDEE_REPLY %s",
 			   tal_hex(reply, reply));
 		uncommitted_channel_disconnect(uc, "bad OPENING_FUNDEE_REPLY");
@@ -503,8 +525,8 @@ static void opening_fundee_finished(struct subd *openingd,
 					&remote_commit_sig,
 					&funding_txid,
 					funding_outnum,
-					funding_satoshi,
-					push_msat,
+					funding,
+					push,
 					channel_flags,
 					&channel_info,
 					feerate);
@@ -604,7 +626,7 @@ new_uncommitted_channel(struct peer *peer)
 {
 	struct lightningd *ld = peer->ld;
 	struct uncommitted_channel *uc = tal(ld, struct uncommitted_channel);
-	char *idname;
+	const char *idname;
 
 	uc->peer = peer;
 	assert(!peer->uncommitted_channel);
@@ -632,12 +654,12 @@ new_uncommitted_channel(struct peer *peer)
 static void channel_config(struct lightningd *ld,
 			   struct channel_config *ours,
 			   u32 *max_to_self_delay,
-			   u64 *min_effective_htlc_capacity_msat)
+			   struct amount_msat *min_effective_htlc_capacity)
 {
 	/* FIXME: depend on feerate. */
 	*max_to_self_delay = ld->config.locktime_max;
 	/* This is 1c at $1000/BTC */
-	*min_effective_htlc_capacity_msat = 1000000;
+	*min_effective_htlc_capacity = AMOUNT_MSAT(1000000);
 
 	/* BOLT #2:
 	 *
@@ -646,11 +668,11 @@ static void channel_config(struct lightningd *ld,
 	 *   - set `dust_limit_satoshis` to a sufficient value to allow
 	 *     commitment transactions to propagate through the Bitcoin network.
 	 */
-	ours->dust_limit_satoshis = 546;
-	ours->max_htlc_value_in_flight_msat = UINT64_MAX;
+	ours->dust_limit = get_chainparams(ld)->dust_limit;
+	ours->max_htlc_value_in_flight = AMOUNT_MSAT(UINT64_MAX);
 
 	/* Don't care */
-	ours->htlc_minimum_msat = 0;
+	ours->htlc_minimum = AMOUNT_MSAT(0);
 
 	/* BOLT #2:
 	 *
@@ -670,7 +692,7 @@ static void channel_config(struct lightningd *ld,
 	 ours->max_accepted_htlcs = 483;
 
 	 /* This is filled in by lightning_openingd, for consistency. */
-	 ours->channel_reserve_satoshis = -1;
+	 ours->channel_reserve = AMOUNT_SAT(UINT64_MAX);
 }
 
 static unsigned int openingd_msg(struct subd *openingd,
@@ -730,7 +752,7 @@ void peer_start_openingd(struct peer *peer,
 {
 	int hsmfd;
 	u32 max_to_self_delay;
-	u64 min_effective_htlc_capacity_msat;
+	struct amount_msat min_effective_htlc_capacity;
 	struct uncommitted_channel *uc;
 	const u8 *msg;
 
@@ -761,7 +783,7 @@ void peer_start_openingd(struct peer *peer,
 
 	channel_config(peer->ld, &uc->our_config,
 		       &max_to_self_delay,
-		       &min_effective_htlc_capacity_msat);
+		       &min_effective_htlc_capacity);
 
 	/* BOLT #2:
 	 *
@@ -775,7 +797,7 @@ void peer_start_openingd(struct peer *peer,
 				  &get_chainparams(peer->ld)->genesis_blockhash,
 				  &uc->our_config,
 				  max_to_self_delay,
-				  min_effective_htlc_capacity_msat,
+				  min_effective_htlc_capacity,
 				  cs, &uc->local_basepoints,
 				  &uc->local_funding_pubkey,
 				  uc->minimum_depth,
@@ -804,30 +826,28 @@ static struct command_result *json_fund_channel(struct command *cmd,
 						const jsmntok_t *params)
 {
 	struct command_result *res;
-	const jsmntok_t *sattok;
 	struct funding_channel * fc = tal(cmd, struct funding_channel);
 	struct pubkey *id;
 	struct peer *peer;
 	struct channel *channel;
-	u32 *feerate_per_kw;
+	u32 *feerate_per_kw, *minconf, maxheight;
 	bool *announce_channel;
 	u8 *msg;
-	u64 max_funding_satoshi = get_chainparams(cmd->ld)->max_funding_satoshi;
+	struct amount_sat max_funding_satoshi;
+
+	max_funding_satoshi = get_chainparams(cmd->ld)->max_funding;
 
 	fc->cmd = cmd;
 	fc->uc = NULL;
-	wtx_init(cmd, &fc->wtx);
+	wtx_init(cmd, &fc->wtx, max_funding_satoshi);
 	if (!param(fc->cmd, buffer, params,
 		   p_req("id", param_pubkey, &id),
-		   p_req("satoshi", param_tok, &sattok),
+		   p_req("satoshi", param_wtx, &fc->wtx),
 		   p_opt("feerate", param_feerate, &feerate_per_kw),
 		   p_opt_def("announce", param_bool, &announce_channel, true),
+		   p_opt_def("minconf", param_number, &minconf, 1),
 		   NULL))
 		return command_param_failed();
-
-	res = param_wtx(&fc->wtx, buffer, sattok, max_funding_satoshi);
-	if (res)
-		return res;
 
 	if (!feerate_per_kw) {
 		feerate_per_kw = tal(cmd, u32);
@@ -863,7 +883,7 @@ static struct command_result *json_fund_channel(struct command *cmd,
 	}
 
 	/* FIXME: Support push_msat? */
-	fc->push_msat = 0;
+	fc->push = AMOUNT_MSAT(0);
 	fc->channel_flags = OUR_CHANNEL_FLAGS;
 	if (!*announce_channel) {
 		fc->channel_flags &= ~CHANNEL_FLAGS_ANNOUNCE_CHANNEL;
@@ -871,19 +891,20 @@ static struct command_result *json_fund_channel(struct command *cmd,
 			type_to_string(fc, struct pubkey, id));
 	}
 
+	maxheight = minconf_to_maxheight(*minconf, cmd->ld);
 	res = wtx_select_utxos(&fc->wtx, *feerate_per_kw,
-			       BITCOIN_SCRIPTPUBKEY_P2WSH_LEN);
+			       BITCOIN_SCRIPTPUBKEY_P2WSH_LEN, maxheight);
 	if (res)
 		return res;
 
-	assert(fc->wtx.amount <= max_funding_satoshi);
+	assert(!amount_sat_greater(fc->wtx.amount, max_funding_satoshi));
 
 	peer->uncommitted_channel->fc = tal_steal(peer->uncommitted_channel, fc);
 	fc->uc = peer->uncommitted_channel;
 
 	msg = towire_opening_funder(NULL,
 				    fc->wtx.amount,
-				    fc->push_msat,
+				    fc->push,
 				    *feerate_per_kw,
 				    fc->wtx.change,
 				    fc->wtx.change_key_index,
@@ -898,9 +919,9 @@ static struct command_result *json_fund_channel(struct command *cmd,
 }
 
 static const struct json_command fund_channel_command = {
-	"fundchannel",
-	json_fund_channel,
-	"Fund channel with {id} using {satoshi} (or 'all') satoshis, at optional {feerate}"
+    "fundchannel", json_fund_channel,
+    "Fund channel with {id} using {satoshi} (or 'all') satoshis, at optional "
+    "{feerate}. Only use outputs that have {minconf} confirmations."
 };
 AUTODATA(json_command, &fund_channel_command);
 

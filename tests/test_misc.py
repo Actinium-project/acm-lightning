@@ -198,7 +198,7 @@ def test_htlc_sig_persistence(node_factory, bitcoind, executor):
     time.sleep(3)
     bitcoind.generate_block(1)
     l1.daemon.wait_for_logs([
-        r'Owning output . (\d+) .SEGWIT. txid',
+        r'Owning output . (\d+)sat .SEGWIT. txid',
     ])
 
     # We should now have a) the change from funding, b) the
@@ -471,11 +471,11 @@ def test_withdraw(node_factory, bitcoind):
     assert l1.db_query('SELECT COUNT(*) as c FROM outputs WHERE status=0')[0]['c'] == 6
 
     # Test withdrawal to self.
-    l1.rpc.withdraw(l1.rpc.newaddr('bech32')['address'], 'all')
+    l1.rpc.withdraw(l1.rpc.newaddr('bech32')['address'], 'all', minconf=0)
     bitcoind.generate_block(1)
     assert l1.db_query('SELECT COUNT(*) as c FROM outputs WHERE status=0')[0]['c'] == 1
 
-    l1.rpc.withdraw(waddr, 'all')
+    l1.rpc.withdraw(waddr, 'all', minconf=0)
     assert l1.db_query('SELECT COUNT(*) as c FROM outputs WHERE status=0')[0]['c'] == 0
 
     # This should fail, can't even afford fee.

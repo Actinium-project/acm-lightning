@@ -215,7 +215,7 @@ def test_closing_different_fees(node_factory, bitcoind, executor):
             peers.append(p)
 
     for p in peers:
-        p.channel = l1.rpc.fundchannel(p.info['id'], 10**6)['channel_id']
+        p.channel = l1.rpc.fundchannel(p.info['id'], 10**6, minconf=0)['channel_id']
         # Technically, this is async to fundchannel returning.
         l1.daemon.wait_for_log('sendrawtx exit 0')
 
@@ -1468,6 +1468,12 @@ def test_permfail(node_factory, bitcoind):
     # failed). Also the output should now be listed as confirmed since we
     # generated some more blocks.
     assert (closetxid, "confirmed") in set([(o['txid'], o['status']) for o in l1.rpc.listfunds()['outputs']])
+
+    # Check that the all the addresses match what we generated ourselves:
+    for o in l1.rpc.listfunds()['outputs']:
+        txout = bitcoind.rpc.gettxout(o['txid'], o['output'])
+        addr = txout['scriptPubKey']['addresses'][0]
+        assert(addr == o['address'])
 
     addr = l1.bitcoin.rpc.getnewaddress()
     l1.rpc.withdraw(addr, "all")

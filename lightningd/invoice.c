@@ -7,6 +7,7 @@
 #include <bitcoin/script.h>
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
+#include <common/amount.h>
 #include <common/bech32.h>
 #include <common/bolt11.h>
 #include <common/json_command.h>
@@ -45,13 +46,14 @@ static void json_add_invoice(struct json_stream *response,
 	json_add_escaped_string(response, "label", inv->label);
 	json_add_string(response, "bolt11", inv->bolt11);
 	json_add_hex(response, "payment_hash", &inv->rhash, sizeof(inv->rhash));
-	if (inv->msatoshi)
-		json_add_u64(response, "msatoshi", *inv->msatoshi);
+	if (inv->msat)
+		json_add_amount_msat(response, *inv->msat,
+				     "msatoshi", "amount_msat");
 	json_add_string(response, "status", invoice_status_str(inv));
 	if (inv->state == PAID) {
 		json_add_u64(response, "pay_index", inv->pay_index);
-		json_add_u64(response, "msatoshi_received",
-			     inv->msatoshi_received);
+		json_add_amount_msat(response, inv->received,
+				     "msatoshi_received", "amount_received_msat");
 		json_add_u64(response, "paid_at", inv->paid_timestamp);
 	}
 
@@ -141,7 +143,7 @@ static struct command_result *parse_fallback(struct command *cmd,
 /* BOLT11 struct wants an array of arrays (can provide multiple routes) */
 static struct route_info **select_inchan(const tal_t *ctx,
 					 struct lightningd *ld,
-					 u64 capacity_needed,
+					 struct amount_msat capacity_needed,
 					 const struct route_info *inchans,
 					 bool *any_offline)
 {
@@ -158,7 +160,7 @@ static struct route_info **select_inchan(const tal_t *ctx,
 	for (size_t i = 0; i < tal_count(inchans); i++) {
 		struct peer *peer;
 		struct channel *c;
-		u64 msatoshi_avail;
+		struct amount_msat avail, excess;
 
 		/* Do we know about this peer? */
 		peer = peer_by_id(ld, &inchans[i].pubkey);
@@ -171,15 +173,22 @@ static struct route_info **select_inchan(const tal_t *ctx,
 			continue;
 
 		/* Does it have sufficient capacity. */
-		msatoshi_avail = c->funding_satoshi * 1000 - c->our_msatoshi;
+		if (!amount_sat_sub_msat(&avail, c->funding, c->our_msat)) {
+			log_broken(ld->log,
+				   "underflow: funding %s - our_msat %s",
+				   type_to_string(tmpctx, struct amount_sat,
+						  &c->funding),
+				   type_to_string(tmpctx, struct amount_msat,
+						  &c->our_msat));
+			continue;
+		}
 
 		/* Even after reserve taken into account */
-		if (c->our_config.channel_reserve_satoshis * 1000
-		    > msatoshi_avail)
+		if (!amount_msat_sub_sat(&avail,
+					 avail, c->our_config.channel_reserve))
 			continue;
 
-		msatoshi_avail -= c->our_config.channel_reserve_satoshis * 1000;
-		if (msatoshi_avail < capacity_needed)
+		if (!amount_msat_sub(&excess, avail, capacity_needed))
 			continue;
 
 		/* Is it offline? */
@@ -189,9 +198,9 @@ static struct route_info **select_inchan(const tal_t *ctx,
 		}
 
 		/* Avoid divide-by-zero corner case. */
-		wsum += (msatoshi_avail - capacity_needed + 1);
+		wsum += excess.millisatoshis + 1; /* Raw: rand select */
 		if (pseudorand(1ULL << 32)
-		    <= ((msatoshi_avail - capacity_needed + 1) << 32) / wsum)
+		    <= ((excess.millisatoshis + 1) << 32) / wsum) /* Raw: rand select */
 			r = &inchans[i];
 	}
 
@@ -235,7 +244,7 @@ static void gossipd_incoming_channels_reply(struct subd *gossipd,
 	info->b11->routes
 		= select_inchan(info->b11,
 				info->cmd->ld,
-				info->b11->msatoshi ? *info->b11->msatoshi : 1,
+				info->b11->msat ? *info->b11->msat : AMOUNT_MSAT(1),
 				inchans,
 				&any_offline);
 
@@ -254,7 +263,7 @@ static void gossipd_incoming_channels_reply(struct subd *gossipd,
 
 	if (!wallet_invoice_create(wallet,
 				   &invoice,
-				   info->b11->msatoshi,
+				   info->b11->msat,
 				   info->label,
 				   info->b11->expiry,
 				   b11enc,
@@ -280,9 +289,11 @@ static void gossipd_incoming_channels_reply(struct subd *gossipd,
 	/* Warn if there's not sufficient incoming capacity. */
 	if (tal_count(info->b11->routes) == 0) {
 		log_unusual(info->cmd->ld->log,
-			    "invoice: insufficient incoming capacity for %"PRIu64
-			    " msatoshis%s",
-			    info->b11->msatoshi ? *info->b11->msatoshi : 0,
+			    "invoice: insufficient incoming capacity for %s%s",
+			    info->b11->msat
+			    ? type_to_string(tmpctx, struct amount_msat,
+					     info->b11->msat)
+			    : "0",
 			    any_offline
 			    ? " (among currently connected peers)" : "");
 
@@ -357,6 +368,27 @@ static struct route_info **unpack_routes(const tal_t *ctx,
 }
 #endif /* DEVELOPER */
 
+static struct command_result *param_msat_or_any(struct command *cmd,
+						const char *name,
+						const char *buffer,
+						const jsmntok_t *tok,
+						struct amount_msat **msat)
+{
+	if (json_tok_streq(buffer, tok, "any")) {
+		*msat = NULL;
+		return NULL;
+	}
+	*msat = tal(cmd, struct amount_msat);
+	if (parse_amount_msat(*msat, buffer + tok->start, tok->end - tok->start))
+		return NULL;
+
+	return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			    "'%s' should be millisatoshis or 'any', not '%.*s'",
+			    name,
+			    tok->end - tok->start,
+			    buffer + tok->start);
+}
+
 static struct command_result *json_invoice(struct command *cmd,
 					   const char *buffer,
 					   const jsmntok_t *obj UNNEEDED,
@@ -364,7 +396,7 @@ static struct command_result *json_invoice(struct command *cmd,
 {
 	const jsmntok_t *fallbacks;
 	const jsmntok_t *preimagetok;
-	u64 *msatoshi_val;
+	struct amount_msat *msatoshi_val;
 	struct invoice_info *info;
 	const char *desc_val;
 	const u8 **fallback_scripts = NULL;
@@ -380,7 +412,7 @@ static struct command_result *json_invoice(struct command *cmd,
 	info->cmd = cmd;
 
 	if (!param(cmd, buffer, params,
-		   p_req("msatoshi", param_msat, &msatoshi_val),
+		   p_req("msatoshi", param_msat_or_any, &msatoshi_val),
 		   p_req("label", param_label, &info->label),
 		   p_req("description", param_escaped_string, &desc_val),
 		   p_opt_def("expiry", param_u64, &expiry, 3600),
@@ -409,11 +441,12 @@ static struct command_result *json_invoice(struct command *cmd,
 	}
 
 	chainparams = get_chainparams(cmd->ld);
-	if (msatoshi_val && *msatoshi_val > chainparams->max_payment_msat) {
+	if (msatoshi_val
+	    && amount_msat_greater(*msatoshi_val, chainparams->max_payment)) {
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				    "msatoshi cannot exceed %"PRIu64
-				    " millisatoshis",
-				    chainparams->max_payment_msat);
+				    "msatoshi cannot exceed %s",
+				    type_to_string(tmpctx, struct amount_msat,
+						   &chainparams->max_payment));
 	}
 
 	if (fallbacks) {
@@ -446,7 +479,6 @@ static struct command_result *json_invoice(struct command *cmd,
 	/* Generate preimage hash. */
 	sha256(&rhash, &info->payment_preimage, sizeof(info->payment_preimage));
 
-	/* Construct bolt11 string. */
 	info->b11 = new_bolt11(info, msatoshi_val);
 	info->b11->chain = chainparams;
 	info->b11->timestamp = time_now().ts.tv_sec;
@@ -780,8 +812,9 @@ static struct command_result *json_decodepay(struct command *cmd,
 	json_add_u64(response, "created_at", b11->timestamp);
 	json_add_u64(response, "expiry", b11->expiry);
 	json_add_pubkey(response, "payee", &b11->receiver_id);
-        if (b11->msatoshi)
-                json_add_u64(response, "msatoshi", *b11->msatoshi);
+        if (b11->msat)
+                json_add_amount_msat(response, *b11->msat,
+				     "msatoshi", "amount_msat");
         if (b11->description) {
 		struct json_escaped *esc = json_escape(NULL, b11->description);
                 json_add_escaped_string(response, "description", take(esc));

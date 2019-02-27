@@ -65,7 +65,7 @@ void fromwire_route_hop(const u8 **pptr, size_t *max, struct route_hop *entry)
 	fromwire_pubkey(pptr, max, &entry->nodeid);
 	fromwire_short_channel_id(pptr, max, &entry->channel_id);
 	entry->direction = fromwire_u8(pptr, max);
-	entry->amount = fromwire_u64(pptr, max);
+	entry->amount = fromwire_amount_msat(pptr, max);
 	entry->delay = fromwire_u32(pptr, max);
 }
 
@@ -74,7 +74,7 @@ void towire_route_hop(u8 **pptr, const struct route_hop *entry)
 	towire_pubkey(pptr, &entry->nodeid);
 	towire_short_channel_id(pptr, &entry->channel_id);
 	towire_u8(pptr, entry->direction);
-	towire_u64(pptr, entry->amount);
+	towire_amount_msat(pptr, entry->amount);
 	towire_u32(pptr, entry->delay);
 }
 
@@ -102,7 +102,7 @@ void fromwire_gossip_getchannels_entry(const u8 **pptr, size_t *max,
 	fromwire_short_channel_id(pptr, max, &entry->short_channel_id);
 	fromwire(pptr, max, entry->source, sizeof(entry->source));
 	fromwire(pptr, max, entry->destination, sizeof(entry->destination));
-	entry->satoshis = fromwire_u64(pptr, max);
+	entry->sat = fromwire_amount_sat(pptr, max);
 	entry->message_flags = fromwire_u8(pptr, max);
 	entry->channel_flags = fromwire_u8(pptr, max);
 	entry->public = fromwire_bool(pptr, max);
@@ -119,7 +119,7 @@ void towire_gossip_getchannels_entry(u8 **pptr,
 	towire_short_channel_id(pptr, &entry->short_channel_id);
 	towire(pptr, entry->source, sizeof(entry->source));
 	towire(pptr, entry->destination, sizeof(entry->destination));
-	towire_u64(pptr, entry->satoshis);
+	towire_amount_sat(pptr, entry->sat);
 	towire_u8(pptr, entry->message_flags);
 	towire_u8(pptr, entry->channel_flags);
 	towire_bool(pptr, entry->public);

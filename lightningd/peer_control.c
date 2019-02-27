@@ -44,6 +44,7 @@
 #include <lightningd/opening_control.h>
 #include <lightningd/options.h>
 #include <lightningd/peer_htlcs.h>
+#include <lightningd/plugin_hook.h>
 #include <unistd.h>
 #include <wally_bip32.h>
 #include <wire/gen_onion_wire.h>
@@ -138,10 +139,16 @@ static void delete_peer(struct peer *peer)
 /* Last one out deletes peer. */
 void maybe_delete_peer(struct peer *peer)
 {
-	if (peer->uncommitted_channel)
-		return;
 	if (!list_empty(&peer->channels))
 		return;
+	if (peer->uncommitted_channel) {
+		/* This isn't sufficient to keep it in db! */
+		if (peer->dbid != 0) {
+			wallet_peer_delete(peer->ld->wallet, peer->dbid);
+			peer->dbid = 0;
+		}
+		return;
+	}
 	delete_peer(peer);
 }
 
@@ -201,7 +208,7 @@ static void sign_last_tx(struct channel *channel)
 					    channel->last_tx,
 					    &channel->channel_info
 					    .remote_fundingkey,
-					    channel->funding_satoshi);
+					    channel->funding);
 
 	if (!wire_sync_write(ld->hsm_fd, take(msg)))
 		fatal("Could not write to HSM: %s", strerror(errno));
@@ -411,39 +418,320 @@ void channel_errmsg(struct channel *channel,
 			       err_for_them ? "sent" : "received", desc);
 }
 
-/* Connectd tells us a peer has connected: it never hands us duplicates, since
- * it holds them until we say peer_died. */
-void peer_connected(struct lightningd *ld, const u8 *msg,
-		    int peer_fd, int gossip_fd)
-{
-	struct pubkey id;
-	struct crypto_state cs;
-	u8 *globalfeatures, *localfeatures;
-	u8 *error;
+/* Possible outcomes returned by the `connected` hook. */
+enum peer_connected_hook_result {
+	PEER_CONNECTED_CONTINUE,
+	PEER_CONNECTED_DISCONNECT,
+};
+
+struct peer_connected_hook_payload {
+	struct lightningd *ld;
+	struct crypto_state crypto_state;
 	struct channel *channel;
 	struct wireaddr_internal addr;
 	struct peer *peer;
+	int peer_fd;
+	int gossip_fd;
+};
 
-	if (!fromwire_connect_peer_connected(msg, msg,
-					     &id, &addr, &cs,
-					     &globalfeatures, &localfeatures))
-		fatal("Connectd gave bad CONNECT_PEER_CONNECTED message %s",
-		      tal_hex(msg, msg));
+struct peer_connected_hook_response {
+	enum peer_connected_hook_result result;
+};
 
-	/* Complete any outstanding connect commands. */
-	connect_succeeded(ld, &id);
+static void json_add_htlcs(struct lightningd *ld,
+			   struct json_stream *response,
+			   const struct channel *channel)
+{
+	/* FIXME: make per-channel htlc maps! */
+	const struct htlc_in *hin;
+	struct htlc_in_map_iter ini;
+	const struct htlc_out *hout;
+	struct htlc_out_map_iter outi;
 
-	/* If we're already dealing with this peer, hand off to correct
-	 * subdaemon.  Otherwise, we'll hand to openingd to wait there. */
-	peer = peer_by_id(ld, &id);
-	if (!peer)
-		peer = new_peer(ld, 0, &id, &addr);
+	/* FIXME: Add more fields. */
+	json_array_start(response, "htlcs");
+	for (hin = htlc_in_map_first(&ld->htlcs_in, &ini);
+	     hin;
+	     hin = htlc_in_map_next(&ld->htlcs_in, &ini)) {
+		if (hin->key.channel != channel)
+			continue;
 
-	peer_update_features(peer, globalfeatures, localfeatures);
+		json_object_start(response, NULL);
+		json_add_string(response, "direction", "in");
+		json_add_u64(response, "id", hin->key.id);
+		json_add_amount_msat(response, hin->msat,
+				     "msatoshi", "amount_msat");
+		json_add_u64(response, "expiry", hin->cltv_expiry);
+		json_add_hex(response, "payment_hash",
+			     &hin->payment_hash, sizeof(hin->payment_hash));
+		json_add_string(response, "state",
+				htlc_state_name(hin->hstate));
+		json_object_end(response);
+	}
 
-	/* Can't be opening, since we wouldn't have sent peer_disconnected. */
-	assert(!peer->uncommitted_channel);
-	channel = peer_active_channel(peer);
+	for (hout = htlc_out_map_first(&ld->htlcs_out, &outi);
+	     hout;
+	     hout = htlc_out_map_next(&ld->htlcs_out, &outi)) {
+		if (hout->key.channel != channel)
+			continue;
+
+		json_object_start(response, NULL);
+		json_add_string(response, "direction", "out");
+		json_add_u64(response, "id", hout->key.id);
+		json_add_amount_msat(response, hout->msat,
+				     "msatoshi", "amount_msat");
+		json_add_u64(response, "expiry", hout->cltv_expiry);
+		json_add_hex(response, "payment_hash",
+			     &hout->payment_hash, sizeof(hout->payment_hash));
+		json_add_string(response, "state",
+				htlc_state_name(hout->hstate));
+		json_object_end(response);
+	}
+	json_array_end(response);
+}
+
+/* We do this replication manually because it's an array. */
+static void json_add_sat_only(struct json_stream *result,
+			      const char *fieldname,
+			      struct amount_sat sat)
+{
+	struct amount_msat msat;
+
+	if (amount_sat_to_msat(&msat, sat))
+		json_add_member(result, fieldname, "\"%s\"",
+				type_to_string(tmpctx, struct amount_msat, &msat));
+}
+
+static void json_add_channel(struct lightningd *ld,
+			     struct json_stream *response, const char *key,
+			     const struct channel *channel)
+{
+	struct channel_id cid;
+	struct channel_stats channel_stats;
+	struct amount_msat spendable, funding_msat;
+	struct peer *p = channel->peer;
+
+	json_object_start(response, key);
+	json_add_string(response, "state", channel_state_name(channel));
+	if (channel->last_tx) {
+		struct bitcoin_txid txid;
+		bitcoin_txid(channel->last_tx, &txid);
+
+		json_add_txid(response, "scratch_txid", &txid);
+	}
+	if (channel->owner)
+		json_add_string(response, "owner", channel->owner->name);
+
+	if (channel->scid) {
+		json_add_short_channel_id(response, "short_channel_id",
+					  channel->scid);
+		json_add_num(response, "direction",
+			     pubkey_idx(&ld->id, &channel->peer->id));
+	}
+
+	derive_channel_id(&cid, &channel->funding_txid,
+			  channel->funding_outnum);
+	json_add_string(response, "channel_id",
+			type_to_string(tmpctx, struct channel_id, &cid));
+	json_add_txid(response, "funding_txid", &channel->funding_txid);
+	json_add_bool(
+	    response, "private",
+	    !(channel->channel_flags & CHANNEL_FLAGS_ANNOUNCE_CHANNEL));
+
+	// FIXME @conscott : Modify this when dual-funded channels
+	// are implemented
+	json_object_start(response, "funding_allocation_msat");
+	if (channel->funder == LOCAL) {
+		json_add_u64(response, pubkey_to_hexstr(tmpctx, &p->id), 0);
+		json_add_u64(response, pubkey_to_hexstr(tmpctx, &ld->id),
+			     channel->funding.satoshis * 1000); /* Raw: raw JSON field */
+	} else {
+		json_add_u64(response, pubkey_to_hexstr(tmpctx, &ld->id), 0);
+		json_add_u64(response, pubkey_to_hexstr(tmpctx, &p->id),
+			     channel->funding.satoshis * 1000); /* Raw: raw JSON field */
+	}
+	json_object_end(response);
+
+	json_object_start(response, "funding_msat");
+	if (channel->funder == LOCAL) {
+		json_add_sat_only(response,
+				  pubkey_to_hexstr(tmpctx, &p->id),
+				  AMOUNT_SAT(0));
+		json_add_sat_only(response,
+				  pubkey_to_hexstr(tmpctx, &ld->id),
+				  channel->funding);
+	} else {
+		json_add_sat_only(response,
+				  pubkey_to_hexstr(tmpctx, &ld->id),
+				  AMOUNT_SAT(0));
+		json_add_sat_only(response,
+				  pubkey_to_hexstr(tmpctx, &p->id),
+				  channel->funding);
+	}
+	json_object_end(response);
+
+	if (!amount_sat_to_msat(&funding_msat, channel->funding)) {
+		log_broken(channel->log,
+			   "Overflow converting funding %s",
+			   type_to_string(tmpctx, struct amount_sat,
+					  &channel->funding));
+		funding_msat = AMOUNT_MSAT(0);
+	}
+	json_add_amount_msat(response, channel->our_msat,
+			     "msatoshi_to_us", "to_us_msat");
+	json_add_amount_msat(response, channel->msat_to_us_min,
+			     "msatoshi_to_us_min", "min_to_us_msat");
+	json_add_amount_msat(response, channel->msat_to_us_max,
+			     "msatoshi_to_us_max", "max_to_us_msat");
+	json_add_amount_msat(response, funding_msat,
+			     "msatoshi_total", "total_msat");
+
+	/* channel config */
+	json_add_amount_sat(response,
+			    channel->our_config.dust_limit,
+			    "dust_limit_satoshis", "dust_limit_msat");
+	json_add_amount_msat(response,
+			     channel->our_config.max_htlc_value_in_flight,
+			     "max_htlc_value_in_flight_msat",
+			     "max_total_htlc_in_msat");
+
+	/* The `channel_reserve_satoshis` is imposed on
+	 * the *other* side (see `channel_reserve_msat`
+	 * function in, it uses `!side` to flip sides).
+	 * So our configuration `channel_reserve_satoshis`
+	 * is imposed on their side, while their
+	 * configuration `channel_reserve_satoshis` is
+	 * imposed on ours. */
+	json_add_amount_sat(response,
+			    channel->our_config.channel_reserve,
+			    "their_channel_reserve_satoshis",
+			    "their_reserve_msat");
+	json_add_amount_sat(response,
+			    channel->channel_info.their_config.channel_reserve,
+			    "our_channel_reserve_satoshis",
+			    "our_reserve_msat");
+	/* Compute how much we can send via this channel. */
+	if (!amount_msat_sub_sat(&spendable,
+				 channel->our_msat,
+				 channel->channel_info.their_config.channel_reserve))
+		spendable = AMOUNT_MSAT(0);
+
+	json_add_amount_msat(response, spendable,
+			     "spendable_msatoshi", "spendable_msat");
+	json_add_amount_msat(response,
+			     channel->our_config.htlc_minimum,
+			     "htlc_minimum_msat",
+			     "minimum_htlc_in_msat");
+
+	/* The `to_self_delay` is imposed on the *other*
+	 * side, so our configuration `to_self_delay` is
+	 * imposed on their side, while their configuration
+	 * `to_self_delay` is imposed on ours. */
+	json_add_num(response, "their_to_self_delay",
+		     channel->our_config.to_self_delay);
+	json_add_num(response, "our_to_self_delay",
+		     channel->channel_info.their_config.to_self_delay);
+	json_add_num(response, "max_accepted_htlcs",
+		     channel->our_config.max_accepted_htlcs);
+
+	json_array_start(response, "status");
+	for (size_t i = 0; i < ARRAY_SIZE(channel->billboard.permanent); i++) {
+		if (!channel->billboard.permanent[i])
+			continue;
+		json_add_string(response, NULL,
+				channel->billboard.permanent[i]);
+	}
+	if (channel->billboard.transient)
+		json_add_string(response, NULL, channel->billboard.transient);
+	json_array_end(response);
+
+	/* Provide channel statistics */
+	wallet_channel_stats_load(ld->wallet, channel->dbid, &channel_stats);
+	json_add_u64(response, "in_payments_offered",
+		     channel_stats.in_payments_offered);
+	json_add_amount_msat(response,
+			     channel_stats.in_msatoshi_offered,
+			     "in_msatoshi_offered",
+			     "in_offered_msat");
+	json_add_u64(response, "in_payments_fulfilled",
+		     channel_stats.in_payments_fulfilled);
+	json_add_amount_msat(response,
+			     channel_stats.in_msatoshi_fulfilled,
+			     "in_msatoshi_fulfilled",
+			     "in_fulfilled_msat");
+	json_add_u64(response, "out_payments_offered",
+		     channel_stats.out_payments_offered);
+	json_add_amount_msat(response,
+			     channel_stats.out_msatoshi_offered,
+			     "out_msatoshi_offered",
+			     "out_offered_msat");
+	json_add_u64(response, "out_payments_fulfilled",
+		     channel_stats.out_payments_fulfilled);
+	json_add_amount_msat(response,
+			     channel_stats.out_msatoshi_fulfilled,
+			     "out_msatoshi_fulfilled",
+			     "out_fulfilled_msat");
+
+	json_add_htlcs(ld, response, channel);
+	json_object_end(response);
+}
+
+static void
+peer_connected_serialize(struct peer_connected_hook_payload *payload,
+			 struct json_stream *stream)
+{
+	const struct peer *p = payload->peer;
+	json_object_start(stream, "peer");
+	json_add_pubkey(stream, "id", &p->id);
+	json_add_string(
+	    stream, "addr",
+	    type_to_string(stream, struct wireaddr_internal, &payload->addr));
+	json_add_hex_talarr(stream, "globalfeatures", p->globalfeatures);
+	json_add_hex_talarr(stream, "localfeatures", p->localfeatures);
+	json_object_end(stream); /* .peer */
+}
+
+static struct peer_connected_hook_response *
+peer_connected_deserialize(const tal_t *ctx, const char *buffer,
+			   const jsmntok_t *toks)
+{
+	const jsmntok_t *resulttok;
+	struct peer_connected_hook_response *resp;
+	resulttok = json_get_member(buffer, toks, "result");
+	if (!resulttok) {
+		return NULL;
+	}
+
+	resp = tal(ctx, struct peer_connected_hook_response);
+	if (json_tok_streq(buffer, resulttok, "continue"))
+		resp->result = PEER_CONNECTED_CONTINUE;
+	else if (json_tok_streq(buffer, resulttok, "disconnect"))
+		resp->result = PEER_CONNECTED_DISCONNECT;
+	else
+		fatal("Plugin returned an invalid response to the connected "
+		      "hook: %s", buffer);
+
+	return resp;
+}
+
+static void
+peer_connected_hook_cb(struct peer_connected_hook_payload *payload,
+		       struct peer_connected_hook_response *response)
+{
+	struct lightningd *ld = payload->ld;
+	struct crypto_state *cs = &payload->crypto_state;
+	struct channel *channel = payload->channel;
+	struct wireaddr_internal addr = payload->addr;
+	struct peer *peer = payload->peer;
+	int gossip_fd = payload->gossip_fd;
+	int peer_fd = payload->peer_fd;
+	u8 *error;
+
+	if (response && response->result == PEER_CONNECTED_DISCONNECT) {
+		close(peer_fd);
+		tal_free(payload);
+		return;
+	}
 
 	if (channel) {
 		log_debug(channel->log, "Peer has reconnected, state %s",
@@ -490,30 +778,82 @@ void peer_connected(struct lightningd *ld, const u8 *msg,
 			assert(!channel->owner);
 
 			channel->peer->addr = addr;
-			peer_start_channeld(channel, &cs,
+			peer_start_channeld(channel, cs,
 					    peer_fd, gossip_fd, NULL,
 					    true);
+			tal_free(payload);
 			return;
 
 		case CLOSINGD_SIGEXCHANGE:
 			assert(!channel->owner);
 
 			channel->peer->addr = addr;
-			peer_start_closingd(channel, &cs,
+			peer_start_closingd(channel, cs,
 					    peer_fd, gossip_fd,
 					    true, NULL);
+			tal_free(payload);
 			return;
 		}
 		abort();
 	}
 
-	notify_connect(ld, &id, &addr);
+	notify_connect(ld, &peer->id, &addr);
 
 	/* No err, all good. */
 	error = NULL;
 
 send_error:
-	peer_start_openingd(peer, &cs, peer_fd, gossip_fd, error);
+	peer_start_openingd(peer, cs, peer_fd, gossip_fd, error);
+	tal_free(payload);
+}
+
+REGISTER_PLUGIN_HOOK(peer_connected, peer_connected_hook_cb,
+		     struct peer_connected_hook_payload *,
+		     peer_connected_serialize,
+		     struct peer_connected_hook_payload *,
+		     peer_connected_deserialize,
+		     struct peer_connected_hook_response *);
+
+/* Connectd tells us a peer has connected: it never hands us duplicates, since
+ * it holds them until we say peer_died. */
+void peer_connected(struct lightningd *ld, const u8 *msg,
+		    int peer_fd, int gossip_fd)
+{
+	struct pubkey id;
+	u8 *globalfeatures, *localfeatures;
+	struct peer *peer;
+	struct peer_connected_hook_payload *hook_payload;
+
+	hook_payload = tal(NULL, struct peer_connected_hook_payload);
+	hook_payload->ld = ld;
+	hook_payload->gossip_fd = gossip_fd;
+	hook_payload->peer_fd = peer_fd;
+
+	if (!fromwire_connect_peer_connected(msg, msg,
+					     &id, &hook_payload->addr, &hook_payload->crypto_state,
+					     &globalfeatures, &localfeatures))
+		fatal("Connectd gave bad CONNECT_PEER_CONNECTED message %s",
+		      tal_hex(msg, msg));
+
+	/* Complete any outstanding connect commands. */
+	connect_succeeded(ld, &id);
+
+	/* If we're already dealing with this peer, hand off to correct
+	 * subdaemon.  Otherwise, we'll hand to openingd to wait there. */
+	peer = peer_by_id(ld, &id);
+	if (!peer)
+		peer = new_peer(ld, 0, &id, &hook_payload->addr);
+
+	tal_steal(peer, hook_payload);
+	hook_payload->peer = peer;
+
+	peer_update_features(peer, globalfeatures, localfeatures);
+
+	/* Can't be opening, since we wouldn't have sent peer_disconnected. */
+	assert(!peer->uncommitted_channel);
+	hook_payload->channel = peer_active_channel(peer);
+
+	plugin_hook_call_peer_connected(ld, hook_payload, hook_payload);
 }
 
 static enum watch_result funding_lockin_cb(struct lightningd *ld,
@@ -598,56 +938,6 @@ void channel_watch_funding(struct lightningd *ld, struct channel *channel)
 		  funding_spent);
 }
 
-static void json_add_htlcs(struct lightningd *ld,
-			   struct json_stream *response,
-			   const struct channel *channel)
-{
-	/* FIXME: make per-channel htlc maps! */
-	const struct htlc_in *hin;
-	struct htlc_in_map_iter ini;
-	const struct htlc_out *hout;
-	struct htlc_out_map_iter outi;
-
-	/* FIXME: Add more fields. */
-	json_array_start(response, "htlcs");
-	for (hin = htlc_in_map_first(&ld->htlcs_in, &ini);
-	     hin;
-	     hin = htlc_in_map_next(&ld->htlcs_in, &ini)) {
-		if (hin->key.channel != channel)
-			continue;
-
-		json_object_start(response, NULL);
-		json_add_string(response, "direction", "in");
-		json_add_u64(response, "id", hin->key.id);
-		json_add_u64(response, "msatoshi", hin->msatoshi);
-		json_add_u64(response, "expiry", hin->cltv_expiry);
-		json_add_hex(response, "payment_hash",
-			     &hin->payment_hash, sizeof(hin->payment_hash));
-		json_add_string(response, "state",
-				htlc_state_name(hin->hstate));
-		json_object_end(response);
-	}
-
-	for (hout = htlc_out_map_first(&ld->htlcs_out, &outi);
-	     hout;
-	     hout = htlc_out_map_next(&ld->htlcs_out, &outi)) {
-		if (hout->key.channel != channel)
-			continue;
-
-		json_object_start(response, NULL);
-		json_add_string(response, "direction", "out");
-		json_add_u64(response, "id", hout->key.id);
-		json_add_u64(response, "msatoshi", hout->msatoshi);
-		json_add_u64(response, "expiry", hout->cltv_expiry);
-		json_add_hex(response, "payment_hash",
-			     &hout->payment_hash, sizeof(hout->payment_hash));
-		json_add_string(response, "state",
-				htlc_state_name(hout->hstate));
-		json_object_end(response);
-	}
-	json_array_end(response);
-}
-
 static void json_add_peer(struct lightningd *ld,
 			  struct json_stream *response,
 			  struct peer *p,
@@ -693,138 +983,8 @@ static void json_add_peer(struct lightningd *ld,
 	json_array_start(response, "channels");
 	json_add_uncommitted_channel(response, p->uncommitted_channel);
 
-	list_for_each(&p->channels, channel, list) {
-		struct channel_id cid;
-		struct channel_stats channel_stats;
-		u64 our_reserve_msat = channel->channel_info.their_config.channel_reserve_satoshis * 1000;
-		json_object_start(response, NULL);
-		json_add_string(response, "state",
-				channel_state_name(channel));
-		if (channel->last_tx) {
-			struct bitcoin_txid txid;
-			bitcoin_txid(channel->last_tx, &txid);
-
-			json_add_txid(response, "scratch_txid", &txid);
-		}
-		if (channel->owner)
-			json_add_string(response, "owner",
-					channel->owner->name);
-		if (channel->scid) {
-			json_add_short_channel_id(response,
-						  "short_channel_id",
-						  channel->scid);
-			json_add_num(response, "direction",
-				     pubkey_idx(&ld->id, &p->id));
-		}
-		derive_channel_id(&cid,
-				  &channel->funding_txid,
-				  channel->funding_outnum);
-		json_add_string(response, "channel_id",
-				type_to_string(tmpctx, struct channel_id, &cid));
-		json_add_txid(response,
-			      "funding_txid",
-			      &channel->funding_txid);
-		json_add_bool(response, "private",
-				!(channel->channel_flags & CHANNEL_FLAGS_ANNOUNCE_CHANNEL));
-
-		// FIXME @conscott : Modify this when dual-funded channels
-		// are implemented
-		json_object_start(response, "funding_allocation_msat");
-		if (channel->funder == LOCAL) {
-			json_add_u64(response, pubkey_to_hexstr(tmpctx, &p->id), 0);
-			json_add_u64(response, pubkey_to_hexstr(tmpctx, &ld->id),
-					channel->funding_satoshi * 1000);
-		} else {
-			json_add_u64(response, pubkey_to_hexstr(tmpctx, &ld->id), 0);
-			json_add_u64(response, pubkey_to_hexstr(tmpctx, &p->id),
-					channel->funding_satoshi * 1000);
-		}
-		json_object_end(response);
-
-		json_add_u64(response, "msatoshi_to_us",
-			     channel->our_msatoshi);
-		json_add_u64(response, "msatoshi_to_us_min",
-			     channel->msatoshi_to_us_min);
-		json_add_u64(response, "msatoshi_to_us_max",
-			     channel->msatoshi_to_us_max);
-		json_add_u64(response, "msatoshi_total",
-			     channel->funding_satoshi * 1000);
-
-		/* channel config */
-		json_add_u64(response, "dust_limit_satoshis",
-			     channel->our_config.dust_limit_satoshis);
-		json_add_u64(response, "max_htlc_value_in_flight_msat",
-			     channel->our_config.max_htlc_value_in_flight_msat);
-
-		/* The `channel_reserve_satoshis` is imposed on
-		 * the *other* side (see `channel_reserve_msat`
-		 * function in, it uses `!side` to flip sides).
-		 * So our configuration `channel_reserve_satoshis`
-		 * is imposed on their side, while their
-		 * configuration `channel_reserve_satoshis` is
-		 * imposed on ours. */
-		json_add_u64(response, "their_channel_reserve_satoshis",
-			     channel->our_config.channel_reserve_satoshis);
-		json_add_u64(response, "our_channel_reserve_satoshis",
-			     channel->channel_info.their_config.channel_reserve_satoshis);
-		/* Compute how much we can send via this channel. */
-		if (channel->our_msatoshi <= our_reserve_msat)
-			json_add_u64(response, "spendable_msatoshi", 0);
-		else
-			json_add_u64(response, "spendable_msatoshi",
-				     channel->our_msatoshi - our_reserve_msat);
-		json_add_u64(response, "htlc_minimum_msat",
-			     channel->our_config.htlc_minimum_msat);
-
-		/* The `to_self_delay` is imposed on the *other*
-		 * side, so our configuration `to_self_delay` is
-		 * imposed on their side, while their configuration
-		 * `to_self_delay` is imposed on ours. */
-		json_add_num(response, "their_to_self_delay",
-			     channel->our_config.to_self_delay);
-		json_add_num(response, "our_to_self_delay",
-			     channel->channel_info.their_config.to_self_delay);
-		json_add_num(response, "max_accepted_htlcs",
-			     channel->our_config.max_accepted_htlcs);
-
-		json_array_start(response, "status");
-		for (size_t i = 0;
-		     i < ARRAY_SIZE(channel->billboard.permanent);
-		     i++) {
-			if (!channel->billboard.permanent[i])
-				continue;
-			json_add_string(response, NULL,
-					channel->billboard.permanent[i]);
-		}
-		if (channel->billboard.transient)
-			json_add_string(response, NULL,
-					channel->billboard.transient);
-		json_array_end(response);
-
-		/* Provide channel statistics */
-		wallet_channel_stats_load(ld->wallet,
-					  channel->dbid,
-					  &channel_stats);
-		json_add_u64(response, "in_payments_offered",
-			     channel_stats.in_payments_offered);
-		json_add_u64(response, "in_msatoshi_offered",
-			     channel_stats.in_msatoshi_offered);
-		json_add_u64(response, "in_payments_fulfilled",
-			     channel_stats.in_payments_fulfilled);
-		json_add_u64(response, "in_msatoshi_fulfilled",
-			     channel_stats.in_msatoshi_fulfilled);
-		json_add_u64(response, "out_payments_offered",
-			     channel_stats.out_payments_offered);
-		json_add_u64(response, "out_msatoshi_offered",
-			     channel_stats.out_msatoshi_offered);
-		json_add_u64(response, "out_payments_fulfilled",
-			     channel_stats.out_payments_fulfilled);
-		json_add_u64(response, "out_msatoshi_fulfilled",
-			     channel_stats.out_msatoshi_fulfilled);
-
-		json_add_htlcs(ld, response, channel);
-		json_object_end(response);
-	}
+	list_for_each(&p->channels, channel, list)
+		json_add_channel(ld, response, NULL, channel);
 	json_array_end(response);
 
 	if (ll)
@@ -1169,8 +1329,9 @@ static struct command_result *json_getinfo(struct command *cmd,
     json_add_string(response, "version", version());
     json_add_num(response, "blockheight", get_block_height(cmd->ld->topology));
     json_add_string(response, "network", get_chainparams(cmd->ld)->network_name);
-    json_add_u64(response, "msatoshi_fees_collected",
-             wallet_total_forward_fees(cmd->ld->wallet));
+    json_add_amount_msat(response,
+			 wallet_total_forward_fees(cmd->ld->wallet),
+			 "msatoshi_fees_collected", "fees_collected_msat");
     json_object_end(response);
     return command_success(cmd, response);
 }

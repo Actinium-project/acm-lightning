@@ -19,6 +19,7 @@
 #include <wally_bip32.h>
 
 enum onion_type;
+struct amount_msat;
 struct invoices;
 struct channel;
 struct lightningd;
@@ -161,7 +162,7 @@ static inline const char* forward_status_name(enum forward_status status)
 
 struct forwarding {
 	struct short_channel_id channel_in, channel_out;
-	u64 msatoshi_in, msatoshi_out, fee;
+	struct amount_msat msat_in, msat_out, fee;
 	struct sha256_double *payment_hash;
 	enum forward_status status;
 };
@@ -215,17 +216,19 @@ struct wallet_payment {
 	struct sha256 payment_hash;
 	enum wallet_payment_status status;
 	struct pubkey destination;
-	u64 msatoshi;
-	u64 msatoshi_sent;
+	struct amount_msat msatoshi;
+	struct amount_msat msatoshi_sent;
 	/* If and only if PAYMENT_COMPLETE */
 	struct preimage *payment_preimage;
 	/* Needed for recovering from routing failures. */
 	struct secret *path_secrets;
 	struct pubkey *route_nodes;
 	struct short_channel_id *route_channels;
+	/* bolt11 string; NULL for old payments. */
+	const char *bolt11;
 
-	/* The description of the payment. Must support `tal_len` */
-	const char *description;
+	/* The label of the payment. Must support `tal_len` */
+	const char *label;
 };
 
 struct outpoint {
@@ -233,7 +236,7 @@ struct outpoint {
 	u32 blockheight;
 	u32 txindex;
 	u32 outnum;
-	u64 satoshis;
+	struct amount_sat sat;
 	u8 *scriptpubkey;
 	u32 spendheight;
 };
@@ -241,9 +244,9 @@ struct outpoint {
 /* Statistics for a channel */
 struct channel_stats {
 	u64  in_payments_offered,  in_payments_fulfilled;
-	u64  in_msatoshi_offered,  in_msatoshi_fulfilled;
+	struct amount_msat  in_msatoshi_offered,  in_msatoshi_fulfilled;
 	u64 out_payments_offered, out_payments_fulfilled;
-	u64 out_msatoshi_offered, out_msatoshi_fulfilled;
+	struct amount_msat out_msatoshi_offered, out_msatoshi_fulfilled;
 };
 
 struct channeltx {
@@ -315,17 +318,19 @@ struct utxo **wallet_get_unconfirmed_closeinfo_utxos(const tal_t *ctx,
 						     struct wallet *w);
 
 const struct utxo **wallet_select_coins(const tal_t *ctx, struct wallet *w,
-					const u64 value,
+					struct amount_sat value,
 					const u32 feerate_per_kw,
 					size_t outscriptlen,
-					u64 *fee_estimate,
-					u64 *change_satoshi);
+					u32 maxheight,
+					struct amount_sat *fee_estimate,
+					struct amount_sat *change_satoshi);
 
 const struct utxo **wallet_select_all(const tal_t *ctx, struct wallet *w,
-					const u32 feerate_per_kw,
-					size_t outscriptlen,
-					u64 *value,
-					u64 *fee_estimate);
+				      const u32 feerate_per_kw,
+				      size_t outscriptlen,
+				      u32 maxheight,
+				      struct amount_sat *sat,
+				      struct amount_sat *fee_estimate);
 
 /**
  * wallet_confirm_utxos - Once we've spent a set of utxos, mark them confirmed.
@@ -434,10 +439,10 @@ bool wallet_channels_load_active(const tal_t *ctx, struct wallet *w);
  * @cdbid: channel database id
  * @msatoshi: amount in msatoshi being transferred
  */
-void wallet_channel_stats_incr_in_offered(struct wallet *w, u64 cdbid, u64 msatoshi);
-void wallet_channel_stats_incr_in_fulfilled(struct wallet *w, u64 cdbid, u64 msatoshi);
-void wallet_channel_stats_incr_out_offered(struct wallet *w, u64 cdbid, u64 msatoshi);
-void wallet_channel_stats_incr_out_fulfilled(struct wallet *w, u64 cdbid, u64 msatoshi);
+void wallet_channel_stats_incr_in_offered(struct wallet *w, u64 cdbid, struct amount_msat msatoshi);
+void wallet_channel_stats_incr_in_fulfilled(struct wallet *w, u64 cdbid, struct amount_msat msatoshi);
+void wallet_channel_stats_incr_out_offered(struct wallet *w, u64 cdbid, struct amount_msat msatoshi);
+void wallet_channel_stats_incr_out_fulfilled(struct wallet *w, u64 cdbid, struct amount_msat msatoshi);
 
 /**
  * wallet_channel_stats_load - Load channel statistics
@@ -465,7 +470,8 @@ void wallet_blocks_heights(struct wallet *w, u32 def, u32 *min, u32 *max);
  * wallet_extract_owned_outputs - given a tx, extract all of our outputs
  */
 int wallet_extract_owned_outputs(struct wallet *w, const struct bitcoin_tx *tx,
-				 const u32 *blockheight, u64 *total_satoshi);
+				 const u32 *blockheight,
+				 struct amount_sat *total);
 
 /**
  * wallet_htlc_save_in - store an htlc_in in the database
@@ -575,13 +581,13 @@ struct invoice_details {
 	/* Label assigned by user */
 	const struct json_escaped *label;
 	/* NULL if they specified "any" */
-	u64 *msatoshi;
+	struct amount_msat *msat;
 	/* Absolute UNIX epoch time this will expire */
 	u64 expiry_time;
 	/* Set if state == PAID; order to be returned by waitanyinvoice */
 	u64 pay_index;
 	/* Set if state == PAID; amount received */
-	u64 msatoshi_received;
+	struct amount_msat received;
 	/* Set if state == PAID; time paid */
 	u64 paid_timestamp;
 	/* BOLT11 encoding for this invoice */
@@ -611,7 +617,7 @@ struct invoice {
  *
  * @wallet - the wallet to create the invoice in.
  * @pinvoice - pointer to location to load new invoice in.
- * @msatoshi - the amount the invoice should have, or
+ * @msat - the amount the invoice should have, or
  * NULL for any-amount invoices.
  * @label - the unique label for this invoice. Must be
  * non-NULL.
@@ -624,7 +630,7 @@ struct invoice {
  */
 bool wallet_invoice_create(struct wallet *wallet,
 			   struct invoice *pinvoice,
-			   u64 *msatoshi TAKES,
+			   const struct amount_msat *msat TAKES,
 			   const struct json_escaped *label TAKES,
 			   u64 expiry,
 			   const char *b11enc,
@@ -743,14 +749,14 @@ const struct invoice_details *wallet_invoice_iterator_deref(const tal_t *ctx,
  *
  * @wallet - the wallet containing the invoice.
  * @invoice - the invoice to mark as paid.
- * @msatoshi_received - the actual amount received.
+ * @received - the actual amount received.
  *
  * Precondition: the invoice must not yet be expired (wallet
  * does not check!).
  */
 void wallet_invoice_resolve(struct wallet *wallet,
 			    struct invoice invoice,
-			    u64 msatoshi_received);
+			    struct amount_msat received);
 
 /**
  * wallet_invoice_waitany - Wait for any invoice to be paid.
@@ -974,7 +980,7 @@ struct outpoint *wallet_outpoint_for_scid(struct wallet *w, tal_t *ctx,
 void wallet_utxoset_add(struct wallet *w, const struct bitcoin_tx *tx,
 			const u32 outnum, const u32 blockheight,
 			const u32 txindex, const u8 *scriptpubkey,
-			const u64 satoshis);
+			struct amount_sat sat);
 
 void wallet_transaction_add(struct wallet *w, const struct bitcoin_tx *tx,
 			    const u32 blockheight, const u32 txindex);
@@ -1028,7 +1034,7 @@ void wallet_forwarded_payment_add(struct wallet *w, const struct htlc_in *in,
 /**
  * Retrieve summary of successful forwarded payments' fees
  */
-u64 wallet_total_forward_fees(struct wallet *w);
+struct amount_msat wallet_total_forward_fees(struct wallet *w);
 
 /**
  * Retrieve a list of all forwarded_payments

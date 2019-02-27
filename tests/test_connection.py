@@ -1169,7 +1169,7 @@ def test_no_fee_estimate(node_factory, bitcoind, executor):
 
     # Can with manual feerate.
     l1.rpc.withdraw(l2.rpc.newaddr()['address'], 10000, '1500perkb')
-    l1.rpc.fundchannel(l2.info['id'], 10**6, '2000perkw')
+    l1.rpc.fundchannel(l2.info['id'], 10**6, '2000perkw', minconf=0)
 
     # Make sure we clean up cahnnel for later attempt.
     l1.daemon.wait_for_log('sendrawtx exit 0')
@@ -1371,9 +1371,9 @@ def test_restart_multi_htlc_rexmit(node_factory, bitcoind, executor):
     del l1.daemon.opts['dev-disconnect']
     l1.start()
 
-    # Payments will fail due to restart, but we can see results in listpayments.
-    print(l1.rpc.listpayments())
-    wait_for(lambda: [p['status'] for p in l1.rpc.listpayments()['payments']] == ['complete', 'complete'])
+    # Payments will fail due to restart, but we can see results in listsendpays.
+    print(l1.rpc.listsendpays())
+    wait_for(lambda: [p['status'] for p in l1.rpc.listsendpays()['payments']] == ['complete', 'complete'])
 
 
 @unittest.skipIf(not DEVELOPER, "needs dev-disconnect")
@@ -1507,4 +1507,75 @@ def test_restart_many_payments(node_factory):
 
     # Wait for them to finish.
     for n in innodes:
-        wait_for(lambda: 'pending' not in [p['status'] for p in n.rpc.listpayments()['payments']])
+        wait_for(lambda: 'pending' not in [p['status'] for p in n.rpc.listsendpays()['payments']])
+
+
+@unittest.skipIf(not DEVELOPER, "need dev-disconnect")
+def test_fail_unconfirmed(node_factory, bitcoind, executor):
+    """Test that if we crash with an unconfirmed connection to a known
+    peer, we don't have a dangling peer in db"""
+    # = is a NOOP disconnect, but sets up file.
+    l1 = node_factory.get_node(disconnect=['=WIRE_OPEN_CHANNEL'])
+    l2 = node_factory.get_node()
+
+    # First one, we close by mutual agreement.
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    l1.fund_channel(l2, 200000, wait_for_active=True)
+    l1.rpc.close(l2.info['id'])
+
+    # Make sure it's closed
+    l1.wait_for_channel_onchain(l2.info['id'])
+    bitcoind.generate_block(1)
+    l1.daemon.wait_for_log('State changed from CLOSINGD_COMPLETE to FUNDING_SPEND_SEEN')
+
+    l1.stop()
+    # Mangle disconnect file so this time it blackholes....
+    with open(l1.daemon.disconnect_file, "w") as f:
+        f.write("0WIRE_OPEN_CHANNEL\n")
+    l1.start()
+
+    # Now we establish a new channel, which gets stuck.
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    l1.fundwallet(10**7)
+    executor.submit(l1.rpc.fundchannel, l2.info['id'], 100000)
+
+    l1.daemon.wait_for_log("dev_disconnect")
+
+    # Now complete old channel.
+    bitcoind.generate_block(100)
+    l1.daemon.wait_for_log('onchaind complete, forgetting peer')
+
+    # And crash l1, which is stuck.
+    l1.daemon.kill()
+
+    # Now, restart and see if it can connect OK.
+    del l1.daemon.opts['dev-disconnect']
+    l1.start()
+
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    l1.fund_channel(l2, 200000, wait_for_active=True)
+
+
+def test_change_chaining(node_factory, bitcoind):
+    """Test change chaining of unconfirmed fundings
+
+    Change chaining is the case where one transaction is broadcast but not
+    confirmed yet and we already build a followup on top of the change. If the
+    first transaction doesn't confirm we may end up creating a series of
+    unconfirmable transactions. This is why we generally disallow chaining.
+
+    """
+    l1, l2, l3 = node_factory.get_nodes(3)
+    l1.fundwallet(10**8)  # This will create an output with 1 confirmation
+
+    # Now fund a channel from l1 to l2, that should succeed, with minconf=1 but not before
+    l1.connect(l2)
+    with pytest.raises(RpcError):
+        l1.rpc.fundchannel(l2.info['id'], 10**7, minconf=2)
+    l1.rpc.fundchannel(l2.info['id'], 10**7)  # Defaults to minconf=1
+
+    # We don't have confirmed outputs anymore, so this should fail without minconf=0
+    l1.connect(l3)
+    with pytest.raises(RpcError):
+        l1.rpc.fundchannel(l3.info['id'], 10**7)  # Defaults to minconf=1
+    l1.rpc.fundchannel(l3.info['id'], 10**7, minconf=0)

@@ -12,6 +12,7 @@ static bool print_superverbose;
 #include <ccan/array_size/array_size.h>
 #include <ccan/err/err.h>
 #include <ccan/str/hex/hex.h>
+#include <common/amount.h>
 #include <common/key_derive.h>
 #include <common/status.h>
 
@@ -122,23 +123,23 @@ static const struct htlc **setup_htlcs(const tal_t *ctx)
 		switch (i) {
 		case 0:
 			htlc->state = RCVD_ADD_ACK_REVOCATION;
-			htlc->msatoshi = 1000000;
+			htlc->amount = AMOUNT_MSAT(1000000);
 			break;
 		case 1:
 			htlc->state = RCVD_ADD_ACK_REVOCATION;
-			htlc->msatoshi = 2000000;
+			htlc->amount = AMOUNT_MSAT(2000000);
 			break;
 		case 2:
 			htlc->state = SENT_ADD_ACK_REVOCATION;
-			htlc->msatoshi = 2000000;
+			htlc->amount = AMOUNT_MSAT(2000000);
 			break;
 		case 3:
 			htlc->state = SENT_ADD_ACK_REVOCATION;
-			htlc->msatoshi = 3000000;
+			htlc->amount = AMOUNT_MSAT(3000000);
 			break;
 		case 4:
 			htlc->state = RCVD_ADD_ACK_REVOCATION;
-			htlc->msatoshi = 4000000;
+			htlc->amount = AMOUNT_MSAT(4000000);
 			break;
 		}
 
@@ -222,7 +223,7 @@ static void report_htlcs(const struct bitcoin_tx *tx,
 
 		if (htlc_owner(htlc) == LOCAL) {
 			htlc_tx[i] = htlc_timeout_tx(htlc_tx, &txid, i,
-						     htlc->msatoshi,
+						     htlc->amount,
 						     htlc->expiry.locktime,
 						     to_self_delay,
 						     feerate_per_kw,
@@ -234,7 +235,7 @@ static void report_htlcs(const struct bitcoin_tx *tx,
 								remote_revocation_key);
 		} else {
 			htlc_tx[i] = htlc_success_tx(htlc_tx, &txid, i,
-						     htlc->msatoshi,
+						     htlc->amount,
 						     to_self_delay,
 						     feerate_per_kw,
 						     &keyset);
@@ -353,15 +354,17 @@ static void report(struct bitcoin_tx *tx,
 }
 
 #ifdef DEBUG
-static u64 calc_fee(const struct bitcoin_tx *tx, u64 input_satoshi)
+static struct amount_sat calc_fee(const struct bitcoin_tx *tx, struct amount_sat input)
 {
 	size_t i;
-	u64 output_satoshi = 0;
+	struct amount_sat output = AMOUNT_SAT(0), fee;
 
 	for (i = 0; i < tal_count(tx->output); i++)
-		output_satoshi += tx->output[i].amount;
+		output.satoshis += tx->output[i].amount;
 
-	return input_satoshi - output_satoshi;
+	if (!amount_sub_sat(&fee, input, output))
+		abort();
+	return fee;
 }
 
 /* For debugging, we do brute-force increase to find thresholds */
@@ -423,7 +426,7 @@ int main(void)
 	setup_locale();
 
 	struct bitcoin_txid funding_txid;
-	u64 funding_amount_satoshi, dust_limit_satoshi;
+	struct amount_sat funding_amount, dust_limit;
 	u32 feerate_per_kw;
 	u16 to_self_delay;
 	/* x_ prefix means internal vars we used to derive spec */
@@ -449,7 +452,8 @@ int main(void)
 	struct keyset keyset;
 	u8 *wscript;
 	unsigned int funding_output_index;
-	u64 commitment_number, cn_obscurer, to_local_msat, to_remote_msat;
+	u64 commitment_number, cn_obscurer;
+	struct amount_msat to_local, to_remote;
 	const struct htlc **htlcs, **htlc_map, **htlc_map2, **inv_htlcs;
 
 	secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY
@@ -486,10 +490,10 @@ int main(void)
 	 */
 	funding_txid = txid_from_hex("8984484a580b825b9972d7adb15050b3ab624ccd731946b3eeddb92f4e7ef6be");
 	funding_output_index = 0;
-	funding_amount_satoshi = 10000000;
+	funding_amount.satoshis = 10000000;
 	commitment_number = 42;
 	to_self_delay = 144;
-	dust_limit_satoshi = 546;
+	dust_limit.satoshis = 546;
 
 #ifdef DEBUG
 	print_superverbose = true;
@@ -688,15 +692,15 @@ int main(void)
 	 *    to_remote_msat: 3000000000
 	 *    local_feerate_per_kw: 15000
 	 */
-	to_local_msat = 7000000000;
-	to_remote_msat = 3000000000;
+	to_local.millisatoshis = 7000000000;
+	to_remote.millisatoshis = 3000000000;
 	feerate_per_kw = 15000;
 	printf("\n"
 	       "name: simple commitment tx with no HTLCs\n"
 	       "to_local_msat: %"PRIu64"\n"
 	       "to_remote_msat: %"PRIu64"\n"
 	       "local_feerate_per_kw: %u\n",
-	       to_local_msat, to_remote_msat, feerate_per_kw);
+	       to_local.millisatoshis, to_remote.millisatoshis, feerate_per_kw);
 
 	keyset.self_revocation_key = remote_revocation_key;
 	keyset.self_delayed_payment_key = local_delayedkey;
@@ -707,24 +711,24 @@ int main(void)
 
 	print_superverbose = true;
 	tx = commit_tx(tmpctx, &funding_txid, funding_output_index,
-		       funding_amount_satoshi,
+		       funding_amount,
 		       LOCAL, to_self_delay,
 		       &keyset,
 		       feerate_per_kw,
-		       dust_limit_satoshi,
-		       to_local_msat,
-		       to_remote_msat,
+		       dust_limit,
+		       to_local,
+		       to_remote,
 		       NULL, &htlc_map, commitment_number ^ cn_obscurer,
 		       LOCAL);
 	print_superverbose = false;
 	tx2 = commit_tx(tmpctx, &funding_txid, funding_output_index,
-			funding_amount_satoshi,
+			funding_amount,
 			REMOTE, to_self_delay,
 			&keyset,
 			feerate_per_kw,
-			dust_limit_satoshi,
-			to_local_msat,
-			to_remote_msat,
+			dust_limit,
+			to_local,
+			to_remote,
 			NULL, &htlc_map2, commitment_number ^ cn_obscurer,
 			REMOTE);
 	tx_must_be_eq(tx, tx2);
@@ -749,36 +753,36 @@ int main(void)
 	 *    to_remote_msat: 3000000000
 	 *    local_feerate_per_kw: 0
 	 */
-	to_local_msat = 6988000000;
-	to_remote_msat = 3000000000;
+	to_local.millisatoshis = 6988000000;
+	to_remote.millisatoshis = 3000000000;
 	feerate_per_kw = 0;
 	printf("\n"
 	       "name: commitment tx with all 5 htlcs untrimmed (minimum feerate)\n"
 	       "to_local_msat: %"PRIu64"\n"
 	       "to_remote_msat: %"PRIu64"\n"
 	       "local_feerate_per_kw: %u\n",
-	       to_local_msat, to_remote_msat, feerate_per_kw);
+	       to_local.millisatoshis, to_remote.millisatoshis, feerate_per_kw);
 
 	print_superverbose = true;
 	tx = commit_tx(tmpctx, &funding_txid, funding_output_index,
-		       funding_amount_satoshi,
+		       funding_amount,
 		       LOCAL, to_self_delay,
 		       &keyset,
 		       feerate_per_kw,
-		       dust_limit_satoshi,
-		       to_local_msat,
-		       to_remote_msat,
+		       dust_limit,
+		       to_local,
+		       to_remote,
 		       htlcs, &htlc_map, commitment_number ^ cn_obscurer,
 		       LOCAL);
 	print_superverbose = false;
 	tx2 = commit_tx(tmpctx, &funding_txid, funding_output_index,
-			funding_amount_satoshi,
+			funding_amount,
 			REMOTE, to_self_delay,
 			&keyset,
 			feerate_per_kw,
-			dust_limit_satoshi,
-			to_local_msat,
-			to_remote_msat,
+			dust_limit,
+			to_local,
+			to_remote,
 			inv_htlcs, &htlc_map2,
 			commitment_number ^ cn_obscurer,
 			REMOTE);
@@ -803,25 +807,25 @@ int main(void)
 		feerate_per_kw = increase(feerate_per_kw);
 		print_superverbose = false;
 		newtx = commit_tx(tmpctx, &funding_txid, funding_output_index,
-				  funding_amount_satoshi,
+				  funding_amount,
 				  LOCAL, to_self_delay,
 				  &keyset,
 				  feerate_per_kw,
-				  dust_limit_satoshi,
-				  to_local_msat,
-				  to_remote_msat,
+				  dust_limit,
+				  to_local,
+				  to_remote,
 				  htlcs, &htlc_map,
 				  commitment_number ^ cn_obscurer,
 				  LOCAL);
 		/* This is what it would look like for peer generating it! */
 		tx2 = commit_tx(tmpctx, &funding_txid, funding_output_index,
-				funding_amount_satoshi,
+				funding_amount,
 				REMOTE, to_self_delay,
 				&keyset,
 				feerate_per_kw,
-				dust_limit_satoshi,
-				to_local_msat,
-				to_remote_msat,
+				dust_limit,
+				to_local,
+				to_remote,
 				inv_htlcs, &htlc_map2,
 				commitment_number ^ cn_obscurer,
 				REMOTE);
@@ -829,7 +833,7 @@ int main(void)
 #ifdef DEBUG
 		if (feerate_per_kw % 100000 == 0)
 			printf("feerate_per_kw = %u, fees = %"PRIu64"\n",
-			       feerate_per_kw, calc_fee(newtx, funding_amount_satoshi));
+			       feerate_per_kw, calc_fee(newtx, funding_amount));
 		if (tal_count(newtx->output) == tal_count(tx->output)) {
 			tal_free(newtx);
 			continue;
@@ -842,17 +846,17 @@ int main(void)
 		       "local_feerate_per_kw: %u\n",
 		       tal_count(tx->output),
 		       tal_count(tx->output) > 1 ? "s" : "",
-		       to_local_msat, to_remote_msat, feerate_per_kw-1);
+		       to_local.millisatoshis, to_remote.millisatoshis, feerate_per_kw-1);
 		/* Recalc with verbosity on */
 		print_superverbose = true;
 		tx = commit_tx(tmpctx, &funding_txid, funding_output_index,
-			       funding_amount_satoshi,
+			       funding_amount,
 			       LOCAL, to_self_delay,
 			       &keyset,
 			       feerate_per_kw-1,
-			       dust_limit_satoshi,
-			       to_local_msat,
-			       to_remote_msat,
+			       dust_limit,
+			       to_local,
+			       to_remote,
 			       htlcs, &htlc_map,
 			       commitment_number ^ cn_obscurer,
 			       LOCAL);
@@ -878,17 +882,17 @@ int main(void)
 		       "local_feerate_per_kw: %u\n",
 		       tal_count(newtx->output),
 		       tal_count(newtx->output) > 1 ? "s" : "",
-		       to_local_msat, to_remote_msat, feerate_per_kw);
+		       to_local.millisatoshis, to_remote.millisatoshis, feerate_per_kw);
 		/* Recalc with verbosity on */
 		print_superverbose = true;
 		newtx = commit_tx(tmpctx, &funding_txid, funding_output_index,
-				  funding_amount_satoshi,
+				  funding_amount,
 				  LOCAL, to_self_delay,
 				  &keyset,
 				  feerate_per_kw,
-				  dust_limit_satoshi,
-				  to_local_msat,
-				  to_remote_msat,
+				  dust_limit,
+				  to_local,
+				  to_remote,
 				  htlcs, &htlc_map,
 				  commitment_number ^ cn_obscurer,
 				  LOCAL);
@@ -916,9 +920,10 @@ int main(void)
 	/* Now make sure we cover case where funder can't afford the fee;
 	 * its output cannot go negative! */
 	for (;;) {
-		u64 base_fee_msat = commit_tx_base_fee_msat(feerate_per_kw, 0);
+		struct amount_sat base_fee
+			= commit_tx_base_fee(feerate_per_kw, 0);
 
-		if (base_fee_msat <= to_local_msat) {
+		if (amount_msat_greater_eq_sat(to_local, base_fee)) {
 			feerate_per_kw++;
 			continue;
 		}
@@ -937,15 +942,15 @@ int main(void)
 		       "to_local_msat: %"PRIu64"\n"
 		       "to_remote_msat: %"PRIu64"\n"
 		       "local_feerate_per_kw: %u\n",
-		       to_local_msat, to_remote_msat, feerate_per_kw);
+		       to_local.millisatoshis, to_remote.millisatoshis, feerate_per_kw);
 		tx = commit_tx(tmpctx, &funding_txid, funding_output_index,
-			       funding_amount_satoshi,
+			       funding_amount,
 			       LOCAL, to_self_delay,
 			       &keyset,
 			       feerate_per_kw,
-			       dust_limit_satoshi,
-			       to_local_msat,
-			       to_remote_msat,
+			       dust_limit,
+			       to_local,
+			       to_remote,
 			       htlcs, &htlc_map,
 			       commitment_number ^ cn_obscurer,
 			       LOCAL);

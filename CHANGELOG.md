@@ -4,27 +4,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
+## [0.7.0rc2] - 2019-02-26
 
 ### Added
 
 - plugins: fully enabled, and ready for you to write some!
 - plugins: `pay` is now a plugin.
 - protocol: `pay` will now use routehints in invoices if it needs to.
-- lightning-cli: `help <cmd>` finds man pages even if `make install` not run.
+- JSON API: New command `paystatus` gives detailed information on `pay` commands.
+- JSON API: `getroute`, `invoice`, `sendpay` and `pay` commands `msatoshi`
+  parameter can have suffixes `msat`, `sat` (optionally with 3 decimals) or `btc`
+  (with 1 to 11 decimal places).
+- JSON API: `fundchannel` and `withdraw` commands `satoshi`
+  parameter can have suffixes `msat` (must end in `000`), `sat` or `btc`
+  (with 1 to 8 decimal places).
+- JSON API: `decodepay`, `getroute`, `sendpay`, `pay`, `listpeers`, `listfunds`, `listchannels` and
+  all invoice commands now return an `amount_msat` field which has an `msat` suffix.
+- JSON API: `listfunds` `channels` now has `_msat` fields for each existing raw amount field, with `msat` suffix.
 - JSON API: `waitsendpay` now has an `erring_direction` field.
 - JSON API: `listpeers` now has a `direction` field in `channels`.
 - JSON API: `listchannels` now takes a `source` option to filter by node id.
-- JSON API: New command `paystatus` gives detailed information on `pay` commands.
 - JSON API: `getroute` `riskfactor` argument is simplified; `pay` now defaults to setting it to 10.
+- JSON API: `sendpay` now takes a `bolt11` field, and it's returned in `listpayments` and `waitsendpay`.
+- JSON API: `fundchannel` and `withdraw` now have a new parameter `minconf` that limits coinselection to outputs that have at least `minconf` confirmations (default 1). (#2380)
+- JSON API: `listfunds` now displays addresses for all outputs owned by the wallet (#2387)
+- JSON API: `waitsendpay` and `sendpay` output field `label` as specified by `sendpay` call.
+- JSON API: `listpays` command for higher-level payment view than `listpayments`, especially important with multi-part-payments coming.
+- JSON API: `listpayments` is now `listsendpays`.
+- lightning-cli: `help <cmd>` finds man pages even if `make install` not run.
+- pylightning: New class 'Millisatoshi' can be used for JSON API, and new '_msat' fields are turned into this on reading.
 
 ### Changed
 
-- The `short_channel_id` separator has been changed to be `x` to match the specification.
+- protocol: `option_data_loss_protect` is now enabled by default.
+- JSON API: The `short_channel_id` separator has been changed to be `x` to match the specification.
 - JSON API: `listpeers` now includes `funding_allocation_msat`, which returns a map of the amounts initially funded to the channel by each peer, indexed by channel id.
-- `option_data_loss_protect` is now enabled by default.
 - JSON API: `help` with a `command` argument gives a JSON array, like other commands.
+- JSON API: `sendpay` `description` parameter is renamed `label`.
+- JSON API: `pay` now takes an optional `label` parameter for labelling payments, in place of never-used `description`.
 - build: we'll use the system libbase58 and libsodium if found suitable.
 
 ### Deprecated
@@ -32,7 +49,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Note: You should always set `allow-deprecated-apis=false` to test for
 changes.
 
+We recommend that you transition to the reading the new JSON `_msat`
+fields for your own sanity checking, and that you similarly
+provide appropriate suffixes for JSON input fields.
+
 - JSON API: `short_channel_id` fields in JSON commands with `:` separators (use `x` instead).
+- JSON API: `pay` `description` is deprecated, as is support for BOLT11 strings using `h`.
+- JSON API: `sendpay` parameter `description` and `waitsendpay` and `sendpay` output fields `description` (now `label`).
+- JSON API: `listpayments` has been deprecated (you probably want `listpays`)
 
 ### Removed
 
@@ -43,6 +67,12 @@ changes.
 - Protocol: handling `query_channel_range` for large numbers of blocks
   (eg. 4 billion) was slow due to a bug.
 - Fixed occasional deadlock with peers when exchanging huge amounts of gossip.
+- Fixed a crash when running in daemon-mode due to db filename overrun (#2348)
+- Handle lnd sending premature 'funding_locked' message when we're expected 'reestablish';
+  we used to close channel if this happened.
+- Cleanup peers that started opening a channel, but then disconnected. These
+  would leave a dangling entry in the DB that would cause this peer to be
+  unable to connect. (PR #2371)
 - You can no longer make giant unpayable "wumbo" invoices.
 - CLTV of total route now correctly evaluated when finding best route.
 - `riskfactor` arguments to `pay` and `getroute` now have an effect.
@@ -91,7 +121,7 @@ changes.
 - Protocol: don't send invalid onion errors if peer says onion was bad.
 - Protocol: don't crash when peer sends a 0-block-expiry HTLC.
 - pylightning: handle multiple simultanous RPC replies reliably.
-
+- build: we use `--prefix` as handed to `./configure`
 
 ### Security
 
@@ -279,7 +309,7 @@ There predate the BOLT specifications, and are only of vague historic interest:
 6. [0.5.1] - 2016-10-21
 7. [0.5.2] - 2016-11-21: "Bitcoin Savings & Trust Daily Interest II"
 
-[Unreleased]: https://github.com/ElementsProject/lightning/compare/v0.6.3...HEAD
+[0.7.0-rc2]: https://github.com/ElementsProject/lightning/compare/v0.6.3...HEAD
 [0.6.3]: https://github.com/ElementsProject/lightning/releases/tag/v0.6.3
 [0.6.2]: https://github.com/ElementsProject/lightning/releases/tag/v0.6.2
 [0.6.1]: https://github.com/ElementsProject/lightning/releases/tag/v0.6.1

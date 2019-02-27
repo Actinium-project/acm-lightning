@@ -1,10 +1,11 @@
 from collections import OrderedDict
 from fixtures import *  # noqa: F401,F403
-from lightning import RpcError
+from lightning import RpcError, Millisatoshi
 from utils import only_one
 
 import pytest
 import subprocess
+import time
 
 
 def test_option_passthrough(node_factory):
@@ -31,6 +32,23 @@ def test_option_passthrough(node_factory):
     # option didn't exist
     n = node_factory.get_node(options={'plugin': plugin_path, 'greeting': 'Ciao'})
     n.stop()
+
+
+def test_millisatoshi_passthrough(node_factory):
+    """ Ensure that Millisatoshi arguments and return work.
+    """
+    plugin_path = 'tests/plugins/millisatoshis.py'
+    n = node_factory.get_node(options={'plugin': plugin_path, 'log-level': 'io'})
+
+    # By keyword
+    ret = n.rpc.call('echo', {'msat': Millisatoshi(17), 'not_an_msat': '22msat'})['echo_msat']
+    assert type(ret) == Millisatoshi
+    assert ret == Millisatoshi(17)
+
+    # By position
+    ret = n.rpc.call('echo', [Millisatoshi(18), '22msat'])['echo_msat']
+    assert type(ret) == Millisatoshi
+    assert ret == Millisatoshi(18)
 
 
 def test_rpc_passthrough(node_factory):
@@ -124,5 +142,49 @@ def test_pay_plugin(node_factory):
         l1.rpc.call('pay')
 
     # Make sure usage messages are present.
-    assert only_one(l1.rpc.help('pay')['help'])['command'] == 'pay bolt11 [msatoshi] [description] [riskfactor] [maxfeepercent] [retry_for] [maxdelay] [exemptfee]'
+    assert only_one(l1.rpc.help('pay')['help'])['command'] == 'pay bolt11 [msatoshi] [label] [riskfactor] [maxfeepercent] [retry_for] [maxdelay] [exemptfee]'
     assert only_one(l1.rpc.help('paystatus')['help'])['command'] == 'paystatus [bolt11]'
+
+
+def test_plugin_connected_hook(node_factory):
+    """ l1 uses the reject plugin to reject connections.
+
+    l1 is configured to accept connections from l2, but not from l3.
+    """
+    opts = [{'plugin': 'tests/plugins/reject.py'}, {}, {}]
+    l1, l2, l3 = node_factory.get_nodes(3, opts=opts)
+    l1.rpc.reject(l3.info['id'])
+
+    l2.connect(l1)
+    l1.daemon.wait_for_log(r"{} is allowed".format(l2.info['id']))
+    assert len(l1.rpc.listpeers(l2.info['id'])['peers']) == 1
+
+    l3.connect(l1)
+    l1.daemon.wait_for_log(r"{} is in reject list".format(l3.info['id']))
+
+    peer = l1.rpc.listpeers(l3.info['id'])['peers']
+    assert(peer == [] or not peer[0]['connected'])
+
+
+def test_async_rpcmethod(node_factory, executor):
+    """This tests the async rpcmethods.
+
+    It works in conjunction with the `asynctest` plugin which stashes
+    requests and then resolves all of them on the fifth call.
+    """
+    l1 = node_factory.get_node(options={'plugin': 'tests/plugins/asynctest.py'})
+
+    results = []
+    for i in range(10):
+        results.append(executor.submit(l1.rpc.asyncqueue))
+
+    time.sleep(3)
+
+    # None of these should have returned yet
+    assert len([r for r in results if r.done()]) == 0
+
+    # This last one triggers the release and all results should be 42,
+    # since the last number is returned for all
+    l1.rpc.asyncflush(42)
+
+    assert [r.result() for r in results] == [42] * len(results)
