@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- JSON API: `newaddr` outputs `bech32` or `p2sh-segwit`, or both with new `all` parameter (#2390)
+
+### Changed
+
+### Deprecated
+
+Note: You should always set `allow-deprecated-apis=false` to test for
+changes.
+
+- JSON API: `newaddr` output field `address`: use `bech32` or `p2sh-segwit` instead.
+
+### Removed
+
+### Fixed
+
+### Security
+
 ## [0.7.0] - 2019-02-28: "Actually an Altcoin"
 
 This release named by Mark Beckwith @wythe.
