@@ -587,6 +587,14 @@ def test_address(node_factory):
     assert bind[0]['address'] == '127.0.0.1'
     assert int(bind[0]['port']) == l1.port
 
+    # Now test UNIX domain binding.
+    l1.stop()
+    l1.daemon.opts['bind-addr'] = os.path.join(l1.daemon.lightning_dir, "sock")
+    l1.start()
+
+    l2 = node_factory.get_node()
+    l2.rpc.connect(l1.info['id'], l1.daemon.opts['bind-addr'])
+
 
 def test_listconfigs(node_factory, bitcoind):
     l1 = node_factory.get_node()
