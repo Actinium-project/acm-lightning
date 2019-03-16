@@ -232,6 +232,7 @@ static unsigned channel_msg(struct subd *sd, const u8 *msg, const int *fds)
 	case WIRE_CHANNEL_SEND_SHUTDOWN:
 	case WIRE_CHANNEL_DEV_REENABLE_COMMIT:
 	case WIRE_CHANNEL_FEERATES:
+	case WIRE_CHANNEL_SPECIFIC_FEERATES:
 	case WIRE_CHANNEL_DEV_MEMLEAK:
 	/* Replies go to requests. */
 	case WIRE_CHANNEL_OFFER_HTLC_REPLY:
@@ -352,8 +353,8 @@ void peer_start_channeld(struct channel *channel,
 				      &channel->channel_info.remote_per_commit,
 				      &channel->channel_info.old_remote_per_commit,
 				      channel->funder,
-				      cfg->fee_base,
-				      cfg->fee_per_satoshi,
+				      channel->feerate_base,
+				      channel->feerate_ppm,
 				      channel->our_msat,
 				      &channel->local_basepoints,
 				      &channel->local_funding_pubkey,

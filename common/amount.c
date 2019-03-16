@@ -362,6 +362,14 @@ bool amount_msat_less_eq_sat(struct amount_msat msat, struct amount_sat sat)
 	return msat.millisatoshis <= msat_from_sat.millisatoshis;
 }
 
+bool amount_msat_to_u32(struct amount_msat msat, u32 *millisatoshis)
+{
+	if (amount_msat_greater_eq(msat, AMOUNT_MSAT(0x100000000)))
+		return false;
+	*millisatoshis = msat.millisatoshis;
+	return true;
+}
+
 bool amount_msat_fee(struct amount_msat *fee,
 		     struct amount_msat amt,
 		     u32 fee_base_msat,
