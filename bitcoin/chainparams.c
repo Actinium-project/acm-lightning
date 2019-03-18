@@ -75,7 +75,8 @@ const struct chainparams networks[] = {
      .max_funding = AMOUNT_SAT_INIT(60 * ((1 << 24) - 1)),
      .max_payment = AMOUNT_MSAT_INIT(60 * 0xFFFFFFFFULL),
      .when_lightning_became_cool = 1,
-     .testnet = true},
+     .testnet = true,
+     .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_TEST_PUBLIC, .bip32_privkey_version = BIP32_VER_TEST_PRIVATE}},
      {.network_name = "actinium",
      .bip173_name = "acm",
      .genesis_blockhash = {{{.u.u8 = { 0x24, 0xb8, 0x00, 0x8b, 0xe7, 0xfd, 0x5c, 0x03, 0xb6, 0x21, 0xcf, 0xfd, 0xe3, 0xbb, 0xc1, 0x23, 0x66, 0x27, 0x2c, 0x79, 0xbe, 0xa1, 0x49, 0x2f, 0x56, 0x14, 0x37, 0xe2, 0x72, 0x78, 0xd7, 0x28 }}}},
@@ -97,7 +98,6 @@ const struct chainparams networks[] = {
      .max_funding = AMOUNT_SAT(128 * ((1 << 24) - 1)),
      .max_payment = AMOUNT_MSAT(128 * 0xFFFFFFFFULL),
      .when_lightning_became_cool = 1,
-     .testnet = true}
      .testnet = true,
      .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_TEST_PUBLIC, .bip32_privkey_version = BIP32_VER_TEST_PRIVATE}}
 };
