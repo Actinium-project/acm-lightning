@@ -85,6 +85,26 @@ static inline bool is_halfchan_enabled(const struct half_chan *hc)
 	return is_halfchan_defined(hc) && !(hc->channel_flags & ROUTING_FLAGS_DISABLED);
 }
 
+/* Container for per-node channel pointers.  Better cache performance
+* than uintmap, and we don't need ordering. */
+static inline const struct short_channel_id *chan_map_scid(const struct chan *c)
+{
+	return &c->scid;
+}
+
+static inline size_t hash_scid(const struct short_channel_id *scid)
+{
+	/* scids cost money to generate, so simple hash works here */
+	return (scid->u64 >> 32) ^ (scid->u64 >> 16) ^ scid->u64;
+}
+
+static inline bool chan_eq_scid(const struct chan *c,
+				const struct short_channel_id *scid)
+{
+	return short_channel_id_eq(scid, &c->scid);
+}
+HTABLE_DEFINE_TYPE(struct chan, chan_map_scid, hash_scid, chan_eq_scid, chan_map);
+
 struct node {
 	struct pubkey id;
 
@@ -95,7 +115,7 @@ struct node {
 	struct wireaddr *addresses;
 
 	/* Channels connecting us to other nodes */
-	struct chan **chans;
+	struct chan_map chans;
 
 	/* Temporary data for routefinding. */
 	struct {
@@ -194,6 +214,15 @@ struct routing_state {
 	/* Cache for txout queries that failed. Allows us to skip failed
 	 * checks if we get another announcement for the same scid. */
 	UINTMAP(bool) txout_failures;
+
+#if DEVELOPER
+	/* Override local time for gossip messages */
+	struct timeabs *gossip_time;
+
+	/* Instead of ignoring unknown channels, pretend they're valid
+	 * with this many satoshis (if non-NULL) */
+	const struct amount_sat *dev_unknown_channel_satoshis;
+#endif
 };
 
 static inline struct chan *
@@ -214,7 +243,9 @@ struct route_hop {
 struct routing_state *new_routing_state(const tal_t *ctx,
 					const struct chainparams *chainparams,
 					const struct pubkey *local_id,
-					u32 prune_timeout);
+					u32 prune_timeout,
+					const u32 *dev_gossip_time,
+					const struct amount_sat *dev_unknown_channel_satoshis);
 
 /**
  * Add a new bidirectional channel from id1 to id2 with the given
@@ -325,4 +356,12 @@ bool handle_local_add_channel(struct routing_state *rstate, const u8 *msg);
 void memleak_remove_routing_tables(struct htable *memtable,
 				   const struct routing_state *rstate);
 #endif
+
+/**
+ * Get the local time.
+ *
+ * This gets overridden in dev mode so we can use canned (stale) gossip.
+ */
+struct timeabs gossip_time_now(const struct routing_state *rstate);
+
 #endif /* LIGHTNING_GOSSIPD_ROUTING_H */

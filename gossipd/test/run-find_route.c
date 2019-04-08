@@ -82,6 +82,9 @@ u8 *towire_errorfmt(const tal_t *ctx UNNEEDED,
 		    const struct channel_id *channel UNNEEDED,
 		    const char *fmt UNNEEDED, ...)
 { fprintf(stderr, "towire_errorfmt called!\n"); abort(); }
+/* Generated stub for towire_gossipd_local_add_channel */
+u8 *towire_gossipd_local_add_channel(const tal_t *ctx UNNEEDED, const struct short_channel_id *short_channel_id UNNEEDED, const struct pubkey *remote_node_id UNNEEDED, struct amount_sat satoshis UNNEEDED)
+{ fprintf(stderr, "towire_gossipd_local_add_channel called!\n"); abort(); }
 /* Generated stub for towire_gossip_store_channel_announcement */
 u8 *towire_gossip_store_channel_announcement(const tal_t *ctx UNNEEDED, const u8 *announcement UNNEEDED, struct amount_sat satoshis UNNEEDED)
 { fprintf(stderr, "towire_gossip_store_channel_announcement called!\n"); abort(); }
@@ -149,14 +152,16 @@ static struct chan *find_channel(struct routing_state *rstate UNUSED,
 					    const struct node *to,
 					    int *idx)
 {
-	int i, n;
+	struct chan_map_iter i;
+	struct chan *c;
 
 	*idx = pubkey_idx(&from->id, &to->id);
 
-	n = tal_count(to->chans);
-	for (i = 0; i < n; i++) {
-		if (to->chans[i]->nodes[*idx] == from)
-			return to->chans[i];
+	for (c = chan_map_first(&to->chans, &i);
+	     c;
+	     c = chan_map_next(&to->chans, &i)) {
+		if (c->nodes[*idx] == from)
+			return c;
 	}
 	return NULL;
 }
@@ -211,7 +216,7 @@ int main(void)
 
 	memset(&tmp, 'a', sizeof(tmp));
 	pubkey_from_privkey(&tmp, &a);
-	rstate = new_routing_state(tmpctx, NULL, &a, 0);
+	rstate = new_routing_state(tmpctx, NULL, &a, 0, NULL, NULL);
 
 	new_node(rstate, &a);
 

@@ -72,11 +72,11 @@ static void copy_to_parent_log(const char *prefix,
 			       bool continued,
 			       const struct timeabs *time UNUSED,
 			       const char *str,
-			       const u8 *io,
+			       const u8 *io, size_t io_len,
 			       struct log *parent_log)
 {
 	if (level == LOG_IO_IN || level == LOG_IO_OUT)
-		log_io(parent_log, level, prefix, io, tal_count(io));
+		log_io(parent_log, level, prefix, io, io_len);
 	else if (continued)
 		log_add(parent_log, "%s ... %s", prefix, str);
 	else
@@ -198,9 +198,9 @@ static void sign_last_tx(struct channel *channel)
 {
 	struct lightningd *ld = channel->peer->ld;
 	struct bitcoin_signature sig;
-	u8 *msg;
+	u8 *msg, **witness;
 
-	assert(!channel->last_tx->input[0].witness);
+	assert(!channel->last_tx->wtx->inputs[0].witness);
 
 	msg = towire_hsm_sign_commitment_tx(tmpctx,
 					    &channel->peer->id,
@@ -218,17 +218,17 @@ static void sign_last_tx(struct channel *channel)
 		fatal("HSM gave bad sign_commitment_tx_reply %s",
 		      tal_hex(tmpctx, msg));
 
-	channel->last_tx->input[0].witness
-		= bitcoin_witness_2of2(channel->last_tx->input,
-				       &channel->last_sig,
-				       &sig,
-				       &channel->channel_info.remote_fundingkey,
-				       &channel->local_funding_pubkey);
+	witness =
+	    bitcoin_witness_2of2(channel->last_tx, &channel->last_sig,
+				 &sig, &channel->channel_info.remote_fundingkey,
+				 &channel->local_funding_pubkey);
+
+	bitcoin_tx_input_set_witness(channel->last_tx, 0, witness);
 }
 
 static void remove_sig(struct bitcoin_tx *signed_tx)
 {
-	signed_tx->input[0].witness = tal_free(signed_tx->input[0].witness);
+	bitcoin_tx_input_set_witness(signed_tx, 0, NULL);
 }
 
 /* Resolve a single close command. */
@@ -856,23 +856,22 @@ void peer_connected(struct lightningd *ld, const u8 *msg,
 	plugin_hook_call_peer_connected(ld, hook_payload, hook_payload);
 }
 
-static enum watch_result funding_lockin_cb(struct lightningd *ld,
+static enum watch_result funding_depth_cb(struct lightningd *ld,
 					   struct channel *channel,
 					   const struct bitcoin_txid *txid,
 					   unsigned int depth)
 {
 	const char *txidstr;
 
-	txidstr = type_to_string(channel, struct bitcoin_txid, txid);
+	txidstr = type_to_string(tmpctx, struct bitcoin_txid, txid);
 	log_debug(channel->log, "Funding tx %s depth %u of %u",
 		  txidstr, depth, channel->minimum_depth);
 	tal_free(txidstr);
 
-	if (depth < channel->minimum_depth)
-		return KEEP_WATCHING;
+	bool local_locked = depth >= channel->minimum_depth;
 
 	/* If we restart, we could already have peer->scid from database */
-	if (!channel->scid) {
+	if (local_locked && !channel->scid) {
 		struct txlocator *loc;
 
 		loc = wallet_transaction_locate(tmpctx, ld->wallet, txid);
@@ -891,9 +890,11 @@ static enum watch_result funding_lockin_cb(struct lightningd *ld,
 	}
 
 	/* Try to tell subdaemon */
-	if (!channel_tell_funding_locked(ld, channel, txid, depth))
+	if (!channel_tell_depth(ld, channel, txid, depth))
 		return KEEP_WATCHING;
 
+	if (!local_locked)
+		return KEEP_WATCHING;
 	/* BOLT #7:
 	 *
 	 * A node:
@@ -932,7 +933,7 @@ void channel_watch_funding(struct lightningd *ld, struct channel *channel)
 {
 	/* FIXME: Remove arg from cb? */
 	watch_txid(channel, ld->topology, channel,
-		   &channel->funding_txid, funding_lockin_cb);
+		   &channel->funding_txid, funding_depth_cb);
 	watch_txo(channel, ld->topology, channel,
 		  &channel->funding_txid, channel->funding_outnum,
 		  funding_spent);
@@ -1531,7 +1532,7 @@ static struct command_result *json_sign_last_tx(struct command *cmd,
 
 	response = json_stream_success(cmd);
 	log_debug(channel->log, "dev-sign-last-tx: signing tx with %zu outputs",
-		  tal_count(channel->last_tx->output));
+		  channel->last_tx->wtx->num_outputs);
 	sign_last_tx(channel);
 	linear = linearize_tx(cmd, channel->last_tx);
 	remove_sig(channel->last_tx);

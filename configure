@@ -169,7 +169,7 @@ int main(void)
 {
 	printf("%p\n", crypto_aead_chacha20poly1305_ietf_encrypt);
 	printf("%d\n", crypto_aead_chacha20poly1305_ietf_NPUBBYTES);
-	exit(0);
+	return 0;
 }
 /*END*/
 var=HAVE_SYSTEM_LIBBASE58
@@ -183,7 +183,21 @@ code=
 int main(void)
 {
 	printf("%p\n", b58check);
-	exit(0);
+	return 0;
+}
+/*END*/
+var=HAVE_SQLITE3_EXPANDED_SQL
+desc=sqlite3_expanded_sql
+style=DEFINES_EVERYTHING|EXECUTE|MAY_NOT_COMPILE
+link=-lsqlite3
+code=
+#include <sqlite3.h>
+#include <stdio.h>
+
+int main(void)
+{
+	printf("%p\n", sqlite3_expanded_sql);
+	return 0;
 }
 /*END*/
 EOF

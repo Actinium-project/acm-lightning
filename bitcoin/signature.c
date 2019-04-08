@@ -88,19 +88,6 @@ void sign_hash(const struct privkey *privkey,
 	assert(ok);
 }
 
-static void sha256_tx_one_input(const struct bitcoin_tx *tx,
-				size_t input_num,
-				const u8 *script,
-				const u8 *witness_script,
-				enum sighash_type sighash_type,
-				struct sha256_double *hash)
-{
-	assert(input_num < tal_count(tx->input));
-
-	sha256_tx_for_sig(hash, tx, input_num, script, witness_script,
-			  sighash_type);
-}
-
 void sign_tx_input(const struct bitcoin_tx *tx,
 		   unsigned int in,
 		   const u8 *subscript,
@@ -110,11 +97,18 @@ void sign_tx_input(const struct bitcoin_tx *tx,
 		   struct bitcoin_signature *sig)
 {
 	struct sha256_double hash;
+	bool use_segwit = witness_script != NULL;
+	int flags = use_segwit ? WALLY_TX_FLAG_USE_WITNESS : 0;
+	const u8 *script = use_segwit ? witness_script : subscript;
 
 	assert(sighash_type_valid(sighash_type));
+
 	sig->sighash_type = sighash_type;
-	sha256_tx_one_input(tx, in, subscript, witness_script,
-			    sighash_type, &hash);
+	wally_tx_get_btc_signature_hash(
+	    tx->wtx, in, script, tal_bytelen(script),
+	    tx->input_amounts[in]->satoshis /* Raw: low-level helper */,
+	    sighash_type, flags, hash.sha.u.u8, sizeof(hash));
+
 	dump_tx("Signing", tx, in, subscript, key, &hash);
 	sign_hash(privkey, &hash, &sig->s);
 }
@@ -138,6 +132,9 @@ bool check_tx_sig(const struct bitcoin_tx *tx, size_t input_num,
 		  const struct bitcoin_signature *sig)
 {
 	struct sha256_double hash;
+	bool use_segwit = witness_script != NULL;
+	int flags = use_segwit ? WALLY_TX_FLAG_USE_WITNESS : 0;
+	const u8 *script = use_segwit ? witness_script : redeemscript;
 	bool ret;
 
 	/* We only support a limited subset of sighash types. */
@@ -147,10 +144,12 @@ bool check_tx_sig(const struct bitcoin_tx *tx, size_t input_num,
 		if (sig->sighash_type != (SIGHASH_SINGLE|SIGHASH_ANYONECANPAY))
 			return false;
 	}
-	assert(input_num < tal_count(tx->input));
+	assert(input_num < tx->wtx->num_inputs);
 
-	sha256_tx_one_input(tx, input_num, redeemscript, witness_script,
-			    sig->sighash_type, &hash);
+	wally_tx_get_btc_signature_hash(
+	    tx->wtx, input_num, script, tal_bytelen(script),
+	    tx->input_amounts[input_num]->satoshis /* Raw: low-level helper */,
+	    sig->sighash_type, flags, hash.sha.u.u8, sizeof(hash));
 
 	ret = check_signed_hash(&hash, &sig->s, key);
 	if (!ret)

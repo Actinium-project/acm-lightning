@@ -97,9 +97,10 @@ int main(void)
 	const struct utxo **utxomap;
 	struct amount_sat funding_sat;
 	u16 funding_outnum;
-	u8 *subscript;
+	u8 *subscript, *script;
 	struct bitcoin_signature sig;
 	struct bitcoin_address addr;
+	struct amount_sat tmpamt;
 
 	secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY
 						 | SECP256K1_CONTEXT_SIGN);
@@ -170,9 +171,11 @@ int main(void)
 			     &inputkey, NULL);
 	printf("# fee: %s\n",
 	       type_to_string(tmpctx, struct amount_sat, &fee));
+
+	tmpamt = bitcoin_tx_output_get_amount(funding, !funding_outnum);
 	printf("change: %s\n",
 	       type_to_string(tmpctx, struct amount_sat,
-			      &funding->output[!funding_outnum].amount));
+			      &tmpamt));
 
 	printf("funding output: %u\n", funding_outnum);
 
@@ -181,8 +184,8 @@ int main(void)
 	sign_tx_input(funding, 0, subscript, NULL, &input_privkey, &inputkey,
 		      SIGHASH_ALL, &sig);
 
-	funding->input[0].script = bitcoin_redeem_p2pkh(funding, &inputkey,
-							&sig);
+	script = bitcoin_redeem_p2pkh(funding, &inputkey, &sig);
+	bitcoin_tx_input_set_script(funding, 0, script);
 	printf("funding tx: %s\n",
 	       tal_hex(tmpctx, linearize_tx(tmpctx, funding)));
 

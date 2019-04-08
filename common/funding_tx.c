@@ -1,4 +1,5 @@
 #include "funding_tx.h"
+#include <assert.h>
 #include <bitcoin/pubkey.h>
 #include <bitcoin/script.h>
 #include <bitcoin/tx.h>
@@ -22,29 +23,30 @@ struct bitcoin_tx *funding_tx(const tal_t *ctx,
 {
 	u8 *wscript;
 	struct bitcoin_tx *tx;
+	bool has_change = !amount_sat_eq(change, AMOUNT_SAT(0));
 
-	tx = tx_spending_utxos(ctx, utxomap, bip32_base,
-			       !amount_sat_eq(change, AMOUNT_SAT(0)));
+	tx = tx_spending_utxos(ctx, utxomap, bip32_base, has_change);
 
-	tx->output[0].amount = funding;
+
 	wscript = bitcoin_redeem_2of2(tx, local_fundingkey, remote_fundingkey);
 	SUPERVERBOSE("# funding witness script = %s\n",
 		     tal_hex(wscript, wscript));
-	tx->output[0].script = scriptpubkey_p2wsh(tx, wscript);
+	bitcoin_tx_add_output(tx, scriptpubkey_p2wsh(tx, wscript), &funding);
 	tal_free(wscript);
 
-	if (!amount_sat_eq(change, AMOUNT_SAT(0))) {
+	if (has_change) {
 		const void *map[2];
 		map[0] = int2ptr(0);
 		map[1] = int2ptr(1);
-		tx->output[1].script = scriptpubkey_p2wpkh(tx, changekey);
-		tx->output[1].amount = change;
-		permute_outputs(tx->output, NULL, map);
+		bitcoin_tx_add_output(tx, scriptpubkey_p2wpkh(tx, changekey),
+				      &change);
+		permute_outputs(tx, NULL, map);
 		*outnum = (map[0] == int2ptr(0) ? 0 : 1);
 	} else {
 		*outnum = 0;
 	}
 
-	permute_inputs(tx->input, (const void **)utxomap);
+	permute_inputs(tx, (const void **)utxomap);
+	assert(bitcoin_tx_check(tx));
 	return tx;
 }

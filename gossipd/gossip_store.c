@@ -150,19 +150,59 @@ static bool gossip_store_append(int fd, struct routing_state *rstate, const u8 *
 		write(fd, msg, msglen) == msglen);
 }
 
+/* Local unannounced channels don't appear in broadcast map, but we need to
+ * remember them anyway, so we manually append to the store.
+ *
+ * Note these do *not* add to gs->count, since that's compared with
+ * the broadcast map count.
+*/
+static bool add_local_unnannounced(int fd,
+				   struct routing_state *rstate,
+				   struct node *self)
+{
+	struct chan_map_iter i;
+	struct chan *c;
+
+	for (c = chan_map_first(&self->chans, &i);
+	     c;
+	     c = chan_map_next(&self->chans, &i)) {
+		struct node *peer = other_node(self, c);
+		const u8 *msg;
+
+		/* Ignore already announced. */
+		if (c->channel_announce)
+			continue;
+
+		msg = towire_gossipd_local_add_channel(tmpctx, &c->scid,
+						       &peer->id, c->sat);
+		if (!gossip_store_append(fd, rstate, msg))
+			return false;
+
+		for (size_t i = 0; i < 2; i++) {
+			msg = c->half[i].channel_update;
+			if (!msg)
+				continue;
+			if (!gossip_store_append(fd, rstate, msg))
+				return false;
+		}
+	}
+
+	return true;
+}
+
 /**
  * Rewrite the on-disk gossip store, compacting it along the way
  *
  * Creates a new file, writes all the updates from the `broadcast_state`, and
  * then atomically swaps the files.
  */
-
-static void gossip_store_compact(struct gossip_store *gs)
+bool gossip_store_compact(struct gossip_store *gs)
 {
 	size_t count = 0;
 	u64 index = 0;
 	int fd;
 	const u8 *msg;
+	struct node *self;
 
 	assert(gs->broadcast);
 	status_trace(
@@ -188,9 +228,16 @@ static void gossip_store_compact(struct gossip_store *gs)
 			status_broken("Failed writing to gossip store: %s",
 				      strerror(errno));
 			goto unlink_disable;
-
 		}
 		count++;
+	}
+
+	/* Local unannounced channels are not in the store! */
+	self = get_node(gs->rstate, &gs->rstate->local_id);
+	if (self && !add_local_unnannounced(fd, gs->rstate, self)) {
+		status_broken("Failed writing unannounced to gossip store: %s",
+			      strerror(errno));
+		goto unlink_disable;
 	}
 
 	if (rename(GOSSIP_STORE_TEMP_FILENAME, GOSSIP_STORE_FILENAME) == -1) {
@@ -206,7 +253,7 @@ static void gossip_store_compact(struct gossip_store *gs)
 	gs->count = count;
 	close(gs->fd);
 	gs->fd = fd;
-	return;
+	return true;
 
 unlink_disable:
 	unlink(GOSSIP_STORE_TEMP_FILENAME);
@@ -214,6 +261,7 @@ disable:
 	status_trace("Encountered an error while compacting, disabling "
 		     "future compactions.");
 	gs->disable_compaction = true;
+	return false;
 }
 
 void gossip_store_add(struct gossip_store *gs, const u8 *gossip_msg)
@@ -255,6 +303,7 @@ void gossip_store_load(struct routing_state *rstate, struct gossip_store *gs)
 	size_t stats[] = {0, 0, 0, 0};
 	int fd = gs->fd;
 	gs->fd = -1;
+	struct timeabs start = time_now();
 
 	if (lseek(fd, known_good, SEEK_SET) < 0) {
 		status_unusual("gossip_store: lseek failure");
@@ -333,6 +382,15 @@ truncate_nomsg:
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Truncating store: %s", strerror(errno));
 out:
+#if DEVELOPER
+	status_info("total store load time: %"PRIu64" msec (%zu entries, %zu bytes)",
+		    time_to_msec(time_between(time_now(), start)),
+		    stats[0] + stats[1] + stats[2] + stats[3],
+		    (size_t)known_good);
+#else
+	status_trace("total store load time: %"PRIu64" msec",
+		     time_to_msec(time_between(time_now(), start)));
+#endif
 	status_trace("gossip_store: Read %zu/%zu/%zu/%zu cannounce/cupdate/nannounce/cdelete from store in %"PRIu64" bytes",
 		     stats[0], stats[1], stats[2], stats[3],
 		     (u64)known_good);

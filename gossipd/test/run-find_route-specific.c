@@ -84,6 +84,9 @@ u8 *towire_errorfmt(const tal_t *ctx UNNEEDED,
 		    const struct channel_id *channel UNNEEDED,
 		    const char *fmt UNNEEDED, ...)
 { fprintf(stderr, "towire_errorfmt called!\n"); abort(); }
+/* Generated stub for towire_gossipd_local_add_channel */
+u8 *towire_gossipd_local_add_channel(const tal_t *ctx UNNEEDED, const struct short_channel_id *short_channel_id UNNEEDED, const struct pubkey *remote_node_id UNNEEDED, struct amount_sat satoshis UNNEEDED)
+{ fprintf(stderr, "towire_gossipd_local_add_channel called!\n"); abort(); }
 /* Generated stub for towire_gossip_store_channel_announcement */
 u8 *towire_gossip_store_channel_announcement(const tal_t *ctx UNNEEDED, const u8 *announcement UNNEEDED, struct amount_sat satoshis UNNEEDED)
 { fprintf(stderr, "towire_gossip_store_channel_announcement called!\n"); abort(); }
@@ -184,7 +187,7 @@ int main(void)
 			   strlen("02cca6c5c966fcf61d121e3a70e03a1cd9eeeea024b26ea666ce974d43b242e636"),
 			   &d);
 
-	rstate = new_routing_state(tmpctx, NULL, &a, 0);
+	rstate = new_routing_state(tmpctx, NULL, &a, 0, NULL, NULL);
 
 	/* [{'active': True, 'short_id': '6990:2:1/1', 'fee_per_kw': 10, 'delay': 5, 'message_flags': 0, 'channel_flags': 1, 'destination': '0230ad0e74ea03976b28fda587bb75bdd357a1938af4424156a18265167f5e40ae', 'source': '02ea622d5c8d6143f15ed3ce1d501dd0d3d09d3b1c83a44d0034949f8a9ab60f06', 'last_update': 1504064344}, */
 

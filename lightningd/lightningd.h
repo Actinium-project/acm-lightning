@@ -196,6 +196,12 @@ struct lightningd {
 	/* Allow and accept localhost node_announcement addresses */
 	bool dev_allow_localhost;
 
+	/* Timestamp to use for gossipd, iff non-zero */
+	u32 dev_gossip_time;
+
+	/* What to override unknown channels with, iff non-NULL */
+	struct amount_sat *dev_unknown_channel_satoshis;
+
 	/* Things we've marked as not leaking. */
 	const void **notleaks;
 #endif /* DEVELOPER */

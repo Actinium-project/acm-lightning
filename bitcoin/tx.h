@@ -8,6 +8,9 @@
 #include <ccan/structeq/structeq.h>
 #include <ccan/tal/tal.h>
 #include <common/amount.h>
+#include <wally_transaction.h>
+
+#define BITCOIN_TX_DEFAULT_SEQUENCE 0xFFFFFFFF
 
 struct bitcoin_txid {
 	struct sha256_double shad;
@@ -16,10 +19,10 @@ struct bitcoin_txid {
 STRUCTEQ_DEF(bitcoin_txid, 0, shad.sha.u);
 
 struct bitcoin_tx {
-	u32 version;
-	struct bitcoin_tx_input *input;
-	struct bitcoin_tx_output *output;
-	u32 lock_time;
+	/* Keep track of input amounts, this is needed for signatures (NULL if
+	 * unknown) */
+	struct amount_sat **input_amounts;
+	struct wally_tx *wtx;
 };
 
 struct bitcoin_tx_output {
@@ -33,9 +36,6 @@ struct bitcoin_tx_input {
 	u8 *script;
 	u32 sequence_number;
 
-	/* Value of the output we're spending (NULL if unknown). */
-	struct amount_sat *amount;
-
 	/* Only if BIP141 used. */
 	u8 **witness;
 };
@@ -43,14 +43,6 @@ struct bitcoin_tx_input {
 
 /* SHA256^2 the tx: simpler than sha256_tx */
 void bitcoin_txid(const struct bitcoin_tx *tx, struct bitcoin_txid *txid);
-
-/* Useful for signature code.  Only supports SIGHASH_ALL and
- * (for segwit) SIGHASH_SINGLE|SIGHASH_ANYONECANPAY. */
-void sha256_tx_for_sig(struct sha256_double *h, const struct bitcoin_tx *tx,
-		       unsigned int input_num,
-		       const u8 *script,
-		       const u8 *witness_script,
-		       enum sighash_type sighash_type);
 
 /* Linear bytes of tx. */
 u8 *linearize_tx(const tal_t *ctx, const struct bitcoin_tx *tx);
@@ -78,5 +70,74 @@ bool bitcoin_txid_to_hex(const struct bitcoin_txid *txid,
 /* Internal de-linearization functions. */
 struct bitcoin_tx *pull_bitcoin_tx(const tal_t *ctx,
 				   const u8 **cursor, size_t *max);
+
+int bitcoin_tx_add_output(struct bitcoin_tx *tx, u8 *script,
+			  struct amount_sat *amount);
+
+int bitcoin_tx_add_input(struct bitcoin_tx *tx, const struct bitcoin_txid *txid,
+			 u32 outnum, u32 sequence,
+			 const struct amount_sat *amount, u8 *script);
+
+
+/**
+ * Set the output amount on the transaction.
+ *
+ * Allows changing the amount on the transaction output after it was set on
+ * creation. This is useful to grind a feerate or subtract the fee from an
+ * existing output.
+ */
+void bitcoin_tx_output_set_amount(struct bitcoin_tx *tx, int outnum,
+				  struct amount_sat *amount);
+
+/**
+ * Helper to get the script of a script's output as a tal_arr
+ *
+ * Internally we use a `wally_tx` to represent the transaction. The script
+ * attached to a `wally_tx_output` is not a `tal_arr`, so in order to keep the
+ * comfort of being able to call `tal_bytelen` and similar on a script we just
+ * return a `tal_arr` clone of the original script.
+ */
+const u8 *bitcoin_tx_output_get_script(const tal_t *ctx, const struct bitcoin_tx *tx, int outnum);
+
+/**
+ * Helper to just get an amount_sat for the output amount.
+ */
+struct amount_sat bitcoin_tx_output_get_amount(const struct bitcoin_tx *tx,
+					       int outnum);
+
+/**
+ * Set the input witness.
+ *
+ * Given that we generate the witness after constructing the transaction
+ * itself, we need a way to attach a witness to an existing input.
+ */
+void bitcoin_tx_input_set_witness(struct bitcoin_tx *tx, int innum,
+				  u8 **witness);
+
+/**
+ * Set the input script on the given input.
+ */
+void bitcoin_tx_input_set_script(struct bitcoin_tx *tx, int innum, u8 *script);
+
+/**
+ * Helper to get a witness as a tal_arr array.
+ */
+const u8 *bitcoin_tx_input_get_witness(const tal_t *ctx,
+				       const struct bitcoin_tx *tx, int innum,
+				       int witnum);
+
+/**
+ * Wrap the raw txhash in the wally_tx_input into a bitcoin_txid
+ */
+void bitcoin_tx_input_get_txid(const struct bitcoin_tx *tx, int innum,
+			       struct bitcoin_txid *out);
+
+/**
+ * Check a transaction for consistency.
+ *
+ * Mainly for the transition from `bitcoin_tx` to the `wally_tx`. Checks that
+ * both transactions serialize to two identical representations.
+ */
+bool bitcoin_tx_check(const struct bitcoin_tx *tx);
 
 #endif /* LIGHTNING_BITCOIN_TX_H */

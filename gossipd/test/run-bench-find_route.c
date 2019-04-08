@@ -95,6 +95,9 @@ u8 *towire_errorfmt(const tal_t *ctx UNNEEDED,
 		    const struct channel_id *channel UNNEEDED,
 		    const char *fmt UNNEEDED, ...)
 { fprintf(stderr, "towire_errorfmt called!\n"); abort(); }
+/* Generated stub for towire_gossipd_local_add_channel */
+u8 *towire_gossipd_local_add_channel(const tal_t *ctx UNNEEDED, const struct short_channel_id *short_channel_id UNNEEDED, const struct pubkey *remote_node_id UNNEEDED, struct amount_sat satoshis UNNEEDED)
+{ fprintf(stderr, "towire_gossipd_local_add_channel called!\n"); abort(); }
 /* Generated stub for towire_gossip_store_channel_announcement */
 u8 *towire_gossip_store_channel_announcement(const tal_t *ctx UNNEEDED, const u8 *announcement UNNEEDED, struct amount_sat satoshis UNNEEDED)
 { fprintf(stderr, "towire_gossip_store_channel_announcement called!\n"); abort(); }
@@ -225,7 +228,7 @@ int main(int argc, char *argv[])
 	setup_tmpctx();
 
 	me = nodeid(0);
-	rstate = new_routing_state(tmpctx, NULL, &me, 0);
+	rstate = new_routing_state(tmpctx, NULL, &me, 0, NULL, NULL);
 	opt_register_noarg("--perfme", opt_set_bool, &perfme,
 			   "Run perfme-start and perfme-stop around benchmark");
 

@@ -320,6 +320,7 @@ static void report(struct bitcoin_tx *tx,
 {
 	char *txhex;
 	struct bitcoin_signature localsig, remotesig;
+	u8 **witness;
 
 	sign_tx_input(tx, 0,
 		      NULL,
@@ -337,10 +338,11 @@ static void report(struct bitcoin_tx *tx,
 		      &localsig);
 	printf("# local_signature = %s\n",
 	       type_to_string(tmpctx, struct bitcoin_signature, &localsig));
-	tx->input[0].witness = bitcoin_witness_2of2(tx->input,
-						    &localsig, &remotesig,
-						    local_funding_pubkey,
-						    remote_funding_pubkey);
+
+	witness =
+	    bitcoin_witness_2of2(tx, &localsig, &remotesig,
+				 local_funding_pubkey, remote_funding_pubkey);
+	bitcoin_tx_input_set_witness(tx, 0, witness);
 	txhex = tal_hex(tmpctx, linearize_tx(tx, tx));
 	printf("output commit_tx: %s\n", txhex);
 
@@ -844,8 +846,8 @@ int main(void)
 		       "to_local_msat: %"PRIu64"\n"
 		       "to_remote_msat: %"PRIu64"\n"
 		       "local_feerate_per_kw: %u\n",
-		       tal_count(tx->output),
-		       tal_count(tx->output) > 1 ? "s" : "",
+		       tx->wtx->num_outputs,
+		       tx->wtx->num_outputs > 1 ? "s" : "",
 		       to_local.millisatoshis, to_remote.millisatoshis, feerate_per_kw-1);
 		/* Recalc with verbosity on */
 		print_superverbose = true;
@@ -880,8 +882,8 @@ int main(void)
 		       "to_local_msat: %"PRIu64"\n"
 		       "to_remote_msat: %"PRIu64"\n"
 		       "local_feerate_per_kw: %u\n",
-		       tal_count(newtx->output),
-		       tal_count(newtx->output) > 1 ? "s" : "",
+		       newtx->wtx->num_outputs,
+		       newtx->wtx->num_outputs > 1 ? "s" : "",
 		       to_local.millisatoshis, to_remote.millisatoshis, feerate_per_kw);
 		/* Recalc with verbosity on */
 		print_superverbose = true;
@@ -911,11 +913,11 @@ int main(void)
 		       feerate_per_kw,
 		       htlc_map);
 
-		assert(tal_count(newtx->output) != tal_count(tx->output));
+		assert(newtx->wtx->num_outputs != tx->wtx->num_outputs);
 
 		tal_free(tx);
 		tx = newtx;
-	} while (tal_count(tx->output) > 1);
+	} while (tx->wtx->num_outputs > 1);
 
 	/* Now make sure we cover case where funder can't afford the fee;
 	 * its output cannot go negative! */

@@ -45,12 +45,12 @@ void broadcast_tx(struct chain_topology *topo UNNEEDED,
 				 int exitstatus UNNEEDED,
 				 const char *err))
 { fprintf(stderr, "broadcast_tx called!\n"); abort(); }
-/* Generated stub for channel_tell_funding_locked */
-bool channel_tell_funding_locked(struct lightningd *ld UNNEEDED,
+/* Generated stub for channel_tell_depth */
+bool channel_tell_depth(struct lightningd *ld UNNEEDED,
 				 struct channel *channel UNNEEDED,
 				 const struct bitcoin_txid *txid UNNEEDED,
 				 u32 depth UNNEEDED)
-{ fprintf(stderr, "channel_tell_funding_locked called!\n"); abort(); }
+{ fprintf(stderr, "channel_tell_depth called!\n"); abort(); }
 /* Generated stub for command_fail */
 struct command_result *command_fail(struct command *cmd UNNEEDED, int code UNNEEDED,
 				    const char *fmt UNNEEDED, ...)
@@ -564,6 +564,9 @@ u8 *wire_sync_read(const tal_t *ctx UNNEEDED, int fd UNNEEDED)
 {
 	return NULL;
 }
+void plugin_hook_db_sync(struct db *db UNNEEDED, const char **changes UNNEEDED, const char *final UNNEEDED)
+{
+}
 bool fromwire_hsm_get_channel_basepoints_reply(const void *p UNNEEDED,
 					       struct basepoints *basepoints,
 					       struct pubkey *funding_pubkey)
@@ -620,6 +623,7 @@ void set_log_outfn_(struct log_book *lr UNNEEDED,
 				  const struct timeabs *time UNNEEDED,
 				  const char *str UNNEEDED,
 				  const u8 *io UNNEEDED,
+				  size_t io_len UNNEEDED,
 				  void *arg) UNNEEDED,
 		    void *arg UNNEEDED)
 {

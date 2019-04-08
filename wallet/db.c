@@ -7,6 +7,7 @@
 #include <inttypes.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
+#include <lightningd/plugin_hook.h>
 
 #define DB_FILE "lightningd.sqlite3"
 
@@ -434,12 +435,58 @@ void db_assert_no_outstanding_statements(void)
 }
 #endif
 
+#if !HAVE_SQLITE3_EXPANDED_SQL
+/* Prior to sqlite3 v3.14, we have to use tracing to dump statements */
+static void trace_sqlite3(void *dbv, const char *stmt)
+{
+	struct db *db = dbv;
+
+	/* We get a "COMMIT;" after we've sent our changes. */
+	if (!db->changes) {
+		assert(streq(stmt, "COMMIT;"));
+		return;
+	}
+
+	tal_arr_expand(&db->changes, tal_strdup(db->changes, stmt));
+}
+#endif
+
 void db_stmt_done(sqlite3_stmt *stmt)
 {
 	dev_statement_end(stmt);
 	sqlite3_finalize(stmt);
 }
 
+sqlite3_stmt *db_select_prepare_(const char *location, struct db *db, const char *query)
+{
+	int err;
+	sqlite3_stmt *stmt;
+	const char *full_query = tal_fmt(db, "SELECT %s", query);
+
+	assert(db->in_transaction);
+
+	err = sqlite3_prepare_v2(db->sql, full_query, -1, &stmt, NULL);
+
+	if (err != SQLITE_OK)
+		db_fatal("%s: %s: %s", location, full_query, sqlite3_errmsg(db->sql));
+
+	dev_statement_start(stmt, location);
+	tal_free(full_query);
+	return stmt;
+}
+
+bool db_select_step_(const char *location, struct db *db, struct sqlite3_stmt *stmt)
+{
+	int ret;
+
+	ret = sqlite3_step(stmt);
+	if (ret == SQLITE_ROW)
+		return true;
+	if (ret != SQLITE_DONE)
+		db_fatal("%s: %s", location, sqlite3_errmsg(db->sql));
+	db_stmt_done(stmt);
+	return false;
+}
 sqlite3_stmt *db_prepare_(const char *location, struct db *db, const char *query)
 {
 	int err;
@@ -463,6 +510,10 @@ void db_exec_prepared_(const char *caller, struct db *db, sqlite3_stmt *stmt)
 	if (sqlite3_step(stmt) !=  SQLITE_DONE)
 		db_fatal("%s: %s", caller, sqlite3_errmsg(db->sql));
 
+#if HAVE_SQLITE3_EXPANDED_SQL
+	tal_arr_expand(&db->changes,
+		       tal_strdup(db->changes, sqlite3_expanded_sql(stmt)));
+#endif
 	db_stmt_done(stmt);
 }
 
@@ -478,6 +529,9 @@ static void db_do_exec(const char *caller, struct db *db, const char *cmd)
 		/* Only reached in testing */
 		sqlite3_free(errmsg);
 	}
+#if HAVE_SQLITE3_EXPANDED_SQL
+	tal_arr_expand(&db->changes, tal_strdup(db->changes, cmd));
+#endif
 }
 
 static void PRINTF_FMT(3, 4)
@@ -496,39 +550,39 @@ static void PRINTF_FMT(3, 4)
 	tal_free(cmd);
 }
 
-bool db_exec_prepared_mayfail_(const char *caller UNUSED, struct db *db, sqlite3_stmt *stmt)
+/* This one can fail: returns NULL if so */
+static sqlite3_stmt *db_query(const char *location,
+			      struct db *db, const char *query)
 {
+	sqlite3_stmt *stmt;
+
 	assert(db->in_transaction);
 
-	if (sqlite3_step(stmt) != SQLITE_DONE) {
-		goto fail;
-	}
-
-	db_stmt_done(stmt);
-	return true;
-fail:
-	db_stmt_done(stmt);
-	return false;
+	/* Sets stmt to NULL if not SQLITE_OK */
+	sqlite3_prepare_v2(db->sql, query, -1, &stmt, NULL);
+	if (stmt)
+		dev_statement_start(stmt, location);
+	return stmt;
 }
 
 sqlite3_stmt *PRINTF_FMT(3, 4)
-    db_query_(const char *location, struct db *db, const char *fmt, ...)
+    db_select_(const char *location, struct db *db, const char *fmt, ...)
 {
 	va_list ap;
-	char *query;
+	char *query = tal_strdup(db, "SELECT ");
 	sqlite3_stmt *stmt;
 
 	assert(db->in_transaction);
 
 	va_start(ap, fmt);
-	query = tal_vfmt(db, fmt, ap);
+ 	tal_append_vfmt(&query, fmt, ap);
 	va_end(ap);
 
-	/* Sets stmt to NULL if not SQLITE_OK */
-	sqlite3_prepare_v2(db->sql, query, -1, &stmt, NULL);
+	stmt = db_query(location, db, query);
+	if (!stmt)
+		db_fatal("%s:%s:%s", location, query, sqlite3_errmsg(db->sql));
 	tal_free(query);
-	if (stmt)
-		dev_statement_start(stmt, location);
+
 	return stmt;
 }
 
@@ -538,21 +592,65 @@ static void destroy_db(struct db *db)
 	sqlite3_close(db->sql);
 }
 
+/* We expect min changes (ie. BEGIN TRANSACTION): report if more.
+ * Optionally add "final" at the end (ie. COMMIT). */
+static void db_report_changes(struct db *db, const char *final, size_t min)
+{
+	assert(db->changes);
+	assert(tal_count(db->changes) >= min);
+
+	if (tal_count(db->changes) > min)
+		plugin_hook_db_sync(db, db->changes, final);
+	db->changes = tal_free(db->changes);
+}
+
+static void db_prepare_for_changes(struct db *db)
+{
+	assert(!db->changes);
+	db->changes = tal_arr(db, const char *, 0);
+}
+
 void db_begin_transaction_(struct db *db, const char *location)
 {
 	if (db->in_transaction)
 		db_fatal("Already in transaction from %s", db->in_transaction);
 
+	db_prepare_for_changes(db);
 	db_do_exec(location, db, "BEGIN TRANSACTION;");
 	db->in_transaction = location;
 }
 
 void db_commit_transaction(struct db *db)
 {
+	int err;
+	char *errmsg;
+	const char *cmd = "COMMIT;";
+
 	assert(db->in_transaction);
 	db_assert_no_outstanding_statements();
-	db_exec(__func__, db, "COMMIT;");
+
+	/* We expect at least the BEGIN TRANSACTION */
+	db_report_changes(db, cmd, 1);
+
+	err = sqlite3_exec(db->sql, cmd, NULL, NULL, &errmsg);
+	if (err != SQLITE_OK)
+		db_fatal("%s:%s:%s:%s", __func__, sqlite3_errstr(err), cmd, errmsg);
+
 	db->in_transaction = NULL;
+}
+
+static void setup_open_db(struct db *db)
+{
+#if !HAVE_SQLITE3_EXPANDED_SQL
+	sqlite3_trace(db->sql, trace_sqlite3, db);
+#endif
+
+	/* This must be outside a transaction, so catch it */
+	assert(!db->in_transaction);
+
+	db_prepare_for_changes(db);
+	db_do_exec(__func__, db, "PRAGMA foreign_keys = ON;");
+	db_report_changes(db, NULL, 0);
 }
 
 /**
@@ -577,7 +675,9 @@ static struct db *db_open(const tal_t *ctx, char *filename)
 	db->sql = sql;
 	tal_add_destructor(db, destroy_db);
 	db->in_transaction = NULL;
-	db_do_exec(__func__, db, "PRAGMA foreign_keys = ON;");
+	db->changes = NULL;
+
+	setup_open_db(db);
 
 	return db;
 }
@@ -592,22 +692,19 @@ static struct db *db_open(const tal_t *ctx, char *filename)
  */
 static int db_get_version(struct db *db)
 {
-	int err;
-	u64 res = -1;
-	sqlite3_stmt *stmt = db_query(db, "SELECT version FROM version LIMIT 1");
+	int res;
+	sqlite3_stmt *stmt = db_query(__func__,
+				      db, "SELECT version FROM version LIMIT 1");
 
 	if (!stmt)
 		return -1;
 
-	err = sqlite3_step(stmt);
-	if (err != SQLITE_ROW) {
-		db_stmt_done(stmt);
+	if (!db_select_step(db, stmt))
 		return -1;
-	} else {
-		res = sqlite3_column_int64(stmt, 0);
-		db_stmt_done(stmt);
-		return res;
-	}
+
+	res = sqlite3_column_int64(stmt, 0);
+	db_stmt_done(stmt);
+	return res;
 }
 
 /**
@@ -680,26 +777,29 @@ void db_reopen_after_fork(struct db *db)
 		db_fatal("failed to re-open database %s: %s", db->filename,
 			 sqlite3_errstr(err));
 	}
-	db_do_exec(__func__, db, "PRAGMA foreign_keys = ON;");
+	setup_open_db(db);
 }
 
 s64 db_get_intvar(struct db *db, char *varname, s64 defval)
 {
-	int err;
-	s64 res = defval;
-	sqlite3_stmt *stmt =
-	    db_query(db,
-		     "SELECT val FROM vars WHERE name='%s' LIMIT 1", varname);
+	s64 res;
+	sqlite3_stmt *stmt;
+	const char *query;
+
+	query = tal_fmt(db, "SELECT val FROM vars WHERE name='%s' LIMIT 1", varname);
+	stmt = db_query(__func__, db, query);
+	tal_free(query);
 
 	if (!stmt)
 		return defval;
 
-	err = sqlite3_step(stmt);
-	if (err == SQLITE_ROW) {
+	if (db_select_step(db, stmt)) {
 		const unsigned char *stringvar = sqlite3_column_text(stmt, 0);
 		res = atol((const char *)stringvar);
-	}
-	db_stmt_done(stmt);
+		db_stmt_done(stmt);
+	} else
+		res = defval;
+
 	return res;
 }
 

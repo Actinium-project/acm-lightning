@@ -31,30 +31,23 @@ static struct bitcoin_tx *htlc_tx(const tal_t *ctx,
 	/* BOLT #3:
 	 * * version: 2
 	 */
-	assert(tx->version == 2);
+	assert(tx->wtx->version == 2);
 
 	/* BOLT #3:
 	 * * locktime: `0` for HTLC-success, `cltv_expiry` for HTLC-timeout
 	 */
-	tx->lock_time = locktime;
+	tx->wtx->locktime = locktime;
 
 	/* BOLT #3:
 	 * * txin count: 1
 	 *    * `txin[0]` outpoint: `txid` of the commitment transaction and
 	 *      `output_index` of the matching HTLC output for the HTLC
 	 *      transaction
-	 */
-	tx->input[0].txid = *commit_txid;
-	tx->input[0].index = commit_output_number;
-
-	/* We need amount for signing. */
-	amount = amount_msat_to_sat_round_down(msat);
-	tx->input[0].amount = tal_dup(tx, struct amount_sat, &amount);
-
-	/* BOLT #3:
 	 *    * `txin[0]` sequence: `0`
 	 */
-	tx->input[0].sequence_number = 0;
+	amount = amount_msat_to_sat_round_down(msat);
+	bitcoin_tx_add_input(tx, commit_txid, commit_output_number, 0, &amount,
+			     NULL);
 
 	/* BOLT #3:
 	 * * txout count: 1
@@ -63,12 +56,12 @@ static struct bitcoin_tx *htlc_tx(const tal_t *ctx,
 	 *    * `txout[0]` script: version-0 P2WSH with witness script as shown
 	 *       below
 	 */
-	if (!amount_sat_sub(&tx->output[0].amount, amount, htlc_fee))
+	if (!amount_sat_sub(&amount, amount, htlc_fee))
 		abort();
 
-	wscript = bitcoin_wscript_htlc_tx(tx, to_self_delay,
-					  revocation_pubkey, local_delayedkey);
-	tx->output[0].script = scriptpubkey_p2wsh(tx, wscript);
+	wscript = bitcoin_wscript_htlc_tx(tx, to_self_delay, revocation_pubkey,
+					  local_delayedkey);
+	bitcoin_tx_add_output(tx, scriptpubkey_p2wsh(tx, wscript), &amount);
 	tal_free(wscript);
 
 	return tx;
@@ -103,7 +96,7 @@ void htlc_success_tx_add_witness(struct bitcoin_tx *htlc_success,
 				 const struct pubkey *revocationkey)
 {
 	struct sha256 hash;
-	u8 *wscript;
+	u8 *wscript, **witness;
 
 	sha256(&hash, payment_preimage, sizeof(*payment_preimage));
 	wscript = bitcoin_wscript_htlc_receive(htlc_success,
@@ -111,11 +104,10 @@ void htlc_success_tx_add_witness(struct bitcoin_tx *htlc_success,
 					       localhtlckey, remotehtlckey,
 					       &hash, revocationkey);
 
-	htlc_success->input[0].witness
-		= bitcoin_witness_htlc_success_tx(htlc_success->input,
+	witness = bitcoin_witness_htlc_success_tx(htlc_success,
 						  localhtlcsig, remotehtlcsig,
-						  payment_preimage,
-						  wscript);
+						  payment_preimage, wscript);
+	bitcoin_tx_input_set_witness(htlc_success, 0, witness);
 	tal_free(wscript);
 }
 
@@ -148,14 +140,14 @@ void htlc_timeout_tx_add_witness(struct bitcoin_tx *htlc_timeout,
 				 const struct bitcoin_signature *localhtlcsig,
 				 const struct bitcoin_signature *remotehtlcsig)
 {
+	u8 **witness;
 	u8 *wscript = bitcoin_wscript_htlc_offer(htlc_timeout,
 						 localhtlckey, remotehtlckey,
 						 payment_hash, revocationkey);
 
-	htlc_timeout->input[0].witness
-		= bitcoin_witness_htlc_timeout_tx(htlc_timeout->input,
-						  localhtlcsig, remotehtlcsig,
-						  wscript);
+	witness = bitcoin_witness_htlc_timeout_tx(htlc_timeout, localhtlcsig,
+						  remotehtlcsig, wscript);
+	bitcoin_tx_input_set_witness(htlc_timeout, 0, witness);
 	tal_free(wscript);
 }
 

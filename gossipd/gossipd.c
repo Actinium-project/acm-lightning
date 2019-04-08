@@ -175,8 +175,12 @@ struct peer {
 static void peer_disable_channels(struct daemon *daemon, struct node *node)
 {
 	/* If this peer had a channel with us, mark it disabled. */
-	for (size_t i = 0; i < tal_count(node->chans); i++) {
-		struct chan *c = node->chans[i];
+	struct chan_map_iter i;
+	struct chan *c;
+
+	for (c = chan_map_first(&node->chans, &i);
+	     c;
+	     c = chan_map_next(&node->chans, &i)) {
 		if (pubkey_eq(&other_node(node, c)->id, &daemon->id))
 			c->local_disabled = true;
 	}
@@ -1798,8 +1802,13 @@ static void gossip_refresh_network(struct daemon *daemon)
 	if (n) {
 		/* Iterate through all outgoing connection and check whether
 		 * it's time to re-announce */
-		for (size_t i = 0; i < tal_count(n->chans); i++) {
-			struct half_chan *hc = half_chan_from(n, n->chans[i]);
+		struct chan_map_iter i;
+		struct chan *c;
+
+		for (c = chan_map_first(&n->chans, &i);
+		     c;
+		     c = chan_map_next(&n->chans, &i)) {
+			struct half_chan *hc = half_chan_from(n, c);
 
 			if (!is_halfchan_defined(hc)) {
 				/* Connection is not announced yet, so don't even
@@ -1817,7 +1826,7 @@ static void gossip_refresh_network(struct daemon *daemon)
 				continue;
 			}
 
-			gossip_send_keepalive_update(daemon, n->chans[i], hc);
+			gossip_send_keepalive_update(daemon, c, hc);
 		}
 	}
 
@@ -1830,14 +1839,18 @@ static void gossip_refresh_network(struct daemon *daemon)
 static void gossip_disable_local_channels(struct daemon *daemon)
 {
 	struct node *local_node = get_node(daemon->rstate, &daemon->id);
+	struct chan_map_iter i;
+	struct chan *c;
 
 	/* We don't have a local_node, so we don't have any channels yet
 	 * either */
 	if (!local_node)
 		return;
 
-	for (size_t i = 0; i < tal_count(local_node->chans); i++)
-		local_node->chans[i]->local_disabled = true;
+	for (c = chan_map_first(&local_node->chans, &i);
+	     c;
+	     c = chan_map_next(&local_node->chans, &i))
+		c->local_disabled = true;
 }
 
 /*~ Parse init message from lightningd: starts the daemon properly. */
@@ -1846,6 +1859,8 @@ static struct io_plan *gossip_init(struct io_conn *conn,
 				   const u8 *msg)
 {
 	u32 update_channel_interval;
+	u32 *dev_gossip_time;
+	struct amount_sat *dev_unknown_channel_satoshis;
 
 	if (!fromwire_gossipctl_init(daemon, msg,
 				     /* 60,000 ms
@@ -1858,7 +1873,9 @@ static struct io_plan *gossip_init(struct io_conn *conn,
 				     /* 1 week in seconds
 				      * (unless --dev-channel-update-interval) */
 				     &update_channel_interval,
-				     &daemon->announcable)) {
+				     &daemon->announcable,
+				     &dev_gossip_time,
+				     &dev_unknown_channel_satoshis)) {
 		master_badmsg(WIRE_GOSSIPCTL_INIT, msg);
 	}
 
@@ -1866,7 +1883,9 @@ static struct io_plan *gossip_init(struct io_conn *conn,
 	daemon->rstate = new_routing_state(daemon,
 					   chainparams_by_chainhash(&daemon->chain_hash),
 					   &daemon->id,
-					   update_channel_interval * 2);
+					   update_channel_interval * 2,
+					   dev_gossip_time,
+					   dev_unknown_channel_satoshis);
 
 	/* Load stored gossip messages */
 	gossip_store_load(daemon->rstate, daemon->rstate->store);
@@ -2013,11 +2032,16 @@ static struct io_plan *getchannels_req(struct io_conn *conn,
 	} else if (source) {
 		struct node *s = get_node(daemon->rstate, source);
 		if (s) {
-			for (size_t i = 0; i < tal_count(s->chans); i++)
+			struct chan_map_iter i;
+			struct chan *c;
+
+			for (c = chan_map_first(&s->chans, &i);
+			     c;
+			     c = chan_map_next(&s->chans, &i)) {
 				append_half_channel(&entries,
-						    s->chans[i],
-						    !half_chan_to(s,
-								  s->chans[i]));
+						    c,
+						    !half_chan_to(s, c));
+			}
 		}
 	} else {
 		u64 idx;
@@ -2152,10 +2176,15 @@ out:
 static bool node_has_public_channels(const struct node *peer,
 				     const struct chan *exclude)
 {
-	for (size_t i = 0; i < tal_count(peer->chans); i++) {
-		if (peer->chans[i] == exclude)
+	struct chan_map_iter i;
+	struct chan *c;
+
+	for (c = chan_map_first(&peer->chans, &i);
+	     c;
+	     c = chan_map_next(&peer->chans, &i)) {
+		if (c == exclude)
 			continue;
-		if (is_chan_public(peer->chans[i]))
+		if (is_chan_public(c))
 			return true;
 	}
 	return false;
@@ -2200,8 +2229,12 @@ static struct io_plan *get_incoming_channels(struct io_conn *conn,
 
 	node = get_node(daemon->rstate, &daemon->rstate->local_id);
 	if (node) {
-		for (size_t i = 0; i < tal_count(node->chans); i++) {
-			const struct chan *c = node->chans[i];
+		struct chan_map_iter i;
+		struct chan *c;
+
+		for (c = chan_map_first(&node->chans, &i);
+		     c;
+		     c = chan_map_next(&node->chans, &i)) {
 			const struct half_chan *hc;
 			struct route_info ri;
 
@@ -2455,6 +2488,17 @@ static struct io_plan *dev_gossip_memleak(struct io_conn *conn,
 	daemon_conn_send(daemon->master,
 			 take(towire_gossip_dev_memleak_reply(NULL,
 							      found_leak)));
+	return daemon_conn_read_next(conn, daemon->master);
+}
+
+static struct io_plan *dev_compact_store(struct io_conn *conn,
+					 struct daemon *daemon,
+					 const u8 *msg)
+{
+	bool done = gossip_store_compact(daemon->rstate->store);
+	daemon_conn_send(daemon->master,
+			 take(towire_gossip_dev_compact_store_reply(NULL,
+								    done)));
 	return daemon_conn_read_next(conn, daemon->master);
 }
 #endif /* DEVELOPER */
@@ -2716,6 +2760,8 @@ static struct io_plan *recv_req(struct io_conn *conn,
 		return dev_gossip_suppress(conn, daemon, msg);
 	case WIRE_GOSSIP_DEV_MEMLEAK:
 		return dev_gossip_memleak(conn, daemon, msg);
+	case WIRE_GOSSIP_DEV_COMPACT_STORE:
+		return dev_compact_store(conn, daemon, msg);
 #else
 	case WIRE_GOSSIP_QUERY_SCIDS:
 	case WIRE_GOSSIP_SEND_TIMESTAMP_FILTER:
@@ -2723,6 +2769,7 @@ static struct io_plan *recv_req(struct io_conn *conn,
 	case WIRE_GOSSIP_DEV_SET_MAX_SCIDS_ENCODE_SIZE:
 	case WIRE_GOSSIP_DEV_SUPPRESS:
 	case WIRE_GOSSIP_DEV_MEMLEAK:
+	case WIRE_GOSSIP_DEV_COMPACT_STORE:
 		break;
 #endif /* !DEVELOPER */
 
@@ -2737,6 +2784,7 @@ static struct io_plan *recv_req(struct io_conn *conn,
 	case WIRE_GOSSIP_GET_INCOMING_CHANNELS_REPLY:
 	case WIRE_GOSSIP_GET_TXOUT:
 	case WIRE_GOSSIP_DEV_MEMLEAK_REPLY:
+	case WIRE_GOSSIP_DEV_COMPACT_STORE_REPLY:
 		break;
 	}
 

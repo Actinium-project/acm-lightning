@@ -20,6 +20,7 @@ struct db {
 	char *filename;
 	const char *in_transaction;
 	sqlite3 *sql;
+	const char **changes;
 };
 
 /**
@@ -37,12 +38,14 @@ struct db {
 struct db *db_setup(const tal_t *ctx, struct lightningd *ld, struct log *log);
 
 /**
- * db_query - Prepare and execute a query, and return the result (or NULL)
+ * db_select - Prepare and execute a SELECT, and return the result
+ *
+ * A simpler version of db_select_prepare.
  */
 sqlite3_stmt *PRINTF_FMT(3, 4)
-	db_query_(const char *location, struct db *db, const char *fmt, ...);
-#define db_query(db, ...) \
-	db_query_(__FILE__ ":" stringify(__LINE__), db, __VA_ARGS__)
+	db_select_(const char *location, struct db *db, const char *fmt, ...);
+#define db_select(db, ...) \
+	db_select_(__FILE__ ":" stringify(__LINE__), db, __VA_ARGS__)
 
 /**
  * db_begin_transaction - Begin a transaction
@@ -78,6 +81,35 @@ void db_set_intvar(struct db *db, char *varname, s64 val);
 s64 db_get_intvar(struct db *db, char *varname, s64 defval);
 
 /**
+ * db_select_prepare -- Prepare a DB select statement (read-only!)
+ *
+ * Tiny wrapper around `sqlite3_prepare_v2` that checks and sets
+ * errors like `db_query` and `db_exec` do.  It calls fatal if
+ * the stmt is not valid.
+ *
+ * Call db_select_step() until it returns false (which will also consume
+ * the stmt).
+ *
+ * @db: Database to query/exec
+ * @query: The SELECT SQL statement to compile
+ */
+#define db_select_prepare(db, query) \
+	db_select_prepare_(__FILE__ ":" stringify(__LINE__), db, query)
+sqlite3_stmt *db_select_prepare_(const char *location,
+				 struct db *db, const char *query);
+
+/**
+ * db_select_step -- iterate through db results.
+ *
+ * Returns false and frees stmt if we've reached end, otherwise
+ * it means sqlite3_step has returned SQLITE_ROW.
+ */
+#define db_select_step(db, stmt)					\
+	db_select_step_(__FILE__ ":" stringify(__LINE__), db, stmt)
+bool db_select_step_(const char *location,
+		     struct db *db, struct sqlite3_stmt *stmt);
+
+/**
  * db_prepare -- Prepare a DB query/command
  *
  * Tiny wrapper around `sqlite3_prepare_v2` that checks and sets
@@ -108,15 +140,6 @@ sqlite3_stmt *db_prepare_(const char *location, struct db *db, const char *query
  */
 #define db_exec_prepared(db,stmt) db_exec_prepared_(__func__,db,stmt)
 void db_exec_prepared_(const char *caller, struct db *db, sqlite3_stmt *stmt);
-
-/**
- * db_exec_prepared_mayfail - db_exec_prepared, but don't fatal() it fails.
- */
-#define db_exec_prepared_mayfail(db,stmt) \
-	db_exec_prepared_mayfail_(__func__,db,stmt)
-bool db_exec_prepared_mayfail_(const char *caller,
-			       struct db *db,
-			       sqlite3_stmt *stmt);
 
 /* Wrapper around sqlite3_finalize(), for tracking statements. */
 void db_stmt_done(sqlite3_stmt *stmt);

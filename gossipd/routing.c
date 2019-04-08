@@ -82,7 +82,9 @@ static struct node_map *empty_node_map(const tal_t *ctx)
 struct routing_state *new_routing_state(const tal_t *ctx,
 					const struct chainparams *chainparams,
 					const struct pubkey *local_id,
-					u32 prune_timeout)
+					u32 prune_timeout,
+					const u32 *dev_gossip_time,
+					const struct amount_sat *dev_unknown_channel_satoshis)
 {
 	struct routing_state *rstate = tal(ctx, struct routing_state);
 	rstate->nodes = empty_node_map(rstate);
@@ -98,6 +100,16 @@ struct routing_state *new_routing_state(const tal_t *ctx,
 
 	rstate->pending_node_map = tal(ctx, struct pending_node_map);
 	pending_node_map_init(rstate->pending_node_map);
+
+#if DEVELOPER
+	if (dev_gossip_time) {
+		rstate->gossip_time = tal(rstate, struct timeabs);
+		rstate->gossip_time->ts.tv_sec = *dev_gossip_time;
+		rstate->gossip_time->ts.tv_nsec = 0;
+	} else
+		rstate->gossip_time = NULL;
+	rstate->dev_unknown_channel_satoshis = dev_unknown_channel_satoshis;
+#endif
 
 	return rstate;
 }
@@ -120,11 +132,14 @@ bool node_map_node_eq(const struct node *n, const struct pubkey *key)
 
 static void destroy_node(struct node *node, struct routing_state *rstate)
 {
+	struct chan_map_iter i;
+	struct chan *c;
 	node_map_del(rstate->nodes, node);
 
-	/* These remove themselves from the array. */
-	while (tal_count(node->chans))
-		tal_free(node->chans[0]);
+	/* These remove themselves from the map. */
+	while ((c = chan_map_first(&node->chans, &i)) != NULL)
+		tal_free(c);
+	chan_map_clear(&node->chans);
 }
 
 struct node *get_node(struct routing_state *rstate, const struct pubkey *id)
@@ -141,7 +156,7 @@ static struct node *new_node(struct routing_state *rstate,
 
 	n = tal(rstate, struct node);
 	n->id = *id;
-	n->chans = tal_arr(n, struct chan *, 0);
+	chan_map_init(&n->chans);
 	n->globalfeatures = NULL;
 	n->node_announcement = NULL;
 	n->node_announcement_index = 0;
@@ -156,9 +171,15 @@ static struct node *new_node(struct routing_state *rstate,
 /* We've received a channel_announce for a channel attached to this node */
 static bool node_has_public_channels(struct node *node)
 {
-	for (size_t i = 0; i < tal_count(node->chans); i++)
-		if (is_chan_public(node->chans[i]))
+	struct chan_map_iter i;
+	struct chan *c;
+
+	for (c = chan_map_first(&node->chans, &i);
+	     c;
+	     c = chan_map_next(&node->chans, &i)) {
+		if (is_chan_public(c))
 			return true;
+	}
 	return false;
 }
 
@@ -166,39 +187,33 @@ static bool node_has_public_channels(struct node *node)
  * we only send once we have a channel_update. */
 static bool node_has_broadcastable_channels(struct node *node)
 {
-	for (size_t i = 0; i < tal_count(node->chans); i++) {
-		if (!is_chan_public(node->chans[i]))
+	struct chan_map_iter i;
+	struct chan *c;
+
+	for (c = chan_map_first(&node->chans, &i);
+	     c;
+	     c = chan_map_next(&node->chans, &i)) {
+		if (!is_chan_public(c))
 			continue;
-		if (is_halfchan_defined(&node->chans[i]->half[0])
-		    || is_halfchan_defined(&node->chans[i]->half[1]))
+		if (is_halfchan_defined(&c->half[0])
+		    || is_halfchan_defined(&c->half[1]))
 			return true;
-	}
-	return false;
-}
-
-static bool remove_channel_from_array(struct chan ***chans, const struct chan *c)
-{
-	size_t i, n;
-
-	n = tal_count(*chans);
-	for (i = 0; i < n; i++) {
-		if ((*chans)[i] != c)
-			continue;
-		n--;
-		memmove(*chans + i, *chans + i + 1, sizeof(**chans) * (n - i));
-		tal_resize(chans, n);
-		return true;
 	}
 	return false;
 }
 
 static bool node_announce_predates_channels(const struct node *node)
 {
-	for (size_t i = 0; i < tal_count(node->chans); i++) {
-		if (!is_chan_announced(node->chans[i]))
+	struct chan_map_iter i;
+	struct chan *c;
+
+	for (c = chan_map_first(&node->chans, &i);
+	     c;
+	     c = chan_map_next(&node->chans, &i)) {
+		if (!is_chan_announced(c))
 			continue;
 
-		if (node->chans[i]->channel_announcement_index
+		if (c->channel_announcement_index
 		    < node->node_announcement_index)
 			return false;
 	}
@@ -216,11 +231,11 @@ static u64 persistent_broadcast(struct routing_state *rstate, const u8 *msg, u32
 static void remove_chan_from_node(struct routing_state *rstate,
 				  struct node *node, const struct chan *chan)
 {
-	if (!remove_channel_from_array(&node->chans, chan))
+	if (!chan_map_del(&node->chans, chan))
 		abort();
 
 	/* Last channel?  Simply delete node (and associated announce) */
-	if (tal_count(node->chans) == 0) {
+	if (node->chans.raw.elems == 0) {
 		tal_free(node);
 		return;
 	}
@@ -267,7 +282,7 @@ static void init_half_chan(struct routing_state *rstate,
 	c->message_flags = 0;
 	/* We haven't seen channel_update: make it halfway to prune time,
 	 * which should be older than any update we'd see. */
-	c->last_timestamp = time_now().ts.tv_sec - rstate->prune_timeout/2;
+	c->last_timestamp = gossip_time_now(rstate).ts.tv_sec - rstate->prune_timeout/2;
 }
 
 static void bad_gossip_order(const u8 *msg, const char *source,
@@ -308,8 +323,8 @@ struct chan *new_chan(struct routing_state *rstate,
 	chan->sat = satoshis;
 	chan->local_disabled = false;
 
-	tal_arr_expand(&n2->chans, chan);
-	tal_arr_expand(&n1->chans, chan);
+	chan_map_add(&n2->chans, chan);
+	chan_map_add(&n1->chans, chan);
 
 	/* Populate with (inactive) connections */
 	init_half_chan(rstate, chan, n1idx);
@@ -520,15 +535,20 @@ find_route(const tal_t *ctx, struct routing_state *rstate,
 		for (n = node_map_first(rstate->nodes, &it);
 		     n;
 		     n = node_map_next(rstate->nodes, &it)) {
-			size_t num_edges = tal_count(n->chans);
-			for (i = 0; i < num_edges; i++) {
-				struct chan *chan = n->chans[i];
+			struct chan_map_iter i;
+			struct chan *chan;
+
+			for (chan = chan_map_first(&n->chans, &i);
+			     chan;
+			     chan = chan_map_next(&n->chans, &i)) {
 				int idx = half_chan_to(n, chan);
 
-				SUPERVERBOSE("Node %s edge %i/%zu",
+				SUPERVERBOSE("Node %s edge %s",
 					     type_to_string(tmpctx, struct pubkey,
 							    &n->id),
-					     i, num_edges);
+					     type_to_string(tmpctx,
+							    struct short_channel_id,
+							    &c->scid));
 
 				if (!hc_is_routable(chan, idx)) {
 					SUPERVERBOSE("...unroutable (local_disabled = %i, is_halfchan_enabled = %i, unroutable_until = %i",
@@ -994,6 +1014,16 @@ void handle_pending_cannouncement(struct routing_state *rstate,
 	if (!pending)
 		return;
 
+#if DEVELOPER
+	if (rstate->dev_unknown_channel_satoshis) {
+		outscript = scriptpubkey_p2wsh(pending,
+			       bitcoin_redeem_2of2(pending,
+						   &pending->bitcoin_key_1,
+						   &pending->bitcoin_key_2));
+		sat = *rstate->dev_unknown_channel_satoshis;
+	}
+#endif
+
 	/* BOLT #7:
 	 *
 	 * The receiving node:
@@ -1162,9 +1192,13 @@ bool routing_add_channel_update(struct routing_state *rstate,
 		= tal_dup_arr(chan, u8, update, tal_count(update), 0);
 
 	/* For private channels, we get updates without an announce: don't
-	 * broadcast them! */
-	if (!chan->channel_announce)
+	 * broadcast them!  But save local ones to store anyway. */
+	if (!chan->channel_announce) {
+		if (is_local_channel(rstate, chan))
+			gossip_store_add(rstate->store,
+					 chan->half[direction].channel_update);
 		return true;
+	}
 
 	/* BOLT #7:
 	 *   - MUST consider the `timestamp` of the `channel_announcement` to be
@@ -1265,7 +1299,7 @@ u8 *handle_channel_update(struct routing_state *rstate, const u8 *update TAKES,
 	 *  - if the `timestamp` is unreasonably far in the future:
 	 *    - MAY discard the `channel_update`.
 	 */
-	if (timestamp > time_now().ts.tv_sec + rstate->prune_timeout) {
+	if (timestamp > gossip_time_now(rstate).ts.tv_sec + rstate->prune_timeout) {
 		status_debug("Received channel_update for %s with far time %u",
 			     type_to_string(tmpctx, struct short_channel_id,
 					    &short_channel_id),
@@ -1274,7 +1308,7 @@ u8 *handle_channel_update(struct routing_state *rstate, const u8 *update TAKES,
 	}
 
 	/* Note: we can consider old timestamps a case of "instant prune" too */
-	if (timestamp < time_now().ts.tv_sec - rstate->prune_timeout) {
+	if (timestamp < gossip_time_now(rstate).ts.tv_sec - rstate->prune_timeout) {
 		status_debug("Received channel_update for %s with old time %u",
 			     type_to_string(tmpctx, struct short_channel_id,
 					    &short_channel_id),
@@ -1669,13 +1703,18 @@ void routing_failure(struct routing_state *rstate,
 				       type_to_string(tmpctx, struct pubkey,
 						      erring_node_pubkey));
 		} else {
+			struct chan_map_iter i;
+			struct chan *c;
+
 			status_trace("Deleting node %s",
 				     type_to_string(tmpctx,
 						    struct pubkey,
 						    &node->id));
-			for (size_t i = 0; i < tal_count(node->chans); ++i) {
+			for (c = chan_map_first(&node->chans, &i);
+			     c;
+			     c = chan_map_next(&node->chans, &i)) {
 				/* Set it up to be pruned. */
-				tal_steal(tmpctx, node->chans[i]);
+				tal_steal(tmpctx, c);
 			}
 		}
 	} else {
@@ -1708,7 +1747,7 @@ void routing_failure(struct routing_state *rstate,
 
 void route_prune(struct routing_state *rstate)
 {
-	u64 now = time_now().ts.tv_sec;
+	u64 now = gossip_time_now(rstate).ts.tv_sec;
 	/* Anything below this highwater mark ought to be pruned */
 	const s64 highwater = now - rstate->prune_timeout;
 	const tal_t *pruned = tal(NULL, char);
@@ -1745,9 +1784,18 @@ void route_prune(struct routing_state *rstate)
 void memleak_remove_routing_tables(struct htable *memtable,
 				   const struct routing_state *rstate)
 {
+	struct node *n;
+	struct node_map_iter nit;
+
 	memleak_remove_htable(memtable, &rstate->nodes->raw);
 	memleak_remove_htable(memtable, &rstate->pending_node_map->raw);
 	memleak_remove_uintmap(memtable, &rstate->broadcasts->broadcasts);
+
+	for (n = node_map_first(rstate->nodes, &nit);
+	     n;
+	     n = node_map_next(rstate->nodes, &nit)) {
+		memleak_remove_htable(memtable, &n->chans.raw);
+	}
 }
 #endif /* DEVELOPER */
 
@@ -1776,4 +1824,13 @@ bool handle_local_add_channel(struct routing_state *rstate, const u8 *msg)
 	/* Create new (unannounced) channel */
 	new_chan(rstate, &scid, &rstate->local_id, &remote_node_id, sat);
 	return true;
+}
+
+struct timeabs gossip_time_now(const struct routing_state *rstate)
+{
+#if DEVELOPER
+	if (rstate->gossip_time)
+		return *rstate->gossip_time;
+#endif
+	return time_now();
 }
