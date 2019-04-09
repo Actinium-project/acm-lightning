@@ -442,9 +442,10 @@ static u8 *funder_channel(struct state *state,
 	struct pubkey *changekey;
 	struct bitcoin_signature sig;
 	u32 minimum_depth;
-	const u8 *wscript;
 	struct bitcoin_tx *funding;
+	const u8 *wscript;
 	struct amount_msat local_msat;
+	char* err_reason;
 
 	/*~ For symmetry, we calculate our own reserve even though lightningd
 	 * could do it for the we-are-funding case. */
@@ -668,13 +669,13 @@ static u8 *funder_channel(struct state *state,
 	/* This gives us their first commitment transaction. */
 	tx = initial_channel_tx(state, &wscript, state->channel,
 				&state->first_per_commitment_point[REMOTE],
-				REMOTE);
+				REMOTE, &err_reason);
 	if (!tx) {
 		/* This should not happen: we should never create channels we
 		 * can't afford the fees for after reserve. */
 		negotiation_failed(state, true,
-				   "Could not meet their fees and reserve");
-		goto fail;
+				   "Could not meet their fees and reserve: %s", err_reason);
+		goto fail_2;
 	}
 
 	/* We ask the HSM to sign their commitment transaction for us: it knows
@@ -724,7 +725,7 @@ static u8 *funder_channel(struct state *state,
 	 * transaction. */
 	msg = opening_negotiate_msg(tmpctx, state, true);
 	if (!msg)
-		goto fail;
+		goto fail_2;
 
 	sig.sighash_type = SIGHASH_ALL;
 	if (!fromwire_funding_signed(msg, &id_in, &sig.s))
@@ -775,11 +776,11 @@ static u8 *funder_channel(struct state *state,
 	 * signature they sent against that. */
 	tx = initial_channel_tx(state, &wscript, state->channel,
 				&state->first_per_commitment_point[LOCAL],
-				LOCAL);
+				LOCAL, &err_reason);
 	if (!tx) {
 		negotiation_failed(state, true,
-				   "Could not meet our fees and reserve");
-		goto fail;
+				   "Could not meet our fees and reserve: %s", err_reason);
+		goto fail_2;
 	}
 
 	if (!check_tx_sig(tx, 0, NULL, wscript, &their_funding_pubkey, &sig)) {
@@ -823,6 +824,9 @@ static u8 *funder_channel(struct state *state,
 					   state->feerate_per_kw,
 					   state->localconf.channel_reserve);
 
+fail_2:
+	tal_free(wscript);
+	tal_free(funding);
 fail:
 	if (taken(utxos))
 		tal_free(utxos);
@@ -841,6 +845,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	u8 *msg;
 	const u8 *wscript;
 	u8 channel_flags;
+	char* err_reason;
 
 	/* BOLT #2:
 	 *
@@ -1067,11 +1072,11 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	 */
 	local_commit = initial_channel_tx(state, &wscript, state->channel,
 					  &state->first_per_commitment_point[LOCAL],
-					  LOCAL);
+					  LOCAL, &err_reason);
 	/* This shouldn't happen either, AFAICT. */
 	if (!local_commit) {
 		negotiation_failed(state, false,
-				   "Could not meet our fees and reserve");
+				   "Could not meet our fees and reserve: %s", err_reason);
 		return NULL;
 	}
 
@@ -1127,10 +1132,10 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	 */
 	remote_commit = initial_channel_tx(state, &wscript, state->channel,
 					   &state->first_per_commitment_point[REMOTE],
-					   REMOTE);
+					   REMOTE, &err_reason);
 	if (!remote_commit) {
 		negotiation_failed(state, false,
-				   "Could not meet their fees and reserve");
+				   "Could not meet their fees and reserve: %s", err_reason);
 		return NULL;
 	}
 
