@@ -185,24 +185,6 @@ void gossipd_notify_spend(struct lightningd *ld,
 	subd_send_msg(ld->gossip, msg);
 }
 
-/* Gossipd shouldn't give us bad pubkeys, but don't abort if they do */
-static void json_add_raw_pubkey(struct json_stream *response,
-			 const char *fieldname,
-			 const u8 raw_pubkey[sizeof(struct pubkey)])
-{
-	secp256k1_pubkey pubkey;
-	u8 der[PUBKEY_DER_LEN];
-	size_t outlen = PUBKEY_DER_LEN;
-
-	memcpy(&pubkey, raw_pubkey, sizeof(pubkey));
-	if (!secp256k1_ec_pubkey_serialize(secp256k1_ctx, der, &outlen,
-					   &pubkey,
-					   SECP256K1_EC_COMPRESSED))
-		json_add_string(response, fieldname, "INVALID PUBKEY");
-	else
-		json_add_hex(response, fieldname, der, sizeof(der));
-}
-
 static void json_getnodes_reply(struct subd *gossip UNUSED, const u8 *reply,
 				const int *fds UNUSED,
 				struct command *cmd)
@@ -225,7 +207,7 @@ static void json_getnodes_reply(struct subd *gossip UNUSED, const u8 *reply,
 		struct json_escaped *esc;
 
 		json_object_start(response, NULL);
-		json_add_raw_pubkey(response, "nodeid", nodes[i]->nodeid);
+		json_add_node_id(response, "nodeid", &nodes[i]->nodeid);
 		if (nodes[i]->last_timestamp < 0) {
 			json_object_end(response);
 			continue;
@@ -262,10 +244,10 @@ static struct command_result *json_listnodes(struct command *cmd,
 					     const jsmntok_t *params)
 {
 	u8 *req;
-	struct pubkey *id;
+	struct node_id *id;
 
 	if (!param(cmd, buffer, params,
-		   p_opt("id", param_pubkey, &id),
+		   p_opt("id", param_node_id, &id),
 		   NULL))
 		return command_param_failed();
 
@@ -308,8 +290,8 @@ static struct command_result *json_getroute(struct command *cmd,
 					    const jsmntok_t *params)
 {
 	struct lightningd *ld = cmd->ld;
-	struct pubkey *destination;
-	struct pubkey *source;
+	struct node_id *destination;
+	struct node_id *source;
 	const jsmntok_t *excludetok;
 	struct amount_msat *msat;
 	unsigned *cltv;
@@ -325,11 +307,11 @@ static struct command_result *json_getroute(struct command *cmd,
 	double *fuzz;
 
 	if (!param(cmd, buffer, params,
-		   p_req("id", param_pubkey, &destination),
+		   p_req("id", param_node_id, &destination),
 		   p_req("msatoshi", param_msat, &msat),
 		   p_req("riskfactor", param_double, &riskfactor),
 		   p_opt_def("cltv", param_number, &cltv, 9),
-		   p_opt_def("fromid", param_pubkey, &source, ld->id),
+		   p_opt_def("fromid", param_node_id, &source, ld->id),
 		   p_opt_def("fuzzpercent", param_percent, &fuzz, 5.0),
 		   p_opt("exclude", param_array, &excludetok),
 		   p_opt_def("maxhops", param_number, &max_hops,
@@ -385,12 +367,43 @@ static const struct json_command getroute_command = {
 };
 AUTODATA(json_command, &getroute_command);
 
+static void json_add_halfchan(struct json_stream *response,
+			      const struct gossip_getchannels_entry *e,
+			      int idx)
+{
+	const struct gossip_halfchannel_entry *he = e->e[idx];
+	if (!he)
+		return;
+
+	json_object_start(response, NULL);
+	json_add_node_id(response, "source", &e->node[idx]);
+	json_add_node_id(response, "destination", &e->node[!idx]);
+	json_add_short_channel_id(response, "short_channel_id",
+				  &e->short_channel_id);
+	json_add_bool(response, "public", e->public);
+	json_add_amount_sat(response, e->sat,
+			    "satoshis", "amount_msat");
+	json_add_num(response, "message_flags", he->message_flags);
+	json_add_num(response, "channel_flags", he->channel_flags);
+	/* Prior to spec v0891374d47ddffa64c5a2e6ad151247e3d6b7a59, these two were a single u16 field */
+	if (deprecated_apis)
+		json_add_num(response, "flags", ((u16)he->message_flags << 8) | he->channel_flags);
+	json_add_bool(response, "active",
+		      !(he->channel_flags & ROUTING_FLAGS_DISABLED)
+		      && !e->local_disabled);
+	json_add_num(response, "last_update", he->last_update_timestamp);
+	json_add_num(response, "base_fee_millisatoshi", he->base_fee_msat);
+	json_add_num(response, "fee_per_millionth", he->fee_per_millionth);
+	json_add_num(response, "delay", he->delay);
+	json_object_end(response);
+}
+
 /* Called upon receiving a getchannels_reply from `gossipd` */
 static void json_listchannels_reply(struct subd *gossip UNUSED, const u8 *reply,
 				   const int *fds UNUSED, struct command *cmd)
 {
 	size_t i;
-	struct gossip_getchannels_entry *entries;
+	struct gossip_getchannels_entry **entries;
 	struct json_stream *response;
 
 	if (!fromwire_gossip_getchannels_reply(reply, reply, &entries)) {
@@ -403,32 +416,8 @@ static void json_listchannels_reply(struct subd *gossip UNUSED, const u8 *reply,
 	json_object_start(response, NULL);
 	json_array_start(response, "channels");
 	for (i = 0; i < tal_count(entries); i++) {
-		json_object_start(response, NULL);
-		json_add_raw_pubkey(response, "source", entries[i].source);
-		json_add_raw_pubkey(response, "destination",
-				    entries[i].destination);
-		json_add_string(response, "short_channel_id",
-				type_to_string(reply, struct short_channel_id,
-					       &entries[i].short_channel_id));
-		json_add_bool(response, "public", entries[i].public);
-		json_add_amount_sat(response, entries[i].sat,
-				    "satoshis", "amount_msat");
-		json_add_num(response, "message_flags", entries[i].message_flags);
-		json_add_num(response, "channel_flags", entries[i].channel_flags);
-		/* Prior to spec v0891374d47ddffa64c5a2e6ad151247e3d6b7a59, these two were a single u16 field */
-		if (deprecated_apis)
-			json_add_num(response, "flags", ((u16)entries[i].message_flags << 8) | entries[i].channel_flags);
-		json_add_bool(response, "active",
-			      !(entries[i].channel_flags & ROUTING_FLAGS_DISABLED)
-			      && !entries[i].local_disabled);
-		json_add_num(response, "last_update",
-			     entries[i].last_update_timestamp);
-		json_add_num(response, "base_fee_millisatoshi",
-			     entries[i].base_fee_msat);
-		json_add_num(response, "fee_per_millionth",
-			     entries[i].fee_per_millionth);
-		json_add_num(response, "delay", entries[i].delay);
-		json_object_end(response);
+		json_add_halfchan(response, entries[i], 0);
+		json_add_halfchan(response, entries[i], 1);
 	}
 	json_array_end(response);
 	json_object_end(response);
@@ -442,11 +431,11 @@ static struct command_result *json_listchannels(struct command *cmd,
 {
 	u8 *req;
 	struct short_channel_id *id;
-	struct pubkey *source;
+	struct node_id *source;
 
 	if (!param(cmd, buffer, params,
 		   p_opt("short_channel_id", param_short_channel_id, &id),
-		   p_opt("source", param_pubkey, &source),
+		   p_opt("source", param_node_id, &source),
 		   NULL))
 		return command_param_failed();
 
@@ -500,12 +489,12 @@ static struct command_result *json_dev_query_scids(struct command *cmd,
 	u8 *msg;
 	const jsmntok_t *scidstok;
 	const jsmntok_t *t;
-	struct pubkey *id;
+	struct node_id *id;
 	struct short_channel_id *scids;
 	size_t i;
 
 	if (!param(cmd, buffer, params,
-		   p_req("id", param_pubkey, &id),
+		   p_req("id", param_node_id, &id),
 		   p_req("scids", param_array, &scidstok),
 		   NULL))
 		return command_param_failed();
@@ -542,11 +531,11 @@ json_dev_send_timestamp_filter(struct command *cmd,
 			       const jsmntok_t *params)
 {
 	u8 *msg;
-	struct pubkey *id;
+	struct node_id *id;
 	u32 *first, *range;
 
 	if (!param(cmd, buffer, params,
-		   p_req("id", param_pubkey, &id),
+		   p_req("id", param_node_id, &id),
 		   p_req("first", param_number, &first),
 		   p_req("range", param_number, &range),
 		   NULL))
@@ -612,11 +601,11 @@ static struct command_result *json_dev_query_channel_range(struct command *cmd,
 					 const jsmntok_t *params)
 {
 	u8 *msg;
-	struct pubkey *id;
+	struct node_id *id;
 	u32 *first, *num;
 
 	if (!param(cmd, buffer, params,
-		   p_req("id", param_pubkey, &id),
+		   p_req("id", param_node_id, &id),
 		   p_req("first", param_number, &first),
 		   p_req("num", param_number, &num),
 		   NULL))

@@ -8,6 +8,7 @@
 #include <bitcoin/tx.h>
 #include <ccan/short_types/short_types.h>
 #include <ccan/tal/tal.h>
+#include <ccan/time/time.h>
 #include <common/amount.h>
 #include <secp256k1_ecdh.h>
 #include <sqlite3.h>
@@ -15,6 +16,7 @@
 
 struct lightningd;
 struct log;
+struct node_id;
 
 struct db {
 	char *filename;
@@ -176,10 +178,18 @@ bool sqlite3_column_signature(sqlite3_stmt *stmt, int col, secp256k1_ecdsa_signa
 bool sqlite3_column_pubkey(sqlite3_stmt *stmt, int col,  struct pubkey *dest);
 bool sqlite3_bind_pubkey(sqlite3_stmt *stmt, int col, const struct pubkey *pk);
 
+bool sqlite3_column_node_id(sqlite3_stmt *stmt, int col, struct node_id *dest);
+bool sqlite3_bind_node_id(sqlite3_stmt *stmt, int col, const struct node_id *id);
+
 bool sqlite3_bind_pubkey_array(sqlite3_stmt *stmt, int col,
 			       const struct pubkey *pks);
 struct pubkey *sqlite3_column_pubkey_array(const tal_t *ctx,
 					   sqlite3_stmt *stmt, int col);
+
+bool sqlite3_bind_node_id_array(sqlite3_stmt *stmt, int col,
+				const struct node_id *ids);
+struct node_id *sqlite3_column_node_id_array(const tal_t *ctx,
+					     sqlite3_stmt *stmt, int col);
 
 bool sqlite3_column_preimage(sqlite3_stmt *stmt, int col,  struct preimage *dest);
 bool sqlite3_bind_preimage(sqlite3_stmt *stmt, int col, const struct preimage *p);
@@ -203,4 +213,9 @@ void sqlite3_bind_amount_msat(sqlite3_stmt *stmt, int col,
 			      struct amount_msat msat);
 void sqlite3_bind_amount_sat(sqlite3_stmt *stmt, int col,
 			     struct amount_sat sat);
+
+/* Helpers to read and write absolute times from and to the database. */
+void sqlite3_bind_timeabs(sqlite3_stmt *stmt, int col, struct timeabs t);
+struct timeabs sqlite3_column_timeabs(sqlite3_stmt *stmt, int col);
+
 #endif /* LIGHTNING_WALLET_DB_H */

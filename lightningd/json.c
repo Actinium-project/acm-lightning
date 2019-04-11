@@ -8,6 +8,7 @@
 #include <common/json_helpers.h>
 #include <common/jsonrpc_errors.h>
 #include <common/memleak.h>
+#include <common/node_id.h>
 #include <common/param.h>
 #include <common/type_to_string.h>
 #include <common/wallet_tx.h>
@@ -28,7 +29,7 @@ json_add_route_hop(struct json_stream *r, char const *n,
 {
 	/* Imitate what getroute/sendpay use */
 	json_object_start(r, n);
-	json_add_pubkey(r, "id", &h->nodeid);
+	json_add_node_id(r, "id", &h->nodeid);
 	json_add_short_channel_id(r, "channel",
 				  &h->channel_id);
 	json_add_num(r, "direction", h->direction);
@@ -50,11 +51,18 @@ json_add_route(struct json_stream *r, char const *n,
 	json_array_end(r);
 }
 
+void json_add_node_id(struct json_stream *response,
+		      const char *fieldname,
+		      const struct node_id *id)
+{
+	json_add_hex(response, fieldname, id->k, sizeof(id->k));
+}
+
 void json_add_pubkey(struct json_stream *response,
 		     const char *fieldname,
 		     const struct pubkey *key)
 {
-	u8 der[PUBKEY_DER_LEN];
+	u8 der[PUBKEY_CMPR_LEN];
 
 	pubkey_to_der(der, key);
 	json_add_hex(response, fieldname, der, sizeof(der));
@@ -68,6 +76,23 @@ void json_add_txid(struct json_stream *result, const char *fieldname,
 	bitcoin_txid_to_hex(txid, hex, sizeof(hex));
 	json_add_string(result, fieldname, hex);
 }
+
+struct command_result *param_node_id(struct command *cmd,
+				     const char *name,
+				     const char *buffer,
+				     const jsmntok_t *tok,
+				     struct node_id **id)
+{
+	*id = tal(cmd, struct node_id);
+	if (json_to_node_id(buffer, tok, *id))
+		return NULL;
+
+	return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			    "'%s' should be a pubkey, not '%.*s'",
+			    name, json_tok_full_len(tok),
+			    json_tok_full(buffer, tok));
+}
+
 
 struct command_result *param_pubkey(struct command *cmd, const char *name,
 				    const char *buffer, const jsmntok_t *tok,
@@ -85,10 +110,12 @@ struct command_result *param_pubkey(struct command *cmd, const char *name,
 
 void json_add_short_channel_id(struct json_stream *response,
 			       const char *fieldname,
-			       const struct short_channel_id *id)
+			       const struct short_channel_id *scid)
 {
-	json_add_string(response, fieldname,
-			type_to_string(response, struct short_channel_id, id));
+	json_add_member(response, fieldname, "\"%dx%dx%d\"",
+			short_channel_id_blocknum(scid),
+			short_channel_id_txnum(scid),
+			short_channel_id_outnum(scid));
 }
 
 struct command_result *param_short_channel_id(struct command *cmd,
@@ -305,16 +332,6 @@ void json_add_null(struct json_stream *stream, const char *fieldname)
 	json_add_member(stream, fieldname, "null");
 }
 
-void json_add_hex(struct json_stream *result, const char *fieldname,
-		  const void *data, size_t len)
-{
-	char *hex = tal_arr(NULL, char, hex_str_size(len));
-
-	hex_encode(data, len, hex, hex_str_size(len));
-	json_add_string(result, fieldname, hex);
-	tal_free(hex);
-}
-
 void json_add_hex_talarr(struct json_stream *result,
 			 const char *fieldname,
 			 const tal_t *data)
@@ -350,4 +367,11 @@ void json_add_amount_sat(struct json_stream *result,
 	if (amount_sat_to_msat(&msat, sat))
 		json_add_member(result, msatfieldname, "\"%s\"",
 				type_to_string(tmpctx, struct amount_msat, &msat));
+}
+
+void json_add_timeabs(struct json_stream *result, const char *fieldname,
+		      struct timeabs t)
+{
+	json_add_member(result, fieldname, "%" PRIu64 ".%03" PRIu64,
+			(u64)t.ts.tv_sec, (u64)t.ts.tv_nsec / 1000000);
 }

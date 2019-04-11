@@ -12,8 +12,7 @@ struct peer_features {
 };
 
 struct gossip_getnodes_entry {
-	/* This is raw to optimize marshaling: be careful! */
-	u8 nodeid[sizeof(struct pubkey)];
+	struct node_id nodeid;
 	s64 last_timestamp; /* -1 means never: following fields ignored */
 	u8 *globalfeatures;
 	struct wireaddr *addresses;
@@ -21,19 +20,23 @@ struct gossip_getnodes_entry {
 	u8 color[3];
 };
 
-struct gossip_getchannels_entry {
-	/* These are raw to optimize marshaling: be careful! */
-	u8 source[sizeof(struct pubkey)], destination[sizeof(struct pubkey)];
-	struct amount_sat sat;
-	struct short_channel_id short_channel_id;
+struct gossip_halfchannel_entry {
 	u8 message_flags;
 	u8 channel_flags;
-	bool public;
-	bool local_disabled;
 	u32 last_update_timestamp;
 	u32 delay;
 	u32 base_fee_msat;
 	u32 fee_per_millionth;
+};
+
+struct gossip_getchannels_entry {
+	struct node_id node[2];
+	struct amount_sat sat;
+	struct short_channel_id short_channel_id;
+	bool public;
+	bool local_disabled;
+	/* NULL if we haven't received an update */
+	struct gossip_halfchannel_entry *e[2];
 };
 
 struct gossip_getnodes_entry *
@@ -51,8 +54,9 @@ void towire_route_hop(u8 **pprt, const struct route_hop *entry);
 void fromwire_route_info(const u8 **pprt, size_t *max, struct route_info *entry);
 void towire_route_info(u8 **pprt, const struct route_info *entry);
 
-void fromwire_gossip_getchannels_entry(const u8 **pptr, size_t *max,
-				       struct gossip_getchannels_entry *entry);
+struct gossip_getchannels_entry *
+fromwire_gossip_getchannels_entry(const tal_t *ctx,
+				  const u8 **pptr, size_t *max);
 void towire_gossip_getchannels_entry(
     u8 **pptr, const struct gossip_getchannels_entry *entry);
 

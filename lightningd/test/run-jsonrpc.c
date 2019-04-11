@@ -21,6 +21,10 @@ const char *feerate_name(enum feerate feerate UNNEEDED)
 /* Generated stub for fmt_wireaddr_without_port */
 char *fmt_wireaddr_without_port(const tal_t *ctx UNNEEDED, const struct wireaddr *a UNNEEDED)
 { fprintf(stderr, "fmt_wireaddr_without_port called!\n"); abort(); }
+/* Generated stub for json_to_node_id */
+bool json_to_node_id(const char *buffer UNNEEDED, const jsmntok_t *tok UNNEEDED,
+			       struct node_id *id UNNEEDED)
+{ fprintf(stderr, "json_to_node_id called!\n"); abort(); }
 /* Generated stub for json_to_pubkey */
 bool json_to_pubkey(const char *buffer UNNEEDED, const jsmntok_t *tok UNNEEDED,
 		    struct pubkey *pubkey UNNEEDED)
@@ -145,12 +149,12 @@ static void test_json_escape(void)
 		if (i == '\\' || i == '"'
 		    || i == '\n' || i == '\r' || i == '\b'
 		    || i == '\t' || i == '\f')
-			assert(strstarts(str, "\n{\n  \"x\": \"\\"));
+			assert(strstarts(str, "{\"x\":\"\\"));
 		else if (i < 32 || i == 127) {
-			assert(strstarts(str, "\n{\n  \"x\": \"\\u00"));
+			assert(strstarts(str, "{\"x\":\"\\u00"));
 		} else {
-			char expect[] = "\n{\n  \"x\": \"?\"\n}";
-			expect[11] = i;
+			char expect[] = "{\"x\":\"?\"}";
+			expect[6] = i;
 			assert(streq(str, expect));
 		}
 		tal_free(result);

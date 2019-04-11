@@ -76,7 +76,7 @@ if ! bitcoin-cli -regtest ping >/dev/null 2>&1; then
 fi
 
 LIGHTNINGD="./lightningd/lightningd --network=regtest --dev-gossip-time=1550513768 --dev-unknown-channel-satoshis=100000"
-LCLI1="./cli/lightning-cli --lightning-dir=$DIR"
+LCLI1="./cli/lightning-cli --lightning-dir=$DIR -R"
 
 if [ -z "$DIR" ]; then
     trap 'rm -rf "$DIR"' 0
@@ -130,7 +130,7 @@ if [ -z "${TARGETS##* routing_sec *}" ]; then
     echo "$DIV" | tr -d \\n; DIV=","
     # shellcheck disable=SC2046
     # shellcheck disable=SC2005
-    echo $(grep nodeid "$DIR"/listnodes.json | cut -d'"' -f4 | sort | head -n2) | while read -r from to; do
+    echo $(tr '{}' '\n' < "$DIR"/listnodes.json | grep nodeid | cut -d'"' -f4 | sort | head -n2) | while read -r from to; do
 	# shellcheck disable=SC2086
 	/usr/bin/time --quiet --append -f %e $LCLI1 getroute $from 1 1 6 $to 2>&1 > /dev/null | print_stat routing_sec # FIXME: this shouldn't fail
     done

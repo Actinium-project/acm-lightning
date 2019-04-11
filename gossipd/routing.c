@@ -33,8 +33,8 @@ struct pending_cannouncement {
 
 	/* Unpacked fields here */
 	struct short_channel_id short_channel_id;
-	struct pubkey node_id_1;
-	struct pubkey node_id_2;
+	struct node_id node_id_1;
+	struct node_id node_id_2;
 	struct pubkey bitcoin_key_1;
 	struct pubkey bitcoin_key_2;
 
@@ -50,21 +50,21 @@ struct pending_cannouncement {
 };
 
 struct pending_node_announce {
-	struct pubkey nodeid;
+	struct node_id nodeid;
 	u8 *node_announcement;
 	u32 timestamp;
 };
 
-static const struct pubkey *
+static const struct node_id *
 pending_node_announce_keyof(const struct pending_node_announce *a)
 {
 	return &a->nodeid;
 }
 
 static bool pending_node_announce_eq(const struct pending_node_announce *pna,
-				     const struct pubkey *key)
+				     const struct node_id *pc)
 {
-	return pubkey_eq(&pna->nodeid, key);
+	return node_id_eq(&pna->nodeid, pc);
 }
 
 HTABLE_DEFINE_TYPE(struct pending_node_announce, pending_node_announce_keyof,
@@ -79,9 +79,75 @@ static struct node_map *empty_node_map(const tal_t *ctx)
 	return map;
 }
 
+/* We use a simple array (with NULL entries) until we have too many. */
+static bool node_uses_chan_map(const struct node *node)
+{
+	/* This is a layering violation: last entry in htable is the table ptr,
+	 * which is never NULL */
+	return node->chans.arr[NUM_IMMEDIATE_CHANS] != NULL;
+}
+
+/* When simple array fills, use a htable. */
+static void convert_node_to_chan_map(struct node *node)
+{
+	struct chan *chans[NUM_IMMEDIATE_CHANS];
+
+	memcpy(chans, node->chans.arr, sizeof(chans));
+	chan_map_init_sized(&node->chans.map, NUM_IMMEDIATE_CHANS + 1);
+	assert(node_uses_chan_map(node));
+	for (size_t i = 0; i < ARRAY_SIZE(chans); i++)
+		chan_map_add(&node->chans.map, chans[i]);
+}
+
+static void add_chan(struct node *node, struct chan *chan)
+{
+	if (!node_uses_chan_map(node)) {
+		for (size_t i = 0; i < NUM_IMMEDIATE_CHANS; i++) {
+			if (node->chans.arr[i] == NULL) {
+				node->chans.arr[i] = chan;
+				return;
+			}
+		}
+		convert_node_to_chan_map(node);
+	}
+
+	chan_map_add(&node->chans.map, chan);
+}
+
+static struct chan *next_chan_arr(const struct node *node,
+				  struct chan_map_iter *i)
+{
+	while (i->i.off < NUM_IMMEDIATE_CHANS) {
+		if (node->chans.arr[i->i.off])
+			return node->chans.arr[i->i.off];
+		i->i.off++;
+	}
+	return NULL;
+}
+
+struct chan *first_chan(const struct node *node, struct chan_map_iter *i)
+{
+	if (!node_uses_chan_map(node)) {
+		i->i.off = 0;
+		return next_chan_arr(node, i);
+	}
+
+	return chan_map_first(&node->chans.map, i);
+}
+
+struct chan *next_chan(const struct node *node, struct chan_map_iter *i)
+{
+	if (!node_uses_chan_map(node)) {
+		i->i.off++;
+		return next_chan_arr(node, i);
+	}
+
+	return chan_map_next(&node->chans.map, i);
+}
+
 struct routing_state *new_routing_state(const tal_t *ctx,
 					const struct chainparams *chainparams,
-					const struct pubkey *local_id,
+					const struct node_id *local_id,
 					u32 prune_timeout,
 					const u32 *dev_gossip_time,
 					const struct amount_sat *dev_unknown_channel_satoshis)
@@ -115,20 +181,21 @@ struct routing_state *new_routing_state(const tal_t *ctx,
 }
 
 
-const struct pubkey *node_map_keyof_node(const struct node *n)
+const struct node_id *node_map_keyof_node(const struct node *n)
 {
 	return &n->id;
 }
 
-size_t node_map_hash_key(const struct pubkey *key)
+size_t node_map_hash_key(const struct node_id *pc)
 {
-	return siphash24(siphash_seed(), key, sizeof(*key));
+	return siphash24(siphash_seed(), pc->k, sizeof(pc->k));
 }
 
-bool node_map_node_eq(const struct node *n, const struct pubkey *key)
+bool node_map_node_eq(const struct node *n, const struct node_id *pc)
 {
-	return pubkey_eq(&n->id, key);
+	return node_id_eq(&n->id, pc);
 }
+
 
 static void destroy_node(struct node *node, struct routing_state *rstate)
 {
@@ -136,19 +203,23 @@ static void destroy_node(struct node *node, struct routing_state *rstate)
 	struct chan *c;
 	node_map_del(rstate->nodes, node);
 
-	/* These remove themselves from the map. */
-	while ((c = chan_map_first(&node->chans, &i)) != NULL)
+	/* These remove themselves from chans[]. */
+	while ((c = first_chan(node, &i)) != NULL)
 		tal_free(c);
-	chan_map_clear(&node->chans);
+
+	/* Free htable if we need. */
+	if (node_uses_chan_map(node))
+		chan_map_clear(&node->chans.map);
 }
 
-struct node *get_node(struct routing_state *rstate, const struct pubkey *id)
+struct node *get_node(struct routing_state *rstate,
+		      const struct node_id *id)
 {
 	return node_map_get(rstate->nodes, id);
 }
 
 static struct node *new_node(struct routing_state *rstate,
-			     const struct pubkey *id)
+			     const struct node_id *id)
 {
 	struct node *n;
 
@@ -156,7 +227,7 @@ static struct node *new_node(struct routing_state *rstate,
 
 	n = tal(rstate, struct node);
 	n->id = *id;
-	chan_map_init(&n->chans);
+	memset(n->chans.arr, 0, sizeof(n->chans.arr));
 	n->globalfeatures = NULL;
 	n->node_announcement = NULL;
 	n->node_announcement_index = 0;
@@ -174,9 +245,7 @@ static bool node_has_public_channels(struct node *node)
 	struct chan_map_iter i;
 	struct chan *c;
 
-	for (c = chan_map_first(&node->chans, &i);
-	     c;
-	     c = chan_map_next(&node->chans, &i)) {
+	for (c = first_chan(node, &i); c; c = next_chan(node, &i)) {
 		if (is_chan_public(c))
 			return true;
 	}
@@ -190,9 +259,7 @@ static bool node_has_broadcastable_channels(struct node *node)
 	struct chan_map_iter i;
 	struct chan *c;
 
-	for (c = chan_map_first(&node->chans, &i);
-	     c;
-	     c = chan_map_next(&node->chans, &i)) {
+	for (c = first_chan(node, &i); c; c = next_chan(node, &i)) {
 		if (!is_chan_public(c))
 			continue;
 		if (is_halfchan_defined(&c->half[0])
@@ -207,9 +274,7 @@ static bool node_announce_predates_channels(const struct node *node)
 	struct chan_map_iter i;
 	struct chan *c;
 
-	for (c = chan_map_first(&node->chans, &i);
-	     c;
-	     c = chan_map_next(&node->chans, &i)) {
+	for (c = first_chan(node, &i); c; c = next_chan(node, &i)) {
 		if (!is_chan_announced(c))
 			continue;
 
@@ -231,11 +296,25 @@ static u64 persistent_broadcast(struct routing_state *rstate, const u8 *msg, u32
 static void remove_chan_from_node(struct routing_state *rstate,
 				  struct node *node, const struct chan *chan)
 {
-	if (!chan_map_del(&node->chans, chan))
-		abort();
+	size_t num_chans;
+
+	if (!node_uses_chan_map(node)) {
+		num_chans = 0;
+		for (size_t i = 0; i < NUM_IMMEDIATE_CHANS; i++) {
+			if (node->chans.arr[i] == chan)
+				node->chans.arr[i] = NULL;
+			else if (node->chans.arr[i] != NULL)
+				num_chans++;
+		}
+	} else {
+		if (!chan_map_del(&node->chans.map, chan))
+			abort();
+		/* FIXME: Expose this in ccan/htable */
+		num_chans = node->chans.map.raw.elems;
+	}
 
 	/* Last channel?  Simply delete node (and associated announce) */
-	if (node->chans.raw.elems == 0) {
+	if (num_chans == 0) {
 		tal_free(node);
 		return;
 	}
@@ -295,12 +374,12 @@ static void bad_gossip_order(const u8 *msg, const char *source,
 
 struct chan *new_chan(struct routing_state *rstate,
 		      const struct short_channel_id *scid,
-		      const struct pubkey *id1,
-		      const struct pubkey *id2,
+		      const struct node_id *id1,
+		      const struct node_id *id2,
 		      struct amount_sat satoshis)
 {
 	struct chan *chan = tal(rstate, struct chan);
-	int n1idx = pubkey_idx(id1, id2);
+	int n1idx = node_id_idx(id1, id2);
 	struct node *n1, *n2;
 
 	/* We should never add a channel twice */
@@ -323,8 +402,8 @@ struct chan *new_chan(struct routing_state *rstate,
 	chan->sat = satoshis;
 	chan->local_disabled = false;
 
-	chan_map_add(&n2->chans, chan);
-	chan_map_add(&n1->chans, chan);
+	add_chan(n2, chan);
+	add_chan(n1, chan);
 
 	/* Populate with (inactive) connections */
 	init_half_chan(rstate, chan, n1idx);
@@ -459,7 +538,7 @@ static void bfg_one_edge(struct node *node,
 		if (amount_msat_less(this_total, curr_total)) {
 			SUPERVERBOSE("...%s can reach here hoplen %zu"
 				     " total %s risk %s",
-				     type_to_string(tmpctx, struct pubkey,
+				     type_to_string(tmpctx, struct node_id,
 						    &src->id),
 				     h,
 				     type_to_string(tmpctx, struct amount_msat,
@@ -483,7 +562,7 @@ static bool hc_is_routable(const struct chan *chan, int idx)
 /* riskfactor is already scaled to per-block amount */
 static struct chan **
 find_route(const tal_t *ctx, struct routing_state *rstate,
-	   const struct pubkey *from, const struct pubkey *to,
+	   const struct node_id *from, const struct node_id *to,
 	   struct amount_msat msat,
 	   double riskfactor,
 	   double fuzz, const struct siphash_seed *base_seed,
@@ -503,15 +582,15 @@ find_route(const tal_t *ctx, struct routing_state *rstate,
 
 	if (!src) {
 		status_info("find_route: cannot find %s",
-			    type_to_string(tmpctx, struct pubkey, to));
+			    type_to_string(tmpctx, struct node_id, to));
 		return NULL;
 	} else if (!dst) {
 		status_info("find_route: cannot find myself (%s)",
-			    type_to_string(tmpctx, struct pubkey, to));
+			    type_to_string(tmpctx, struct node_id, to));
 		return NULL;
 	} else if (dst == src) {
 		status_info("find_route: this is %s, refusing to create empty route",
-			    type_to_string(tmpctx, struct pubkey, to));
+			    type_to_string(tmpctx, struct node_id, to));
 		return NULL;
 	}
 
@@ -538,13 +617,13 @@ find_route(const tal_t *ctx, struct routing_state *rstate,
 			struct chan_map_iter i;
 			struct chan *chan;
 
-			for (chan = chan_map_first(&n->chans, &i);
+			for (chan = first_chan(n, &i);
 			     chan;
-			     chan = chan_map_next(&n->chans, &i)) {
+			     chan = next_chan(n, &i)) {
 				int idx = half_chan_to(n, chan);
 
 				SUPERVERBOSE("Node %s edge %s",
-					     type_to_string(tmpctx, struct pubkey,
+					     type_to_string(tmpctx, struct node_id,
 							    &n->id),
 					     type_to_string(tmpctx,
 							    struct short_channel_id,
@@ -588,7 +667,7 @@ find_route(const tal_t *ctx, struct routing_state *rstate,
 	/* No route? */
 	if (amount_msat_greater_eq(best_total, INFINITE)) {
 		status_trace("find_route: No route to %s",
-			     type_to_string(tmpctx, struct pubkey, to));
+			     type_to_string(tmpctx, struct node_id, to));
 		return NULL;
 	}
 
@@ -614,9 +693,20 @@ find_route(const tal_t *ctx, struct routing_state *rstate,
 	return route;
 }
 
+/* Checks that key is valid, and signed this hash */
+static bool check_signed_hash_nodeid(const struct sha256_double *hash,
+				     const secp256k1_ecdsa_signature *signature,
+				     const struct node_id *id)
+{
+	struct pubkey key;
+
+	return pubkey_from_node_id(&key, id)
+		&& check_signed_hash(hash, signature, &key);
+}
+
 /* Verify the signature of a channel_update message */
 static u8 *check_channel_update(const tal_t *ctx,
-				const struct pubkey *node_key,
+				const struct node_id *node_id,
 				const secp256k1_ecdsa_signature *node_sig,
 				const u8 *update)
 {
@@ -625,7 +715,7 @@ static u8 *check_channel_update(const tal_t *ctx,
 	struct sha256_double hash;
 	sha256_double(&hash, update + offset, tal_count(update) - offset);
 
-	if (!check_signed_hash(&hash, node_sig, node_key))
+	if (!check_signed_hash_nodeid(&hash, node_sig, node_id))
 		return towire_errorfmt(ctx, NULL,
 				       "Bad signature for %s hash %s"
 				       " on channel_update %s",
@@ -640,7 +730,7 @@ static u8 *check_channel_update(const tal_t *ctx,
 }
 
 static u8 *check_channel_announcement(const tal_t *ctx,
-	const struct pubkey *node1_key, const struct pubkey *node2_key,
+	const struct node_id *node1_id, const struct node_id *node2_id,
 	const struct pubkey *bitcoin1_key, const struct pubkey *bitcoin2_key,
 	const secp256k1_ecdsa_signature *node1_sig,
 	const secp256k1_ecdsa_signature *node2_sig,
@@ -653,7 +743,7 @@ static u8 *check_channel_announcement(const tal_t *ctx,
 	sha256_double(&hash, announcement + offset,
 		      tal_count(announcement) - offset);
 
-	if (!check_signed_hash(&hash, node1_sig, node1_key)) {
+	if (!check_signed_hash_nodeid(&hash, node1_sig, node1_id)) {
 		return towire_errorfmt(ctx, NULL,
 				       "Bad node_signature_1 %s hash %s"
 				       " on node_announcement %s",
@@ -665,7 +755,7 @@ static u8 *check_channel_announcement(const tal_t *ctx,
 						      &hash),
 				       tal_hex(ctx, announcement));
 	}
-	if (!check_signed_hash(&hash, node2_sig, node2_key)) {
+	if (!check_signed_hash_nodeid(&hash, node2_sig, node2_id)) {
 		return towire_errorfmt(ctx, NULL,
 				       "Bad node_signature_2 %s hash %s"
 				       " on node_announcement %s",
@@ -704,7 +794,7 @@ static u8 *check_channel_announcement(const tal_t *ctx,
 	return NULL;
 }
 
-static void add_pending_node_announcement(struct routing_state *rstate, struct pubkey *nodeid)
+static void add_pending_node_announcement(struct routing_state *rstate, struct node_id *nodeid)
 {
 	struct pending_node_announce *pna = tal(rstate, struct pending_node_announce);
 	pna->nodeid = *nodeid;
@@ -714,7 +804,7 @@ static void add_pending_node_announcement(struct routing_state *rstate, struct p
 }
 
 static void process_pending_node_announcement(struct routing_state *rstate,
-					      struct pubkey *nodeid)
+					      struct node_id *nodeid)
 {
 	struct pending_node_announce *pna = pending_node_map_get(rstate->pending_node_map, nodeid);
 	if (!pna)
@@ -724,7 +814,7 @@ static void process_pending_node_announcement(struct routing_state *rstate,
 		u8 *err;
 		SUPERVERBOSE(
 		    "Processing deferred node_announcement for node %s",
-		    type_to_string(pna, struct pubkey, nodeid));
+		    type_to_string(pna, struct node_id, nodeid));
 
 		/* Should not error, since we processed it before */
 		err = handle_node_announcement(rstate, pna->node_announcement);
@@ -760,8 +850,8 @@ static void destroy_pending_cannouncement(struct pending_cannouncement *pending,
 static bool is_local_channel(const struct routing_state *rstate,
 			     const struct chan *chan)
 {
-	return pubkey_eq(&chan->nodes[0]->id, &rstate->local_id)
-		|| pubkey_eq(&chan->nodes[1]->id, &rstate->local_id);
+	return node_id_eq(&chan->nodes[0]->id, &rstate->local_id)
+		|| node_id_eq(&chan->nodes[1]->id, &rstate->local_id);
 }
 
 static void add_channel_announce_to_broadcast(struct routing_state *rstate,
@@ -795,8 +885,8 @@ bool routing_add_channel_announcement(struct routing_state *rstate,
 	u8 *features;
 	struct bitcoin_blkid chain_hash;
 	struct short_channel_id scid;
-	struct pubkey node_id_1;
-	struct pubkey node_id_2;
+	struct node_id node_id_1;
+	struct node_id node_id_2;
 	struct pubkey bitcoin_key_1;
 	struct pubkey bitcoin_key_2;
 
@@ -933,6 +1023,7 @@ u8 *handle_channel_announcement(struct routing_state *rstate,
 		goto ignored;
 	}
 
+	/* Note that if node_id_1 or node_id_2 are malformed, it's caught here */
 	err = check_channel_announcement(rstate,
 					 &pending->node_id_1,
 					 &pending->node_id_2,
@@ -1403,12 +1494,13 @@ bool routing_add_node_announcement(struct routing_state *rstate, const u8 *msg T
 	struct node *node;
 	secp256k1_ecdsa_signature signature;
 	u32 timestamp;
-	struct pubkey node_id;
+	struct node_id node_id;
 	u8 rgb_color[3];
 	u8 alias[32];
 	u8 *features, *addresses;
 	struct wireaddr *wireaddrs;
 
+	/* Note: validity of node_id is already checked. */
 	if (!fromwire_node_announcement(tmpctx, msg,
 					&signature, &features, &timestamp,
 					&node_id, rgb_color, alias,
@@ -1450,7 +1542,7 @@ u8 *handle_node_announcement(struct routing_state *rstate, const u8 *node_ann)
 	struct node *node;
 	secp256k1_ecdsa_signature signature;
 	u32 timestamp;
-	struct pubkey node_id;
+	struct node_id node_id;
 	u8 rgb_color[3];
 	u8 alias[32];
 	u8 *features, *addresses;
@@ -1487,13 +1579,14 @@ u8 *handle_node_announcement(struct routing_state *rstate, const u8 *node_ann)
 	 */
 	if (!features_supported(features, NULL)) {
 		status_trace("Ignoring node announcement for node %s, unsupported features %s.",
-			     type_to_string(tmpctx, struct pubkey, &node_id),
+			     type_to_string(tmpctx, struct node_id, &node_id),
 			     tal_hex(tmpctx, features));
 		return NULL;
 	}
 
 	sha256_double(&hash, serialized + 66, tal_count(serialized) - 66);
-	if (!check_signed_hash(&hash, &signature, &node_id)) {
+	/* If node_id is invalid, it fails here */
+	if (!check_signed_hash_nodeid(&hash, &signature, &node_id)) {
 		/* BOLT #7:
 		 *
 		 * - if `signature` is not a valid signature, using
@@ -1550,12 +1643,12 @@ u8 *handle_node_announcement(struct routing_state *rstate, const u8 *node_ann)
 					   &node_id);
 		if (!pna) {
 			bad_gossip_order(serialized, "node_announcement",
-					 type_to_string(tmpctx, struct pubkey,
+					 type_to_string(tmpctx, struct node_id,
 							&node_id));
 		} else if (pna->timestamp < timestamp) {
 			SUPERVERBOSE(
 			    "Deferring node_announcement for node %s",
-			    type_to_string(tmpctx, struct pubkey, &node_id));
+			    type_to_string(tmpctx, struct node_id, &node_id));
 			pna->timestamp = timestamp;
 			tal_free(pna->node_announcement);
 			pna->node_announcement = tal_dup_arr(pna, u8, node_ann,
@@ -1571,7 +1664,7 @@ u8 *handle_node_announcement(struct routing_state *rstate, const u8 *node_ann)
 	}
 
 	status_trace("Received node_announcement for node %s",
-		     type_to_string(tmpctx, struct pubkey, &node_id));
+		     type_to_string(tmpctx, struct node_id, &node_id));
 
 	applied = routing_add_node_announcement(rstate, serialized);
 	assert(applied);
@@ -1579,8 +1672,8 @@ u8 *handle_node_announcement(struct routing_state *rstate, const u8 *node_ann)
 }
 
 struct route_hop *get_route(const tal_t *ctx, struct routing_state *rstate,
-			    const struct pubkey *source,
-			    const struct pubkey *destination,
+			    const struct node_id *source,
+			    const struct node_id *destination,
 			    struct amount_msat msat, double riskfactor,
 			    u32 final_cltv,
 			    double fuzz, u64 seed,
@@ -1655,13 +1748,13 @@ struct route_hop *get_route(const tal_t *ctx, struct routing_state *rstate,
 		total_delay += c->delay;
 		n = other_node(n, route[i]);
 	}
-	assert(pubkey_eq(&n->id, source));
+	assert(node_id_eq(&n->id, source));
 
 	return hops;
 }
 
 void routing_failure(struct routing_state *rstate,
-		     const struct pubkey *erring_node_pubkey,
+		     const struct node_id *erring_node_id,
 		     const struct short_channel_id *scid,
 		     int erring_direction,
 		     enum onion_type failcode,
@@ -1671,7 +1764,7 @@ void routing_failure(struct routing_state *rstate,
 		     "erring node %s, "
 		     "channel %s/%u",
 		     (int) failcode, onion_type_name(failcode),
-		     type_to_string(tmpctx, struct pubkey, erring_node_pubkey),
+		     type_to_string(tmpctx, struct node_id, erring_node_id),
 		     type_to_string(tmpctx, struct short_channel_id, scid),
 		     erring_direction);
 
@@ -1697,22 +1790,20 @@ void routing_failure(struct routing_state *rstate,
 		return;
 
 	if (failcode & NODE) {
-		struct node *node = get_node(rstate, erring_node_pubkey);
+		struct node *node = get_node(rstate, erring_node_id);
 		if (!node) {
 			status_unusual("routing_failure: Erring node %s not in map",
-				       type_to_string(tmpctx, struct pubkey,
-						      erring_node_pubkey));
+				       type_to_string(tmpctx, struct node_id,
+						      erring_node_id));
 		} else {
 			struct chan_map_iter i;
 			struct chan *c;
 
 			status_trace("Deleting node %s",
 				     type_to_string(tmpctx,
-						    struct pubkey,
+						    struct node_id,
 						    &node->id));
-			for (c = chan_map_first(&node->chans, &i);
-			     c;
-			     c = chan_map_next(&node->chans, &i)) {
+			for (c = first_chan(node, &i); c; c = next_chan(node, &i)) {
 				/* Set it up to be pruned. */
 				tal_steal(tmpctx, c);
 			}
@@ -1730,8 +1821,8 @@ void routing_failure(struct routing_state *rstate,
 			/* This error can be triggered by sendpay if caller
 			 * uses the wrong key for dest. */
 			if (failcode == WIRE_INVALID_ONION_HMAC
-			    && !pubkey_eq(&chan->nodes[!erring_direction]->id,
-					  erring_node_pubkey))
+			    && !node_id_eq(&chan->nodes[!erring_direction]->id,
+					   erring_node_id))
 				return;
 
 			status_trace("Deleting channel %s",
@@ -1794,7 +1885,8 @@ void memleak_remove_routing_tables(struct htable *memtable,
 	for (n = node_map_first(rstate->nodes, &nit);
 	     n;
 	     n = node_map_next(rstate->nodes, &nit)) {
-		memleak_remove_htable(memtable, &n->chans.raw);
+		if (node_uses_chan_map(n))
+			memleak_remove_htable(memtable, &n->chans.map.raw);
 	}
 }
 #endif /* DEVELOPER */
@@ -1802,7 +1894,7 @@ void memleak_remove_routing_tables(struct htable *memtable,
 bool handle_local_add_channel(struct routing_state *rstate, const u8 *msg)
 {
 	struct short_channel_id scid;
-	struct pubkey remote_node_id;
+	struct node_id remote_node_id;
 	struct amount_sat sat;
 
 	if (!fromwire_gossipd_local_add_channel(msg, &scid, &remote_node_id,

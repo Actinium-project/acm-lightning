@@ -93,7 +93,7 @@ bool wallet_add_utxo(struct wallet *w, struct utxo *utxo,
 	sqlite3_bind_int(stmt, 6, utxo->keyindex);
 	if (utxo->close_info) {
 		sqlite3_bind_int64(stmt, 7, utxo->close_info->channel_id);
-		sqlite3_bind_pubkey(stmt, 8, &utxo->close_info->peer_id);
+		sqlite3_bind_node_id(stmt, 8, &utxo->close_info->peer_id);
 		sqlite3_bind_pubkey(stmt, 9, &utxo->close_info->commitment_point);
 	} else {
 		sqlite3_bind_null(stmt, 7);
@@ -138,7 +138,7 @@ static struct utxo *wallet_stmt2output(const tal_t *ctx, sqlite3_stmt *stmt)
 	if (sqlite3_column_type(stmt, 6) != SQLITE_NULL) {
 		utxo->close_info = tal(utxo, struct unilateral_close_info);
 		utxo->close_info->channel_id = sqlite3_column_int64(stmt, 6);
-		sqlite3_column_pubkey(stmt, 7, &utxo->close_info->peer_id);
+		sqlite3_column_node_id(stmt, 7, &utxo->close_info->peer_id);
 		sqlite3_column_pubkey(stmt, 8, &utxo->close_info->commitment_point);
 	} else {
 		utxo->close_info = NULL;
@@ -550,7 +550,7 @@ static struct peer *wallet_peer_load(struct wallet *w, const u64 dbid)
 {
 	const unsigned char *addrstr;
 	struct peer *peer;
-	struct pubkey id;
+	struct node_id id;
 	struct wireaddr_internal addr;
 
 	sqlite3_stmt *stmt =
@@ -560,7 +560,7 @@ static struct peer *wallet_peer_load(struct wallet *w, const u64 dbid)
 	if (!db_select_step(w->db, stmt))
 		return NULL;
 
-	if (!sqlite3_column_pubkey(stmt, 1, &id)) {
+	if (!sqlite3_column_node_id(stmt, 1, &id)) {
 		db_stmt_done(stmt);
 		return NULL;
 	}
@@ -1087,7 +1087,7 @@ void wallet_channel_insert(struct wallet *w, struct channel *chan)
 	if (chan->peer->dbid == 0) {
 		/* Need to create the peer first */
 		stmt = db_prepare(w->db, "INSERT INTO peers (node_id, address) VALUES (?, ?);");
-		sqlite3_bind_pubkey(stmt, 1, &chan->peer->id);
+		sqlite3_bind_node_id(stmt, 1, &chan->peer->id);
 		sqlite3_bind_text(stmt, 2,
 				  type_to_string(tmpctx, struct wireaddr_internal, &chan->peer->addr),
 				  -1, SQLITE_TRANSIENT);
@@ -1233,8 +1233,9 @@ void wallet_htlc_save_in(struct wallet *wallet,
 		" payment_key,"
 		" hstate,"
 		" shared_secret,"
-		" routing_onion) VALUES "
-		"(?, ?, ?, ?, ?, ?, ?, ?, ?, ?);");
+		" routing_onion,"
+		" received_time) VALUES "
+		"(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);");
 
 	sqlite3_bind_int64(stmt, 1, chan->dbid);
 	sqlite3_bind_int64(stmt, 2, in->key.id);
@@ -1257,6 +1258,8 @@ void wallet_htlc_save_in(struct wallet *wallet,
 
 	sqlite3_bind_blob(stmt, 10, &in->onion_routing_packet,
 			  sizeof(in->onion_routing_packet), SQLITE_TRANSIENT);
+
+	sqlite3_bind_timeabs(stmt, 11, in->received_time);
 
 	db_exec_prepared(wallet->db, stmt);
 	in->dbid = sqlite3_last_insert_rowid(wallet->db->sql);
@@ -1351,7 +1354,7 @@ void wallet_htlc_update(struct wallet *wallet, const u64 htlc_dbid,
 	"id, channel_htlc_id, msatoshi, cltv_expiry, hstate, "	\
 	"payment_hash, payment_key, routing_onion, "		\
 	"failuremsg, malformed_onion,"				\
-	"origin_htlc, shared_secret"
+	"origin_htlc, shared_secret, received_time"
 
 static bool wallet_stmt2htlc_in(struct channel *channel,
 				sqlite3_stmt *stmt, struct htlc_in *in)
@@ -1392,6 +1395,8 @@ static bool wallet_stmt2htlc_in(struct channel *channel,
 			in->shared_secret = tal_free(in->shared_secret);
 #endif
 	}
+
+	in->received_time = sqlite3_column_timeabs(stmt, 12);
 
 	return ok;
 }
@@ -1469,7 +1474,7 @@ static void fixup_hin(struct wallet *wallet, struct htlc_in *hin)
 		   " subsituting temporary node failure",
 		   hin->key.id, htlc_state_name(hin->hstate),
 		   type_to_string(tmpctx, struct amount_msat, &hin->msat),
-		   type_to_string(tmpctx, struct pubkey,
+		   type_to_string(tmpctx, struct node_id,
 				  &hin->key.channel->peer->id));
 #endif
 }
@@ -1721,13 +1726,13 @@ void wallet_payment_store(struct wallet *wallet,
 
 	sqlite3_bind_int(stmt, 1, payment->status);
 	sqlite3_bind_sha256(stmt, 2, &payment->payment_hash);
-	sqlite3_bind_pubkey(stmt, 3, &payment->destination);
+	sqlite3_bind_node_id(stmt, 3, &payment->destination);
 	sqlite3_bind_amount_msat(stmt, 4, payment->msatoshi);
 	sqlite3_bind_int(stmt, 5, payment->timestamp);
 	sqlite3_bind_blob(stmt, 6, payment->path_secrets,
 				   tal_bytelen(payment->path_secrets),
 				   SQLITE_TRANSIENT);
-	sqlite3_bind_pubkey_array(stmt, 7, payment->route_nodes);
+	sqlite3_bind_node_id_array(stmt, 7, payment->route_nodes);
 	sqlite3_bind_short_channel_id_array(stmt, 8,
 					    payment->route_channels);
 	sqlite3_bind_amount_msat(stmt, 9, payment->msatoshi_sent);
@@ -1779,7 +1784,7 @@ static struct wallet_payment *wallet_stmt2payment(const tal_t *ctx,
 	payment->id = sqlite3_column_int64(stmt, 0);
 	payment->status = sqlite3_column_int(stmt, 1);
 
-	sqlite3_column_pubkey(stmt, 2, &payment->destination);
+	sqlite3_column_node_id(stmt, 2, &payment->destination);
 	payment->msatoshi = sqlite3_column_amount_msat(stmt, 3);
 	sqlite3_column_sha256(stmt, 4, &payment->payment_hash);
 
@@ -1793,7 +1798,7 @@ static struct wallet_payment *wallet_stmt2payment(const tal_t *ctx,
 	/* Can be NULL for old db! */
 	payment->path_secrets = sqlite3_column_secrets(payment, stmt, 7);
 
-	payment->route_nodes = sqlite3_column_pubkey_array(payment, stmt, 8);
+	payment->route_nodes = sqlite3_column_node_id_array(payment, stmt, 8);
 	payment->route_channels
 		= sqlite3_column_short_channel_id_array(payment, stmt, 9);
 
@@ -1896,7 +1901,7 @@ void wallet_payment_get_failinfo(const tal_t *ctx,
 				 bool *faildestperm,
 				 int *failindex,
 				 enum onion_type *failcode,
-				 struct pubkey **failnode,
+				 struct node_id **failnode,
 				 struct short_channel_id **failchannel,
 				 u8 **failupdate,
 				 char **faildetail,
@@ -1929,8 +1934,8 @@ void wallet_payment_get_failinfo(const tal_t *ctx,
 	if (sqlite3_column_type(stmt, 4) == SQLITE_NULL)
 		*failnode = NULL;
 	else {
-		*failnode = tal(ctx, struct pubkey);
-		resb = sqlite3_column_pubkey(stmt, 4, *failnode);
+		*failnode = tal(ctx, struct node_id);
+		resb = sqlite3_column_node_id(stmt, 4, *failnode);
 		assert(resb);
 	}
 	if (sqlite3_column_type(stmt, 5) == SQLITE_NULL)
@@ -1962,7 +1967,7 @@ void wallet_payment_set_failinfo(struct wallet *wallet,
 				 bool faildestperm,
 				 int failindex,
 				 enum onion_type failcode,
-				 const struct pubkey *failnode,
+				 const struct node_id *failnode,
 				 const struct short_channel_id *failchannel,
 				 const u8 *failupdate /*tal_arr*/,
 				 const char *faildetail,
@@ -1992,7 +1997,7 @@ void wallet_payment_set_failinfo(struct wallet *wallet,
 	sqlite3_bind_int(stmt, 3, failindex);
 	sqlite3_bind_int(stmt, 4, (int) failcode);
 	if (failnode)
-		sqlite3_bind_pubkey(stmt, 5, failnode);
+		sqlite3_bind_node_id(stmt, 5, failnode);
 	else
 		sqlite3_bind_null(stmt, 5);
 	if (failchannel) {
@@ -2487,7 +2492,10 @@ void wallet_forwarded_payment_add(struct wallet *w, const struct htlc_in *in,
 		", out_channel_scid"
 		", in_msatoshi"
 		", out_msatoshi"
-		", state) VALUES (?, ?, ?, ?, ?, ?, ?);");
+		", state"
+		", received_time"
+		", resolved_time"
+		") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);");
 	sqlite3_bind_int64(stmt, 1, in->dbid);
 	sqlite3_bind_int64(stmt, 2, out->dbid);
 	sqlite3_bind_int64(stmt, 3, in->key.channel->scid->u64);
@@ -2495,6 +2503,13 @@ void wallet_forwarded_payment_add(struct wallet *w, const struct htlc_in *in,
 	sqlite3_bind_amount_msat(stmt, 5, in->msat);
 	sqlite3_bind_amount_msat(stmt, 6, out->msat);
 	sqlite3_bind_int(stmt, 7, wallet_forward_status_in_db(state));
+	sqlite3_bind_timeabs(stmt, 8, in->received_time);
+
+	if (state == FORWARD_SETTLED || state == FORWARD_FAILED)
+		sqlite3_bind_timeabs(stmt, 9, time_now());
+	else
+		sqlite3_bind_null(stmt, 9);
+
 	db_exec_prepared(w->db, stmt);
 }
 
@@ -2532,7 +2547,9 @@ const struct forwarding *wallet_forwarded_payments_get(struct wallet *w,
 			  ", out_msatoshi"
 			  ", hin.payment_hash as payment_hash"
 			  ", in_channel_scid"
-			  ", out_channel_scid "
+			  ", out_channel_scid"
+			  ", f.received_time"
+			  ", f.resolved_time "
 			  "FROM forwarded_payments f "
 			  "LEFT JOIN channel_htlcs hin ON (f.in_htlc_id == hin.id)");
 
@@ -2560,6 +2577,15 @@ const struct forwarding *wallet_forwarded_payments_get(struct wallet *w,
 
 		cur->channel_in.u64 = sqlite3_column_int64(stmt, 4);
 		cur->channel_out.u64 = sqlite3_column_int64(stmt, 5);
+
+		cur->received_time = sqlite3_column_timeabs(stmt, 6);
+		if (sqlite3_column_type(stmt, 7) != SQLITE_NULL) {
+			cur->resolved_time = tal(ctx, struct timeabs);
+			*cur->resolved_time = sqlite3_column_timeabs(stmt, 7);
+		} else {
+			cur->resolved_time = NULL;
+		}
+
 	}
 
 	return results;

@@ -5,6 +5,7 @@
 #include <bitcoin/address.h>
 #include <bitcoin/base58.h>
 #include <bitcoin/script.h>
+#include <ccan/array_size/array_size.h>
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
 #include <common/amount.h>
@@ -14,6 +15,7 @@
 #include <common/json_escaped.h>
 #include <common/json_helpers.h>
 #include <common/jsonrpc_errors.h>
+#include <common/overflows.h>
 #include <common/param.h>
 #include <common/pseudorand.h>
 #include <common/utils.h>
@@ -334,7 +336,7 @@ static struct route_info *unpack_route(const tal_t *ctx,
 					   "fee_proportional_millionths");
 		cltv = json_get_member(buffer, t, "cltv_expiry_delta");
 
-		if (!json_to_pubkey(buffer, pubkey, &r->pubkey)
+		if (!json_to_node_id(buffer, pubkey, &r->pubkey)
 		    || !json_to_short_channel_id(buffer, scid,
 						 &r->short_channel_id,
 						 deprecated_apis)
@@ -389,6 +391,56 @@ static struct command_result *param_msat_or_any(struct command *cmd,
 			    buffer + tok->start);
 }
 
+/* Parse time with optional suffix, return seconds */
+static struct command_result *param_time(struct command *cmd, const char *name,
+					 const char *buffer,
+					 const jsmntok_t *tok,
+					 uint64_t **secs)
+{
+	/* We need to manipulate this, so make copy */
+	jsmntok_t timetok = *tok;
+	u64 mul;
+	char s;
+	struct {
+		char suffix;
+		u64 mul;
+	} suffixes[] = {
+		{ 's', 1 },
+		{ 'm', 60 },
+		{ 'h', 60*60 },
+		{ 'd', 24*60*60 },
+		{ 'w', 7*24*60*60 } };
+
+	mul = 1;
+	if (timetok.end == timetok.start)
+		s = '\0';
+	else
+		s = buffer[timetok.end - 1];
+	for (size_t i = 0; i < ARRAY_SIZE(suffixes); i++) {
+		if (s == suffixes[i].suffix) {
+			mul = suffixes[i].mul;
+			timetok.end--;
+			break;
+		}
+	}
+
+	*secs = tal(cmd, uint64_t);
+	if (json_to_u64(buffer, &timetok, *secs)) {
+		if (mul_overflows_u64(**secs, mul)) {
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "'%s' string '%.*s' is too large",
+					    name, tok->end - tok->start,
+					    buffer + tok->start);
+		}
+		**secs *= mul;
+		return NULL;
+	}
+
+	return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			    "'%s' should be a number with optional {s,m,h,d,w} suffix, not '%.*s'",
+			    name, tok->end - tok->start, buffer + tok->start);
+}
+
 static struct command_result *json_invoice(struct command *cmd,
 					   const char *buffer,
 					   const jsmntok_t *obj UNNEEDED,
@@ -415,7 +467,7 @@ static struct command_result *json_invoice(struct command *cmd,
 		   p_req("msatoshi", param_msat_or_any, &msatoshi_val),
 		   p_req("label", param_label, &info->label),
 		   p_req("description", param_escaped_string, &desc_val),
-		   p_opt_def("expiry", param_u64, &expiry, 3600),
+		   p_opt_def("expiry", param_time, &expiry, 3600*24*7),
 		   p_opt("fallbacks", param_array, &fallbacks),
 		   p_opt("preimage", param_tok, &preimagetok),
 		   p_opt("exposeprivatechannels", param_bool, &exposeprivate),
@@ -811,7 +863,7 @@ static struct command_result *json_decodepay(struct command *cmd,
 	json_add_string(response, "currency", b11->chain->bip173_name);
 	json_add_u64(response, "created_at", b11->timestamp);
 	json_add_u64(response, "expiry", b11->expiry);
-	json_add_pubkey(response, "payee", &b11->receiver_id);
+	json_add_node_id(response, "payee", &b11->receiver_id);
         if (b11->msat)
                 json_add_amount_msat(response, *b11->msat,
 				     "msatoshi", "amount_msat");
@@ -841,8 +893,8 @@ static struct command_result *json_decodepay(struct command *cmd,
                         json_array_start(response, NULL);
                         for (n = 0; n < tal_count(b11->routes[i]); n++) {
                                 json_object_start(response, NULL);
-                                json_add_pubkey(response, "pubkey",
-                                                &b11->routes[i][n].pubkey);
+                                json_add_node_id(response, "pubkey",
+						 &b11->routes[i][n].pubkey);
                                 json_add_short_channel_id(response,
                                                           "short_channel_id",
                                                           &b11->routes[i][n]

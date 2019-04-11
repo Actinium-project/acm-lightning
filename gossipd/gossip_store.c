@@ -89,8 +89,8 @@ static u8 *gossip_store_wrap_channel_announcement(const tal_t *ctx,
 	u8 *features;
 	struct bitcoin_blkid chain_hash;
 	struct short_channel_id scid;
-	struct pubkey node_id_1;
-	struct pubkey node_id_2;
+	struct node_id node_id_1;
+	struct node_id node_id_2;
 	struct pubkey bitcoin_key_1;
 	struct pubkey bitcoin_key_2;
 
@@ -163,9 +163,7 @@ static bool add_local_unnannounced(int fd,
 	struct chan_map_iter i;
 	struct chan *c;
 
-	for (c = chan_map_first(&self->chans, &i);
-	     c;
-	     c = chan_map_next(&self->chans, &i)) {
+	for (c = first_chan(self, &i); c; c = next_chan(self, &i)) {
 		struct node *peer = other_node(self, c);
 		const u8 *msg;
 
