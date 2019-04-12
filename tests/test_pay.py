@@ -214,7 +214,7 @@ def test_pay_get_error_with_update(node_factory):
     l1.daemon.wait_for_log(r'Extracted channel_update 0102.*from onionreply 10070088[0-9a-fA-F]{88}')
 
     # And now monitor for l1 to apply the channel_update we just extracted
-    l1.daemon.wait_for_log(r'Received channel_update for channel {}/. now DISABLED was ACTIVE \(from error\)'.format(chanid2))
+    l1.daemon.wait_for_log(r'Received channel_update for channel {}/. now DISABLED \(from error\)'.format(chanid2))
 
 
 def test_pay_optional_args(node_factory):
@@ -979,8 +979,7 @@ def test_forward_different_fees_and_cltv(node_factory, bitcoind):
                            .format(bitcoind.rpc.getblockcount() + 20 + 9 + shadow_route))
     l2.daemon.wait_for_log("Adding HTLC 0 amount=4999999msat cltv={} gave CHANNEL_ERR_ADD_OK"
                            .format(bitcoind.rpc.getblockcount() + 9 + shadow_route))
-    l3.daemon.wait_for_log("test_forward_different_fees_and_cltv: Actual amount 4999999msat, HTLC expiry {}"
-                           .format(bitcoind.rpc.getblockcount() + 9 + shadow_route))
+    l3.daemon.wait_for_log("Resolved invoice 'test_forward_different_fees_and_cltv' with amount 4999999msat")
     assert only_one(l3.rpc.listinvoices('test_forward_different_fees_and_cltv')['invoices'])['status'] == 'paid'
 
     # Check that we see all the channels

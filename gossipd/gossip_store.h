@@ -13,12 +13,11 @@
  */
 #define GOSSIP_STORE_VERSION 3
 
+struct broadcast_state;
 struct gossip_store;
 struct routing_state;
 
-struct gossip_store *gossip_store_new(const tal_t *ctx,
-				      struct routing_state *rstate,
-				      struct broadcast_state *broadcast);
+struct gossip_store *gossip_store_new(struct routing_state *rstate);
 
 /**
  * Load the initial gossip store, if any.
@@ -31,7 +30,7 @@ void gossip_store_load(struct routing_state *rstate, struct gossip_store *gs);
 /**
  * Add a gossip message to the gossip_store
  */
-void gossip_store_add(struct gossip_store *gs, const u8 *gossip_msg);
+u64 gossip_store_add(struct gossip_store *gs, const u8 *gossip_msg);
 
 /**
  * Remember that we deleted a channel as a result of its outpoint being spent
@@ -39,6 +38,33 @@ void gossip_store_add(struct gossip_store *gs, const u8 *gossip_msg);
 void gossip_store_add_channel_delete(struct gossip_store *gs,
 				     const struct short_channel_id *scid);
 
-/* Expose for dev-compact-gossip-store */
-bool gossip_store_compact(struct gossip_store *gs);
+/**
+ * Direct store accessor: loads gossip msg back from store.
+ *
+ * Caller must ensure offset != 0.  Never returns NULL.
+ */
+const u8 *gossip_store_get(const tal_t *ctx,
+			   struct gossip_store *gs,
+			   u64 offset);
+
+/**
+ * If we need to compact the gossip store, do so.
+ * @gs: the gossip store.
+ * @bs: a pointer to the broadcast state: replaced if we compact it.
+ * @offset: the change in the store, if any.
+ *
+ * If @offset is non-zero on return, caller must update peers.
+ */
+void gossip_store_maybe_compact(struct gossip_store *gs,
+				struct broadcast_state **bs,
+				u32 *offset);
+
+
+/* Expose for dev-compact-gossip-store to force compaction. */
+bool gossip_store_compact(struct gossip_store *gs,
+			  struct broadcast_state **bs,
+			  u32 *offset);
+
+/* Callback for when gossip_store indexes move */
+
 #endif /* LIGHTNING_GOSSIPD_GOSSIP_STORE_H */

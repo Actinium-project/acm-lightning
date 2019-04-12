@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - JSON API: `listpeers` status now shows how many confirmations until channel is open (#2405)
 - Config: Adds parameter `min-capacity-sat` to reject tiny channels.
 - JSON API: `listforwards` now includes the time an HTLC was received and when it was resolved. Both are expressed as UNIX timestamps to facilitate parsing (Issue [#2491](https://github.com/ElementsProject/lightning/issues/2491), PR [#2528](https://github.com/ElementsProject/lightning/pull/2528))
+- JSON API: new plugin `invoice_payment` hook for intercepting invoices before they're paid.
 
 ### Changed
 
@@ -26,6 +27,8 @@ changes.
 
 ### Removed
 
+- JSON RPC: `global_features` and `local_features` fields and `listchannels`' `flags` field.  (Deprecated since 0.6.2).
+
 ### Fixed
 
 - protocol: reconnection during closing negotiation now supports
@@ -33,6 +36,7 @@ changes.
 - `--bind-addr=<path>` fixed for nodes using local sockets (eg. testing).
 - Unannounced local channels were forgotten for routing on restart until reconnection occurred.
 - lightning-cli: arguments containing `"` now succeed, rather than causing JSON errors.
+- protocol: handle lnd sending more messages before `reestablish`; don't fail channel.
 
 ### Security
 

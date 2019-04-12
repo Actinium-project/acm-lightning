@@ -14,9 +14,6 @@
 #include <wire/wire.h>
 
 struct half_chan {
-	/* Cached `channel_update` which initialized below (or NULL) */
-	const u8 *channel_update;
-
 	/* millisatoshi. */
 	u32 base_fee;
 	/* millionths */
@@ -25,11 +22,8 @@ struct half_chan {
 	/* Delay for HTLC in blocks.*/
 	u32 delay;
 
-	/* -1 if channel_update is NULL */
-	s64 last_timestamp;
-
-	/* Minimum and maximum number of msatoshi in an HTLC */
-	struct amount_msat htlc_minimum, htlc_maximum;
+	/* Timestamp and index into store file */
+	struct broadcastable bcast;
 
 	/* Flags as specified by the `channel_update`s, among other
 	 * things indicated direction wrt the `channel_id` */
@@ -38,11 +32,13 @@ struct half_chan {
 	/* Flags as specified by the `channel_update`s, indicates
 	 * optional fields.  */
 	u8 message_flags;
+
+	/* Minimum and maximum number of msatoshi in an HTLC */
+	struct amount_msat htlc_minimum, htlc_maximum;
 };
 
 struct chan {
 	struct short_channel_id scid;
-	u8 *txout_script;
 
 	/*
 	 * half[0]->src == nodes[0] half[0]->dst == nodes[1]
@@ -52,33 +48,22 @@ struct chan {
 	/* node[0].id < node[1].id */
 	struct node *nodes[2];
 
-	/* NULL if not announced yet (ie. not public). */
-	const u8 *channel_announce;
-	/* Index in broadcast map, if public (otherwise 0) */
-	u64 channel_announcement_index;
-
-	/* Disabled locally (due to peer disconnect) */
-	bool local_disabled;
+	/* Timestamp and index into store file */
+	struct broadcastable bcast;
 
 	struct amount_sat sat;
 };
 
-/* A local channel can exist which isn't announcable. */
+/* A local channel can exist which isn't announced; normal channels are only
+ * created once we have both an announcement *and* an update. */
 static inline bool is_chan_public(const struct chan *chan)
 {
-	return chan->channel_announce != NULL;
-}
-
-/* A channel is only announced once we have a channel_update to send
- * with it. */
-static inline bool is_chan_announced(const struct chan *chan)
-{
-	return chan->channel_announcement_index != 0;
+	return chan->bcast.index != 0;
 }
 
 static inline bool is_halfchan_defined(const struct half_chan *hc)
 {
-	return hc->channel_update != NULL;
+	return hc->bcast.index != 0;
 }
 
 static inline bool is_halfchan_enabled(const struct half_chan *hc)
@@ -114,11 +99,8 @@ HTABLE_DEFINE_TYPE(struct chan, chan_map_scid, hash_scid, chan_eq_scid, chan_map
 struct node {
 	struct node_id id;
 
-	/* -1 means never; other fields undefined */
-	s64 last_timestamp;
-
-	/* IP/Hostname and port of this node (may be NULL) */
-	struct wireaddr *addresses;
+	/* Timestamp and index into store file */
+	struct broadcastable bcast;
 
 	/* Channels connecting us to other nodes */
 	union {
@@ -135,20 +117,6 @@ struct node {
 		/* Where that came from. */
 		struct chan *prev;
 	} bfg[ROUTING_MAX_HOPS+1];
-
-	/* UTF-8 encoded alias, not zero terminated */
-	u8 alias[32];
-
-	/* Color to be used when displaying the name */
-	u8 rgb_color[3];
-
-	/* (Global) features */
-	u8 *globalfeatures;
-
-	/* Cached `node_announcement` we might forward to new peers (or NULL). */
-	const u8 *node_announcement;
-	/* If public, this is non-zero. */
-	u64 node_announcement_index;
 };
 
 const struct node_id *node_map_keyof_node(const struct node *n);
@@ -158,6 +126,7 @@ HTABLE_DEFINE_TYPE(struct node, node_map_keyof_node, node_map_hash_key, node_map
 
 struct pending_node_map;
 struct pending_cannouncement;
+struct unupdated_channel;
 
 /* Fast versions: if you know n is one end of the channel */
 static inline struct node *other_node(const struct node *n,
@@ -202,6 +171,7 @@ struct routing_state {
 	/* channel_announcement which are pending short_channel_id lookup */
 	struct list_head pending_cannouncement;
 
+	/* Broadcast map, and access to gossip store */
 	struct broadcast_state *broadcasts;
 
 	/* Our own ID so we can identify local channels */
@@ -210,12 +180,12 @@ struct routing_state {
 	/* How old does a channel have to be before we prune it? */
 	u32 prune_timeout;
 
-	/* Store for processed messages that we might want to remember across
-	 * restarts */
-	struct gossip_store *store;
-
         /* A map of channels indexed by short_channel_ids */
 	UINTMAP(struct chan *) chanmap;
+
+        /* A map of channel_announcements indexed by short_channel_ids:
+	 * we haven't got a channel_update for these yet. */
+	UINTMAP(struct unupdated_channel *) unupdated_chanmap;
 
 	/* Has one of our own channels been announced? */
 	bool local_channel_announced;
@@ -223,6 +193,9 @@ struct routing_state {
 	/* Cache for txout queries that failed. Allows us to skip failed
 	 * checks if we get another announcement for the same scid. */
 	UINTMAP(bool) txout_failures;
+
+        /* A map of (local) disabled channels by short_channel_ids */
+	struct chan_map local_disabled_map;
 
 #if DEVELOPER
 	/* Override local time for gossip messages */
@@ -253,6 +226,7 @@ struct routing_state *new_routing_state(const tal_t *ctx,
 					const struct chainparams *chainparams,
 					const struct node_id *local_id,
 					u32 prune_timeout,
+					struct list_head *peers,
 					const u32 *dev_gossip_time,
 					const struct amount_sat *dev_unknown_channel_satoshis);
 
@@ -330,10 +304,14 @@ void route_prune(struct routing_state *rstate);
  * Directly add the channel to the local network, without checking it first. Use
  * this only for messages from trusted sources. Untrusted sources should use the
  * @see{handle_channel_announcement} entrypoint to check before adding.
+ *
+ * index is usually 0, in which case it's set by insert_broadcast adding it
+ * to the store.
  */
 bool routing_add_channel_announcement(struct routing_state *rstate,
 				      const u8 *msg TAKES,
-				      struct amount_sat sat);
+				      struct amount_sat sat,
+				      u32 index);
 
 /**
  * Add a channel_update without checking for errors
@@ -344,7 +322,8 @@ bool routing_add_channel_announcement(struct routing_state *rstate,
  * @see{handle_channel_update}
  */
 bool routing_add_channel_update(struct routing_state *rstate,
-				const u8 *update TAKES);
+				const u8 *update TAKES,
+				u32 index);
 
 /**
  * Add a node_announcement to the network view without checking it
@@ -354,7 +333,8 @@ bool routing_add_channel_update(struct routing_state *rstate,
  * sources (peers) please use @see{handle_node_announcement}.
  */
 bool routing_add_node_announcement(struct routing_state *rstate,
-                                  const u8 *msg TAKES);
+				   const u8 *msg TAKES,
+				   u32 index);
 
 
 /**
@@ -378,4 +358,28 @@ void memleak_remove_routing_tables(struct htable *memtable,
  */
 struct timeabs gossip_time_now(const struct routing_state *rstate);
 
+/* Because we can have millions of channels, and we only want a local_disable
+ * flag on ones connected to us, we keep a separate hashtable for that flag.
+ */
+static inline bool is_chan_local_disabled(struct routing_state *rstate,
+					  const struct chan *chan)
+{
+	return chan_map_get(&rstate->local_disabled_map, &chan->scid) != NULL;
+}
+
+static inline void local_disable_chan(struct routing_state *rstate,
+				      const struct chan *chan)
+{
+	if (!is_chan_local_disabled(rstate, chan))
+		chan_map_add(&rstate->local_disabled_map, chan);
+}
+
+static inline void local_enable_chan(struct routing_state *rstate,
+				     const struct chan *chan)
+{
+	chan_map_del(&rstate->local_disabled_map, chan);
+}
+
+/* Helper to convert on-wire addresses format to wireaddrs array */
+struct wireaddr *read_addresses(const tal_t *ctx, const u8 *ser);
 #endif /* LIGHTNING_GOSSIPD_ROUTING_H */

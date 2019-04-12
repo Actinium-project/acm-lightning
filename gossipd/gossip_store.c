@@ -19,16 +19,18 @@
 #define GOSSIP_STORE_TEMP_FILENAME "gossip_store.tmp"
 
 struct gossip_store {
+	/* This is false when we're loading */
+	bool writable;
+
 	int fd;
 	u8 version;
+
+	/* Offset of current EOF */
+	u64 len;
 
 	/* Counters for entries in the gossip_store entries. This is used to
 	 * decide whether we should rewrite the on-disk store or not */
 	size_t count;
-
-	/* The broadcast struct we source messages from when rewriting the
-	 * gossip_store */
-	struct broadcast_state *broadcast;
 
 	/* Handle to the routing_state to retrieve additional information,
 	 * should it be needed */
@@ -44,16 +46,15 @@ static void gossip_store_destroy(struct gossip_store *gs)
 	close(gs->fd);
 }
 
-struct gossip_store *gossip_store_new(const tal_t *ctx,
-				      struct routing_state *rstate,
-				      struct broadcast_state *broadcast)
+struct gossip_store *gossip_store_new(struct routing_state *rstate)
 {
-	struct gossip_store *gs = tal(ctx, struct gossip_store);
+	struct gossip_store *gs = tal(rstate, struct gossip_store);
 	gs->count = 0;
+	gs->writable = true;
 	gs->fd = open(GOSSIP_STORE_FILENAME, O_RDWR|O_APPEND|O_CREAT, 0600);
-	gs->broadcast = broadcast;
 	gs->rstate = rstate;
 	gs->disable_compaction = false;
+	gs->len = sizeof(gs->version);
 
 	tal_add_destructor(gs, gossip_store_destroy);
 
@@ -115,10 +116,15 @@ static u8 *gossip_store_wrap_channel_announcement(const tal_t *ctx,
  * Wrap the raw gossip message and write it to fd
  *
  * @param fd File descriptor to write the wrapped message into
+ * @param rstate Routing state if we need to look up channel capacity
  * @param gossip_msg The message to write
+ * @param len The length to increase by amount written.
  * @return true if the message was wrapped and written
  */
-static bool gossip_store_append(int fd, struct routing_state *rstate, const u8 *gossip_msg)
+static bool gossip_store_append(int fd,
+				struct routing_state *rstate,
+				const u8 *gossip_msg,
+				u64 *len)
 {
 	int t =  fromwire_peektype(gossip_msg);
 	u32 msglen;
@@ -145,9 +151,54 @@ static bool gossip_store_append(int fd, struct routing_state *rstate, const u8 *
 	belen = cpu_to_be32(msglen);
 	checksum = cpu_to_be32(crc32c(0, msg, msglen));
 
+	*len += sizeof(belen) + sizeof(checksum) + msglen;
+
 	return (write(fd, &belen, sizeof(belen)) == sizeof(belen) &&
 		write(fd, &checksum, sizeof(checksum)) == sizeof(checksum) &&
 		write(fd, msg, msglen) == msglen);
+}
+
+/* Copy a whole message from one gossip_store to another.  Returns
+ * total msg length including header, or 0 on error. */
+static size_t copy_message(int in_fd, int out_fd, unsigned offset)
+{
+	beint32_t belen, becsum;
+	u32 msglen;
+	u8 *msg;
+
+	/* FIXME: optimize both read and allocation */
+	if (lseek(in_fd, offset, SEEK_SET) < 0
+	    || read(in_fd, &belen, sizeof(belen)) != sizeof(belen)
+	    || read(in_fd, &becsum, sizeof(becsum)) != sizeof(becsum)) {
+		status_broken("Failed reading header from to gossip store @%u"
+			      ": %s",
+			      offset, strerror(errno));
+		return 0;
+	}
+
+	msglen = be32_to_cpu(belen);
+	msg = tal_arr(NULL, u8, sizeof(belen) + sizeof(becsum) + msglen);
+	memcpy(msg, &belen, sizeof(belen));
+	memcpy(msg + sizeof(belen), &becsum, sizeof(becsum));
+	if (read(in_fd, msg + sizeof(belen) + sizeof(becsum), msglen)
+	    != msglen) {
+		status_broken("Failed reading %u from to gossip store @%u"
+			      ": %s",
+			      msglen, offset, strerror(errno));
+		tal_free(msg);
+		return 0;
+	}
+
+	if (write(out_fd, msg, msglen + sizeof(belen) + sizeof(becsum))
+	    != msglen + sizeof(belen) + sizeof(becsum)) {
+		status_broken("Failed writing to gossip store: %s",
+			      strerror(errno));
+		tal_free(msg);
+		return 0;
+	}
+
+	tal_free(msg);
+	return msglen + sizeof(belen) + sizeof(becsum);
 }
 
 /* Local unannounced channels don't appear in broadcast map, but we need to
@@ -156,9 +207,10 @@ static bool gossip_store_append(int fd, struct routing_state *rstate, const u8 *
  * Note these do *not* add to gs->count, since that's compared with
  * the broadcast map count.
 */
-static bool add_local_unnannounced(int fd,
+static bool add_local_unnannounced(int in_fd, int out_fd,
 				   struct routing_state *rstate,
-				   struct node *self)
+				   struct node *self,
+				   u64 *len)
 {
 	struct chan_map_iter i;
 	struct chan *c;
@@ -168,20 +220,28 @@ static bool add_local_unnannounced(int fd,
 		const u8 *msg;
 
 		/* Ignore already announced. */
-		if (c->channel_announce)
+		if (is_chan_public(c))
 			continue;
 
 		msg = towire_gossipd_local_add_channel(tmpctx, &c->scid,
 						       &peer->id, c->sat);
-		if (!gossip_store_append(fd, rstate, msg))
+		if (!gossip_store_append(out_fd, rstate, msg, len))
 			return false;
 
 		for (size_t i = 0; i < 2; i++) {
-			msg = c->half[i].channel_update;
-			if (!msg)
+			size_t len_with_header;
+
+			if (!is_halfchan_defined(&c->half[i]))
 				continue;
-			if (!gossip_store_append(fd, rstate, msg))
+
+			len_with_header = copy_message(in_fd, out_fd,
+						       c->half[i].bcast.index);
+			if (!len_with_header)
 				return false;
+
+			c->half[i].bcast.index = *len;
+
+			*len += len_with_header;
 		}
 	}
 
@@ -193,20 +253,32 @@ static bool add_local_unnannounced(int fd,
  *
  * Creates a new file, writes all the updates from the `broadcast_state`, and
  * then atomically swaps the files.
+ *
+ * Returns the amount of shrinkage in @offset on success, otherwise @offset
+ * is unchanged.
  */
-bool gossip_store_compact(struct gossip_store *gs)
+bool gossip_store_compact(struct gossip_store *gs,
+			  struct broadcast_state **bs,
+			  u32 *offset)
 {
 	size_t count = 0;
-	u64 index = 0;
 	int fd;
-	const u8 *msg;
 	struct node *self;
+	u64 len = sizeof(gs->version);
+	struct broadcastable *bcast;
+	struct broadcast_state *oldb = *bs;
+	struct broadcast_state *newb;
+	u32 idx = 0;
 
-	assert(gs->broadcast);
+	if (gs->disable_compaction)
+		return false;
+
+	assert(oldb);
 	status_trace(
 	    "Compacting gossip_store with %zu entries, %zu of which are stale",
-	    gs->count, gs->count - gs->broadcast->count);
+	    gs->count, gs->count - oldb->count);
 
+	newb = new_broadcast_state(gs->rstate, gs, oldb->peers);
 	fd = open(GOSSIP_STORE_TEMP_FILENAME, O_RDWR|O_APPEND|O_CREAT, 0600);
 
 	if (fd < 0) {
@@ -221,18 +293,50 @@ bool gossip_store_compact(struct gossip_store *gs)
 		goto unlink_disable;
 	}
 
-	while ((msg = next_broadcast(gs->broadcast, 0, UINT32_MAX, &index)) != NULL) {
-		if (!gossip_store_append(fd, gs->rstate, msg)) {
+	/* Copy entries one at a time. */
+	while ((bcast = next_broadcast_raw(oldb, &idx)) != NULL) {
+		beint32_t hdr[2];
+		u32 msglen;
+		u8 *msg;
+
+		if (pread(gs->fd, hdr, sizeof(hdr), bcast->index) != sizeof(hdr)) {
+			status_broken("Failed reading header from to gossip store @%u"
+				      ": %s",
+				      bcast->index, strerror(errno));
+			goto unlink_disable;
+		}
+
+		msglen = be32_to_cpu(hdr[0]);
+		/* FIXME: Reuse buffer? */
+		msg = tal_arr(tmpctx, u8, sizeof(hdr) + msglen);
+		memcpy(msg, hdr, sizeof(hdr));
+		if (pread(gs->fd, msg + sizeof(hdr), msglen,
+			  bcast->index + sizeof(hdr))
+		    != msglen) {
+			status_broken("Failed reading %u from to gossip store @%u"
+				      ": %s",
+				      msglen, bcast->index, strerror(errno));
+			goto unlink_disable;
+		}
+
+		broadcast_del(oldb, bcast);
+		bcast->index = len;
+		insert_broadcast_nostore(newb, bcast);
+
+		if (write(fd, msg, msglen + sizeof(hdr))
+		    != msglen + sizeof(hdr)) {
 			status_broken("Failed writing to gossip store: %s",
 				      strerror(errno));
 			goto unlink_disable;
 		}
+		len += sizeof(hdr) + msglen;
 		count++;
 	}
 
 	/* Local unannounced channels are not in the store! */
 	self = get_node(gs->rstate, &gs->rstate->local_id);
-	if (self && !add_local_unnannounced(fd, gs->rstate, self)) {
+	if (self && !add_local_unnannounced(gs->fd, fd, gs->rstate, self,
+					    &len)) {
 		status_broken("Failed writing unannounced to gossip store: %s",
 			      strerror(errno));
 		goto unlink_disable;
@@ -246,11 +350,16 @@ bool gossip_store_compact(struct gossip_store *gs)
 	}
 
 	status_trace(
-	    "Compaction completed: dropped %zu messages, new count %zu",
-	    gs->count - count, count);
+	    "Compaction completed: dropped %zu messages, new count %zu, len %"PRIu64,
+	    gs->count - count, count, len);
 	gs->count = count;
+	*offset = gs->len - len;
+	gs->len = len;
 	close(gs->fd);
 	gs->fd = fd;
+
+	tal_free(oldb);
+	*bs = newb;
 	return true;
 
 unlink_disable:
@@ -259,61 +368,127 @@ disable:
 	status_trace("Encountered an error while compacting, disabling "
 		     "future compactions.");
 	gs->disable_compaction = true;
+	tal_free(newb);
 	return false;
 }
 
-void gossip_store_add(struct gossip_store *gs, const u8 *gossip_msg)
+void gossip_store_maybe_compact(struct gossip_store *gs,
+				struct broadcast_state **bs,
+				u32 *offset)
 {
-	/* Only give error message once. */
-	if (gs->fd == -1)
+	*offset = 0;
+
+	/* Don't compact while loading! */
+	if (!gs->writable)
+		return;
+	if (gs->count < 1000)
+		return;
+	if (gs->count < (*bs)->count * 1.25)
 		return;
 
-	if (!gossip_store_append(gs->fd, gs->rstate, gossip_msg)) {
+	gossip_store_compact(gs, bs, offset);
+}
+
+u64 gossip_store_add(struct gossip_store *gs, const u8 *gossip_msg)
+{
+	u64 off = gs->len;
+
+	/* Should never get here during loading! */
+	assert(gs->writable);
+
+	if (!gossip_store_append(gs->fd, gs->rstate, gossip_msg, &gs->len)) {
 		status_broken("Failed writing to gossip store: %s",
 			      strerror(errno));
-		gs->fd = -1;
+		return 0;
 	}
 
 	gs->count++;
-	if (gs->count >= 1000 && gs->count > gs->broadcast->count * 1.25 &&
-	    !gs->disable_compaction)
-		gossip_store_compact(gs);
+	return off;
 }
 
 void gossip_store_add_channel_delete(struct gossip_store *gs,
 				     const struct short_channel_id *scid)
 {
 	u8 *msg = towire_gossip_store_channel_delete(NULL, scid);
-	gossip_store_append(gs->fd, gs->rstate, msg);
+
+	/* Should never get here during loading! */
+	assert(gs->writable);
+
+	if (!gossip_store_append(gs->fd, gs->rstate, msg, &gs->len))
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Failed writing channel_delete to gossip store: %s",
+			      strerror(errno));
 	tal_free(msg);
+}
+
+const u8 *gossip_store_get(const tal_t *ctx,
+			   struct gossip_store *gs,
+			   u64 offset)
+{
+	beint32_t hdr[2];
+	u32 msglen, checksum;
+	u8 *msg, *gossip_msg;
+	struct amount_sat satoshis;
+
+	if (offset == 0 || offset > gs->len)
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "gossip_store: can't access offset %"PRIu64
+			      ", store len %"PRIu64,
+			      offset, gs->len);
+	if (pread(gs->fd, hdr, sizeof(hdr), offset) != sizeof(hdr)) {
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "gossip_store: can't read hdr offset %"PRIu64
+			      ", store len %"PRIu64": %s",
+			      offset, gs->len, strerror(errno));
+	}
+
+	msglen = be32_to_cpu(hdr[0]);
+	checksum = be32_to_cpu(hdr[1]);
+	msg = tal_arr(tmpctx, u8, msglen);
+	if (pread(gs->fd, msg, msglen, offset + sizeof(hdr)) != msglen)
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "gossip_store: can't read len %u offset %"PRIu64
+			      ", store len %"PRIu64,
+			      msglen, offset, gs->len);
+
+	if (checksum != crc32c(0, msg, msglen))
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "gossip_store: bad checksum offset %"PRIu64
+			      ", store len %"PRIu64,
+			      offset, gs->len);
+
+	/* Now try decoding it */
+	if (!fromwire_gossip_store_node_announcement(ctx, msg, &gossip_msg)
+	    && !fromwire_gossip_store_channel_announcement(ctx, msg,
+							   &gossip_msg,
+							   &satoshis)
+	    && !fromwire_gossip_store_channel_update(ctx, msg, &gossip_msg)) {
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "gossip_store: bad message %s offset %"PRIu64
+			      " from store len %"PRIu64,
+			      tal_hex(tmpctx, msg), offset, gs->len);
+	}
+	return gossip_msg;
 }
 
 void gossip_store_load(struct routing_state *rstate, struct gossip_store *gs)
 {
-	beint32_t belen, becsum;
+	beint32_t hdr[2];
 	u32 msglen, checksum;
 	u8 *msg, *gossip_msg;
 	struct amount_sat satoshis;
 	struct short_channel_id scid;
-	/* We set/check version byte on creation */
-	off_t known_good = 1;
 	const char *bad;
 	size_t stats[] = {0, 0, 0, 0};
-	int fd = gs->fd;
-	gs->fd = -1;
 	struct timeabs start = time_now();
 
-	if (lseek(fd, known_good, SEEK_SET) < 0) {
-		status_unusual("gossip_store: lseek failure");
-		goto truncate_nomsg;
-	}
-	while (read(fd, &belen, sizeof(belen)) == sizeof(belen) &&
-	       read(fd, &becsum, sizeof(becsum)) == sizeof(becsum)) {
-		msglen = be32_to_cpu(belen);
-		checksum = be32_to_cpu(becsum);
-		msg = tal_arr(gs, u8, msglen);
+	gs->writable = false;
+	while (pread(gs->fd, hdr, sizeof(hdr), gs->len) == sizeof(hdr)) {
+		msglen = be32_to_cpu(hdr[0]);
+		checksum = be32_to_cpu(hdr[1]);
+		msg = tal_arr(tmpctx, u8, msglen);
 
-		if (read(fd, msg, msglen) != msglen) {
+		if (pread(gs->fd, msg, msglen, gs->len+sizeof(hdr)) != msglen) {
 			status_unusual("gossip_store: truncated file?");
 			goto truncate_nomsg;
 		}
@@ -327,22 +502,27 @@ void gossip_store_load(struct routing_state *rstate, struct gossip_store *gs)
 							       &gossip_msg,
 							       &satoshis)) {
 			if (!routing_add_channel_announcement(rstate,
-							      gossip_msg,
-							      satoshis)) {
+							      take(gossip_msg),
+							      satoshis,
+							      gs->len)) {
 				bad = "Bad channel_announcement";
 				goto truncate;
 			}
 			stats[0]++;
 		} else if (fromwire_gossip_store_channel_update(msg, msg,
 								&gossip_msg)) {
-			if (!routing_add_channel_update(rstate, gossip_msg)) {
+			if (!routing_add_channel_update(rstate,
+							take(gossip_msg),
+							gs->len)) {
 				bad = "Bad channel_update";
 				goto truncate;
 			}
 			stats[1]++;
 		} else if (fromwire_gossip_store_node_announcement(msg, msg,
 								   &gossip_msg)) {
-			if (!routing_add_node_announcement(rstate, gossip_msg)) {
+			if (!routing_add_node_announcement(rstate,
+							   take(gossip_msg),
+							   gs->len)) {
 				bad = "Bad node_announcement";
 				goto truncate;
 			}
@@ -362,9 +542,9 @@ void gossip_store_load(struct routing_state *rstate, struct gossip_store *gs)
 			bad = "Unknown message";
 			goto truncate;
 		}
-		known_good += sizeof(belen) + msglen;
+		gs->len += sizeof(hdr) + msglen;
 		gs->count++;
-		tal_free(msg);
+		clean_tmpctx();
 	}
 	goto out;
 
@@ -376,7 +556,7 @@ truncate_nomsg:
 	 * miss channel_delete msgs.  If we put block numbers into the store
 	 * as we process them, we can know how far we need to roll back if we
 	 * truncate the store */
-	if (ftruncate(fd, 1) != 0)
+	if (ftruncate(gs->fd, 1) != 0)
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Truncating store: %s", strerror(errno));
 out:
@@ -384,13 +564,13 @@ out:
 	status_info("total store load time: %"PRIu64" msec (%zu entries, %zu bytes)",
 		    time_to_msec(time_between(time_now(), start)),
 		    stats[0] + stats[1] + stats[2] + stats[3],
-		    (size_t)known_good);
+		    (size_t)gs->len);
 #else
 	status_trace("total store load time: %"PRIu64" msec",
 		     time_to_msec(time_between(time_now(), start)));
 #endif
 	status_trace("gossip_store: Read %zu/%zu/%zu/%zu cannounce/cupdate/nannounce/cdelete from store in %"PRIu64" bytes",
 		     stats[0], stats[1], stats[2], stats[3],
-		     (u64)known_good);
-	gs->fd = fd;
+		     gs->len);
+	gs->writable = true;
 }
