@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - JSON API: `invoice` expiry defaults to 7 days, and can have s/m/h/d/w suffixes.
+- Config: Increased default amount for minimal channel capacity from 1k sat to 10k sat.
 
 ### Deprecated
 
@@ -36,7 +37,7 @@ changes.
 - `--bind-addr=<path>` fixed for nodes using local sockets (eg. testing).
 - Unannounced local channels were forgotten for routing on restart until reconnection occurred.
 - lightning-cli: arguments containing `"` now succeed, rather than causing JSON errors.
-- protocol: handle lnd sending more messages before `reestablish`; don't fail channel.
+- protocol: handle lnd sending more messages before `reestablish`; don't fail channel, and handle older lnd's spurious empty commitments.
 
 ### Security
 
