@@ -1,20 +1,7 @@
-#include <assert.h>
-#include <bitcoin/pubkey.h>
-#include <ccan/err/err.h>
-#include <ccan/opt/opt.h>
-#include <ccan/tal/str/str.h>
-#include <ccan/time/time.h>
-#include <common/pseudorand.h>
-#include <common/status.h>
-#include <common/type_to_string.h>
-#include <stdio.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
 #include "../routing.c"
 #include "../gossip_store.c"
 #include "../broadcast.c"
+#include <stdio.h>
 
 void status_fmt(enum log_level level UNUSED, const char *fmt, ...)
 {
@@ -114,171 +101,103 @@ void memleak_remove_intmap_(struct htable *memtable UNNEEDED, const struct intma
 { fprintf(stderr, "memleak_remove_intmap_ called!\n"); abort(); }
 #endif
 
-/* Updates existing route if required. */
-static void add_connection(struct routing_state *rstate,
-			   const struct node_id *nodes,
-			   u32 from, u32 to,
-			   u32 base_fee, s32 proportional_fee,
-			   u32 delay)
+static void node_id_from_privkey(const struct privkey *p, struct node_id *id)
 {
-	struct short_channel_id scid;
-	struct half_chan *c;
-	struct chan *chan;
-	int idx = node_id_idx(&nodes[from], &nodes[to]);
-
-	/* Encode src and dst in scid. */
-	memcpy((char *)&scid + idx * sizeof(from), &from, sizeof(from));
-	memcpy((char *)&scid + (!idx) * sizeof(to), &to, sizeof(to));
-
-	chan = get_channel(rstate, &scid);
-	if (!chan)
-		chan = new_chan(rstate, &scid, &nodes[from], &nodes[to],
-				AMOUNT_SAT(1000000));
-
-	c = &chan->half[idx];
-	c->base_fee = base_fee;
-	c->proportional_fee = proportional_fee;
-	c->delay = delay;
-	c->channel_flags = node_id_idx(&nodes[from], &nodes[to]);
-	/* This must be non-zero, otherwise we consider it disabled! */
-	c->bcast.index = 1;
-	c->htlc_maximum = AMOUNT_MSAT(-1ULL);
-	c->htlc_minimum = AMOUNT_MSAT(0);
-}
-
-static struct node_id nodeid(size_t n)
-{
-	struct node_id id;
 	struct pubkey k;
-	struct secret s;
-
-	memset(&s, 0xFF, sizeof(s));
-	memcpy(&s, &n, sizeof(n));
-	pubkey_from_secret(&s, &k);
-	node_id_from_pubkey(&id, &k);
-	return id;
+	pubkey_from_privkey(p, &k);
+	node_id_from_pubkey(id, &k);
 }
 
-static void populate_random_node(struct routing_state *rstate,
-				 const struct node_id *nodes,
-				 u32 n)
-{
-	/* Create 2 random channels. */
-	if (n < 1)
-		return;
+#define NUM_NODES (ROUTING_MAX_HOPS + 1)
 
-	for (size_t i = 0; i < 2; i++) {
-		u32 randnode = pseudorand(n);
-
-		add_connection(rstate, nodes, n, randnode,
-			       pseudorand(1000),
-			       pseudorand(1000),
-			       pseudorand(144));
-		add_connection(rstate, nodes, randnode, n,
-			       pseudorand(1000),
-			       pseudorand(1000),
-			       pseudorand(144));
-	}
-}
-
-static void run(const char *name)
-{
-	int status;
-
-	switch (fork()) {
-	case 0:
-		execlp(name, name, NULL);
-		exit(127);
-	case -1:
-		err(1, "forking %s", name);
-	default:
-		wait(&status);
-		if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
-			errx(1, "%s failed", name);
-	}
-}
-
-int main(int argc, char *argv[])
+/* We create an arrangement of nodes, each node N connected to N+1 and
+ * to node 1.  The cost for each N to N+1 route is 1, for N to 1 is
+ * 2^N.  That means it's always cheapest to go the longer route */
+int main(void)
 {
 	setup_locale();
 
 	struct routing_state *rstate;
-	size_t num_nodes = 100, num_runs = 1;
-	struct timemono start, end;
-	size_t route_lengths[ROUTING_MAX_HOPS+1];
-	struct node_id me;
-	struct node_id *nodes;
-	bool perfme = false;
-	const double riskfactor = 0.01 / BLOCKS_PER_YEAR / 10000;
-	struct siphash_seed base_seed;
+	struct node_id ids[NUM_NODES];
+	struct chan **route;
+	struct amount_msat last_fee;
 
 	secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY
 						 | SECP256K1_CONTEXT_SIGN);
 	setup_tmpctx();
 
-	me = nodeid(0);
-	rstate = new_routing_state(tmpctx, NULL, &me, 0, NULL, NULL, NULL);
-	opt_register_noarg("--perfme", opt_set_bool, &perfme,
-			   "Run perfme-start and perfme-stop around benchmark");
-
-	opt_parse(&argc, argv, opt_log_stderr_exit);
-
-	if (argc > 1)
-		num_nodes = atoi(argv[1]);
-	if (argc > 2)
-		num_runs = atoi(argv[2]);
-	if (argc > 3)
-		opt_usage_and_exit("[num_nodes [num_runs]]");
-
-	printf("Creating nodes...\n");
-	nodes = tal_arr(rstate, struct node_id, num_nodes);
-	for (size_t i = 0; i < num_nodes; i++)
-		nodes[i] = nodeid(i);
-
-	printf("Populating nodes...\n");
-	memset(&base_seed, 0, sizeof(base_seed));
-	for (size_t i = 0; i < num_nodes; i++)
-		populate_random_node(rstate, nodes, i);
-
-	if (perfme)
-		run("perfme-start");
-
-	printf("Starting...\n");
-	memset(route_lengths, 0, sizeof(route_lengths));
-	start = time_mono();
-	for (size_t i = 0; i < num_runs; i++) {
-		const struct node_id *from = &nodes[pseudorand(num_nodes)];
-		const struct node_id *to = &nodes[pseudorand(num_nodes)];
-		struct amount_msat fee;
-		struct chan **route;
-		size_t num_hops;
-
-		route = find_route(tmpctx, rstate, from, to,
-				   (struct amount_msat){pseudorand(100000)},
-				   riskfactor,
-				   0.75, &base_seed,
-				   ROUTING_MAX_HOPS,
-				   &fee);
-		num_hops = tal_count(route);
-		assert(num_hops < ARRAY_SIZE(route_lengths));
-		route_lengths[num_hops]++;
-		tal_free(route);
+	for (size_t i = 0; i < NUM_NODES; i++) {
+		struct privkey tmp;
+		memset(&tmp, i+1, sizeof(tmp));
+		node_id_from_privkey(&tmp, &ids[i]);
 	}
-	end = time_mono();
+	/* We are node 0 */
+	rstate = new_routing_state(tmpctx, NULL, &ids[0], 0, NULL, NULL, NULL);
 
-	if (perfme)
-		run("perfme-stop");
+	for (size_t i = 0; i < NUM_NODES; i++) {
+		struct chan *chan;
+		struct half_chan *hc;
+		struct short_channel_id scid;
 
-	printf("%zu (%zu succeeded) routes in %zu nodes in %"PRIu64" msec (%"PRIu64" nanoseconds per route)\n",
-	       num_runs, num_runs - route_lengths[0], num_nodes,
-	       time_to_msec(timemono_between(end, start)),
-	       time_to_nsec(time_divide(timemono_between(end, start), num_runs)));
-	for (size_t i = 0; i < ARRAY_SIZE(route_lengths); i++)
-		if (route_lengths[i])
-			printf(" Length %zu: %zu\n", i, route_lengths[i]);
+		new_node(rstate, &ids[i]);
+
+		if (i == 0)
+			continue;
+		if (!mk_short_channel_id(&scid, i, i-1, 0))
+			abort();
+		chan = new_chan(rstate, &scid, &ids[i], &ids[i-1],
+				AMOUNT_SAT(1000000));
+
+		hc = &chan->half[node_id_idx(&ids[i-1], &ids[i])];
+		hc->bcast.index = 1;
+		hc->base_fee = 1;
+		hc->proportional_fee = 0;
+		hc->delay = 0;
+		hc->channel_flags = node_id_idx(&ids[i-1], &ids[i]);
+		hc->htlc_minimum = AMOUNT_MSAT(0);
+		hc->htlc_maximum = AMOUNT_MSAT(1000000 * 1000);
+		SUPERVERBOSE("Joining %s to %s, fee %u",
+			     type_to_string(tmpctx, struct node_id, &ids[i-1]),
+			     type_to_string(tmpctx, struct node_id, &ids[i]),
+			     (int)hc->base_fee);
+
+		if (i <= 2)
+			continue;
+		if (!mk_short_channel_id(&scid, i, 1, 0))
+			abort();
+		chan = new_chan(rstate, &scid, &ids[i], &ids[1],
+				AMOUNT_SAT(1000000));
+		hc = &chan->half[node_id_idx(&ids[1], &ids[i])];
+		hc->bcast.index = 1;
+		hc->base_fee = 1 << i;
+		hc->proportional_fee = 0;
+		hc->delay = 0;
+		hc->channel_flags = node_id_idx(&ids[1], &ids[i]);
+		hc->htlc_minimum = AMOUNT_MSAT(0);
+		hc->htlc_maximum = AMOUNT_MSAT(1000000 * 1000);
+		SUPERVERBOSE("Joining %s to %s, fee %u",
+			     type_to_string(tmpctx, struct node_id, &ids[1]),
+			     type_to_string(tmpctx, struct node_id, &ids[i]),
+			     (int)hc->base_fee);
+	}
+
+	for (size_t i = ROUTING_MAX_HOPS; i > 1; i--) {
+		struct amount_msat fee;
+		SUPERVERBOSE("%s -> %s:",
+			     type_to_string(tmpctx, struct node_id, &ids[0]),
+			     type_to_string(tmpctx, struct node_id, &ids[NUM_NODES-1]));
+
+		route = find_route(tmpctx, rstate, &ids[0], &ids[NUM_NODES-1],
+				   AMOUNT_MSAT(1000), 0, 0.0, NULL,
+				   i, &fee);
+		assert(route);
+		assert(tal_count(route) == i);
+		if (i != ROUTING_MAX_HOPS)
+			assert(amount_msat_greater(fee, last_fee));
+		last_fee = fee;
+	}
 
 	tal_free(tmpctx);
 	secp256k1_context_destroy(secp256k1_ctx);
-	opt_free_table();
 	return 0;
 }
