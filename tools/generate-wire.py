@@ -809,7 +809,8 @@ struct {struct_name} {{
             elif f.is_len_var:
                 subcalls.append('towire_{}(p, {});'.format(basetype, f.name))
             else:
-                subcalls.append('towire_{}(p, {}->{});'.format(basetype, self.name, f.name))
+                ref = '&' if f.fieldtype.needs_ptr() else ''
+                subcalls.append('towire_{}(p, {}{}->{});'.format(basetype, ref, self.name, f.name))
         return tlv_message_towire_stub.format(
             tlv_name=tlv_name,
             name=self.name,
@@ -865,8 +866,9 @@ struct {struct_name} {{
                         s = '{}->{} = fromwire_{}(cursor, plen);'.format(
                             self.name, f.name, basetype)
                 else:
-                    s = 'fromwire_{}(cursor, plen, &{}->{});'.format(
-                        basetype, self.name, f.name)
+                    ref = '&' if f.fieldtype.needs_ptr() else ''
+                    s = 'fromwire_{}(cursor, plen, {}{}->{});'.format(
+                        basetype, ref, self.name, f.name)
                 subcalls.append(s)
 
         return fromwire_tlv_impl_templ.format(
@@ -1353,7 +1355,7 @@ def build_tlv_structs(tlv_fields):
 
 def build_subtype_structs(subtypes):
     structs = ""
-    for subtype in subtypes:
+    for subtype in reversed(subtypes):
         structs += subtype.print_struct()
     return structs
 
@@ -1494,15 +1496,6 @@ else:
     towire_decls = []
     fromwire_decls = []
 
-    for tlv_field, tlv_messages in tlv_fields.items():
-        for m in tlv_messages:
-            towire_decls.append(m.print_towire(options.header, tlv_field))
-            fromwire_decls.append(m.print_fromwire(options.header, tlv_field))
-
-    if not options.header:
-        towire_decls += build_tlv_towires(tlv_fields)
-        fromwire_decls += build_tlv_fromwires(tlv_fields)
-
     if not options.header or (options.header and options.subtypes):
         subtype_towires = []
         subtype_fromwires = []
@@ -1513,6 +1506,15 @@ else:
         subtype_fromwires.reverse()
         towire_decls += subtype_towires
         fromwire_decls += subtype_fromwires
+
+    for tlv_field, tlv_messages in tlv_fields.items():
+        for m in tlv_messages:
+            towire_decls.append(m.print_towire(options.header, tlv_field))
+            fromwire_decls.append(m.print_fromwire(options.header, tlv_field))
+
+    if not options.header:
+        towire_decls += build_tlv_towires(tlv_fields)
+        fromwire_decls += build_tlv_fromwires(tlv_fields)
 
     towire_decls += [m.print_towire(options.header) for m in toplevel_messages + messages_with_option]
     fromwire_decls += [m.print_fromwire(options.header) for m in toplevel_messages + messages_with_option]
@@ -1526,5 +1528,5 @@ print(template.format(
     enumname=options.enumname,
     formatted_hdr_enums=built_hdr_enums,
     formatted_impl_enums=built_impl_enums,
-    gen_structs=tlv_structs + subtype_structs,
+    gen_structs=subtype_structs + tlv_structs,
     func_decls='\n'.join(decls)))
