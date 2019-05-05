@@ -379,6 +379,9 @@ static struct migration dbmigrations[] = {
 	{ "ALTER TABLE channel_htlcs ADD received_time INTEGER", NULL },
 	{ "ALTER TABLE forwarded_payments ADD received_time INTEGER", NULL },
 	{ "ALTER TABLE forwarded_payments ADD resolved_time INTEGER", NULL },
+	{ "ALTER TABLE channels ADD remote_upfront_shutdown_script BLOB;", NULL },
+	/* PR #2524: Add failcode into forward_payment */
+	{ "ALTER TABLE forwarded_payments ADD failcode INTEGER;", NULL },
 };
 
 /* Leak tracking. */

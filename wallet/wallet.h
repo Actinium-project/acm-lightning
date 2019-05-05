@@ -17,6 +17,7 @@
 #include <lightningd/log.h>
 #include <onchaind/onchain_wire.h>
 #include <wally_bip32.h>
+#include <wire/gen_onion_wire.h>
 
 enum onion_type;
 struct amount_msat;
@@ -128,7 +129,8 @@ static inline enum wallet_output_type wallet_output_type_in_db(enum wallet_outpu
 enum forward_status {
 	FORWARD_OFFERED = 0,
 	FORWARD_SETTLED = 1,
-	FORWARD_FAILED = 2
+	FORWARD_FAILED = 2,
+	FORWARD_LOCAL_FAILED = 3
 };
 
 static inline enum forward_status wallet_forward_status_in_db(enum forward_status s)
@@ -143,6 +145,9 @@ static inline enum forward_status wallet_forward_status_in_db(enum forward_statu
 	case FORWARD_FAILED:
 		BUILD_ASSERT(FORWARD_FAILED == 2);
 		return s;
+	case FORWARD_LOCAL_FAILED:
+		BUILD_ASSERT(FORWARD_LOCAL_FAILED == 3);
+		return s;
 	}
 	fatal("%s: %u is invalid", __func__, s);
 }
@@ -156,6 +161,8 @@ static inline const char* forward_status_name(enum forward_status status)
 		return "settled";
 	case FORWARD_FAILED:
 		return "failed";
+	case FORWARD_LOCAL_FAILED:
+		return "local_failed";
 	}
 	abort();
 }
@@ -165,6 +172,7 @@ struct forwarding {
 	struct amount_msat msat_in, msat_out, fee;
 	struct sha256_double *payment_hash;
 	enum forward_status status;
+	enum onion_type failcode;
 	struct timeabs received_time;
 	/* May not be present if the HTLC was not resolved yet. */
 	struct timeabs *resolved_time;
@@ -1032,7 +1040,8 @@ struct channeltx *wallet_channeltxs_get(struct wallet *w, const tal_t *ctx,
  */
 void wallet_forwarded_payment_add(struct wallet *w, const struct htlc_in *in,
 				  const struct htlc_out *out,
-				  enum forward_status state);
+				  enum forward_status state,
+				  enum onion_type failcode);
 
 /**
  * Retrieve summary of successful forwarded payments' fees

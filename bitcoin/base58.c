@@ -67,40 +67,24 @@ static bool from_base58(u8 *version,
 	return true;
 }
 
-bool bitcoin_from_base58(bool *test_net,
-			 struct bitcoin_address *addr,
+bool bitcoin_from_base58(u8 *version, struct bitcoin_address *addr,
 			 const char *base58, size_t len)
 {
-	u8 version;
-
-	if (!from_base58(&version, &addr->addr, base58, len))
-		return false;
-
-	if (version == 111)
-		*test_net = true;
-	else if (version == 0)
-		*test_net = false;
-	else
-		return false;
-	return true;
+	return from_base58(version, &addr->addr, base58, len);
 }
 
-bool p2sh_from_base58(bool *test_net,
-		      struct ripemd160 *p2sh,
-		      const char *base58, size_t len)
+
+bool p2sh_from_base58(u8 *version, struct ripemd160 *p2sh, const char *base58,
+		      size_t len)
 {
-	u8 version;
 
-	if (!from_base58(&version, p2sh, base58, len))
-		return false;
+	return from_base58(version, p2sh, base58, len);
+}
 
-	if (version == 196)
-		*test_net = true;
-	else if (version == 5)
-		*test_net = false;
-	else
-		return false;
-	return true;
+bool ripemd160_from_base58(u8 *version, struct ripemd160 *rmd,
+			   const char *base58, size_t base58_len)
+{
+	return from_base58(version, rmd, base58, base58_len);
 }
 
 bool key_from_base58(const char *base58, size_t base58_len,
