@@ -235,15 +235,15 @@ static void queue_peer_msg(struct peer *peer, const u8 *msg TAKES)
 	daemon_conn_send(peer->dc, take(send));
 }
 
-/* Load a message from the gossip_store, and queue to send. */
+/*~ We have a shortcut for messages from the store: we send the offset, and
+ * the other daemon reads and sends, saving us much work. */
 static void queue_peer_from_store(struct peer *peer,
 				  const struct broadcastable *bcast)
 {
-	const u8 *msg;
+	const u8 *msg = towire_gossipd_send_gossip_from_store(NULL,
+							      bcast->index);
 
-	msg = gossip_store_get(NULL, peer->daemon->rstate->broadcasts->gs,
-			       bcast->index);
-	queue_peer_msg(peer, take(msg));
+	daemon_conn_send(peer->dc, take(msg));
 }
 
 /* This pokes daemon_conn, which calls dump_gossip: the NULL gossip_timer
@@ -700,13 +700,28 @@ static u8 *handle_gossip_timestamp_filter(struct peer *peer, const u8 *msg)
  * some, but that's a lesser evil than skipping some. */
 void update_peers_broadcast_index(struct list_head *peers, u32 offset)
 {
-	struct peer *peer;
+	struct peer *peer, *next;
 
-	list_for_each(peers, peer, list) {
+	list_for_each_safe(peers, peer, next, list) {
+		int gs_fd;
 		if (peer->broadcast_index < offset)
 			peer->broadcast_index = 0;
 		else
 			peer->broadcast_index -= offset;
+
+		/*~ Since store has been compacted, they need a new fd for the
+		 * new store.  The only one will still work, but after this
+		 * any offsets will refer to the new store. */
+		gs_fd = gossip_store_readonly_fd(peer->daemon->rstate->broadcasts->gs);
+		if (gs_fd < 0) {
+			status_broken("Can't get read-only gossip store fd:"
+				      " killing peer");
+			tal_free(peer);
+		} else {
+			u8 *msg = towire_gossipd_new_store_fd(NULL);
+			daemon_conn_send(peer->dc, take(msg));
+			daemon_conn_send_fd(peer->dc, gs_fd);
+		}
 	}
 }
 
@@ -1199,7 +1214,7 @@ static void maybe_create_next_scid_reply(struct peer *peer)
 /*~ If we're supposed to be sending gossip, do so now. */
 static void maybe_queue_gossip(struct peer *peer)
 {
-	const u8 *next;
+	struct broadcastable *next;
 
 	/* If the gossip timer is still running, don't send. */
 	if (peer->gossip_timer)
@@ -1215,13 +1230,13 @@ static void maybe_queue_gossip(struct peer *peer)
 	 * only needs to keep an index; this returns the next gossip message
 	 * which is past the previous index and within the timestamp: it
 	 * also updates `broadcast_index`. */
-	next = next_broadcast(NULL, peer->daemon->rstate->broadcasts,
+	next = next_broadcast(peer->daemon->rstate->broadcasts,
 			      peer->gossip_timestamp_min,
 			      peer->gossip_timestamp_max,
 			      &peer->broadcast_index);
 
 	if (next) {
-		queue_peer_msg(peer, take(next));
+		queue_peer_from_store(peer, next);
 		return;
 	}
 
@@ -1661,7 +1676,7 @@ static struct io_plan *peer_msg_in(struct io_conn *conn,
 		ok = handle_local_add_channel(peer->daemon->rstate, msg);
 		if (ok)
 			gossip_store_add(peer->daemon->rstate->broadcasts->gs,
-					 msg);
+					 msg, NULL);
 		goto handled_cmd;
 	case WIRE_GOSSIPD_LOCAL_CHANNEL_UPDATE:
 		ok = handle_local_channel_update(peer, msg);
@@ -1670,6 +1685,8 @@ static struct io_plan *peer_msg_in(struct io_conn *conn,
 	/* These are the ones we send, not them */
 	case WIRE_GOSSIPD_GET_UPDATE_REPLY:
 	case WIRE_GOSSIPD_SEND_GOSSIP:
+	case WIRE_GOSSIPD_NEW_STORE_FD:
+	case WIRE_GOSSIPD_SEND_GOSSIP_FROM_STORE:
 		break;
 	}
 
@@ -1703,6 +1720,7 @@ static struct io_plan *connectd_new_peer(struct io_conn *conn,
 {
 	struct peer *peer = tal(conn, struct peer);
 	int fds[2];
+	int gossip_store_fd;
 
 	if (!fromwire_gossip_new_peer(msg, &peer->id,
 				      &peer->gossip_queries_feature,
@@ -1712,10 +1730,20 @@ static struct io_plan *connectd_new_peer(struct io_conn *conn,
 		return io_close(conn);
 	}
 
+	gossip_store_fd = gossip_store_readonly_fd(daemon->rstate->broadcasts->gs);;
+	if (gossip_store_fd < 0) {
+		status_broken("Failed to get readonly store fd: %s",
+			      strerror(errno));
+		daemon_conn_send(daemon->connectd,
+				 take(towire_gossip_new_peer_reply(NULL, false)));
+		goto done;
+	}
+
 	/* This can happen: we handle it gracefully, returning a `failed` msg. */
 	if (socketpair(AF_LOCAL, SOCK_STREAM, 0, fds) != 0) {
 		status_broken("Failed to create socketpair: %s",
 			      strerror(errno));
+		close(gossip_store_fd);
 		daemon_conn_send(daemon->connectd,
 				 take(towire_gossip_new_peer_reply(NULL, false)));
 		goto done;
@@ -1787,6 +1815,7 @@ static struct io_plan *connectd_new_peer(struct io_conn *conn,
 	daemon_conn_send(daemon->connectd,
 			 take(towire_gossip_new_peer_reply(NULL, true)));
 	daemon_conn_send_fd(daemon->connectd, fds[1]);
+	daemon_conn_send_fd(daemon->connectd, gossip_store_fd);
 
 done:
 	return daemon_conn_read_next(conn, daemon->connectd);
@@ -2150,16 +2179,13 @@ static struct io_plan *getchannels_req(struct io_conn *conn,
 
 /*~ Similarly, lightningd asks us for all nodes when it gets `listnodes` */
 /* We keep pointers into n, assuming it won't change. */
-static void append_node(struct daemon *daemon,
-			const struct gossip_getnodes_entry ***entries,
-			const struct node *n)
+static void add_node_entry(const tal_t *ctx,
+			   struct daemon *daemon,
+			   const struct node *n,
+			   struct gossip_getnodes_entry *e)
 {
-	struct gossip_getnodes_entry *e;
-
-	e = tal(*entries, struct gossip_getnodes_entry);
 	e->nodeid = n->id;
-
-	if (get_node_announcement(e, daemon, n,
+	if (get_node_announcement(ctx, daemon, n,
 				  e->color, e->alias,
 				  &e->globalfeatures,
 				  &e->addresses)) {
@@ -2170,8 +2196,6 @@ static void append_node(struct daemon *daemon,
 		 * channel_update". */
 		e->last_timestamp = -1;
 	}
-
-	tal_arr_expand(entries, e);
 }
 
 /* Simply routine when they ask for `listnodes` */
@@ -2181,6 +2205,7 @@ static struct io_plan *getnodes(struct io_conn *conn, struct daemon *daemon,
 	u8 *out;
 	struct node *n;
 	const struct gossip_getnodes_entry **nodes;
+	struct gossip_getnodes_entry *node_arr;
 	struct node_id *id;
 
 	if (!fromwire_gossip_getnodes_request(tmpctx, msg, &id))
@@ -2188,19 +2213,33 @@ static struct io_plan *getnodes(struct io_conn *conn, struct daemon *daemon,
 
 	/* Format of reply is the same whether they ask for a specific node
 	 * (0 or one responses) or all nodes (0 or more) */
-	nodes = tal_arr(tmpctx, const struct gossip_getnodes_entry *, 0);
 	if (id) {
 		n = get_node(daemon->rstate, id);
-		if (n)
-			append_node(daemon, &nodes, n);
+		if (n) {
+			node_arr = tal_arr(tmpctx,
+					   struct gossip_getnodes_entry,
+					   1);
+			add_node_entry(node_arr, daemon, n, &node_arr[0]);
+		} else
+			nodes = NULL;
 	} else {
-		struct node_map_iter i;
-		n = node_map_first(daemon->rstate->nodes, &i);
+		struct node_map_iter it;
+		size_t i = 0;
+		node_arr = tal_arr(tmpctx, struct gossip_getnodes_entry,
+				   daemon->rstate->nodes->raw.elems);
+		n = node_map_first(daemon->rstate->nodes, &it);
 		while (n != NULL) {
-			append_node(daemon, &nodes, n);
-			n = node_map_next(daemon->rstate->nodes, &i);
+			add_node_entry(node_arr, daemon, n, &node_arr[i++]);
+			n = node_map_next(daemon->rstate->nodes, &it);
 		}
+		assert(i == daemon->rstate->nodes->raw.elems);
 	}
+
+	/* FIXME: towire wants array of pointers. */
+	nodes = tal_arr(node_arr, const struct gossip_getnodes_entry *,
+			tal_count(node_arr));
+	for (size_t i = 0; i < tal_count(node_arr); i++)
+		nodes[i] = &node_arr[i];
 	out = towire_gossip_getnodes_reply(NULL, nodes);
 	daemon_conn_send(daemon->master, take(out));
 	return daemon_conn_read_next(conn, daemon->master);

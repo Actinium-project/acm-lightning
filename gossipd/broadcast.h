@@ -37,9 +37,13 @@ struct broadcast_state *new_broadcast_state(struct routing_state *rstate,
 					    struct list_head *peers);
 
 /* Append a queued message for broadcast.  Must be explicitly deleted.
- * Also adds it to the gossip store. */
+ * Also adds it to the gossip store.
+ *
+ * If it's a channel_announcement, channel_announce_sat must be set.
+ */
 void insert_broadcast(struct broadcast_state **bstate,
 		      const u8 *msg,
+		      const struct amount_sat *channel_announce_sat,
 		      struct broadcastable *bcast);
 
 /* Add to broadcast, but not store: for gossip store compaction. */
@@ -57,10 +61,9 @@ struct broadcastable *next_broadcast_raw(struct broadcast_state *bstate,
 /* Return the broadcast with index >= *last_index, timestamp >= min and <= max
  * and update *last_index.
  * There's no broadcast with index 0. */
-const u8 *next_broadcast(const tal_t *ctx,
-			 struct broadcast_state *bstate,
-			 u32 timestamp_min, u32 timestamp_max,
-			 u32 *last_index);
+struct broadcastable *next_broadcast(struct broadcast_state *bstate,
+				     u32 timestamp_min, u32 timestamp_max,
+				     u32 *last_index);
 
 /* index of last entry. */
 u64 broadcast_final_index(const struct broadcast_state *bstate);

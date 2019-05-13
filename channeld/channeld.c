@@ -59,11 +59,12 @@
 #include <wire/wire_io.h>
 #include <wire/wire_sync.h>
 
-/* stdin == requests, 3 == peer, 4 = gossip, 5 = HSM */
+/* stdin == requests, 3 == peer, 4 = gossip, 5 = gossip_store, 6 = HSM */
 #define MASTER_FD STDIN_FILENO
 #define PEER_FD 3
 #define GOSSIP_FD 4
-#define HSM_FD 5
+#define GOSSIP_STORE_FD 5
+#define HSM_FD 6
 
 struct peer {
 	struct crypto_state cs;
@@ -792,18 +793,24 @@ static u8 *wait_sync_reply(const tal_t *ctx,
 	status_trace("... , awaiting %u", replytype);
 
 	for (;;) {
+		int type;
+
 		reply = wire_sync_read(ctx, fd);
 		if (!reply)
 			status_failed(STATUS_FAIL_INTERNAL_ERROR,
 				      "Could not set sync read from %s: %s",
 				      who, strerror(errno));
-		if (fromwire_peektype(reply) == replytype) {
+		type = fromwire_peektype(reply);
+		if (type == replytype) {
 			status_trace("Got it!");
 			break;
 		}
 
-		status_trace("Nope, got %u instead", fromwire_peektype(reply));
+		status_trace("Nope, got %u instead", type);
 		msg_enqueue(queue, take(reply));
+		/* This one has an fd appended */
+		if (type == WIRE_GOSSIPD_NEW_STORE_FD)
+			msg_enqueue_fd(queue, fdpass_recv(fd));
 	}
 
 	return reply;
@@ -1771,7 +1778,7 @@ static void peer_in(struct peer *peer, const u8 *msg)
 		return;
 	}
 
-	if (handle_peer_gossip_or_error(PEER_FD, GOSSIP_FD,
+	if (handle_peer_gossip_or_error(PEER_FD, GOSSIP_FD, GOSSIP_STORE_FD,
 					&peer->cs,
 					&peer->channel_id, msg))
 		return;
@@ -2232,8 +2239,8 @@ static void peer_reconnect(struct peer *peer,
 	do {
 		clean_tmpctx();
 		msg = sync_crypto_read(tmpctx, &peer->cs, PEER_FD);
-	} while (handle_peer_gossip_or_error(PEER_FD, GOSSIP_FD, &peer->cs,
-					     &peer->channel_id, msg)
+	} while (handle_peer_gossip_or_error(PEER_FD, GOSSIP_FD, GOSSIP_STORE_FD,
+					     &peer->cs, &peer->channel_id, msg)
 		 || capture_premature_msg(&premature_msgs, msg));
 
 	if (dataloss_protect) {
@@ -2971,6 +2978,7 @@ static void send_shutdown_complete(struct peer *peer)
 			take(towire_channel_shutdown_complete(NULL, &peer->cs)));
 	fdpass_send(MASTER_FD, PEER_FD);
 	fdpass_send(MASTER_FD, GOSSIP_FD);
+	fdpass_send(MASTER_FD, GOSSIP_STORE_FD);
 	close(MASTER_FD);
 }
 
@@ -3050,9 +3058,18 @@ int main(int argc, char *argv[])
 
 		msg = msg_dequeue(peer->from_gossipd);
 		if (msg) {
+			if (fromwire_gossipd_new_store_fd(msg)) {
+				tal_free(msg);
+				msg = msg_dequeue(peer->from_gossipd);
+				new_gossip_store(GOSSIP_STORE_FD,
+						 msg_extract_fd(msg));
+				tal_free(msg);
+				continue;
+			}
 			status_trace("Now dealing with deferred gossip %u",
 				     fromwire_peektype(msg));
-			handle_gossip_msg(PEER_FD, &peer->cs, take(msg));
+			handle_gossip_msg(PEER_FD, GOSSIP_STORE_FD,
+					  &peer->cs, take(msg));
 			continue;
 		}
 
@@ -3089,7 +3106,14 @@ int main(int argc, char *argv[])
 			 * connection comes in. */
 			if (!msg)
 				peer_failed_connection_lost();
-			handle_gossip_msg(PEER_FD, &peer->cs, take(msg));
+			if (fromwire_gossipd_new_store_fd(msg)) {
+				tal_free(msg);
+				new_gossip_store(GOSSIP_STORE_FD,
+						 fdpass_recv(GOSSIP_FD));
+				continue;
+			}
+			handle_gossip_msg(PEER_FD, GOSSIP_STORE_FD,
+					  &peer->cs, take(msg));
 		}
 	}
 

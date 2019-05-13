@@ -11,7 +11,6 @@
 /**
  * gossip_store -- On-disk storage related information
  */
-#define GOSSIP_STORE_VERSION 3
 
 struct broadcast_state;
 struct gossip_store;
@@ -30,7 +29,8 @@ void gossip_store_load(struct routing_state *rstate, struct gossip_store *gs);
 /**
  * Add a gossip message to the gossip_store
  */
-u64 gossip_store_add(struct gossip_store *gs, const u8 *gossip_msg);
+u64 gossip_store_add(struct gossip_store *gs, const u8 *gossip_msg,
+		     const struct amount_sat *channel_announce_sat);
 
 /**
  * Remember that we deleted a channel as a result of its outpoint being spent
@@ -53,9 +53,9 @@ const u8 *gossip_store_get(const tal_t *ctx,
  * @bs: a pointer to the broadcast state: replaced if we compact it.
  * @offset: the change in the store, if any.
  *
- * If @offset is non-zero on return, caller must update peers.
+ * If return value is true, caller must update peers.
  */
-void gossip_store_maybe_compact(struct gossip_store *gs,
+bool gossip_store_maybe_compact(struct gossip_store *gs,
 				struct broadcast_state **bs,
 				u32 *offset);
 
@@ -65,6 +65,12 @@ bool gossip_store_compact(struct gossip_store *gs,
 			  struct broadcast_state **bs,
 			  u32 *offset);
 
-/* Callback for when gossip_store indexes move */
+/**
+ * Get a readonly fd for the gossip_store.
+ * @gs: the gossip store.
+ *
+ * Returns -1 on failure, and sets errno.
+ */
+int gossip_store_readonly_fd(struct gossip_store *gs);
 
 #endif /* LIGHTNING_GOSSIPD_GOSSIP_STORE_H */

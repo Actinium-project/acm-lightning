@@ -63,6 +63,7 @@ void insert_broadcast_nostore(struct broadcast_state *bstate,
 
 void insert_broadcast(struct broadcast_state **bstate,
 		      const u8 *msg,
+		      const struct amount_sat *channel_announce_sat,
 		      struct broadcastable *bcast)
 {
 	u32 offset;
@@ -71,7 +72,8 @@ void insert_broadcast(struct broadcast_state **bstate,
 	if (!bcast->index) {
 		u64 idx;
 
-		bcast->index = idx = gossip_store_add((*bstate)->gs, msg);
+		bcast->index = idx = gossip_store_add((*bstate)->gs, msg,
+						      channel_announce_sat);
 		if (!idx)
 			status_failed(STATUS_FAIL_INTERNAL_ERROR,
 				      "Could not add to gossip store: %s",
@@ -83,8 +85,7 @@ void insert_broadcast(struct broadcast_state **bstate,
 	insert_broadcast_nostore(*bstate, bcast);
 
 	/* If it compacts, it replaces *bstate */
-	gossip_store_maybe_compact((*bstate)->gs, bstate, &offset);
-	if (offset)
+	if (gossip_store_maybe_compact((*bstate)->gs, bstate, &offset))
 		update_peers_broadcast_index((*bstate)->peers, offset);
 }
 
@@ -103,17 +104,16 @@ struct broadcastable *next_broadcast_raw(struct broadcast_state *bstate,
 	return b;
 }
 
-const u8 *next_broadcast(const tal_t *ctx,
-			 struct broadcast_state *bstate,
-			 u32 timestamp_min, u32 timestamp_max,
-			 u32 *last_index)
+struct broadcastable *next_broadcast(struct broadcast_state *bstate,
+				     u32 timestamp_min, u32 timestamp_max,
+				     u32 *last_index)
 {
 	struct broadcastable *b;
 
 	while ((b = next_broadcast_raw(bstate, last_index)) != NULL) {
 		if (b->timestamp >= timestamp_min
 		    && b->timestamp <= timestamp_max) {
-			return gossip_store_get(ctx, bstate->gs, b->index);
+			return b;
 		}
 	}
 	return NULL;
@@ -175,13 +175,15 @@ struct broadcast_state *broadcast_state_check(struct broadcast_state *b,
 	u32 index = 0;
 	u64 htlc_minimum_msat;
 	struct pubkey_set pubkeys;
+	struct broadcastable *bcast;
 	/* We actually only need a set, not a map. */
 	UINTMAP(u64 *) channels;
 
 	pubkey_set_init(&pubkeys);
 	uintmap_init(&channels);
 
-	while ((msg = next_broadcast(b, 0, UINT32_MAX, &index)) != NULL) {
+	while ((bcast = next_broadcast_raw(b, &index)) != NULL) {
+		msg = gossip_store_get(b, b->gs, b->index);
 		if (fromwire_channel_announcement(tmpctx, msg, &sig, &sig, &sig,
 						  &sig, &features, &chain_hash,
 						  &scid, &node_id_1, &node_id_2,

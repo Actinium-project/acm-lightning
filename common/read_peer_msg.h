@@ -57,21 +57,30 @@ bool is_wrong_channel(const u8 *msg, const struct channel_id *expected,
 
 /**
  * handle_peer_gossip_or_error - simple handler for all the above cases.
- * @peer_fd, @gossip_fd: peer and gossip fd.
+ * @peer_fd, @gossip_fd, @gossip_store_fd: peer, gossip and gossip_store fds.
  * @cs: the cryptostate (updated)
+ * @channel_id: the channel id of the current channel.
  * @msg: the peer message (only taken if returns true).
  *
  * This returns true if it handled the packet: a gossip packet (forwarded
  * to gossipd), an error packet (causes peer_failed_received_errmsg or
  * ignored), or a message about the wrong channel (sends sync error reply).
  */
-bool handle_peer_gossip_or_error(int peer_fd, int gossip_fd,
+bool handle_peer_gossip_or_error(int peer_fd, int gossip_fd, int gossip_store_fd,
 				 struct crypto_state *cs,
 				 const struct channel_id *channel_id,
 				 const u8 *msg TAKES);
 
 /* We got this message from gossipd: forward/quit as it asks. */
-void handle_gossip_msg(int peer_fd, struct crypto_state *cs,
+void handle_gossip_msg(int peer_fd,
+		       int gossip_store_fd,
+		       struct crypto_state *cs,
 		       const u8 *msg TAKES);
 
+/**
+ * new_gossip_store - handle replacement gossip_store_fd.
+ * @gossip_store_fd: our fixed fd we expect to use to read gossip_store.
+ * @new_gossip_store_fd: fd received from gossipd.
+ */
+void new_gossip_store(int gossip_store_fd, int new_gossip_store_fd);
 #endif /* LIGHTNING_COMMON_READ_PEER_MSG_H */

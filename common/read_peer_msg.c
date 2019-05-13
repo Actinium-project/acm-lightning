@@ -1,4 +1,5 @@
 #include <common/crypto_sync.h>
+#include <common/gossip_store.h>
 #include <common/peer_failed.h>
 #include <common/read_peer_msg.h>
 #include <common/status.h>
@@ -8,6 +9,7 @@
 #include <errno.h>
 #include <gossipd/gen_gossip_peerd_wire.h>
 #include <sys/select.h>
+#include <unistd.h>
 #include <wire/peer_wire.h>
 #include <wire/wire_sync.h>
 
@@ -80,11 +82,15 @@ bool is_wrong_channel(const u8 *msg, const struct channel_id *expected,
 	return !channel_id_eq(expected, actual);
 }
 
-void handle_gossip_msg(int peer_fd, struct crypto_state *cs, const u8 *msg TAKES)
+void handle_gossip_msg(int peer_fd, int gossip_store_fd,
+		       struct crypto_state *cs, const u8 *msg TAKES)
 {
 	u8 *gossip;
+	u64 offset;
 
-	if (!fromwire_gossipd_send_gossip(tmpctx, msg, &gossip)) {
+	if (fromwire_gossipd_send_gossip_from_store(msg, &offset))
+		gossip = gossip_store_read(tmpctx, gossip_store_fd, offset);
+	else if (!fromwire_gossipd_send_gossip(tmpctx, msg, &gossip)) {
 		status_broken("Got bad message from gossipd: %s",
 			      tal_hex(msg, msg));
 		peer_failed_connection_lost();
@@ -106,7 +112,7 @@ void handle_gossip_msg(int peer_fd, struct crypto_state *cs, const u8 *msg TAKES
 		tal_free(msg);
 }
 
-bool handle_peer_gossip_or_error(int peer_fd, int gossip_fd,
+bool handle_peer_gossip_or_error(int peer_fd, int gossip_fd, int gossip_store_fd,
 				 struct crypto_state *cs,
 				 const struct channel_id *channel_id,
 				 const u8 *msg TAKES)
@@ -124,6 +130,7 @@ bool handle_peer_gossip_or_error(int peer_fd, int gossip_fd,
 	if (is_peer_error(tmpctx, msg, channel_id, &err, &all_channels)) {
 		if (err)
 			peer_failed_received_errmsg(peer_fd, gossip_fd,
+						    gossip_store_fd,
 						    cs, err,
 						    all_channels
 						    ? NULL : channel_id);
@@ -150,4 +157,13 @@ handled:
 	if (taken(msg))
 		tal_free(msg);
 	return true;
+}
+
+void new_gossip_store(int gossip_store_fd, int new_gossip_store_fd)
+{
+	if (dup2(new_gossip_store_fd, gossip_store_fd) == -1)
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Could not dup2 new fd %i onto %i: %s",
+			      new_gossip_store_fd, gossip_store_fd,
+			      strerror(errno));
 }

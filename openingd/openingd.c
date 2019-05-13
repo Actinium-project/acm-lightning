@@ -35,6 +35,7 @@
 #include <common/version.h>
 #include <common/wire_error.h>
 #include <errno.h>
+#include <gossipd/gen_gossip_peerd_wire.h>
 #include <hsmd/gen_hsm_wire.h>
 #include <inttypes.h>
 #include <openingd/gen_opening_wire.h>
@@ -47,11 +48,12 @@
 #include <wire/wire.h>
 #include <wire/wire_sync.h>
 
-/* stdin == lightningd, 3 == peer, 4 == gossipd, 5 = hsmd */
+/* stdin == lightningd, 3 == peer, 4 == gossipd, 5 = gossip_store, 6 = hsmd */
 #define REQ_FD STDIN_FILENO
 #define PEER_FD 3
 #define GOSSIP_FD 4
-#define HSM_FD 5
+#define GOSSIP_STORE_FD 5
+#define HSM_FD 6
 
 /* Global state structure.  This is only for the one specific peer and channel */
 struct state {
@@ -375,7 +377,14 @@ static u8 *opening_negotiate_msg(const tal_t *ctx, struct state *state,
 		/* Use standard helper for gossip msgs (forwards, if it's an
 		 * error, exits). */
 		if (from_gossipd) {
-			handle_gossip_msg(PEER_FD, &state->cs, take(msg));
+			if (fromwire_gossipd_new_store_fd(msg)) {
+				tal_free(msg);
+				new_gossip_store(GOSSIP_STORE_FD,
+						 fdpass_recv(GOSSIP_FD));
+				continue;
+			}
+			handle_gossip_msg(PEER_FD, GOSSIP_STORE_FD,
+					  &state->cs, take(msg));
 			continue;
 		}
 
@@ -408,6 +417,7 @@ static u8 *opening_negotiate_msg(const tal_t *ctx, struct state *state,
 					wire_sync_write(REQ_FD, take(msg));
 				}
 				peer_failed_received_errmsg(PEER_FD, GOSSIP_FD,
+							    GOSSIP_STORE_FD,
 							    &state->cs, err,
 							    NULL);
 			}
@@ -1306,7 +1316,9 @@ static u8 *handle_peer_in(struct state *state)
 	case WIRE_UPDATE_FEE:
 	case WIRE_ANNOUNCEMENT_SIGNATURES:
 		/* Standard cases */
-		if (handle_peer_gossip_or_error(PEER_FD, GOSSIP_FD, &state->cs,
+		if (handle_peer_gossip_or_error(PEER_FD, GOSSIP_FD,
+						GOSSIP_STORE_FD,
+						&state->cs,
 						&state->channel_id, msg))
 			return NULL;
 		break;
@@ -1336,7 +1348,7 @@ static void handle_gossip_in(struct state *state)
 		status_failed(STATUS_FAIL_GOSSIP_IO,
 			      "Reading gossip: %s", strerror(errno));
 
-	handle_gossip_msg(PEER_FD, &state->cs, take(msg));
+	handle_gossip_msg(PEER_FD, GOSSIP_STORE_FD, &state->cs, take(msg));
 }
 
 /*~ Is this message of type `error` with the special zero-id
@@ -1542,6 +1554,7 @@ int main(int argc, char *argv[])
 	wire_sync_write(REQ_FD, msg);
 	fdpass_send(REQ_FD, PEER_FD);
 	fdpass_send(REQ_FD, GOSSIP_FD);
+	fdpass_send(REQ_FD, GOSSIP_STORE_FD);
 	status_trace("Sent %s with fd",
 		     opening_wire_type_name(fromwire_peektype(msg)));
 
