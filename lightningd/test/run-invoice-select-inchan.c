@@ -126,20 +126,20 @@ void json_add_address_internal(struct json_stream *response UNNEEDED,
 			       const char *fieldname UNNEEDED,
 			       const struct wireaddr_internal *addr UNNEEDED)
 { fprintf(stderr, "json_add_address_internal called!\n"); abort(); }
-/* Generated stub for json_add_amount_msat */
-void json_add_amount_msat(struct json_stream *result UNNEEDED,
-			  struct amount_msat msat UNNEEDED,
-			  const char *rawfieldname UNNEEDED,
-			  const char *msatfieldname)
+/* Generated stub for json_add_amount_msat_compat */
+void json_add_amount_msat_compat(struct json_stream *result UNNEEDED,
+				 struct amount_msat msat UNNEEDED,
+				 const char *rawfieldname UNNEEDED,
+				 const char *msatfieldname)
 
-{ fprintf(stderr, "json_add_amount_msat called!\n"); abort(); }
-/* Generated stub for json_add_amount_sat */
-void json_add_amount_sat(struct json_stream *result UNNEEDED,
-			 struct amount_sat sat UNNEEDED,
-			 const char *rawfieldname UNNEEDED,
-			 const char *msatfieldname)
+{ fprintf(stderr, "json_add_amount_msat_compat called!\n"); abort(); }
+/* Generated stub for json_add_amount_sat_compat */
+void json_add_amount_sat_compat(struct json_stream *result UNNEEDED,
+				struct amount_sat sat UNNEEDED,
+				const char *rawfieldname UNNEEDED,
+				const char *msatfieldname)
 
-{ fprintf(stderr, "json_add_amount_sat called!\n"); abort(); }
+{ fprintf(stderr, "json_add_amount_sat_compat called!\n"); abort(); }
 /* Generated stub for json_add_bool */
 void json_add_bool(struct json_stream *result UNNEEDED, const char *fieldname UNNEEDED,
 		   bool value UNNEEDED)
@@ -290,9 +290,6 @@ enum watch_result onchaind_funding_spent(struct channel *channel UNNEEDED,
 					 const struct bitcoin_tx *tx UNNEEDED,
 					 u32 blockheight UNNEEDED)
 { fprintf(stderr, "onchaind_funding_spent called!\n"); abort(); }
-/* Generated stub for opening_peer_no_active_channels */
-void opening_peer_no_active_channels(struct peer *peer UNNEEDED)
-{ fprintf(stderr, "opening_peer_no_active_channels called!\n"); abort(); }
 /* Generated stub for param */
 bool param(struct command *cmd UNNEEDED, const char *buffer UNNEEDED,
 	   const jsmntok_t params[] UNNEEDED, ...)
