@@ -54,6 +54,9 @@ struct chan {
 	struct amount_sat sat;
 };
 
+/* Use this instead of tal_free(chan)! */
+void free_chan(struct routing_state *rstate, struct chan *chan);
+
 /* A local channel can exist which isn't announced; normal channels are only
  * created once we have both an announcement *and* an update. */
 static inline bool is_chan_public(const struct chan *chan)
@@ -244,10 +247,6 @@ struct routing_state {
 #if DEVELOPER
 	/* Override local time for gossip messages */
 	struct timeabs *gossip_time;
-
-	/* Instead of ignoring unknown channels, pretend they're valid
-	 * with this many satoshis (if non-NULL) */
-	const struct amount_sat *dev_unknown_channel_satoshis;
 #endif
 };
 
@@ -271,8 +270,7 @@ struct routing_state *new_routing_state(const tal_t *ctx,
 					const struct node_id *local_id,
 					u32 prune_timeout,
 					struct list_head *peers,
-					const u32 *dev_gossip_time,
-					const struct amount_sat *dev_unknown_channel_satoshis);
+					const u32 *dev_gossip_time);
 
 /**
  * Add a new bidirectional channel from id1 to id2 with the given

@@ -407,14 +407,6 @@ static void config_register_opts(struct lightningd *ld)
 			       opt_set_bool_arg, opt_show_bool,
 			       &deprecated_apis,
 			       "Enable deprecated options, JSONRPC commands, fields, etc.");
-	opt_register_arg("--autocleaninvoice-cycle",
-			 opt_set_u64, opt_show_u64,
-			 &ld->ini_autocleaninvoice_cycle,
-			 "Perform cleanup of expired invoices every given seconds, or do not autoclean if 0");
-	opt_register_arg("--autocleaninvoice-expired-by",
-			 opt_set_u64, opt_show_u64,
-			 &ld->ini_autocleaninvoice_expiredby,
-			 "If expired invoice autoclean enabled, invoices that have expired for at least this given seconds are cleaned");
 	opt_register_arg("--proxy", opt_add_proxy_addr, NULL,
 			ld,"Set a socks v5 proxy IP address and port");
 	opt_register_arg("--tor-service-password", opt_set_talstr, NULL,
@@ -444,15 +436,6 @@ static char *opt_subprocess_debug(const char *optarg, struct lightningd *ld)
 {
 	ld->dev_debug_subprocess = optarg;
 	return NULL;
-}
-
-static char *opt_set_dev_unknown_channel_satoshis(const char *optarg,
-						  struct lightningd *ld)
-{
-	tal_free(ld->dev_unknown_channel_satoshis);
-	ld->dev_unknown_channel_satoshis = tal(ld, struct amount_sat);
-	return opt_set_u64(optarg,
-			   &ld->dev_unknown_channel_satoshis->satoshis); /* Raw: dev code */
 }
 
 static void dev_register_opts(struct lightningd *ld)
@@ -491,10 +474,7 @@ static void dev_register_opts(struct lightningd *ld)
 	opt_register_arg("--dev-gossip-time", opt_set_u32, opt_show_u32,
 			 &ld->dev_gossip_time,
 			 "UNIX time to override gossipd to use.");
-	opt_register_arg("--dev-unknown-channel-satoshis",
-			 opt_set_dev_unknown_channel_satoshis, NULL, ld,
-			 "Amount to pretend is in channels which we can't find funding tx for.");
-}
+ }
 #endif
 
 static const struct config testnet_config = {

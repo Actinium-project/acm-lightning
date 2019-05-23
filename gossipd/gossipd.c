@@ -1976,7 +1976,6 @@ static struct io_plan *gossip_init(struct io_conn *conn,
 {
 	u32 update_channel_interval;
 	u32 *dev_gossip_time;
-	struct amount_sat *dev_unknown_channel_satoshis;
 
 	if (!fromwire_gossipctl_init(daemon, msg,
 				     /* 60,000 ms
@@ -1990,8 +1989,7 @@ static struct io_plan *gossip_init(struct io_conn *conn,
 				      * (unless --dev-channel-update-interval) */
 				     &update_channel_interval,
 				     &daemon->announcable,
-				     &dev_gossip_time,
-				     &dev_unknown_channel_satoshis)) {
+				     &dev_gossip_time)) {
 		master_badmsg(WIRE_GOSSIPCTL_INIT, msg);
 	}
 
@@ -2001,8 +1999,7 @@ static struct io_plan *gossip_init(struct io_conn *conn,
 					   &daemon->id,
 					   update_channel_interval * 2,
 					   &daemon->peers,
-					   dev_gossip_time,
-					   dev_unknown_channel_satoshis);
+					   dev_gossip_time);
 
 	/* Load stored gossip messages */
 	gossip_store_load(daemon->rstate, daemon->rstate->broadcasts->gs);
@@ -2136,11 +2133,13 @@ static struct io_plan *getchannels_req(struct io_conn *conn,
 	u8 *out;
 	const struct gossip_getchannels_entry **entries;
 	struct chan *chan;
-	struct short_channel_id *scid;
+	struct short_channel_id *scid, *prev;
 	struct node_id *source;
+	bool complete = true;
 
 	/* Note: scid is marked optional in gossip_wire.csv */
-	if (!fromwire_gossip_getchannels_request(msg, msg, &scid, &source))
+	if (!fromwire_gossip_getchannels_request(msg, msg, &scid, &source,
+						 &prev))
 		master_badmsg(WIRE_GOSSIP_GETCHANNELS_REQUEST, msg);
 
 	entries = tal_arr(tmpctx, const struct gossip_getchannels_entry *, 0);
@@ -2164,15 +2163,20 @@ static struct io_plan *getchannels_req(struct io_conn *conn,
 		u64 idx;
 
 		/* For the more general case, we just iterate through every
-		 * short channel id. */
-		for (chan = uintmap_first(&daemon->rstate->chanmap, &idx);
-		     chan;
-		     chan = uintmap_after(&daemon->rstate->chanmap, &idx)) {
+		 * short channel id, starting with previous if any (there is
+		 * no scid 0). */
+		idx = prev ? prev->u64 : 0;
+		while ((chan = uintmap_after(&daemon->rstate->chanmap, &idx))) {
 			append_channel(daemon->rstate, &entries, chan, NULL);
+			/* Limit how many we do at once. */
+			if (tal_count(entries) == 4096) {
+				complete = false;
+				break;
+			}
 		}
 	}
 
-	out = towire_gossip_getchannels_reply(NULL, entries);
+	out = towire_gossip_getchannels_reply(NULL, complete, entries);
 	daemon_conn_send(daemon->master, take(out));
 	return daemon_conn_read_next(conn, daemon->master);
 }
@@ -2802,9 +2806,9 @@ static struct io_plan *handle_outpoint_spent(struct io_conn *conn,
 		    "spent",
 		    type_to_string(msg, struct short_channel_id, &scid));
 		/* Freeing is sufficient since everything else is allocated off
-		 * of the channel and the destructor takes care of unregistering
+		 * of the channel and this takes care of unregistering
 		 * the channel */
-		tal_free(chan);
+		free_chan(rstate, chan);
 		/* We put a tombstone marker in the channel store, so we don't
 		 * have to replay blockchain spends on restart. */
 		gossip_store_add_channel_delete(rstate->broadcasts->gs, &scid);

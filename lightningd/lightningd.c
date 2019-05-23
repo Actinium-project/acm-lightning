@@ -117,7 +117,6 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->dev_subdaemon_fail = false;
 	ld->dev_allow_localhost = false;
 	ld->dev_gossip_time = 0;
-	ld->dev_unknown_channel_satoshis = NULL;
 #endif
 
 	/*~ These are CCAN lists: an embedded double-linked list.  It's not
@@ -196,8 +195,6 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->daemon = false;
 	ld->config_filename = NULL;
 	ld->pidfile = NULL;
-	ld->ini_autocleaninvoice_cycle = 0;
-	ld->ini_autocleaninvoice_expiredby = 86400;
 	ld->proxyaddr = NULL;
 	ld->use_proxy_always = false;
 	ld->pure_tor_setup = false;
@@ -721,11 +718,6 @@ int main(int argc, char *argv[])
 
 	/*~ Initialize the transaction filter with our pubkeys. */
 	init_txfilter(ld->wallet, ld->owned_txfilter);
-
-	/*~ Set up invoice autoclean. */
-	wallet_invoice_autoclean(ld->wallet,
-				 ld->ini_autocleaninvoice_cycle,
-				 ld->ini_autocleaninvoice_expiredby);
 
 	/*~ Pull peers, channels and HTLCs from db. */
 	load_channels_from_wallet(ld);

@@ -8,6 +8,7 @@
 #include <common/json_helpers.h>
 #include <common/jsonrpc_errors.h>
 #include <common/param.h>
+#include <common/status_levels.h>
 
 struct command;
 struct plugin_conn;
@@ -24,20 +25,29 @@ struct plugin_command {
 					 const jsmntok_t *params);
 };
 
+/* Create an array of these, one for each --option you support. */
+struct plugin_option {
+	const char *name;
+	const char *description;
+	char *(*handle)(const char *str, void *arg);
+	void *arg;
+};
+
 /* Return this iff the param() call failed in your handler. */
 struct command_result *command_param_failed(void);
 
 /* Call this on fatal error. */
 void NORETURN plugin_err(const char *fmt, ...);
 
-/* This command is finished, here's a detailed error. data can be NULL. */
+/* This command is finished, here's a detailed error; @cmd cannot be
+ * NULL, data can be NULL. */
 struct command_result *WARN_UNUSED_RESULT
 command_done_err(struct command *cmd,
 		 int code,
 		 const char *errmsg,
 		 const char *data);
 
-/* This command is finished, here's the success msg. */
+/* This command is finished, here's the success msg; @cmd cannot be NULL. */
 struct command_result *WARN_UNUSED_RESULT
 command_success(struct command *cmd, const char *result);
 
@@ -47,7 +57,9 @@ const char *rpc_delve(const tal_t *ctx,
 		      const char *method, const char *params,
 		      struct plugin_conn *rpc, const char *guide);
 
-/* Async rpc request.  For convenience, and single ' are turned into ". */
+/* Async rpc request.  For convenience, and single ' are turned into ".
+ * @cmd can be NULL if we're coming from a timer callback.
+ */
 PRINTF_FMT(6,7) struct command_result *
 send_outreq_(struct command *cmd,
 	     const char *method,
@@ -76,21 +88,49 @@ send_outreq_(struct command *cmd,
 					 const jsmntok_t *result),	\
 		     (arg), __VA_ARGS__)
 
-/* Callback to just forward error and close request. */
+/* Callback to just forward error and close request; @cmd cannot be NULL */
 struct command_result *forward_error(struct command *cmd,
 				     const char *buf,
 				     const jsmntok_t *error,
 				     void *arg);
 
-/* Callback to just forward result and close request. */
+/* Callback to just forward result and close request; @cmd cannot be NULL */
 struct command_result *forward_result(struct command *cmd,
 				      const char *buf,
 				      const jsmntok_t *result,
 				      void *arg);
 
-/* The main plugin runner. */
-void NORETURN plugin_main(char *argv[],
-			  void (*init)(struct plugin_conn *rpc),
-			  const struct plugin_command *commands,
-			  size_t num_commands);
+/* Callback for timer where we expect a 'command_result'.  All timers
+ * must return this eventually, though they may do so via a convoluted
+ * send_req() path. */
+struct command_result *timer_complete(void);
+
+/* Access timer infrastructure to add a timer.
+ *
+ * Freeing this releases the timer, otherwise it's freed after @cb
+ * if it hasn't been freed already.
+ */
+struct plugin_timer *plugin_timer(struct plugin_conn *rpc,
+				  struct timerel t,
+				  struct command_result *(*cb)(void));
+
+/* Log something */
+void PRINTF_FMT(2, 3) plugin_log(enum log_level l, const char *fmt, ...);
+
+/* Macro to define arguments */
+#define plugin_option(name, description, set, arg)			\
+	(name),								\
+	(description),							\
+	typesafe_cb_preargs(char *, void *, (set), (arg), const char *),	\
+	(arg)
+
+/* Standard helpers */
+char *u64_option(const char *arg, u64 *i);
+char *charp_option(const char *arg, char **p);
+
+/* The main plugin runner: append with 0 or more plugin_option(), then NULL. */
+void NORETURN LAST_ARG_NULL plugin_main(char *argv[],
+					void (*init)(struct plugin_conn *rpc),
+					const struct plugin_command *commands,
+					size_t num_commands, ...);
 #endif /* LIGHTNING_PLUGINS_LIBPLUGIN_H */

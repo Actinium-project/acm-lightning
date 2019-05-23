@@ -178,10 +178,6 @@ struct lightningd {
 	/* PID file */
 	char *pidfile;
 
-	/* Initial autocleaninvoice settings. */
-	u64 ini_autocleaninvoice_cycle;
-	u64 ini_autocleaninvoice_expiredby;
-
 	/* Number of blocks we wait for a channel to get funded
 	 * if we are the fundee. */
 	u32 max_funding_unconfirmed;
@@ -202,9 +198,6 @@ struct lightningd {
 	/* Timestamp to use for gossipd, iff non-zero */
 	u32 dev_gossip_time;
 
-	/* What to override unknown channels with, iff non-NULL */
-	struct amount_sat *dev_unknown_channel_satoshis;
-
 	/* Things we've marked as not leaking. */
 	const void **notleaks;
 #endif /* DEVELOPER */
@@ -217,6 +210,10 @@ struct lightningd {
 
 	struct plugins *plugins;
 };
+
+/* Turning this on allows a tal allocation to return NULL, rather than aborting.
+ * Use only on carefully tested code! */
+extern bool tal_oom_ok;
 
 const struct chainparams *get_chainparams(const struct lightningd *ld);
 

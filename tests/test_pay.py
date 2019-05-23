@@ -4,6 +4,7 @@ from utils import DEVELOPER, wait_for, only_one, sync_blockheight, SLOW_MACHINE
 
 
 import copy
+import concurrent.futures
 import pytest
 import random
 import re
@@ -1459,13 +1460,31 @@ def test_pay_retry(node_factory, bitcoind):
     exhaust_channel(l2, l5, scid25)
     exhaust_channel(l3, l5, scid35)
 
+    def listpays_nofail(b11):
+        while True:
+            pays = l1.rpc.listpays(b11)['pays']
+            if len(pays) != 0:
+                if only_one(pays)['status'] == 'complete':
+                    return
+                assert only_one(pays)['status'] != 'failed'
+
+    inv = l5.rpc.invoice(10**8, 'test_retry', 'test_retry')
+
+    # Make sure listpays doesn't transiently show failure while pay
+    # is retrying.
+    executor = concurrent.futures.ThreadPoolExecutor()
+    fut = executor.submit(listpays_nofail, inv['bolt11'])
+
     # Pay l1->l5 should succeed via straight line (eventually)
-    l1.rpc.pay(l5.rpc.invoice(10**8, 'test_retry', 'test_retry')['bolt11'])
+    l1.rpc.pay(inv['bolt11'])
+
+    # This should be OK.
+    fut.result()
 
     # This should make it fail.
     exhaust_channel(l4, l5, scid45, 10**8)
 
-    with pytest.raises(RpcError):
+    with pytest.raises(RpcError, match=r'5 attempts'):
         l1.rpc.pay(l5.rpc.invoice(10**8, 'test_retry2', 'test_retry2')['bolt11'])
 
 
@@ -1475,6 +1494,11 @@ def test_pay_routeboost(node_factory, bitcoind):
     # l1->l2->l3--private-->l4
     l1, l2 = node_factory.line_graph(2, announce_channels=True, wait_for_announce=True)
     l3, l4, l5 = node_factory.line_graph(3, announce_channels=False, wait_for_announce=False)
+
+    # This should a "could not find a route" because that's true.
+    with pytest.raises(RpcError, match=r'Could not find a route'):
+        l1.rpc.pay(l5.rpc.invoice(10**8, 'test_retry', 'test_retry')['bolt11'])
+
     l2.rpc.connect(l3.info['id'], 'localhost', l3.port)
     scidl2l3 = l2.fund_channel(l3, 10**6)
 

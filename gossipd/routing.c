@@ -14,6 +14,7 @@
 #include <common/wire_error.h>
 #include <common/wireaddr.h>
 #include <gossipd/gen_gossip_peerd_wire.h>
+#include <gossipd/gen_gossip_store.h>
 #include <gossipd/gen_gossip_wire.h>
 #include <inttypes.h>
 #include <wire/gen_peer_wire.h>
@@ -153,13 +154,22 @@ struct chan *next_chan(const struct node *node, struct chan_map_iter *i)
 	return chan_map_next(&node->chans.map, i);
 }
 
+static void destroy_routing_state(struct routing_state *rstate)
+{
+	/* Since we omitted destructors on these, clean up manually */
+	u64 idx;
+	for (struct chan *chan = uintmap_first(&rstate->chanmap, &idx);
+	     chan;
+	     chan = uintmap_after(&rstate->chanmap, &idx))
+		free_chan(rstate, chan);
+}
+
 struct routing_state *new_routing_state(const tal_t *ctx,
 					const struct chainparams *chainparams,
 					const struct node_id *local_id,
 					u32 prune_timeout,
 					struct list_head *peers,
-					const u32 *dev_gossip_time,
-					const struct amount_sat *dev_unknown_channel_satoshis)
+					const u32 *dev_gossip_time)
 {
 	struct routing_state *rstate = tal(ctx, struct routing_state);
 	rstate->nodes = new_node_map(rstate);
@@ -187,8 +197,8 @@ struct routing_state *new_routing_state(const tal_t *ctx,
 		rstate->gossip_time->ts.tv_nsec = 0;
 	} else
 		rstate->gossip_time = NULL;
-	rstate->dev_unknown_channel_satoshis = dev_unknown_channel_satoshis;
 #endif
+	tal_add_destructor(rstate, destroy_routing_state);
 
 	return rstate;
 }
@@ -221,7 +231,7 @@ static void destroy_node(struct node *node, struct routing_state *rstate)
 
 	/* These remove themselves from chans[]. */
 	while ((c = first_chan(node, &i)) != NULL)
-		tal_free(c);
+		free_chan(rstate, c);
 
 	/* Free htable if we need. */
 	if (node_uses_chan_map(node))
@@ -345,7 +355,9 @@ static void remove_chan_from_node(struct routing_state *rstate,
 	}
 }
 
-static void destroy_chan(struct chan *chan, struct routing_state *rstate)
+/* We used to make this a tal_add_destructor2, but that costs 40 bytes per
+ * chan, and we only ever explicitly free it anyway. */
+void free_chan(struct routing_state *rstate, struct chan *chan)
 {
 	remove_chan_from_node(rstate, chan->nodes[0], chan);
 	remove_chan_from_node(rstate, chan->nodes[1], chan);
@@ -359,6 +371,7 @@ static void destroy_chan(struct chan *chan, struct routing_state *rstate)
 
 	/* Remove from local_disabled_map if it's there. */
 	chan_map_del(&rstate->local_disabled_map, chan);
+	tal_free(chan);
 }
 
 static void init_half_chan(struct routing_state *rstate,
@@ -417,8 +430,6 @@ struct chan *new_chan(struct routing_state *rstate,
 	init_half_chan(rstate, chan, !n1idx);
 
 	uintmap_add(&rstate->chanmap, scid->u64, chan);
-
-	tal_add_destructor2(chan, destroy_chan, rstate);
 	return chan;
 }
 
@@ -1334,10 +1345,12 @@ static void add_channel_announce_to_broadcast(struct routing_state *rstate,
 					      u32 timestamp,
 					      u32 index)
 {
+	u8 *addendum = towire_gossip_store_channel_amount(tmpctx, chan->sat);
+
 	chan->bcast.timestamp = timestamp;
 	/* 0, unless we're loading from store */
 	chan->bcast.index = index;
-	insert_broadcast(&rstate->broadcasts, channel_announce, &chan->sat,
+	insert_broadcast(&rstate->broadcasts, channel_announce, addendum,
 			 &chan->bcast);
 	rstate->local_channel_announced |= is_local_channel(rstate, chan);
 }
@@ -1394,7 +1407,8 @@ bool routing_add_channel_announcement(struct routing_state *rstate,
 	}
 
 	/* Pretend it didn't exist, for the moment. */
-	tal_free(chan);
+	if (chan)
+		free_chan(rstate, chan);
 
 	uc = tal(rstate, struct unupdated_channel);
 	uc->channel_announce = tal_dup_arr(uc, u8, msg, tal_count(msg), 0);
@@ -1611,16 +1625,6 @@ void handle_pending_cannouncement(struct routing_state *rstate,
 	pending = find_pending_cannouncement(rstate, scid);
 	if (!pending)
 		return;
-
-#if DEVELOPER
-	if (rstate->dev_unknown_channel_satoshis) {
-		outscript = scriptpubkey_p2wsh(pending,
-			       bitcoin_redeem_2of2(pending,
-						   &pending->bitcoin_key_1,
-						   &pending->bitcoin_key_2));
-		sat = *rstate->dev_unknown_channel_satoshis;
-	}
-#endif
 
 	/* BOLT #7:
 	 *
@@ -2295,6 +2299,8 @@ void routing_failure(struct routing_state *rstate,
 		     enum onion_type failcode,
 		     const u8 *channel_update)
 {
+	struct chan **pruned = tal_arr(tmpctx, struct chan *, 0);
+
 	status_trace("Received routing failure 0x%04x (%s), "
 		     "erring node %s, "
 		     "channel %s/%u",
@@ -2340,7 +2346,7 @@ void routing_failure(struct routing_state *rstate,
 						    &node->id));
 			for (c = first_chan(node, &i); c; c = next_chan(node, &i)) {
 				/* Set it up to be pruned. */
-				tal_steal(tmpctx, c);
+				tal_arr_expand(&pruned, c);
 			}
 		}
 	} else {
@@ -2365,9 +2371,13 @@ void routing_failure(struct routing_state *rstate,
 						    struct short_channel_id,
 						    scid));
 			/* Set it up to be deleted. */
-			tal_steal(tmpctx, chan);
+			tal_arr_expand(&pruned, chan);
 		}
 	}
+
+	/* Now free all the chans and maybe even nodes. */
+	for (size_t i = 0; i < tal_count(pruned); i++)
+		free_chan(rstate, pruned[i]);
 }
 
 
@@ -2376,7 +2386,7 @@ void route_prune(struct routing_state *rstate)
 	u64 now = gossip_time_now(rstate).ts.tv_sec;
 	/* Anything below this highwater mark ought to be pruned */
 	const s64 highwater = now - rstate->prune_timeout;
-	const tal_t *pruned = tal(NULL, char);
+	struct chan **pruned = tal_arr(tmpctx, struct chan *, 0);
 	struct chan *chan;
 	struct unupdated_channel *uc;
 	u64 idx;
@@ -2403,7 +2413,7 @@ void route_prune(struct routing_state *rstate)
 			    : now - chan->half[1].bcast.timestamp);
 
 			/* This may perturb iteration so do outside loop. */
-			tal_steal(pruned, chan);
+			tal_arr_expand(&pruned, chan);
 		}
 	}
 
@@ -2412,12 +2422,13 @@ void route_prune(struct routing_state *rstate)
 	     uc;
 	     uc = uintmap_after(&rstate->unupdated_chanmap, &idx)) {
 		if (uc->added.ts.tv_sec < highwater) {
-			tal_steal(pruned, uc);
+			tal_arr_expand(&pruned, chan);
 		}
 	}
 
-	/* This frees all the chans and maybe even nodes. */
-	tal_free(pruned);
+	/* Now free all the chans and maybe even nodes. */
+	for (size_t i = 0; i < tal_count(pruned); i++)
+		free_chan(rstate, pruned[i]);
 }
 
 #if DEVELOPER

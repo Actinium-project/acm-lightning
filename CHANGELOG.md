@@ -17,12 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - plugin: the `connected` hook can now send an `error_message` to the rejected peer.
 - Protocol: we now enforce `option_upfront_shutdown_script` if a peer negotiates it.
 - JSON API: `listforwards` now includes the local_failed forwards with failcode (Issue [#2435](https://github.com/ElementsProject/lightning/issues/2435), PR [#2524](https://github.com/ElementsProject/lightning/pull/2524))
+- Config: Added a default plugin directory : `lightning_dir/plugins`. Each plugin directory it contains will be added to lightningd on startup.
 
 ### Changed
 
 - JSON API: `invoice` expiry defaults to 7 days, and can have s/m/h/d/w suffixes.
 - Config: Increased default amount for minimal channel capacity from 1k sat to 10k sat.
 - Build: Non-developer builds are now done with "-Og" optimization.
+- JSON API: `pay` will no longer return failure until it is no longer retrying; previously it could "timeout" but still make the payment.
 
 ### Deprecated
 

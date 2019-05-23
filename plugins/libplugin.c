@@ -4,11 +4,13 @@
 #include <ccan/read_write_all/read_write_all.h>
 #include <ccan/strmap/strmap.h>
 #include <ccan/tal/str/str.h>
+#include <ccan/timer/timer.h>
 #include <common/daemon.h>
 #include <common/utils.h>
 #include <errno.h>
 #include <poll.h>
 #include <plugins/libplugin.h>
+#include <stdarg.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -25,17 +27,29 @@ static u64 next_outreq_id;
  * struct json_command as it's good practice to have those const. */
 static STRMAP(const char *) usagemap;
 
+/* Timers */
+static struct timers timers;
+static size_t in_timer;
+
 bool deprecated_apis;
+
+struct plugin_timer {
+	struct timer timer;
+	struct command_result *(*cb)(void);
+};
 
 struct plugin_conn {
 	int fd;
 	MEMBUF(char) mb;
 };
 
+/* Connection to make RPC requests. */
+static struct plugin_conn rpc_conn;
+
 struct command {
 	u64 id;
 	const char *methodname;
-	struct plugin_conn *rpc;
+	bool usage_only;
 };
 
 struct out_req {
@@ -67,16 +81,6 @@ static struct command_result complete, pending;
 struct command_result *command_param_failed(void)
 {
 	return &complete;
-}
-
-void NORETURN plugin_err(const char *fmt, ...)
-{
-	va_list ap;
-
-	/* FIXME: log */
-	va_start(ap, fmt);
-	errx(1, "%s", tal_vfmt(NULL, fmt, ap));
-	va_end(ap);
 }
 
 /* Realloc helper for tal membufs */
@@ -143,8 +147,7 @@ static struct command *read_json_request(const tal_t *ctx,
 		plugin_err("JSON id '%*.s' is not a number",
 			   id->end - id->start,
 			   membuf_elems(&conn->mb) + id->start);
-	/* Putting this in cmd avoids a global, or direct exposure to users */
-	cmd->rpc = rpc;
+	cmd->usage_only = false;
 	cmd->methodname = json_strdup(cmd, membuf_elems(&conn->mb), method);
 
 	return cmd;
@@ -229,6 +232,13 @@ command_done_raw(struct command *cmd,
 	return end_cmd(cmd);
 }
 
+struct command_result *timer_complete(void)
+{
+	assert(in_timer > 0);
+	in_timer--;
+	return &complete;
+}
+
 struct command_result *command_success(struct command *cmd, const char *result)
 {
 	return command_done_raw(cmd, "result", result, strlen(result));
@@ -270,7 +280,7 @@ struct command_result *command_fail(struct command *cmd,
 /* We invoke param for usage at registration time. */
 bool command_usage_only(const struct command *cmd)
 {
-	return cmd->rpc == NULL;
+	return cmd->usage_only;
 }
 
 /* FIXME: would be good to support this! */
@@ -408,24 +418,38 @@ send_outreq_(struct command *cmd,
 	out->arg = arg;
 	uintmap_add(&out_reqs, out->id, out);
 
-	printf_json(cmd->rpc->fd,
+	printf_json(rpc_conn.fd,
 		    "{ 'method': '%s', 'id': %"PRIu64", 'params': {",
 		    method, out->id);
 	va_start(ap, paramfmt_single_ticks);
-	vprintf_json(cmd->rpc->fd, paramfmt_single_ticks, ap);
+	vprintf_json(rpc_conn.fd, paramfmt_single_ticks, ap);
 	va_end(ap);
-	printf_json(cmd->rpc->fd, "} }");
+	printf_json(rpc_conn.fd, "} }");
 	return &pending;
 }
 
 static struct command_result *
 handle_getmanifest(struct command *getmanifest_cmd,
 		   const struct plugin_command *commands,
-		   size_t num_commands)
+		   size_t num_commands,
+		   const struct plugin_option *opts)
 {
 	char *params = tal_strdup(getmanifest_cmd,
-				   "'options': [],\n"
-				   "'rpcmethods': [ ");
+				  "'options': [");
+
+	for (size_t i = 0; i < tal_count(opts); i++) {
+		tal_append_fmt(&params, "{ 'name': '%s',"
+			       "    'type': 'string',"
+			       "    'description': '%s' }%s",
+			       opts[i].name,
+			       opts[i].description,
+			       i == tal_count(opts) - 1 ? "" : ",\n");
+	}
+
+	tal_append_fmt(&params,
+		       "],\n"
+		       "'rpcmethods': [ ");
+
 	for (size_t i = 0; i < num_commands; i++) {
 		tal_append_fmt(&params, "{ 'name': '%s',"
 			       "    'usage': '%s',"
@@ -447,10 +471,12 @@ handle_getmanifest(struct command *getmanifest_cmd,
 static struct command_result *handle_init(struct command *init_cmd,
 					  const char *buf,
 					  const jsmntok_t *params,
+					  const struct plugin_option *opts,
 					  void (*init)(struct plugin_conn *))
 {
-	const jsmntok_t *rpctok, *dirtok;
+	const jsmntok_t *rpctok, *dirtok, *opttok, *t;
 	struct sockaddr_un addr;
+	size_t i;
 	char *dir;
 
 	/* Move into lightning directory: other files are relative */
@@ -460,7 +486,7 @@ static struct command_result *handle_init(struct command *init_cmd,
 		plugin_err("chdir to %s: %s", dir, strerror(errno));
 
 	rpctok = json_delve(buf, params, ".configuration.rpc-file");
-	init_cmd->rpc->fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	rpc_conn.fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (rpctok->end - rpctok->start + 1 > sizeof(addr.sun_path))
 		plugin_err("rpc filename '%.*s' too long",
 			   rpctok->end - rpctok->start,
@@ -469,21 +495,58 @@ static struct command_result *handle_init(struct command *init_cmd,
 	addr.sun_path[rpctok->end - rpctok->start] = '\0';
 	addr.sun_family = AF_UNIX;
 
-	if (connect(init_cmd->rpc->fd, (struct sockaddr *)&addr, sizeof(addr)) != 0)
+	if (connect(rpc_conn.fd, (struct sockaddr *)&addr, sizeof(addr)) != 0)
 		plugin_err("Connecting to '%.*s': %s",
 			   rpctok->end - rpctok->start, buf + rpctok->start,
 			   strerror(errno));
 
 	deprecated_apis = streq(rpc_delve(tmpctx, "listconfigs",
 					  "'config': 'allow-deprecated-apis'",
-					  init_cmd->rpc,
+					  &rpc_conn,
 					  ".allow-deprecated-apis"),
 				"true");
 
+	opttok = json_get_member(buf, params, "options");
+	json_for_each_obj(i, t, opttok) {
+		char *opt = json_strdup(NULL, buf, t);
+		for (size_t i = 0; i < tal_count(opts); i++) {
+			char *problem;
+			if (!streq(opts[i].name, opt))
+				continue;
+			problem = opts[i].handle(json_strdup(opt, buf, t+1),
+						 opts[i].arg);
+			if (problem)
+				plugin_err("option '%s': %s",
+					   opts[i].name, problem);
+			break;
+		}
+		tal_free(opt);
+	}
+
 	if (init)
-		init(init_cmd->rpc);
+		init(&rpc_conn);
 
 	return command_done_ok(init_cmd, "");
+}
+
+char *u64_option(const char *arg, u64 *i)
+{
+	char *endp;
+
+	/* This is how the manpage says to do it.  Yech. */
+	errno = 0;
+	*i = strtol(arg, &endp, 0);
+	if (*endp || !arg[0])
+		return tal_fmt(NULL, "'%s' is not a number", arg);
+	if (errno)
+		return tal_fmt(NULL, "'%s' is out of range", arg);
+	return NULL;
+}
+
+char *charp_option(const char *arg, char **p)
+{
+	*p = tal_strdup(NULL, arg);
+	return NULL;
 }
 
 static void handle_new_command(const tal_t *ctx,
@@ -515,7 +578,7 @@ static void setup_command_usage(const struct plugin_command *commands,
 	struct command *usage_cmd = tal(tmpctx, struct command);
 
 	/* This is how common/param can tell it's just a usage request */
-	usage_cmd->rpc = NULL;
+	usage_cmd->usage_only = true;
 	for (size_t i = 0; i < num_commands; i++) {
 		struct command_result *res;
 
@@ -526,17 +589,86 @@ static void setup_command_usage(const struct plugin_command *commands,
 	}
 }
 
+static void call_plugin_timer(struct plugin_conn *rpc, struct timer *timer)
+{
+	struct plugin_timer *t = container_of(timer, struct plugin_timer, timer);
+
+	in_timer++;
+	/* Free this if they don't. */
+	tal_steal(tmpctx, t);
+	t->cb();
+}
+
+static void destroy_plugin_timer(struct plugin_timer *timer)
+{
+	timer_del(&timers, &timer->timer);
+}
+
+struct plugin_timer *plugin_timer(struct plugin_conn *rpc, struct timerel t,
+				  struct command_result *(*cb)(void))
+{
+	struct plugin_timer *timer = tal(NULL, struct plugin_timer);
+	timer->cb = cb;
+	timer_init(&timer->timer);
+	timer_addrel(&timers, &timer->timer, t);
+	tal_add_destructor(timer, destroy_plugin_timer);
+	return timer;
+}
+
+static void plugin_logv(enum log_level l, const char *fmt, va_list ap)
+{
+	char *message;
+
+	printf_json(STDOUT_FILENO,
+		    "{ 'jsonrpc': '2.0', "
+		    "'method': 'log', "
+		    "'params': { 'level': '%s', 'message': \"",
+		    l == LOG_DBG ? "debug"
+		    : l == LOG_INFORM ? "info"
+		    : l == LOG_UNUSUAL ? "warn"
+		    : "error");
+
+	message = tal_vfmt(NULL, fmt, ap);
+	write_all(STDOUT_FILENO, message, strlen(message));
+	printf_json(STDOUT_FILENO, "\" } }\n\n");
+	tal_free(message);
+}
+
+void NORETURN plugin_err(const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	plugin_logv(LOG_BROKEN, fmt, ap);
+	va_end(ap);
+	va_start(ap, fmt);
+	errx(1, "%s", tal_vfmt(NULL, fmt, ap));
+	va_end(ap);
+}
+
+void plugin_log(enum log_level l, const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	plugin_logv(l, fmt, ap);
+	va_end(ap);
+}
+
 void plugin_main(char *argv[],
 		 void (*init)(struct plugin_conn *rpc),
 		 const struct plugin_command *commands,
-		 size_t num_commands)
+		 size_t num_commands, ...)
 {
-	struct plugin_conn request_conn, rpc_conn;
+	struct plugin_conn request_conn;
 	const tal_t *ctx = tal(NULL, char);
 	struct command *cmd;
 	const jsmntok_t *params;
 	int reqlen;
 	struct pollfd fds[2];
+	struct plugin_option *opts = tal_arr(ctx, struct plugin_option, 0);
+	va_list ap;
+	const char *optname;
 
 	setup_locale();
 
@@ -547,6 +679,7 @@ void plugin_main(char *argv[],
 
 	setup_command_usage(commands, num_commands);
 
+	timers_init(&timers, time_mono());
 	membuf_init(&rpc_conn.mb,
 		    tal_arr(ctx, char, READ_CHUNKSIZE), READ_CHUNKSIZE,
 		    membuf_tal_realloc);
@@ -556,13 +689,24 @@ void plugin_main(char *argv[],
 		    membuf_tal_realloc);
 	uintmap_init(&out_reqs);
 
+	va_start(ap, num_commands);
+	while ((optname = va_arg(ap, const char *)) != NULL) {
+		struct plugin_option o;
+		o.name = optname;
+		o.description = va_arg(ap, const char *);
+		o.handle = va_arg(ap, char *(*)(const char *str, void *arg));
+		o.arg = va_arg(ap, void *);
+		tal_arr_expand(&opts, o);
+	}
+	va_end(ap);
+
 	cmd = read_json_request(tmpctx, &request_conn, NULL,
 				&params, &reqlen);
 	if (!streq(cmd->methodname, "getmanifest"))
 		plugin_err("Expected getmanifest not %s", cmd->methodname);
 
 	membuf_consume(&request_conn.mb, reqlen);
-	handle_getmanifest(cmd, commands, num_commands);
+	handle_getmanifest(cmd, commands, num_commands, opts);
 
 	cmd = read_json_request(tmpctx, &request_conn, &rpc_conn,
 				&params, &reqlen);
@@ -570,7 +714,7 @@ void plugin_main(char *argv[],
 		plugin_err("Expected init not %s", cmd->methodname);
 
 	handle_init(cmd, membuf_elems(&request_conn.mb),
-		    params, init);
+		    params, opts, init);
 	membuf_consume(&request_conn.mb, reqlen);
 
 	/* Set up fds for poll. */
@@ -580,6 +724,10 @@ void plugin_main(char *argv[],
 	fds[1].events = POLLIN;
 
 	for (;;) {
+		struct timer *expired;
+		struct timemono now, first;
+		int t;
+
 		clean_tmpctx();
 
 		/* If we already have some input, process now. */
@@ -593,8 +741,22 @@ void plugin_main(char *argv[],
 			continue;
 		}
 
+		/* Handle any timeouts */
+		now = time_mono();
+		expired = timers_expire(&timers, now);
+		if (expired) {
+			call_plugin_timer(&rpc_conn, expired);
+			continue;
+		}
+
+		/* If we have a pending timer, timeout then */
+		if (timer_earliest(&timers, &first))
+			t = time_to_msec(timemono_between(first, now));
+		else
+			t = -1;
+
 		/* Otherwise, we poll. */
-		poll(fds, 2, -1);
+		poll(fds, 2, t);
 
 		if (fds[0].revents & POLLIN)
 			handle_new_command(ctx, &request_conn, &rpc_conn,
