@@ -382,6 +382,9 @@ static struct migration dbmigrations[] = {
 	{ "ALTER TABLE channels ADD remote_upfront_shutdown_script BLOB;", NULL },
 	/* PR #2524: Add failcode into forward_payment */
 	{ "ALTER TABLE forwarded_payments ADD failcode INTEGER;", NULL },
+	/* remote signatures for channel announcement */
+	{ "ALTER TABLE channels ADD remote_ann_node_sig BLOB;", NULL },
+	{ "ALTER TABLE channels ADD remote_ann_bitcoin_sig BLOB;", NULL },
 };
 
 /* Leak tracking. */
@@ -1165,7 +1168,7 @@ void migrate_pr2342_feerate_per_channel(struct lightningd *ld, struct db *db)
 
 void sqlite3_bind_timeabs(sqlite3_stmt *stmt, int col, struct timeabs t)
 {
-	u64 timestamp =  t.ts.tv_nsec + (t.ts.tv_sec * NSEC_IN_SEC);
+	u64 timestamp =  t.ts.tv_nsec + (((u64) t.ts.tv_sec) * ((u64) NSEC_IN_SEC));
 	sqlite3_bind_int64(stmt, col, timestamp);
 }
 

@@ -117,6 +117,25 @@ static void peer_got_funding_locked(struct channel *channel, const u8 *msg)
 		lockin_complete(channel);
 }
 
+static void peer_got_announcement(struct channel *channel, const u8 *msg)
+{
+	secp256k1_ecdsa_signature remote_ann_node_sig;
+	secp256k1_ecdsa_signature remote_ann_bitcoin_sig;
+
+	if (!fromwire_channel_got_announcement(msg,
+					       &remote_ann_node_sig,
+					       &remote_ann_bitcoin_sig)) {
+		channel_internal_error(channel,
+				       "bad channel_got_funding_locked %s",
+				       tal_hex(tmpctx, msg));
+		return;
+	}
+
+	wallet_announcement_save(channel->peer->ld->wallet, channel->dbid,
+				 &remote_ann_node_sig,
+				 &remote_ann_bitcoin_sig);
+}
+
 static void peer_got_shutdown(struct channel *channel, const u8 *msg)
 {
 	u8 *scriptpubkey;
@@ -219,6 +238,9 @@ static unsigned channel_msg(struct subd *sd, const u8 *msg, const int *fds)
 	case WIRE_CHANNEL_GOT_FUNDING_LOCKED:
 		peer_got_funding_locked(sd->channel, msg);
 		break;
+	case WIRE_CHANNEL_GOT_ANNOUNCEMENT:
+		peer_got_announcement(sd->channel, msg);
+		break;
 	case WIRE_CHANNEL_GOT_SHUTDOWN:
 		peer_got_shutdown(sd->channel, msg);
 		break;
@@ -275,6 +297,7 @@ void peer_start_channeld(struct channel *channel,
 	const struct config *cfg = &ld->config;
 	bool reached_announce_depth;
 	struct secret last_remote_per_commit_secret;
+	secp256k1_ecdsa_signature *remote_ann_node_sig, *remote_ann_bitcoin_sig;
 
 	hsmfd = hsm_get_client_fd(ld, &channel->peer->id,
 				  channel->dbid,
@@ -348,6 +371,13 @@ void peer_start_channeld(struct channel *channel,
 	if (ld->config.ignore_fee_limits)
 		log_debug(channel->log, "Ignoring fee limits!");
 
+	if(!wallet_remote_ann_sigs_load(tmpctx, channel->peer->ld->wallet, channel->dbid,
+				       &remote_ann_node_sig, &remote_ann_bitcoin_sig)) {
+		channel_internal_error(channel,
+				       "Could not load remote announcement signatures");
+		return;
+	}
+
 	initmsg = towire_channel_init(tmpctx,
 				      &get_chainparams(ld)->genesis_blockhash,
 				      &channel->funding_txid,
@@ -397,7 +427,9 @@ void peer_start_channeld(struct channel *channel,
 				      reached_announce_depth,
 				      &last_remote_per_commit_secret,
 				      channel->peer->localfeatures,
-				      channel->remote_upfront_shutdown_script);
+				      channel->remote_upfront_shutdown_script,
+				      remote_ann_node_sig,
+				      remote_ann_bitcoin_sig);
 
 	/* We don't expect a response: we are triggered by funding_depth_cb. */
 	subd_send_msg(channel->owner, take(initmsg));

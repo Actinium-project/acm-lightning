@@ -177,7 +177,7 @@ static void billboard_update(const struct peer *peer)
 		funding_status = "Funding transaction locked.";
 	else if (!peer->funding_locked[LOCAL] && !peer->funding_locked[REMOTE])
 		funding_status = tal_fmt(tmpctx,
-					"Funding needs %d confirmations to reach lockin.",
+					"Funding needs %d more confirmations for lockin.",
 					peer->depth_togo);
 	else if (peer->funding_locked[LOCAL] && !peer->funding_locked[REMOTE])
 		funding_status = "We've confirmed funding, they haven't yet.";
@@ -451,8 +451,6 @@ static void announce_channel(struct peer *peer)
 {
 	u8 *cannounce;
 
-	check_short_ids_match(peer);
-
 	cannounce = create_channel_announcement(tmpctx, peer);
 
 	wire_sync_write(GOSSIP_FD, cannounce);
@@ -493,6 +491,10 @@ static void channel_announcement_negotiate(struct peer *peer)
 	 *      has been sent and received AND the funding transaction has at least six confirmations.
  	 */
 	if (peer->announce_depth_reached && !peer->have_sigs[LOCAL]) {
+		/* When we reenable the channel, we will also send the announcement to remote peer, and
+		 * receive the remote announcement reply. But we will rebuild the channel with announcement
+		 * from the DB directly, other than waiting for the remote announcement reply.
+		 */
 		send_announcement_signatures(peer);
 		peer->have_sigs[LOCAL] = true;
 		billboard_update(peer);
@@ -500,8 +502,18 @@ static void channel_announcement_negotiate(struct peer *peer)
 
 	/* If we've completed the signature exchange, we can send a real
 	 * announcement, otherwise we send a temporary one */
-	if (peer->have_sigs[LOCAL] && peer->have_sigs[REMOTE])
+	if (peer->have_sigs[LOCAL] && peer->have_sigs[REMOTE]) {
+		check_short_ids_match(peer);
+
+		/* After making sure short_channel_ids match, we can send remote
+		 * announcement to MASTER. */
+		wire_sync_write(MASTER_FD,
+			        take(towire_channel_got_announcement(NULL,
+			        &peer->announcement_node_sigs[REMOTE],
+			        &peer->announcement_bitcoin_sigs[REMOTE])));
+
 		announce_channel(peer);
+	}
 }
 
 static void handle_peer_funding_locked(struct peer *peer, const u8 *msg)
@@ -2778,6 +2790,7 @@ static void req_in(struct peer *peer, const u8 *msg)
 	case WIRE_CHANNEL_GOT_COMMITSIG_REPLY:
 	case WIRE_CHANNEL_GOT_REVOKE_REPLY:
 	case WIRE_CHANNEL_GOT_FUNDING_LOCKED:
+	case WIRE_CHANNEL_GOT_ANNOUNCEMENT:
 	case WIRE_CHANNEL_GOT_SHUTDOWN:
 	case WIRE_CHANNEL_SHUTDOWN_COMPLETE:
 	case WIRE_CHANNEL_DEV_REENABLE_COMMIT_REPLY:
@@ -2829,6 +2842,8 @@ static void init_channel(struct peer *peer)
 	u32 feerate_per_kw[NUM_SIDES];
 	u32 minimum_depth;
 	struct secret last_remote_per_commit_secret;
+	secp256k1_ecdsa_signature *remote_ann_node_sig;
+	secp256k1_ecdsa_signature *remote_ann_bitcoin_sig;
 
 	assert(!(fcntl(MASTER_FD, F_GETFL) & O_NONBLOCK));
 
@@ -2883,7 +2898,9 @@ static void init_channel(struct peer *peer)
 				   &peer->announce_depth_reached,
 				   &last_remote_per_commit_secret,
 				   &peer->localfeatures,
-				   &peer->remote_upfront_shutdown_script)) {
+				   &peer->remote_upfront_shutdown_script,
+				   &remote_ann_node_sig,
+				   &remote_ann_bitcoin_sig)) {
 					   master_badmsg(WIRE_CHANNEL_INIT, msg);
 	}
 
@@ -2901,6 +2918,18 @@ static void init_channel(struct peer *peer)
 		     peer->revocations_received,
 		     feerate_per_kw[LOCAL], feerate_per_kw[REMOTE],
 		     peer->feerate_min, peer->feerate_max);
+
+	if(remote_ann_node_sig && remote_ann_bitcoin_sig) {
+		peer->announcement_node_sigs[REMOTE] = *remote_ann_node_sig;
+		peer->announcement_bitcoin_sigs[REMOTE] = *remote_ann_bitcoin_sig;
+		peer->have_sigs[REMOTE] = true;
+
+		/* Before we store announcement into DB, we have made sure
+		 * remote short_channel_id matched the local. Now we initial
+		 * it directly!
+		 */
+		peer->short_channel_ids[REMOTE] = peer->short_channel_ids[LOCAL];
+	}
 
 	/* First commit is used for opening: if we've sent 0, we're on
 	 * index 1. */
@@ -2946,6 +2975,8 @@ static void init_channel(struct peer *peer)
 	tal_free(fulfilled_sides);
 	tal_free(failed);
 	tal_free(failed_sides);
+	tal_free(remote_ann_node_sig);
+	tal_free(remote_ann_bitcoin_sig);
 
 	peer->channel_direction = node_id_idx(&peer->node_ids[LOCAL],
 					      &peer->node_ids[REMOTE]);

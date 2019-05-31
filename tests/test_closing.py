@@ -66,8 +66,8 @@ def test_closing(node_factory, bitcoind):
     ]
     bitcoind.generate_block(1)
 
-    l1.daemon.wait_for_log(r'Owning output .* txid %s' % closetxid)
-    l2.daemon.wait_for_log(r'Owning output .* txid %s' % closetxid)
+    l1.daemon.wait_for_log(r'Owning output.* \(SEGWIT\).* txid %s.* CONFIRMED' % closetxid)
+    l2.daemon.wait_for_log(r'Owning output.* \(SEGWIT\).* txid %s.* CONFIRMED' % closetxid)
 
     # Make sure both nodes have grabbed their close tx funds
     assert closetxid in set([o['txid'] for o in l1.rpc.listfunds()['outputs']])
@@ -308,7 +308,7 @@ def test_penalty_inhtlc(node_factory, bitcoind, executor):
     l2.daemon.wait_for_log('=WIRE_COMMITMENT_SIGNED-nocommit')
 
     # Make sure l1 got l2's commitment to the HTLC, and sent to master.
-    l1.daemon.wait_for_log('UPDATE WIRE_CHANNEL_GOT_COMMITSIG')
+    l1.daemon.wait_for_log('got commitsig')
 
     # Take our snapshot.
     tx = l1.rpc.dev_sign_last_tx(l2.info['id'])['tx']
@@ -779,7 +779,7 @@ def test_onchain_middleman(node_factory, bitcoind):
         print("Got err from sendpay thread")
         raise err
     t.join(timeout=1)
-    assert not t.isAlive()
+    assert not t.is_alive()
 
     # Three more, l2 can spend to-us.
     bitcoind.generate_block(3)

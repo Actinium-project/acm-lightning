@@ -1,5 +1,6 @@
 from collections import namedtuple
 from fixtures import *  # noqa: F401,F403
+from flaky import flaky  # noqa: F401
 from lightning import RpcError
 from utils import DEVELOPER, only_one, wait_for, sync_blockheight, VALGRIND
 
@@ -363,8 +364,10 @@ def test_reconnect_openingd(node_factory):
     l1.rpc.fundchannel(l2.info['id'], 20000)
     l1.daemon.wait_for_log('sendrawtx exit 0')
 
-    # Just to be sure, second openingd hand over to channeld.
-    l2.daemon.wait_for_log('lightning_openingd.*UPDATE WIRE_OPENING_FUNDEE')
+    l1.bitcoin.generate_block(3)
+
+    # Just to be sure, second openingd hand over to channeld. This log line is about channeld being started
+    l2.daemon.wait_for_log(r'lightning_channeld-[0-9a-f]{66} chan #[0-9]: pid [0-9]+, msgfd [0-9]+')
 
 
 @unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1")
@@ -375,6 +378,8 @@ def test_reconnect_gossiping(node_factory):
     l2 = node_factory.get_node(disconnect=disconnects,
                                may_reconnect=True)
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    # Make sure l2 knows about l1
+    wait_for(lambda: l2.rpc.listpeers(l1.info['id'])['peers'] != [])
 
     l2.rpc.ping(l1.info['id'], 1, 65532)
     wait_for(lambda: l1.rpc.listpeers(l2.info['id'])['peers'] == [])
@@ -563,6 +568,7 @@ def test_reconnect_receiver_fulfill(node_factory):
     assert only_one(l2.rpc.listinvoices('testpayment2')['invoices'])['status'] == 'paid'
 
 
+@flaky
 @unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1")
 def test_shutdown_reconnect(node_factory):
     disconnects = ['-WIRE_SHUTDOWN',
@@ -1120,8 +1126,8 @@ def test_peerinfo(node_factory, bitcoind):
     wait_for(lambda: not only_one(l2.rpc.listpeers(l1.info['id'])['peers'])['connected'])
 
     bitcoind.generate_block(100)
-    l1.daemon.wait_for_log('WIRE_ONCHAIN_ALL_IRREVOCABLY_RESOLVED')
-    l2.daemon.wait_for_log('WIRE_ONCHAIN_ALL_IRREVOCABLY_RESOLVED')
+    l1.daemon.wait_for_log('onchaind complete, forgetting peer')
+    l2.daemon.wait_for_log('onchaind complete, forgetting peer')
 
     # The only channel was closed, everybody should have forgotten the nodes
     assert l1.rpc.listnodes()['nodes'] == []
@@ -1414,7 +1420,7 @@ def test_dataloss_protection(node_factory, bitcoind):
 
     l2.daemon.wait_for_log("ERROR: Unknown commitment #[0-9], recovering our funds!")
     bitcoind.generate_block(100)
-    l2.daemon.wait_for_log('WIRE_ONCHAIN_ALL_IRREVOCABLY_RESOLVED')
+    l2.daemon.wait_for_log('onchaind complete, forgetting peer')
 
     # l2 should have it in wallet.
     assert (closetxid, "confirmed") in set([(o['txid'], o['status']) for o in l2.rpc.listfunds()['outputs']])
