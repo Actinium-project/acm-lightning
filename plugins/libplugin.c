@@ -439,11 +439,12 @@ handle_getmanifest(struct command *getmanifest_cmd,
 
 	for (size_t i = 0; i < tal_count(opts); i++) {
 		tal_append_fmt(&params, "{ 'name': '%s',"
-			       "    'type': 'string',"
-			       "    'description': '%s' }%s",
-			       opts[i].name,
-			       opts[i].description,
-			       i == tal_count(opts) - 1 ? "" : ",\n");
+				"    'type': '%s',"
+				"    'description': '%s' }%s",
+				opts[i].name,
+				opts[i].type,
+				opts[i].description,
+				i == tal_count(opts) - 1 ? "" : ",\n");
 	}
 
 	tal_append_fmt(&params,
@@ -452,14 +453,16 @@ handle_getmanifest(struct command *getmanifest_cmd,
 
 	for (size_t i = 0; i < num_commands; i++) {
 		tal_append_fmt(&params, "{ 'name': '%s',"
-			       "    'usage': '%s',"
-			       "    'description': '%s'",
+				   "    'category': '%s',"
+				   "    'usage': '%s',"
+				   "    'description': '%s'",
 			       commands[i].name,
+				   commands[i].category,
 			       strmap_get(&usagemap, commands[i].name),
 			       commands[i].description);
 		if (commands[i].long_description)
 			tal_append_fmt(&params,
-				       "   'long_description': '%s'",
+				       "    'long_description': '%s'",
 				       commands[i].long_description);
 		tal_append_fmt(&params,
 			       "}%s", i == num_commands - 1 ? "" : ",\n");
@@ -505,7 +508,6 @@ static struct command_result *handle_init(struct command *init_cmd,
 					  &rpc_conn,
 					  ".allow-deprecated-apis"),
 				"true");
-
 	opttok = json_get_member(buf, params, "options");
 	json_for_each_obj(i, t, opttok) {
 		char *opt = json_strdup(NULL, buf, t);
@@ -693,6 +695,7 @@ void plugin_main(char *argv[],
 	while ((optname = va_arg(ap, const char *)) != NULL) {
 		struct plugin_option o;
 		o.name = optname;
+		o.type = va_arg(ap, const char *);
 		o.description = va_arg(ap, const char *);
 		o.handle = va_arg(ap, char *(*)(const char *str, void *arg));
 		o.arg = va_arg(ap, void *);

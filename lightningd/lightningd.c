@@ -70,6 +70,7 @@
 #include <lightningd/channel_control.h>
 #include <lightningd/connect_control.h>
 #include <lightningd/invoice.h>
+#include <lightningd/io_loop_with_timers.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/log.h>
 #include <lightningd/onchain_control.h>
@@ -408,9 +409,9 @@ static void shutdown_subdaemons(struct lightningd *ld)
 	close(ld->hsm_fd);
 	/*~ The three "global" daemons, which we shutdown explicitly: we
 	 * give them 10 seconds to exit gracefully before killing them.  */
-	subd_shutdown(ld->connectd, 10);
-	subd_shutdown(ld->gossip, 10);
-	subd_shutdown(ld->hsm, 10);
+	ld->connectd = subd_shutdown(ld->connectd, 10);
+	ld->gossip = subd_shutdown(ld->gossip, 10);
+	ld->hsm = subd_shutdown(ld->hsm, 10);
 
 	/* Now we free all the HTLCs */
 	free_htlcs(ld, NULL);
@@ -810,30 +811,12 @@ int main(int argc, char *argv[])
 
 	/*~ The root of every backtrace (almost).  This is our main event
 	 *  loop. */
-	for (;;) {
-		/* ~ccan/io's io_loop() continuously calls
-		 * io_poll_lightningd() for all file descriptors registered
-		 * with it, then calls their callbacks or closes them if they
-		 * fail, as appropriate.
-		 *
-		 * It will only exit if there's an expired timer, *or* someone
-		 * calls io_break, or if there are no more file descriptors
-		 * (which never happens in our code). */
-		struct timer *expired;
-		void *v = io_loop(&ld->timers, &expired);
-
-		/*~ We use io_break(ld) to shut down. */
-		if (v == ld)
-			break;
-
-		/*~ Notice that timers are called here in the event loop like
-		 * anything else, so there are no weird concurrency issues. */
-		if (expired) {
-			db_begin_transaction(ld->wallet->db);
-			timer_expired(ld, expired);
-			db_commit_transaction(ld->wallet->db);
-		}
-	}
+	void *io_loop_ret = io_loop_with_timers(ld);
+	/*~ io_loop_with_timers will only exit if we call io_break.
+	 *  At this point in code, we should use io_break(ld) to
+	 *  shut down.
+	 */
+	assert(io_loop_ret == ld);
 
 	shutdown_subdaemons(ld);
 

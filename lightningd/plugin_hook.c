@@ -54,7 +54,7 @@ static void plugin_hook_callback(const char *buffer, const jsmntok_t *toks,
 	if (!resulttok)
 		fatal("Plugin for %s returned non-result response %.*s",
 		      r->hook->name,
-		      toks->end - toks->start, buffer + toks->end);
+		      toks->end - toks->start, buffer + toks->start);
 
 	db_begin_transaction(r->db);
 	r->hook->response_cb(r->cb_arg, buffer, resulttok);
@@ -74,8 +74,8 @@ void plugin_hook_call_(struct lightningd *ld, const struct plugin_hook *hook,
 		 * currently have a list to store these. We might want
 		 * to eventually to inspect in-flight requests. */
 		ph_req = notleak(tal(hook->plugin, struct plugin_hook_request));
-		/* FIXME: do IO logging for these! */
-		req = jsonrpc_request_start(NULL, hook->name, NULL,
+		req = jsonrpc_request_start(NULL, hook->name,
+					    plugin_get_log(hook->plugin),
 					    plugin_hook_callback, ph_req);
 		ph_req->hook = hook;
 		ph_req->cb_arg = cb_arg;

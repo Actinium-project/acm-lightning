@@ -300,6 +300,7 @@ static size_t transfer_store_msg(int from_fd, size_t from_off, int to_fd,
 	const u8 *p;
 	size_t tmplen;
 
+	*type = -1;
 	if (pread(from_fd, hdr, sizeof(hdr), from_off) != sizeof(hdr)) {
 		status_broken("Failed reading header from to gossip store @%zu"
 			      ": %s",
@@ -528,7 +529,7 @@ void gossip_store_load(struct routing_state *rstate, struct gossip_store *gs)
 	size_t stats[] = {0, 0, 0, 0};
 	struct timeabs start = time_now();
 	const u8 *chan_ann = NULL;
-	u64 chan_ann_off;
+	u64 chan_ann_off = 0; /* Spurious gcc-9 (Ubuntu 9-20190402-1ubuntu1) 9.0.1 20190402 (experimental) warning */
 
 	gs->writable = false;
 	while (pread(gs->fd, hdr, sizeof(hdr), gs->len) == sizeof(hdr)) {
