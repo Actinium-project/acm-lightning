@@ -4,6 +4,7 @@
 #include <bitcoin/pubkey.h>
 #include <ccan/crypto/siphash24/siphash24.h>
 #include <ccan/htable/htable_type.h>
+#include <ccan/intmap/intmap.h>
 #include <ccan/time/time.h>
 #include <common/amount.h>
 #include <common/node_id.h>
@@ -12,6 +13,8 @@
 #include <gossipd/gossip_store.h>
 #include <wire/gen_onion_wire.h>
 #include <wire/wire.h>
+
+struct routing_state;
 
 struct half_chan {
 	/* millisatoshi. */
@@ -57,11 +60,11 @@ struct chan {
 /* Use this instead of tal_free(chan)! */
 void free_chan(struct routing_state *rstate, struct chan *chan);
 
-/* A local channel can exist which isn't announced; normal channels are only
- * created once we have both an announcement *and* an update. */
+/* A local channel can exist which isn't announced: we abuse timestamp
+ * to indicate this. */
 static inline bool is_chan_public(const struct chan *chan)
 {
-	return chan->bcast.index != 0;
+	return chan->bcast.timestamp != 0;
 }
 
 static inline bool is_halfchan_defined(const struct half_chan *hc)
@@ -218,8 +221,8 @@ struct routing_state {
 	/* channel_announcement which are pending short_channel_id lookup */
 	struct pending_cannouncement_map pending_cannouncements;
 
-	/* Broadcast map, and access to gossip store */
-	struct broadcast_state *broadcasts;
+	/* Gossip store */
+	struct gossip_store *gs;
 
 	/* Our own ID so we can identify local channels */
 	struct node_id local_id;
@@ -386,7 +389,8 @@ bool routing_add_node_announcement(struct routing_state *rstate,
  * is the case for private channels or channels that have not yet reached
  * `announce_depth`.
  */
-bool handle_local_add_channel(struct routing_state *rstate, const u8 *msg);
+bool handle_local_add_channel(struct routing_state *rstate, const u8 *msg,
+			      u64 index);
 
 #if DEVELOPER
 void memleak_remove_routing_tables(struct htable *memtable,
@@ -424,5 +428,9 @@ static inline void local_enable_chan(struct routing_state *rstate,
 
 /* Helper to convert on-wire addresses format to wireaddrs array */
 struct wireaddr *read_addresses(const tal_t *ctx, const u8 *ser);
+
+/* Remove channel from store: announcement and any updates. */
+void remove_channel_from_store(struct routing_state *rstate,
+			       struct chan *chan);
 
 #endif /* LIGHTNING_GOSSIPD_ROUTING_H */

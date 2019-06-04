@@ -32,6 +32,7 @@ struct pending_node_announce {
 	size_t refcount;
 	u8 *node_announcement;
 	u32 timestamp;
+	u32 index;
 };
 
 static const struct node_id *
@@ -173,8 +174,7 @@ struct routing_state *new_routing_state(const tal_t *ctx,
 {
 	struct routing_state *rstate = tal(ctx, struct routing_state);
 	rstate->nodes = new_node_map(rstate);
-	rstate->broadcasts
-		= new_broadcast_state(rstate, gossip_store_new(rstate), peers);
+	rstate->gs = gossip_store_new(rstate, peers);
 	rstate->chainparams = chainparams;
 	rstate->local_id = *local_id;
 	rstate->prune_timeout = prune_timeout;
@@ -225,9 +225,6 @@ static void destroy_node(struct node *node, struct routing_state *rstate)
 	struct chan_map_iter i;
 	struct chan *c;
 	node_map_del(rstate->nodes, node);
-
-	/* Safe even if never placed in broadcast map */
-	broadcast_del(rstate->broadcasts, &node->bcast);
 
 	/* These remove themselves from chans[]. */
 	while ((c = first_chan(node, &i)) != NULL)
@@ -329,6 +326,9 @@ static void remove_chan_from_node(struct routing_state *rstate,
 
 	/* Last channel?  Simply delete node (and associated announce) */
 	if (num_chans == 0) {
+		gossip_store_delete(rstate->gs,
+				    &node->bcast,
+				    WIRE_NODE_ANNOUNCEMENT);
 		tal_free(node);
 		return;
 	}
@@ -338,20 +338,26 @@ static void remove_chan_from_node(struct routing_state *rstate,
 
 	/* Removed only public channel?  Remove node announcement. */
 	if (!node_has_broadcastable_channels(node)) {
-		broadcast_del(rstate->broadcasts, &node->bcast);
+		gossip_store_delete(rstate->gs,
+				    &node->bcast,
+				    WIRE_NODE_ANNOUNCEMENT);
 	} else if (node_announce_predates_channels(node)) {
 		const u8 *announce;
 
-		announce = gossip_store_get(tmpctx, rstate->broadcasts->gs,
+		announce = gossip_store_get(tmpctx, rstate->gs,
 					    node->bcast.index);
 
 		/* node announcement predates all channel announcements?
 		 * Move to end (we could, in theory, move to just past next
 		 * channel_announce, but we don't care that much about spurious
 		 * retransmissions in this corner case */
-		broadcast_del(rstate->broadcasts, &node->bcast);
-		insert_broadcast(&rstate->broadcasts, announce, NULL,
-				 &node->bcast);
+		gossip_store_delete(rstate->gs,
+				    &node->bcast,
+				    WIRE_NODE_ANNOUNCEMENT);
+		node->bcast.index = gossip_store_add(rstate->gs,
+						     announce,
+						     node->bcast.timestamp,
+						     NULL);
 	}
 }
 
@@ -361,11 +367,6 @@ void free_chan(struct routing_state *rstate, struct chan *chan)
 {
 	remove_chan_from_node(rstate, chan->nodes[0], chan);
 	remove_chan_from_node(rstate, chan->nodes[1], chan);
-
-	/* Safe even if never placed in map */
-	broadcast_del(rstate->broadcasts, &chan->bcast);
-	broadcast_del(rstate->broadcasts, &chan->half[0].bcast);
-	broadcast_del(rstate->broadcasts, &chan->half[1].bcast);
 
 	uintmap_del(&rstate->chanmap, chan->scid.u64);
 
@@ -420,6 +421,8 @@ struct chan *new_chan(struct routing_state *rstate,
 	chan->nodes[n1idx] = n1;
 	chan->nodes[!n1idx] = n2;
 	broadcastable_init(&chan->bcast);
+	/* This is how we indicate it's not public yet. */
+	chan->bcast.timestamp = 0;
 	chan->sat = satoshis;
 
 	add_chan(n2, chan);
@@ -1285,6 +1288,7 @@ static void catch_node_announcement(const tal_t *ctx,
 		pna->nodeid = *nodeid;
 		pna->node_announcement = NULL;
 		pna->timestamp = 0;
+		pna->index = 0;
 		pna->refcount = 0;
 		pending_node_map_add(rstate->pending_node_map, pna);
 	}
@@ -1300,18 +1304,17 @@ static void process_pending_node_announcement(struct routing_state *rstate,
 		return;
 
 	if (pna->node_announcement) {
-		u8 *err;
 		SUPERVERBOSE(
 		    "Processing deferred node_announcement for node %s",
 		    type_to_string(pna, struct node_id, nodeid));
 
 		/* Should not error, since we processed it before */
-		err = handle_node_announcement(rstate, pna->node_announcement);
-		if (err)
+		if (!routing_add_node_announcement(rstate,
+						   pna->node_announcement,
+						   pna->index))
 			status_failed(STATUS_FAIL_INTERNAL_ERROR,
-				      "pending node_announcement %s malformed %s?",
-				      tal_hex(tmpctx, pna->node_announcement),
-				      sanitize_error(tmpctx, err, NULL));
+				      "pending node_announcement %s malformed?",
+				      tal_hex(tmpctx, pna->node_announcement));
 	}
 }
 
@@ -1349,9 +1352,13 @@ static void add_channel_announce_to_broadcast(struct routing_state *rstate,
 
 	chan->bcast.timestamp = timestamp;
 	/* 0, unless we're loading from store */
-	chan->bcast.index = index;
-	insert_broadcast(&rstate->broadcasts, channel_announce, addendum,
-			 &chan->bcast);
+	if (index)
+		chan->bcast.index = index;
+	else
+		chan->bcast.index = gossip_store_add(rstate->gs,
+						     channel_announce,
+						     chan->bcast.timestamp,
+						     addendum);
 	rstate->local_channel_announced |= is_local_channel(rstate, chan);
 }
 
@@ -1390,25 +1397,31 @@ bool routing_add_channel_announcement(struct routing_state *rstate,
 
 	/* private updates will exist in the store before the announce: we
 	 * can't index those for broadcast since they would predate it, so we
-	 * add fresh ones.  But if we're loading off disk right now, we can't
-	 * do that. */
-	if (chan && index == 0) {
+	 * add fresh ones. */
+	if (chan) {
+		/* If this was in the gossip_store, gossip_store is bad! */
+		if (index) {
+			status_broken("gossip_store channel_announce"
+				      " %u replaces %u!",
+				      index, chan->bcast.index);
+			return false;
+		}
+
 		/* Reload any private updates */
 		if (chan->half[0].bcast.index)
 			private_updates[0]
-				= gossip_store_get(NULL,
-						   rstate->broadcasts->gs,
+				= gossip_store_get_private_update(NULL,
+						   rstate->gs,
 						   chan->half[0].bcast.index);
 		if (chan->half[1].bcast.index)
 			private_updates[1]
-				= gossip_store_get(NULL,
-						   rstate->broadcasts->gs,
+				= gossip_store_get_private_update(NULL,
+						   rstate->gs,
 						   chan->half[1].bcast.index);
-	}
 
-	/* Pretend it didn't exist, for the moment. */
-	if (chan)
+		remove_channel_from_store(rstate, chan);
 		free_chan(rstate, chan);
+	}
 
 	uc = tal(rstate, struct unupdated_channel);
 	uc->channel_announce = tal_dup_arr(uc, u8, msg, tal_count(msg), 0);
@@ -1749,10 +1762,6 @@ bool routing_add_channel_update(struct routing_state *rstate,
 	if (taken(update))
 		tal_steal(tmpctx, update);
 
-	/* In case it's free in a failure path */
-	if (taken(update))
-		tal_steal(tmpctx, update);
-
 	if (!fromwire_channel_update(update, &signature, &chain_hash,
 				     &short_channel_id, &timestamp,
 				     &message_flags, &channel_flags,
@@ -1810,6 +1819,14 @@ bool routing_add_channel_update(struct routing_state *rstate,
 
 	/* Discard older updates */
 	hc = &chan->half[direction];
+
+	/* If we're loading from store, duplicate entries are a bug. */
+	if (is_halfchan_defined(hc) && index != 0) {
+		status_broken("gossip_store channel_update %u replaces %u!",
+			      index, hc->bcast.index);
+		return false;
+	}
+
 	if (is_halfchan_defined(hc) && timestamp <= hc->bcast.timestamp) {
 		SUPERVERBOSE("Ignoring outdated update.");
 		/* Ignoring != failing */
@@ -1827,8 +1844,12 @@ bool routing_add_channel_update(struct routing_state *rstate,
 			      message_flags, channel_flags,
 			      timestamp, htlc_minimum, htlc_maximum);
 
-	/* Safe even if was never added */
-	broadcast_del(rstate->broadcasts, &chan->half[direction].bcast);
+	/* Safe even if was never added, but if it's a private channel it
+	 * would be a WIRE_GOSSIP_STORE_PRIVATE_UPDATE. */
+	gossip_store_delete(rstate->gs, &hc->bcast,
+			    is_chan_public(chan)
+			    ? WIRE_CHANNEL_UPDATE
+			    : WIRE_GOSSIP_STORE_PRIVATE_UPDATE);
 
 	/* BOLT #7:
 	 *   - MUST consider the `timestamp` of the `channel_announcement` to be
@@ -1844,23 +1865,25 @@ bool routing_add_channel_update(struct routing_state *rstate,
 	} else if (!is_chan_public(chan)) {
 		/* For private channels, we get updates without an announce: don't
 		 * broadcast them!  But save local ones to store anyway. */
-		struct half_chan *hc = &chan->half[direction];
-		/* Don't save if we're loading from store */
 		assert(is_local_channel(rstate, chan));
+		/* Don't save if we're loading from store */
 		if (!index) {
-			hc->bcast.index = gossip_store_add(rstate->broadcasts->gs,
-							   update, NULL);
+			hc->bcast.index
+				= gossip_store_add_private_update(rstate->gs,
+								  update);
 		} else
 			hc->bcast.index = index;
 		return true;
 	}
 
 	/* If we're loading from store, this means we don't re-add to store. */
-	chan->half[direction].bcast.index = index;
-
-	insert_broadcast(&rstate->broadcasts,
-			 update, NULL,
-			 &chan->half[direction].bcast);
+	if (index)
+		hc->bcast.index = index;
+	else
+		hc->bcast.index
+			= gossip_store_add(rstate->gs, update,
+					   hc->bcast.timestamp,
+					   NULL);
 
 	if (uc) {
 		/* If we were waiting for these nodes to appear (or gain a
@@ -1887,6 +1910,28 @@ static const struct node_id *get_channel_owner(struct routing_state *rstate,
 	if (uc)
 		return &uc->id[direction];
 	return NULL;
+}
+
+void remove_channel_from_store(struct routing_state *rstate,
+			       struct chan *chan)
+{
+	int update_type, announcment_type;
+
+	if (is_chan_public(chan)) {
+		update_type = WIRE_CHANNEL_UPDATE;
+		announcment_type = WIRE_CHANNEL_ANNOUNCEMENT;
+	} else {
+		update_type = WIRE_GOSSIP_STORE_PRIVATE_UPDATE;
+		announcment_type = WIRE_GOSSIPD_LOCAL_ADD_CHANNEL;
+	}
+
+	/* If these aren't in the store, these are noops. */
+	gossip_store_delete(rstate->gs,
+			    &chan->bcast, announcment_type);
+	gossip_store_delete(rstate->gs,
+			    &chan->half[0].bcast, update_type);
+	gossip_store_delete(rstate->gs,
+			    &chan->half[1].bcast, update_type);
 }
 
 u8 *handle_channel_update(struct routing_state *rstate, const u8 *update TAKES,
@@ -2051,23 +2096,69 @@ bool routing_add_node_announcement(struct routing_state *rstate,
 		return false;
 	}
 
+	/* Only log this if *not* loading from store. */
+	if (!index)
+		status_trace("Received node_announcement for node %s",
+			     type_to_string(tmpctx, struct node_id, &node_id));
+
 	node = get_node(rstate, &node_id);
 
-	/* May happen if we accepted the node_announcement due to a local
-	 * channel, for which we didn't have the announcement yet. */
-	if (node == NULL)
-		return false;
+	if (node == NULL || !node_has_broadcastable_channels(node)) {
+		struct pending_node_announce *pna;
+		/* BOLT #7:
+		 *
+		 * - if `node_id` is NOT previously known from a
+		 *   `channel_announcement` message, OR if `timestamp` is NOT
+		 *   greater than the last-received `node_announcement` from
+		 *   this `node_id`:
+		 *    - SHOULD ignore the message.
+		 */
+		/* Check if we are currently verifying the txout for a
+		 * matching channel */
+		pna = pending_node_map_get(rstate->pending_node_map,
+					   &node_id);
+		if (!pna) {
+			bad_gossip_order(msg, "node_announcement",
+					 type_to_string(tmpctx, struct node_id,
+							&node_id));
+			return false;
+		} else if (timestamp <= pna->timestamp)
+			/* Ignore old ones: they're OK though. */
+			return true;
 
-	/* Shouldn't get here, but gossip_store bugs are possible. */
-	if (!node_has_broadcastable_channels(node))
+		SUPERVERBOSE("Deferring node_announcement for node %s",
+			     type_to_string(tmpctx, struct node_id, &node_id));
+		pna->timestamp = timestamp;
+		pna->index = index;
+		tal_free(pna->node_announcement);
+		pna->node_announcement = tal_dup_arr(pna, u8, msg,
+						     tal_count(msg),
+						     0);
+		return true;
+	}
+
+	if (node->bcast.index && index != 0) {
+		status_broken("gossip_store node_announcement %u replaces %u!",
+			      index, node->bcast.index);
 		return false;
+	}
+	if (node->bcast.index && node->bcast.timestamp >= timestamp) {
+		SUPERVERBOSE("Ignoring node announcement, it's outdated.");
+		return true;
+	}
 
 	/* Harmless if it was never added */
-	broadcast_del(rstate->broadcasts, &node->bcast);
+	gossip_store_delete(rstate->gs,
+			    &node->bcast,
+			    WIRE_NODE_ANNOUNCEMENT);
 
 	node->bcast.timestamp = timestamp;
-	node->bcast.index = index;
-	insert_broadcast(&rstate->broadcasts, msg, NULL, &node->bcast);
+	if (index)
+		node->bcast.index = index;
+	else
+		node->bcast.index
+			= gossip_store_add(rstate->gs, msg,
+					   node->bcast.timestamp, NULL);
 	return true;
 }
 
@@ -2075,7 +2166,6 @@ u8 *handle_node_announcement(struct routing_state *rstate, const u8 *node_ann)
 {
 	u8 *serialized;
 	struct sha256_double hash;
-	struct node *node;
 	secp256k1_ecdsa_signature signature;
 	u32 timestamp;
 	struct node_id node_id;
@@ -2083,9 +2173,7 @@ u8 *handle_node_announcement(struct routing_state *rstate, const u8 *node_ann)
 	u8 alias[32];
 	u8 *features, *addresses;
 	struct wireaddr *wireaddrs;
-	struct pending_node_announce *pna;
 	size_t len = tal_count(node_ann);
-	bool applied;
 
 	serialized = tal_dup_arr(tmpctx, u8, node_ann, len, 0);
 	if (!fromwire_node_announcement(tmpctx, serialized,
@@ -2161,49 +2249,8 @@ u8 *handle_node_announcement(struct routing_state *rstate, const u8 *node_ann)
 		return err;
 	}
 
-	/* Beyond this point it's not malformed, so safe if we make it
-	 * pending and requeue later. */
-	node = get_node(rstate, &node_id);
-
-	/* BOLT #7:
-	 *
-	 * - if `node_id` is NOT previously known from a `channel_announcement`
-	 *   message, OR if `timestamp` is NOT greater than the last-received
-	 *   `node_announcement` from this `node_id`:
-	 *    - SHOULD ignore the message.
-	 */
-	if (!node || !node_has_public_channels(node)) {
-		/* Check if we are currently verifying the txout for a
-		 * matching channel */
-		pna = pending_node_map_get(rstate->pending_node_map,
-					   &node_id);
-		if (!pna) {
-			bad_gossip_order(serialized, "node_announcement",
-					 type_to_string(tmpctx, struct node_id,
-							&node_id));
-		} else if (pna->timestamp < timestamp) {
-			SUPERVERBOSE(
-			    "Deferring node_announcement for node %s",
-			    type_to_string(tmpctx, struct node_id, &node_id));
-			pna->timestamp = timestamp;
-			tal_free(pna->node_announcement);
-			pna->node_announcement = tal_dup_arr(pna, u8, node_ann,
-							     tal_count(node_ann),
-							     0);
-		}
-		return NULL;
-	}
-
-	if (node->bcast.index && node->bcast.timestamp >= timestamp) {
-		SUPERVERBOSE("Ignoring node announcement, it's outdated.");
-		return NULL;
-	}
-
-	status_trace("Received node_announcement for node %s",
-		     type_to_string(tmpctx, struct node_id, &node_id));
-
-	applied = routing_add_node_announcement(rstate, serialized, 0);
-	assert(applied);
+	/* May still fail, if we don't know the node. */
+	routing_add_node_announcement(rstate, serialized, 0);
 	return NULL;
 }
 
@@ -2427,8 +2474,10 @@ void route_prune(struct routing_state *rstate)
 	}
 
 	/* Now free all the chans and maybe even nodes. */
-	for (size_t i = 0; i < tal_count(pruned); i++)
+	for (size_t i = 0; i < tal_count(pruned); i++) {
+		remove_channel_from_store(rstate, pruned[i]);
 		free_chan(rstate, pruned[i]);
+	}
 }
 
 #if DEVELOPER
@@ -2451,11 +2500,13 @@ void memleak_remove_routing_tables(struct htable *memtable,
 }
 #endif /* DEVELOPER */
 
-bool handle_local_add_channel(struct routing_state *rstate, const u8 *msg)
+bool handle_local_add_channel(struct routing_state *rstate,
+			      const u8 *msg, u64 index)
 {
 	struct short_channel_id scid;
 	struct node_id remote_node_id;
 	struct amount_sat sat;
+	struct chan *chan;
 
 	if (!fromwire_gossipd_local_add_channel(msg, &scid, &remote_node_id,
 						&sat)) {
@@ -2474,7 +2525,10 @@ bool handle_local_add_channel(struct routing_state *rstate, const u8 *msg)
 		     type_to_string(tmpctx, struct short_channel_id, &scid));
 
 	/* Create new (unannounced) channel */
-	new_chan(rstate, &scid, &rstate->local_id, &remote_node_id, sat);
+	chan = new_chan(rstate, &scid, &rstate->local_id, &remote_node_id, sat);
+	if (!index)
+		index = gossip_store_add(rstate->gs, msg, 0, NULL);
+	chan->bcast.index = index;
 	return true;
 }
 

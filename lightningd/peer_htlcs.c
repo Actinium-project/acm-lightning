@@ -1,3 +1,4 @@
+#include <bitcoin/preimage.h>
 #include <bitcoin/tx.h>
 #include <ccan/build_assert/build_assert.h>
 #include <ccan/cast/cast.h>
@@ -22,6 +23,7 @@
 #include <lightningd/pay.h>
 #include <lightningd/peer_control.h>
 #include <lightningd/peer_htlcs.h>
+#include <lightningd/plugin_hook.h>
 #include <lightningd/subd.h>
 #include <onchaind/gen_onchain_wire.h>
 #include <onchaind/onchain_wire.h>
@@ -612,16 +614,206 @@ static void channel_resolve_reply(struct subd *gossip, const u8 *msg,
 	tal_free(gr);
 }
 
-/* Everyone is committed to this htlc of theirs */
-static bool peer_accepted_htlc(struct channel *channel,
-			       u64 id,
-			       enum onion_type *failcode)
+/**
+ * Data passed to the plugin, and as the context for the hook callback
+ */
+struct htlc_accepted_hook_payload {
+	struct route_step *route_step;
+	struct htlc_in *hin;
+	struct channel *channel;
+	struct lightningd *ld;
+	u8 *next_onion;
+};
+
+/* The possible return value types that a plugin may return for the
+ * `htlc_accepted` hook. */
+enum htlc_accepted_result {
+	htlc_accepted_continue,
+	htlc_accepted_fail,
+	htlc_accepted_resolve,
+};
+
+/**
+ * Parses the JSON-RPC response into a struct understood by the callback.
+ */
+static enum htlc_accepted_result htlc_accepted_hook_deserialize(const char *buffer, const jsmntok_t *toks,
+                                                                /* If accepted */
+                                                                struct preimage *payment_preimage,
+                                                                /* If rejected */
+                                                                enum onion_type *failure_code,
+                                                                u8 **channel_update)
+{
+	const jsmntok_t *resulttok, *failcodetok, *paykeytok, *chanupdtok;
+	enum htlc_accepted_result result;
+
+	if (!toks || !buffer)
+		return htlc_accepted_continue;
+
+	resulttok = json_get_member(buffer, toks, "result");
+
+	/* If the result is "continue" we can just return NULL since
+	 * this is the default behavior for this hook anyway */
+	if (!resulttok) {
+		fatal("Plugin return value does not contain 'result' key %s",
+		      json_strdup(tmpctx, buffer, toks));
+	}
+
+	if (json_tok_streq(buffer, resulttok, "continue")) {
+		return htlc_accepted_continue;
+	}
+
+	if (json_tok_streq(buffer, resulttok, "fail")) {
+		result = htlc_accepted_fail;
+		failcodetok = json_get_member(buffer, toks, "failure_code");
+		chanupdtok = json_get_member(buffer, toks, "channel_update");
+		if (failcodetok &&
+		    !json_to_number(buffer, failcodetok, failure_code))
+			fatal("Plugin provided a non-numeric failcode "
+			      "in response to an htlc_accepted hook");
+
+		if (!failcodetok)
+			*failure_code = WIRE_TEMPORARY_NODE_FAILURE;
+
+		if (chanupdtok)
+			*channel_update =
+			    json_tok_bin_from_hex(buffer, buffer, chanupdtok);
+		else
+			*channel_update = NULL;
+
+	} else if (json_tok_streq(buffer, resulttok, "resolve")) {
+		result = htlc_accepted_resolve;
+		paykeytok = json_get_member(buffer, toks, "payment_key");
+		if (!paykeytok)
+			fatal(
+			    "Plugin did not specify a 'payment_key' in return "
+			    "value to the htlc_accepted hook: %s",
+			    json_strdup(tmpctx, buffer, resulttok));
+
+		if (!json_to_preimage(buffer, paykeytok,
+				      payment_preimage))
+			fatal("Plugin specified an invalid 'payment_key': %s",
+			      json_tok_full(buffer, resulttok));
+	} else {
+		fatal("Plugin responded with an unknown result to the "
+		      "htlc_accepted hook: %s",
+		      json_strdup(tmpctx, buffer, resulttok));
+	}
+
+	return result;
+}
+
+static void htlc_accepted_hook_serialize(struct htlc_accepted_hook_payload *p,
+					 struct json_stream *s)
+{
+	const struct route_step *rs = p->route_step;
+	const struct htlc_in *hin = p->hin;
+	s32 expiry = hin->cltv_expiry, blockheight = p->ld->topology->tip->height;
+	json_object_start(s, "onion");
+
+	json_add_hex_talarr (s, "payload", rs->raw_payload);
+	if (rs->hop_data.realm == 0x00) {
+		json_object_start(s, "per_hop_v0");
+		json_add_hex(s, "realm", &rs->hop_data.realm, 1);
+		json_add_short_channel_id(s, "short_channel_id", &rs->hop_data.channel_id);
+		json_add_amount_msat_only(s, "forward_amount", rs->hop_data.amt_forward);
+		json_add_u64(s, "outgoing_cltv_value", rs->hop_data.outgoing_cltv);
+		json_object_end(s);
+	}
+
+	json_add_hex_talarr(s, "next_onion", p->next_onion);
+	json_add_hex(s, "shared_secret", &hin->shared_secret, sizeof(hin->shared_secret));
+	json_object_end(s);
+
+	json_object_start(s, "htlc");
+	json_add_amount_msat_only(s, "amount", hin->msat);
+	json_add_u32(s, "cltv_expiry", expiry);
+	json_add_s32(s, "cltv_expiry_relative", expiry - blockheight);
+	json_add_hex(s, "payment_hash", hin->payment_hash.u.u8, sizeof(hin->payment_hash));
+	json_object_end(s);
+}
+
+/**
+ * Callback when a plugin answers to the htlc_accepted hook
+ */
+static void
+htlc_accepted_hook_callback(struct htlc_accepted_hook_payload *request,
+			    const char *buffer, const jsmntok_t *toks)
+{
+	struct route_step *rs = request->route_step;
+	struct htlc_in *hin = request->hin;
+	struct channel *channel = request->channel;
+	struct lightningd *ld = request->ld;
+	struct preimage payment_preimage;
+	u8 *req;
+	enum htlc_accepted_result result;
+	enum onion_type failure_code;
+	u8 *channel_update;
+	result = htlc_accepted_hook_deserialize(buffer, toks, &payment_preimage, &failure_code, &channel_update);
+
+	switch (result) {
+	case htlc_accepted_continue:
+		if (rs->nextcase == ONION_FORWARD) {
+			struct gossip_resolve *gr =
+			    tal(ld, struct gossip_resolve);
+
+			gr->next_onion = tal_steal(gr, request->next_onion);
+			serialize_onionpacket(gr, rs->next);
+			gr->next_channel = rs->hop_data.channel_id;
+			gr->amt_to_forward = rs->hop_data.amt_forward;
+			gr->outgoing_cltv_value = rs->hop_data.outgoing_cltv;
+			gr->hin = hin;
+
+			req = towire_gossip_get_channel_peer(tmpctx,
+							     &gr->next_channel);
+			log_debug(
+			    channel->log, "Asking gossip to resolve channel %s",
+			    type_to_string(tmpctx, struct short_channel_id,
+					   &gr->next_channel));
+			subd_req(hin, ld->gossip, req, -1, 0,
+				 channel_resolve_reply, gr);
+		} else
+			handle_localpay(hin, hin->cltv_expiry,
+					&hin->payment_hash,
+					rs->hop_data.amt_forward,
+					rs->hop_data.outgoing_cltv);
+
+		break;
+	case htlc_accepted_fail:
+		log_debug(channel->log,
+			  "Failing incoming HTLC as instructed by plugin hook");
+		fail_in_htlc(hin, failure_code, NULL, NULL);
+		break;
+	case htlc_accepted_resolve:
+		fulfill_htlc(hin, &payment_preimage);
+		break;
+	}
+
+	tal_free(request);
+}
+
+REGISTER_PLUGIN_HOOK(htlc_accepted, htlc_accepted_hook_callback,
+		     struct htlc_accepted_hook_payload *,
+		     htlc_accepted_hook_serialize,
+		     struct htlc_accepted_hook_payload *);
+
+/**
+ * Everyone is committed to this htlc of theirs
+ *
+ * @param channel: The channel this HTLC was accepted from.
+ * @param id: the ID of the HTLC we accepted
+ * @param replay: Are we loading from the database and therefore should not
+ *        perform the transition to RCVD_ADD_ACK_REVOCATION?
+ * @param[out] failcode: If we decide to fail right away this will be set to a
+ *        non-zero failcode.
+ */
+static bool peer_accepted_htlc(struct channel *channel, u64 id,
+			       bool replay, enum onion_type *failcode)
 {
 	struct htlc_in *hin;
-	u8 *req;
 	struct route_step *rs;
 	struct onionpacket *op;
 	struct lightningd *ld = channel->peer->ld;
+	struct htlc_accepted_hook_payload *hook_payload;
 
 	hin = find_htlc_in(&ld->htlcs_in, channel, id);
 	if (!hin) {
@@ -630,7 +822,7 @@ static bool peer_accepted_htlc(struct channel *channel,
 		return false;
 	}
 
-	if (!htlc_in_update_state(channel, hin, RCVD_ADD_ACK_REVOCATION))
+	if (!replay && !htlc_in_update_state(channel, hin, RCVD_ADD_ACK_REVOCATION))
 		return false;
 	htlc_in_check(hin, __func__);
 
@@ -695,31 +887,25 @@ static bool peer_accepted_htlc(struct channel *channel,
 	}
 
 	/* Unknown realm isn't a bad onion, it's a normal failure. */
+	/* FIXME: if we want hooks to handle foreign realms we should
+	 * move this check to the hook callback. */
 	if (rs->hop_data.realm != 0) {
 		*failcode = WIRE_INVALID_REALM;
 		goto out;
 	}
 
-	if (rs->nextcase == ONION_FORWARD) {
-		struct gossip_resolve *gr = tal(ld, struct gossip_resolve);
+	/* It's time to package up all the information and call the
+	 * hook so plugins can interject if they want */
+	hook_payload = tal(hin, struct htlc_accepted_hook_payload);
+	hook_payload->route_step = tal_steal(hook_payload, rs);
+	hook_payload->ld = ld;
+	hook_payload->hin = hin;
+	hook_payload->channel = channel;
+	hook_payload->next_onion = serialize_onionpacket(hook_payload, rs->next);
 
-		gr->next_onion = serialize_onionpacket(gr, rs->next);
-		gr->next_channel = rs->hop_data.channel_id;
-		gr->amt_to_forward = rs->hop_data.amt_forward;
-		gr->outgoing_cltv_value = rs->hop_data.outgoing_cltv;
-		gr->hin = hin;
+	plugin_hook_call_htlc_accepted(ld, hook_payload, hook_payload);
 
-		req = towire_gossip_get_channel_peer(tmpctx, &gr->next_channel);
-		log_debug(channel->log, "Asking gossip to resolve channel %s",
-			  type_to_string(tmpctx, struct short_channel_id,
-					 &gr->next_channel));
-		subd_req(hin, ld->gossip, req, -1, 0,
-			 channel_resolve_reply, gr);
-	} else
-		handle_localpay(hin, hin->cltv_expiry, &hin->payment_hash,
-				rs->hop_data.amt_forward,
-				rs->hop_data.outgoing_cltv);
-
+	/* Falling through here is ok, after all the HTLC locked */
 	*failcode = 0;
 out:
 	log_debug(channel->log, "their htlc %"PRIu64" %s",
@@ -1369,7 +1555,7 @@ void peer_got_revoke(struct channel *channel, const u8 *msg)
 	for (i = 0; i < tal_count(changed); i++) {
 		/* If we're doing final accept, we need to forward */
 		if (changed[i].newstate == RCVD_ADD_ACK_REVOCATION) {
-			if (!peer_accepted_htlc(channel, changed[i].id,
+			if (!peer_accepted_htlc(channel, changed[i].id, false,
 						&failcodes[i]))
 				return;
 		} else {
@@ -1789,6 +1975,7 @@ void htlcs_reconnect(struct lightningd *ld,
 	struct htlc_in *hin;
 	struct htlc_out *hout;
 	struct htlc_in_map unprocessed;
+	enum onion_type failcode;
 
 	/* Any HTLCs which happened to be incoming and weren't forwarded before
 	 * we shutdown/crashed: fail them now.
@@ -1848,9 +2035,17 @@ void htlcs_reconnect(struct lightningd *ld,
 	for (hin = htlc_in_map_first(&unprocessed, &ini); hin;
 	     hin = htlc_in_map_next(&unprocessed, &ini)) {
 		log_unusual(hin->key.channel->log,
-			    "Failing old unprocessed HTLC #%"PRIu64,
+			    "Replaying old unprocessed HTLC #%"PRIu64,
 			    hin->key.id);
-		fail_in_htlc(hin, WIRE_TEMPORARY_NODE_FAILURE, NULL, NULL);
+		if (!peer_accepted_htlc(hin->key.channel, hin->key.id, true, &failcode)) {
+			fail_in_htlc(hin,
+				     failcode != 0
+					 ? failcode
+					 : WIRE_TEMPORARY_NODE_FAILURE,
+				     NULL, NULL);
+		}  else if (failcode) {
+			fail_in_htlc(hin, failcode, NULL, NULL);
+		}
 	}
 
 	/* Don't leak memory! */

@@ -53,6 +53,7 @@ CLOSINGD_COMMON_OBJS :=				\
 	common/daemon_conn.o			\
 	common/dev_disconnect.o			\
 	common/derive_basepoints.o		\
+	common/features.o			\
 	common/gen_peer_status_wire.o		\
 	common/gen_status_wire.o		\
 	common/gossip_store.o			\
@@ -62,6 +63,7 @@ CLOSINGD_COMMON_OBJS :=				\
 	common/msg_queue.o			\
 	common/peer_billboard.o			\
 	common/peer_failed.o			\
+	common/per_peer_state.o			\
 	common/permute_tx.o			\
 	common/read_peer_msg.o			\
 	common/socket_close.o			\

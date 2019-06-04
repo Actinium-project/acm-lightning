@@ -1,6 +1,8 @@
+#include <ccan/fdpass/fdpass.h>
 #include <common/crypto_sync.h>
 #include <common/gossip_store.h>
 #include <common/peer_failed.h>
+#include <common/per_peer_state.h>
 #include <common/read_peer_msg.h>
 #include <common/status.h>
 #include <common/type_to_string.h>
@@ -14,27 +16,46 @@
 #include <wire/wire_sync.h>
 
 u8 *peer_or_gossip_sync_read(const tal_t *ctx,
-			     int peer_fd, int gossip_fd,
-			     struct crypto_state *cs,
+			     struct per_peer_state *pps,
 			     bool *from_gossipd)
 {
 	fd_set readfds;
 	u8 *msg;
 
-	FD_ZERO(&readfds);
-	FD_SET(peer_fd, &readfds);
-	FD_SET(gossip_fd, &readfds);
+	for (;;) {
+		struct timeval tv, *tptr;
+		struct timerel trel;
 
-	select(peer_fd > gossip_fd ? peer_fd + 1 : gossip_fd + 1,
-	       &readfds, NULL, NULL, NULL);
+		if (time_to_next_gossip(pps, &trel)) {
+			tv = timerel_to_timeval(trel);
+			tptr = &tv;
+		} else
+			tptr = NULL;
 
-	if (FD_ISSET(peer_fd, &readfds)) {
-		msg = sync_crypto_read(ctx, cs, peer_fd);
+		FD_ZERO(&readfds);
+		FD_SET(pps->peer_fd, &readfds);
+		FD_SET(pps->gossip_fd, &readfds);
+
+		if (select(pps->peer_fd > pps->gossip_fd
+			   ? pps->peer_fd + 1 : pps->gossip_fd + 1,
+			   &readfds, NULL, NULL, tptr) != 0)
+			break;
+
+		/* We timed out; look in gossip_store.  Failure resets timer. */
+		msg = gossip_store_next(tmpctx, pps);
+		if (msg) {
+			*from_gossipd = true;
+			return msg;
+		}
+	}
+
+	if (FD_ISSET(pps->peer_fd, &readfds)) {
+		msg = sync_crypto_read(ctx, pps);
 		*from_gossipd = false;
 		return msg;
 	}
 
-	msg = wire_sync_read(ctx, gossip_fd);
+	msg = wire_sync_read(ctx, pps->gossip_fd);
 	if (!msg)
 		status_failed(STATUS_FAIL_GOSSIP_IO,
 			      "Error reading gossip msg: %s",
@@ -82,38 +103,50 @@ bool is_wrong_channel(const u8 *msg, const struct channel_id *expected,
 	return !channel_id_eq(expected, actual);
 }
 
-void handle_gossip_msg(int peer_fd, int gossip_store_fd,
-		       struct crypto_state *cs, const u8 *msg TAKES)
+void handle_gossip_msg(struct per_peer_state *pps, const u8 *msg TAKES)
 {
 	u8 *gossip;
-	u64 offset;
+	u64 offset_shorter;
 
-	if (fromwire_gossipd_send_gossip_from_store(msg, &offset))
-		gossip = gossip_store_read(tmpctx, gossip_store_fd, offset);
-	else if (!fromwire_gossipd_send_gossip(tmpctx, msg, &gossip)) {
-		status_broken("Got bad message from gossipd: %s",
-			      tal_hex(msg, msg));
-		peer_failed_connection_lost();
-	}
+	if (fromwire_gossipd_new_store_fd(msg, &offset_shorter)) {
+		gossip_store_switch_fd(pps, fdpass_recv(pps->gossip_fd),
+				       offset_shorter);
+		goto out;
+	} else
+		/* It's a raw gossip msg: this copies or takes() */
+		gossip = tal_dup_arr(tmpctx, u8, msg, tal_bytelen(msg), 0);
 
 	/* Gossipd can send us gossip messages, OR errors */
-	if (is_msg_for_gossipd(gossip)) {
-		sync_crypto_write(cs, peer_fd, gossip);
-	} else if (fromwire_peektype(gossip) == WIRE_ERROR) {
+	if (fromwire_peektype(gossip) == WIRE_ERROR) {
 		status_debug("Gossipd told us to send error");
-		sync_crypto_write(cs, peer_fd, gossip);
+		sync_crypto_write(pps, gossip);
 		peer_failed_connection_lost();
 	} else {
-		status_broken("Gossipd gave us bad send_gossip message %s",
-			      tal_hex(msg, msg));
-		peer_failed_connection_lost();
+		sync_crypto_write(pps, gossip);
 	}
+
+out:
 	if (taken(msg))
 		tal_free(msg);
 }
 
-bool handle_peer_gossip_or_error(int peer_fd, int gossip_fd, int gossip_store_fd,
-				 struct crypto_state *cs,
+/* takes iff returns true */
+bool handle_timestamp_filter(struct per_peer_state *pps, const u8 *msg TAKES)
+{
+	struct bitcoin_blkid chain_hash; /* FIXME: don't ignore! */
+	u32 first_timestamp, timestamp_range;
+
+	if (!fromwire_gossip_timestamp_filter(msg, &chain_hash,
+					      &first_timestamp,
+					      &timestamp_range)) {
+		return false;
+	}
+
+	gossip_setup_timestamp_filter(pps, first_timestamp, timestamp_range);
+	return true;
+}
+
+bool handle_peer_gossip_or_error(struct per_peer_state *pps,
 				 const struct channel_id *channel_id,
 				 const u8 *msg TAKES)
 {
@@ -121,17 +154,17 @@ bool handle_peer_gossip_or_error(int peer_fd, int gossip_fd, int gossip_store_fd
 	bool all_channels;
 	struct channel_id actual;
 
-	if (is_msg_for_gossipd(msg)) {
-		wire_sync_write(gossip_fd, msg);
+	if (handle_timestamp_filter(pps, msg))
+		return true;
+	else if (is_msg_for_gossipd(msg)) {
+		wire_sync_write(pps->gossip_fd, msg);
 		/* wire_sync_write takes, so don't take again. */
 		return true;
 	}
 
 	if (is_peer_error(tmpctx, msg, channel_id, &err, &all_channels)) {
 		if (err)
-			peer_failed_received_errmsg(peer_fd, gossip_fd,
-						    gossip_store_fd,
-						    cs, err,
+			peer_failed_received_errmsg(pps, err,
 						    all_channels
 						    ? NULL : channel_id);
 
@@ -144,7 +177,7 @@ bool handle_peer_gossip_or_error(int peer_fd, int gossip_fd, int gossip_store_fd
 		status_trace("Rejecting %s for unknown channel_id %s",
 			     wire_type_name(fromwire_peektype(msg)),
 			     type_to_string(tmpctx, struct channel_id, &actual));
-		sync_crypto_write(cs, peer_fd,
+		sync_crypto_write(pps,
 				  take(towire_errorfmt(NULL, &actual,
 						       "Multiple channels"
 						       " unsupported")));
@@ -157,13 +190,4 @@ handled:
 	if (taken(msg))
 		tal_free(msg);
 	return true;
-}
-
-void new_gossip_store(int gossip_store_fd, int new_gossip_store_fd)
-{
-	if (dup2(new_gossip_store_fd, gossip_store_fd) == -1)
-		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			      "Could not dup2 new fd %i onto %i: %s",
-			      new_gossip_store_fd, gossip_store_fd,
-			      strerror(errno));
 }
