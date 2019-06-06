@@ -108,6 +108,21 @@ struct command_result *param_pubkey(struct command *cmd, const char *name,
 			    json_tok_full(buffer, tok));
 }
 
+struct command_result *param_txid(struct command *cmd,
+				  const char *name,
+				  const char *buffer,
+				  const jsmntok_t *tok,
+				  struct bitcoin_txid **txid)
+{
+	*txid = tal(cmd, struct bitcoin_txid);
+	if (json_to_txid(buffer, tok, *txid))
+		return NULL;
+	return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			    "'%s' should be txid, not '%.*s'",
+			    name, json_tok_full_len(tok),
+			    json_tok_full(buffer, tok));
+}
+
 void json_add_short_channel_id(struct json_stream *response,
 			       const char *fieldname,
 			       const struct short_channel_id *scid)
@@ -355,6 +370,13 @@ void json_add_hex_talarr(struct json_stream *result,
 			 const tal_t *data)
 {
 	json_add_hex(result, fieldname, data, tal_bytelen(data));
+}
+
+void json_add_tx(struct json_stream *result,
+		 const char *fieldname,
+		 const struct bitcoin_tx *tx)
+{
+	json_add_hex_talarr(result, fieldname, linearize_tx(tmpctx, tx));
 }
 
 void json_add_escaped_string(struct json_stream *result, const char *fieldname,

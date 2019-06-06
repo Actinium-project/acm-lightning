@@ -5,8 +5,10 @@
 #include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
 #include <common/key_derive.h>
+#include <common/memleak.h>
 #include <common/wireaddr.h>
 #include <inttypes.h>
+#include <lightningd/bitcoind.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/peer_control.h>
 #include <lightningd/peer_htlcs.h>
@@ -52,6 +54,7 @@ struct wallet *wallet_new(struct lightningd *ld,
 	wallet->log = log;
 	wallet->bip32_base = NULL;
 	list_head_init(&wallet->unstored_payments);
+	list_head_init(&wallet->unreleased_txs);
 
 	db_begin_transaction(wallet->db);
 	wallet->invoices = invoices_new(wallet, wallet->db, log, timers);
@@ -2698,4 +2701,79 @@ const struct forwarding *wallet_forwarded_payments_get(struct wallet *w,
 	}
 
 	return results;
+}
+
+struct unreleased_tx *find_unreleased_tx(struct wallet *w,
+					 const struct bitcoin_txid *txid)
+{
+	struct unreleased_tx *utx;
+
+	list_for_each(&w->unreleased_txs, utx, list) {
+		if (bitcoin_txid_eq(txid, &utx->txid))
+			return utx;
+	}
+	return NULL;
+}
+
+static void destroy_unreleased_tx(struct unreleased_tx *utx)
+{
+	list_del(&utx->list);
+}
+
+void remove_unreleased_tx(struct unreleased_tx *utx)
+{
+	tal_del_destructor(utx, destroy_unreleased_tx);
+	list_del(&utx->list);
+}
+
+void add_unreleased_tx(struct wallet *w, struct unreleased_tx *utx)
+{
+	list_add_tail(&w->unreleased_txs, &utx->list);
+	tal_add_destructor(utx, destroy_unreleased_tx);
+}
+
+/* These will touch the db, so need to be explicitly freed. */
+void free_unreleased_txs(struct wallet *w)
+{
+	struct unreleased_tx *utx;
+
+	while ((utx = list_top(&w->unreleased_txs, struct unreleased_tx, list)))
+		tal_free(utx);
+}
+
+static void process_utxo_result(struct bitcoind *bitcoind,
+				const struct bitcoin_tx_output *txout,
+				void *_utxos)
+{
+	struct utxo **utxos = _utxos;
+	enum output_status newstate =
+	    txout == NULL ? output_state_spent : output_state_available;
+
+	log_unusual(bitcoind->ld->wallet->log,
+		    "wallet: reserved output %s/%u reset to %s",
+		    type_to_string(tmpctx, struct bitcoin_txid, &utxos[0]->txid),
+		    utxos[0]->outnum,
+		    newstate == output_state_spent ? "spent" : "available");
+	wallet_update_output_status(bitcoind->ld->wallet,
+				    &utxos[0]->txid, utxos[0]->outnum,
+				    utxos[0]->status, newstate);
+
+	/* If we have more, resolve them too. */
+	tal_arr_remove(&utxos, 0);
+	if (tal_count(utxos) != 0) {
+		bitcoind_gettxout(bitcoind, &utxos[0]->txid, utxos[0]->outnum,
+				  process_utxo_result, utxos);
+	} else
+		tal_free(utxos);
+}
+
+void wallet_clean_utxos(struct wallet *w, struct bitcoind *bitcoind)
+{
+	struct utxo **utxos = wallet_get_utxos(NULL, w, output_state_reserved);
+
+	if (tal_count(utxos) != 0) {
+		bitcoind_gettxout(bitcoind, &utxos[0]->txid, utxos[0]->outnum,
+				  process_utxo_result, notleak(utxos));
+	} else
+		tal_free(utxos);
 }

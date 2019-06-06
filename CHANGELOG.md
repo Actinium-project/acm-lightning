@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Config: Added a default plugin directory : `lightning_dir/plugins`. Each plugin directory it contains will be added to lightningd on startup.
 - DB: Store the signatures of channel announcement sent from remote peer into DB, and init channel with signatures from DB directly when reenable the channel.
 (Issue [#2409](https://github.com/ElementsProject/lightning/issues/2409))
+- JSON API: new withdraw methods `txprepare`, `txsend` and `txdiscard`.
 
 ### Changed
 
@@ -53,6 +54,7 @@ changes.
 - Fixed `fundchannel` crash when we have many UTXOs and we skip unconfirmed ones.
 - lightningd: fixed occasional hang on `connect` when peer had sent error.
 - JSON RPC: `decodeinvoice` and `pay` now handle unknown invoice fields properly.
+- JSON API: `waitsendpay` (PAY_STOPPED_RETRYING) error handler now returns valid JSON
 
 ### Security
 

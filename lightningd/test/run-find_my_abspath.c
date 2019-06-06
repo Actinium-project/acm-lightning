@@ -63,6 +63,9 @@ void   fatal(const char *fmt UNNEEDED, ...)
 /* Generated stub for free_htlcs */
 void free_htlcs(struct lightningd *ld UNNEEDED, const struct channel *channel UNNEEDED)
 { fprintf(stderr, "free_htlcs called!\n"); abort(); }
+/* Generated stub for free_unreleased_txs */
+void free_unreleased_txs(struct wallet *w UNNEEDED)
+{ fprintf(stderr, "free_unreleased_txs called!\n"); abort(); }
 /* Generated stub for fromwire_status_fail */
 bool fromwire_status_fail(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, enum status_failreason *failreason UNNEEDED, wirestring **desc UNNEEDED)
 { fprintf(stderr, "fromwire_status_fail called!\n"); abort(); }
@@ -170,6 +173,9 @@ const char *version(void)
 /* Generated stub for wallet_blocks_heights */
 void wallet_blocks_heights(struct wallet *w UNNEEDED, u32 def UNNEEDED, u32 *min UNNEEDED, u32 *max UNNEEDED)
 { fprintf(stderr, "wallet_blocks_heights called!\n"); abort(); }
+/* Generated stub for wallet_clean_utxos */
+void wallet_clean_utxos(struct wallet *w UNNEEDED, struct bitcoind *bitcoind UNNEEDED)
+{ fprintf(stderr, "wallet_clean_utxos called!\n"); abort(); }
 /* Generated stub for wallet_network_check */
 bool wallet_network_check(struct wallet *w UNNEEDED,
 			  const struct chainparams *chainparams UNNEEDED)

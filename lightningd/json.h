@@ -16,6 +16,7 @@
 #define JSMN_STRICT 1
 # include <external/jsmn/jsmn.h>
 
+struct bitcoin_tx;
 struct bitcoin_txid;
 struct chainparams;
 struct channel_id;
@@ -54,6 +55,9 @@ struct command_result *param_pubkey(struct command *cmd, const char *name,
 				    const char *buffer, const jsmntok_t *tok,
 				    struct pubkey **pubkey);
 
+struct command_result *param_txid(struct command *cmd, const char *name,
+				  const char *buffer, const jsmntok_t *tok,
+				  struct bitcoin_txid **txid);
 /* Makes sure *id is valid. */
 struct command_result *param_node_id(struct command *cmd,
 					       const char *name,
@@ -150,6 +154,10 @@ void json_add_hex(struct json_stream *result, const char *fieldname,
 void json_add_hex_talarr(struct json_stream *result,
 			 const char *fieldname,
 			 const tal_t *data);
+/* '"fieldname" : "010000000001..."' or "010000000001..." if fieldname is NULL */
+void json_add_tx(struct json_stream *result,
+		 const char *fieldname,
+		 const struct bitcoin_tx *tx);
 
 /* Adds both a 'raw' number field and an 'amount_msat' field */
 void json_add_amount_msat_compat(struct json_stream *result,
