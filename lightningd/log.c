@@ -4,7 +4,6 @@
 #include <ccan/array_size/array_size.h>
 #include <ccan/err/err.h>
 #include <ccan/io/io.h>
-#include <ccan/list/list.h>
 #include <ccan/opt/opt.h>
 #include <ccan/read_write_all/read_write_all.h>
 #include <ccan/str/hex/hex.h>
@@ -19,8 +18,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <lightningd/json.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/lightningd.h>
+#include <lightningd/notification.h>
 #include <lightningd/options.h>
 #include <signal.h>
 #include <stdio.h>
@@ -30,39 +31,6 @@
 
 /* Once we're up and running, this is set up. */
 struct log *crashlog;
-
-struct log_entry {
-	struct list_node list;
-	struct timeabs time;
-	enum log_level level;
-	unsigned int skipped;
-	const char *prefix;
-	char *log;
-	/* Iff LOG_IO */
-	const u8 *io;
-};
-
-struct log_book {
-	size_t mem_used;
-	size_t max_mem;
-	void (*print)(const char *prefix,
-		      enum log_level level,
-		      bool continued,
-		      const struct timeabs *time,
-		      const char *str,
-		      const u8 *io, size_t io_len,
-		      void *arg);
-	void *print_arg;
-	enum log_level print_level;
-	struct timeabs init_time;
-
-	struct list_head log;
-};
-
-struct log {
-	struct log_book *lr;
-	const char *prefix;
-};
 
 static void log_to_file(const char *prefix,
 			enum log_level level,
@@ -135,7 +103,7 @@ static size_t prune_log(struct log_book *log)
 	return deleted;
 }
 
-struct log_book *new_log_book(size_t max_mem,
+struct log_book *new_log_book(struct lightningd *ld, size_t max_mem,
 			      enum log_level printlevel)
 {
 	struct log_book *lr = tal_linkable(tal(NULL, struct log_book));
@@ -147,6 +115,7 @@ struct log_book *new_log_book(size_t max_mem,
 	lr->print = log_to_stdout;
 	lr->print_level = printlevel;
 	lr->init_time = time_now();
+	lr->ld = ld;
 	list_head_init(&lr->log);
 
 	return lr;
@@ -259,7 +228,8 @@ static void maybe_print(const struct log *log, const struct log_entry *l,
 			       l->io, tal_bytelen(l->io), log->lr->print_arg);
 }
 
-void logv(struct log *log, enum log_level level, const char *fmt, va_list ap)
+void logv(struct log *log, enum log_level level, bool call_notifier,
+			const char *fmt, va_list ap)
 {
 	int save_errno = errno;
 	struct log_entry *l = new_log_entry(log, level);
@@ -276,6 +246,10 @@ void logv(struct log *log, enum log_level level, const char *fmt, va_list ap)
 	maybe_print(log, l, 0);
 
 	add_entry(log, l);
+
+	if (call_notifier)
+		notify_warning(log->lr->ld, l);
+
 	errno = save_errno;
 }
 
@@ -328,12 +302,13 @@ void logv_add(struct log *log, const char *fmt, va_list ap)
 	maybe_print(log, l, oldlen);
 }
 
-void log_(struct log *log, enum log_level level, const char *fmt, ...)
+void log_(struct log *log, enum log_level level, bool call_notifier,
+			const char *fmt, ...)
 {
 	va_list ap;
 
 	va_start(ap, fmt);
-	logv(log, level, fmt, ap);
+	logv(log, level, call_notifier, fmt, ap);
 	va_end(ap);
 }
 
@@ -569,7 +544,7 @@ void log_backtrace_print(const char *fmt, ...)
 		return;
 
 	va_start(ap, fmt);
-	logv(crashlog, LOG_BROKEN, fmt, ap);
+	logv(crashlog, LOG_BROKEN, false, fmt, ap);
 	va_end(ap);
 }
 
@@ -642,7 +617,7 @@ void fatal(const char *fmt, ...)
 		exit(1);
 
 	va_start(ap, fmt);
-	logv(crashlog, LOG_BROKEN, fmt, ap);
+	logv(crashlog, LOG_BROKEN, true, fmt, ap);
 	va_end(ap);
 	abort();
 }
@@ -662,17 +637,6 @@ static void add_skipped(struct log_info *info)
 		json_object_end(info->response);
 		info->num_skipped = 0;
 	}
-}
-
-static void json_add_time(struct json_stream *result, const char *fieldname,
-			  struct timespec ts)
-{
-	char timebuf[100];
-
-	snprintf(timebuf, sizeof(timebuf), "%lu.%09u",
-		(unsigned long)ts.tv_sec,
-		(unsigned)ts.tv_nsec);
-	json_add_string(result, fieldname, timebuf);
 }
 
 static void log_to_json(unsigned int skipped,
