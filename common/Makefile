@@ -53,6 +53,7 @@ COMMON_SRC_NOGEN :=				\
 	common/utils.c				\
 	common/utxo.c				\
 	common/version.c			\
+	common/wallet.c				\
 	common/wallet_tx.c			\
 	common/wireaddr.c			\
 	common/wire_error.c			\

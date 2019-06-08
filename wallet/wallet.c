@@ -2415,6 +2415,35 @@ void wallet_transaction_add(struct wallet *w, const struct bitcoin_tx *tx,
 	}
 }
 
+void wallet_transaction_annotate(struct wallet *w,
+				 const struct bitcoin_txid *txid, enum wallet_tx_type type,
+				 u64 channel_id)
+{
+	sqlite3_stmt *stmt = db_select_prepare(w->db, "type, channel_id FROM transactions WHERE id=?");
+	sqlite3_bind_sha256(stmt, 1, &txid->shad.sha);
+	if (!db_select_step(w->db, stmt))
+		fatal("Attempting to annotate a transaction we don't have: %s",
+		      type_to_string(tmpctx, struct bitcoin_txid, txid));
+	type |= sqlite3_column_int(stmt, 0);
+	if (channel_id == 0)
+		channel_id = sqlite3_column_int64(stmt, 1);
+
+	db_stmt_done(stmt);
+
+	stmt = db_prepare(w->db, "UPDATE transactions "
+				 "SET type = ?"
+				 ", channel_id = ? "
+				 "WHERE id = ?");
+
+	sqlite3_bind_int(stmt, 1, type);
+	if (channel_id)
+		sqlite3_bind_int(stmt, 2, channel_id);
+	else
+		sqlite3_bind_null(stmt, 2);
+	sqlite3_bind_sha256(stmt, 3, &txid->shad.sha);
+	db_exec_prepared(w->db, stmt);
+}
+
 u32 wallet_transaction_height(struct wallet *w, const struct bitcoin_txid *txid)
 {
 	u32 blockheight;
@@ -2528,7 +2557,7 @@ struct channeltx *wallet_channeltxs_get(struct wallet *w, const tal_t *ctx,
 			  ", t.id as txid "
 			  "FROM channeltxs c "
 			  "JOIN transactions t ON t.id == c.transaction_id "
-			  "WHERE channel_id = ? "
+			  "WHERE c.channel_id = ? "
 			  "ORDER BY c.id ASC;");
 	sqlite3_bind_int(stmt, 1, channel_id);
 
@@ -2776,4 +2805,28 @@ void wallet_clean_utxos(struct wallet *w, struct bitcoind *bitcoind)
 				  process_utxo_result, notleak(utxos));
 	} else
 		tal_free(utxos);
+}
+
+struct wallet_transaction *wallet_transactions_get(struct wallet *w, const tal_t *ctx)
+{
+	sqlite3_stmt *stmt;
+	size_t count;
+	struct wallet_transaction *cur, *txs = tal_arr(ctx, struct wallet_transaction, 0);
+
+	stmt = db_select_prepare(w->db,
+				 "id, id, rawtx, blockheight, txindex, type, channel_id "
+				 "FROM transactions");
+	for (count = 0; db_select_step(w->db, stmt); count++) {
+		tal_resize(&txs, count + 1);
+		cur = &txs[count];
+		sqlite3_column_sha256_double(stmt, 1, &cur->id.shad);
+		cur->rawtx = tal_dup_arr(txs, u8, sqlite3_column_blob(stmt, 2),
+					 sqlite3_column_bytes(stmt, 2), 0);
+		cur->blockheight = sqlite3_column_int(stmt, 3);
+		cur->txindex = sqlite3_column_int(stmt, 4);
+		cur->type = sqlite3_column_int(stmt, 5);
+		cur->channel_id = sqlite3_column_int(stmt, 6);
+	}
+
+	return txs;
 }

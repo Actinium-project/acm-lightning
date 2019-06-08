@@ -165,11 +165,18 @@ static void watch_tx_and_outputs(struct channel *channel,
 static void handle_onchain_broadcast_tx(struct channel *channel, const u8 *msg)
 {
 	struct bitcoin_tx *tx;
+	struct wallet *w = channel->peer->ld->wallet;
+	struct bitcoin_txid txid;
+	enum wallet_tx_type type;
 
-	if (!fromwire_onchain_broadcast_tx(msg, msg, &tx)) {
+	if (!fromwire_onchain_broadcast_tx(msg, msg, &tx, &type)) {
 		channel_internal_error(channel, "Invalid onchain_broadcast_tx");
 		return;
 	}
+
+	bitcoin_txid(tx, &txid);
+	wallet_transaction_add(w, tx, 0, 0);
+	wallet_transaction_annotate(w, &txid, type, channel->dbid);
 
 	/* We don't really care if it fails, we'll respond via watch. */
 	broadcast_tx(channel->peer->ld->topology, channel, tx, NULL);
@@ -284,6 +291,18 @@ static void onchain_add_utxo(struct channel *channel, const u8 *msg)
 	wallet_add_utxo(channel->peer->ld->wallet, u, p2wpkh);
 }
 
+static void onchain_transaction_annotate(struct channel *channel, const u8 *msg)
+{
+	struct bitcoin_txid txid;
+	enum wallet_tx_type type;
+	if (!fromwire_onchain_transaction_annotate(msg, &txid, &type))
+		fatal("onchaind gave invalid onchain_transaction_annotate "
+		      "message: %s",
+		      tal_hex(msg, msg));
+	wallet_transaction_annotate(channel->peer->ld->wallet, &txid, type,
+				    channel->dbid);
+}
+
 static unsigned int onchain_msg(struct subd *sd, const u8 *msg, const int *fds UNUSED)
 {
 	enum onchain_wire_type t = fromwire_peektype(msg);
@@ -319,6 +338,10 @@ static unsigned int onchain_msg(struct subd *sd, const u8 *msg, const int *fds U
 
 	case WIRE_ONCHAIN_ADD_UTXO:
 		onchain_add_utxo(sd->channel, msg);
+		break;
+
+	case WIRE_ONCHAIN_TRANSACTION_ANNOTATE:
+		onchain_transaction_annotate(sd->channel, msg);
 		break;
 
 	/* We send these, not receive them */
@@ -394,7 +417,7 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 					 u32 blockheight)
 {
 	u8 *msg;
-	struct bitcoin_txid our_last_txid;
+	struct bitcoin_txid our_last_txid, txid;
 	struct htlc_stub *stubs;
 	struct lightningd *ld = channel->peer->ld;
 	struct pubkey final_key;
@@ -442,6 +465,7 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 		return KEEP_WATCHING;
 	}
 	/* This could be a mutual close, but it doesn't matter. */
+	bitcoin_txid(tx, &txid);
 	bitcoin_txid(channel->last_tx, &our_last_txid);
 
 	/* We try to use normal feerate for onchaind spends. */
