@@ -8,12 +8,12 @@
 #include <ccan/crypto/siphash24/siphash24.h>
 #include <ccan/err/err.h>
 #include <ccan/fdpass/fdpass.h>
+#include <ccan/json_escape/json_escape.h>
 #include <ccan/take/take.h>
 #include <ccan/tal/str/str.h>
 #include <common/amount.h>
 #include <common/features.h>
 #include <common/json_command.h>
-#include <common/json_escaped.h>
 #include <common/json_helpers.h>
 #include <common/jsonrpc_errors.h>
 #include <common/param.h>
@@ -198,11 +198,10 @@ static void json_getnodes_reply(struct subd *gossip UNUSED, const u8 *reply,
 	}
 
 	response = json_stream_success(cmd);
-	json_object_start(response, NULL);
 	json_array_start(response, "nodes");
 
 	for (i = 0; i < tal_count(nodes); i++) {
-		struct json_escaped *esc;
+		struct json_escape *esc;
 
 		json_object_start(response, NULL);
 		json_add_node_id(response, "nodeid", &nodes[i]->nodeid);
@@ -229,7 +228,6 @@ static void json_getnodes_reply(struct subd *gossip UNUSED, const u8 *reply,
 		json_object_end(response);
 	}
 	json_array_end(response);
-	json_object_end(response);
 	was_pending(command_success(cmd, response));
 }
 
@@ -274,9 +272,7 @@ static void json_getroute_reply(struct subd *gossip UNUSED, const u8 *reply, con
 	}
 
 	response = json_stream_success(cmd);
-	json_object_start(response, NULL);
 	json_add_route(response, "route", hops, tal_count(hops));
-	json_object_end(response);
 	was_pending(command_success(cmd, response));
 }
 
@@ -307,7 +303,7 @@ static struct command_result *json_getroute(struct command *cmd,
 		   p_req("msatoshi", param_msat, &msat),
 		   p_req("riskfactor", param_double, &riskfactor),
 		   p_opt_def("cltv", param_number, &cltv, 9),
-		   p_opt_def("fromid", param_node_id, &source, ld->id),
+		   p_opt("fromid", param_node_id, &source),
 		   p_opt_def("fuzzpercent", param_percent, &fuzz, 5.0),
 		   p_opt("exclude", param_array, &excludetok),
 		   p_opt_def("maxhops", param_number, &max_hops,
@@ -389,6 +385,8 @@ static void json_add_halfchan(struct json_stream *response,
 	json_add_num(response, "base_fee_millisatoshi", he->base_fee_msat);
 	json_add_num(response, "fee_per_millionth", he->fee_per_millionth);
 	json_add_num(response, "delay", he->delay);
+	json_add_amount_msat_only(response, "htlc_minimum_msat", he->min);
+	json_add_amount_msat_only(response, "htlc_maximum_msat", he->max);
 	json_object_end(response);
 }
 
@@ -434,7 +432,6 @@ static void json_listchannels_reply(struct subd *gossip UNUSED, const u8 *reply,
 			 req, -1, 0, json_listchannels_reply, linfo);
 	} else {
 		json_array_end(linfo->response);
-		json_object_end(linfo->response);
 		was_pending(command_success(linfo->cmd, linfo->response));
 	}
 }
@@ -460,7 +457,6 @@ static struct command_result *json_listchannels(struct command *cmd,
 
 	/* Start JSON response, then we stream. */
 	linfo->response = json_stream_success(cmd);
-	json_object_start(linfo->response, NULL);
 	json_array_start(linfo->response, "channels");
 
 	req = towire_gossip_getchannels_request(cmd, linfo->id, linfo->source,
@@ -499,9 +495,7 @@ static void json_scids_reply(struct subd *gossip UNUSED, const u8 *reply,
 	}
 
 	response = json_stream_success(cmd);
-	json_object_start(response, NULL);
 	json_add_bool(response, "complete", complete);
-	json_object_end(response);
 	was_pending(command_success(cmd, response));
 }
 
@@ -571,7 +565,7 @@ json_dev_send_timestamp_filter(struct command *cmd,
 	msg = towire_gossip_send_timestamp_filter(NULL, id, *first, *range);
 	subd_send_msg(cmd->ld->gossip, take(msg));
 
-	return command_success(cmd, null_response(cmd));
+	return command_success(cmd, json_stream_success(cmd));
 }
 
 static const struct json_command dev_send_timestamp_filter = {
@@ -607,7 +601,6 @@ static void json_channel_range_reply(struct subd *gossip UNUSED, const u8 *reply
 	}
 
 	response = json_stream_success(cmd);
-	json_object_start(response, NULL);
 	/* As this is a dev interface, we don't bother saving and
 	 * returning all the replies, just the final one. */
 	json_add_num(response, "final_first_block", final_first_block);
@@ -617,7 +610,6 @@ static void json_channel_range_reply(struct subd *gossip UNUSED, const u8 *reply
 	for (size_t i = 0; i < tal_count(scids); i++)
 		json_add_short_channel_id(response, NULL, &scids[i]);
 	json_array_end(response);
-	json_object_end(response);
 	was_pending(command_success(cmd, response));
 }
 
@@ -669,7 +661,7 @@ json_dev_set_max_scids_encode_size(struct command *cmd,
 	msg = towire_gossip_dev_set_max_scids_encode_size(NULL, *max);
 	subd_send_msg(cmd->ld->gossip, take(msg));
 
-	return command_success(cmd, null_response(cmd));
+	return command_success(cmd, json_stream_success(cmd));
 }
 
 static const struct json_command dev_set_max_scids_encode_size = {
@@ -690,7 +682,7 @@ static struct command_result *json_dev_suppress_gossip(struct command *cmd,
 
 	subd_send_msg(cmd->ld->gossip, take(towire_gossip_dev_suppress(NULL)));
 
-	return command_success(cmd, null_response(cmd));
+	return command_success(cmd, json_stream_success(cmd));
 }
 
 static const struct json_command dev_suppress_gossip = {
@@ -718,7 +710,7 @@ static void dev_compact_gossip_store_reply(struct subd *gossip UNUSED,
 		was_pending(command_fail(cmd, LIGHTNINGD,
 					 "gossip_compact_store failed"));
 	else
-		was_pending(command_success(cmd, null_response(cmd)));
+		was_pending(command_success(cmd, json_stream_success(cmd)));
 }
 
 static struct command_result *json_dev_compact_gossip_store(struct command *cmd,

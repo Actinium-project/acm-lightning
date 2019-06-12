@@ -112,11 +112,18 @@ u32 get_block_height(const struct chain_topology *topo UNNEEDED)
 /* Generated stub for get_chainparams */
 const struct chainparams *get_chainparams(const struct lightningd *ld UNNEEDED)
 { fprintf(stderr, "get_chainparams called!\n"); abort(); }
+/* Generated stub for htlc_is_trimmed */
+bool htlc_is_trimmed(enum side htlc_owner UNNEEDED,
+		     struct amount_msat htlc_amount UNNEEDED,
+		     u32 feerate_per_kw UNNEEDED,
+		     struct amount_sat dust_limit UNNEEDED,
+		     enum side side UNNEEDED)
+{ fprintf(stderr, "htlc_is_trimmed called!\n"); abort(); }
 /* Generated stub for invoices_create */
 bool invoices_create(struct invoices *invoices UNNEEDED,
 		     struct invoice *pinvoice UNNEEDED,
 		     const struct amount_msat *msat TAKES UNNEEDED,
-		     const struct json_escaped *label TAKES UNNEEDED,
+		     const struct json_escape *label TAKES UNNEEDED,
 		     u64 expiry UNNEEDED,
 		     const char *b11enc UNNEEDED,
 		     const char *description UNNEEDED,
@@ -134,7 +141,7 @@ void invoices_delete_expired(struct invoices *invoices UNNEEDED,
 /* Generated stub for invoices_find_by_label */
 bool invoices_find_by_label(struct invoices *invoices UNNEEDED,
 			    struct invoice *pinvoice UNNEEDED,
-			    const struct json_escaped *label UNNEEDED)
+			    const struct json_escape *label UNNEEDED)
 { fprintf(stderr, "invoices_find_by_label called!\n"); abort(); }
 /* Generated stub for invoices_find_by_rhash */
 bool invoices_find_by_rhash(struct invoices *invoices UNNEEDED,
@@ -237,10 +244,6 @@ void json_add_hex_talarr(struct json_stream *result UNNEEDED,
 void json_add_log(struct json_stream *result UNNEEDED,
 		  const struct log_book *lr UNNEEDED, enum log_level minlevel UNNEEDED)
 { fprintf(stderr, "json_add_log called!\n"); abort(); }
-/* Generated stub for json_add_member */
-void json_add_member(struct json_stream *js UNNEEDED, const char *fieldname UNNEEDED,
-		     const char *fmt UNNEEDED, ...)
-{ fprintf(stderr, "json_add_member called!\n"); abort(); }
 /* Generated stub for json_add_node_id */
 void json_add_node_id(struct json_stream *response UNNEEDED,
 				const char *fieldname UNNEEDED,
@@ -298,10 +301,6 @@ void json_array_end(struct json_stream *js UNNEEDED)
 /* Generated stub for json_array_start */
 void json_array_start(struct json_stream *js UNNEEDED, const char *fieldname UNNEEDED)
 { fprintf(stderr, "json_array_start called!\n"); abort(); }
-/* Generated stub for json_escaped_string_ */
-struct json_escaped *json_escaped_string_(const tal_t *ctx UNNEEDED,
-					  const void *bytes UNNEEDED, size_t len UNNEEDED)
-{ fprintf(stderr, "json_escaped_string_ called!\n"); abort(); }
 /* Generated stub for json_get_member */
 const jsmntok_t *json_get_member(const char *buffer UNNEEDED, const jsmntok_t tok[] UNNEEDED,
 				 const char *label UNNEEDED)
@@ -368,9 +367,6 @@ void notify_connect(struct lightningd *ld UNNEEDED, struct node_id *nodeid UNNEE
 /* Generated stub for notify_disconnect */
 void notify_disconnect(struct lightningd *ld UNNEEDED, struct node_id *nodeid UNNEEDED)
 { fprintf(stderr, "notify_disconnect called!\n"); abort(); }
-/* Generated stub for null_response */
-struct json_stream *null_response(struct command *cmd UNNEEDED)
-{ fprintf(stderr, "null_response called!\n"); abort(); }
 /* Generated stub for onchaind_funding_spent */
 enum watch_result onchaind_funding_spent(struct channel *channel UNNEEDED,
 					 const struct bitcoin_tx *tx UNNEEDED,

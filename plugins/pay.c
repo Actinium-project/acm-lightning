@@ -1,6 +1,7 @@
 #include <ccan/array_size/array_size.h>
 #include <ccan/cast/cast.h>
 #include <ccan/intmap/intmap.h>
+#include <ccan/json_out/json_out.h>
 #include <ccan/tal/str/str.h>
 #include <ccan/time/time.h>
 #include <common/amount.h>
@@ -27,8 +28,10 @@ struct pay_attempt {
 	const char **excludes;
 	/* Route we got (NULL == route lookup fail). */
 	const char *route;
+	/* Did we actually try to send a payment? */
+	bool sendpay;
 	/* The failure result (NULL on success) */
-	const char *failure;
+	struct json_out *failure;
 	/* The non-failure result (NULL on failure) */
 	const char *result;
 };
@@ -109,35 +112,78 @@ static struct pay_attempt *current_attempt(struct pay_command *pc)
 	return &pc->ps->attempts[tal_count(pc->ps->attempts)-1];
 }
 
-PRINTF_FMT(2,3) static void attempt_failed_fmt(struct pay_command *pc, const char *fmt, ...)
+/* Helper to copy JSON object directly into a json_out */
+static void json_out_add_raw_len(struct json_out *jout,
+				 const char *fieldname,
+				 const char *jsonstr, size_t len)
 {
-	struct pay_attempt *attempt = current_attempt(pc);
-	va_list ap;
+	char *p;
 
-	va_start(ap,fmt);
-	attempt->failure = tal_vfmt(pc->ps->attempts, fmt, ap);
-	attempt->end = time_now();
-	va_end(ap);
+	p = json_out_member_direct(jout, fieldname, len);
+	memcpy(p, jsonstr, len);
 }
 
+static void json_out_add_raw(struct json_out *jout,
+			     const char *fieldname,
+			     const char *jsonstr)
+{
+	json_out_add_raw_len(jout, fieldname, jsonstr, strlen(jsonstr));
+}
+
+static struct json_out *failed_start(struct pay_command *pc)
+{
+	struct pay_attempt *attempt = current_attempt(pc);
+
+	attempt->end = time_now();
+	attempt->failure = json_out_new(pc->ps->attempts);
+	json_out_start(attempt->failure, NULL, '{');
+	return attempt->failure;
+}
+
+static void failed_end(struct json_out *jout)
+{
+	json_out_end(jout, '}');
+	json_out_finished(jout);
+}
+
+/* Copy field and member to output, if it exists: return member */
+static const jsmntok_t *copy_member(struct json_out *ret,
+				    const char *buf, const jsmntok_t *obj,
+				    const char *membername)
+{
+	const jsmntok_t *m = json_get_member(buf, obj, membername);
+	if (!m)
+		return NULL;
+
+	/* Literal copy: it's already JSON escaped, and may be a string. */
+	json_out_add_raw_len(ret, membername,
+			     json_tok_full(buf, m), json_tok_full_len(m));
+	return m;
+}
+
+/* Copy (and modify) error object. */
 static void attempt_failed_tok(struct pay_command *pc, const char *method,
 			       const char *buf, const jsmntok_t *errtok)
 {
 	const jsmntok_t *msg = json_get_member(buf, errtok, "message");
+	struct json_out *failed = failed_start(pc);
 
-	if (msg)
-		attempt_failed_fmt(pc, "%.*sCall to %s:%.*s",
-				   msg->start - errtok->start,
-				   buf + errtok->start,
-				   method,
-				   errtok->end - msg->start,
-				   buf + msg->start);
-	else
-		attempt_failed_fmt(pc,
-				   "{ 'message': 'Call to %s failed', %.*s",
-				   method,
-				   errtok->end - errtok->start - 1,
-				   buf + errtok->start + 1);
+	/* Every JSON error response has code and error. */
+	copy_member(failed, buf, errtok, "code");
+	json_out_add(failed, "message", true,
+		     "Call to %s: %.*s",
+		     method, msg->end - msg->start,
+		     buf + msg->start);
+	copy_member(failed, buf, errtok, "data");
+	failed_end(failed);
+}
+
+/* Helper to add a u64. */
+static void json_out_add_u64(struct json_out *jout,
+			     const char *fieldname,
+			     u64 val)
+{
+	json_out_add(jout, fieldname, false, "%"PRIu64, val);
 }
 
 static struct command_result *start_pay_attempt(struct command *cmd,
@@ -146,13 +192,13 @@ static struct command_result *start_pay_attempt(struct command *cmd,
 
 /* Is this (erring) channel within the routehint itself? */
 static bool channel_in_routehint(const struct route_info *routehint,
-				 const char *buf, const jsmntok_t *scidtok)
+				 const char *scidstr, size_t scidlen)
 {
 	struct short_channel_id scid;
 
-	if (!json_to_short_channel_id(buf, scidtok, &scid, false))
+	if (!short_channel_id_from_str(scidstr, scidlen, &scid, false))
 		plugin_err("bad erring_channel '%.*s'",
-			   scidtok->end - scidtok->start, buf + scidtok->start);
+			   (int)scidlen, scidstr);
 
 	for (size_t i = 0; i < tal_count(routehint); i++)
 		if (short_channel_id_eq(&scid, &routehint[i].short_channel_id))
@@ -161,36 +207,68 @@ static bool channel_in_routehint(const struct route_info *routehint,
 	return false;
 }
 
+/* Count times we actually tried to pay, not where route lookup failed or
+ * we disliked route for being too expensive, etc. */
+static size_t count_sendpays(const struct pay_attempt *attempts)
+{
+	size_t n = 0;
+
+	for (size_t i = 0; i < tal_count(attempts); i++)
+		n += attempts[i].sendpay;
+
+	return n;
+}
+
 static struct command_result *waitsendpay_expired(struct command *cmd,
 						  struct pay_command *pc)
 {
-	char *errmsg, *data;
+	char *errmsg;
+	struct json_out *data;
+	size_t num_attempts = count_sendpays(pc->ps->attempts);
 
-	errmsg = tal_fmt(pc, "Gave up after %zu attempts",
-			 tal_count(pc->ps->attempts));
-	data = tal_strdup(pc, "{ 'attempts': [ ");
+	errmsg = tal_fmt(pc, "Gave up after %zu attempt%s: see paystatus",
+			 num_attempts, num_attempts == 1 ? "" : "s");
+	data = json_out_new(NULL);
+	json_out_start(data, NULL, '{');
+	json_out_start(data, "attempts", '[');
 	for (size_t i = 0; i < tal_count(pc->ps->attempts); i++) {
 		if (pc->ps->attempts[i].route)
-			tal_append_fmt(&data, "%s { 'route': %s,\n 'failure': %s\n }",
-				       i == 0 ? "" : ",",
-				       pc->ps->attempts[i].route,
-				       pc->ps->attempts[i].failure);
-		else
-			tal_append_fmt(&data, "%s { 'failure': %s\n }",
-				       i == 0 ? "" : ",",
-				       pc->ps->attempts[i].failure);
+			json_out_add_raw(data, "route",
+					 pc->ps->attempts[i].route);
+		json_out_add_splice(data, "failure",
+				    pc->ps->attempts[i].failure);
 	}
-	tal_append_fmt(&data, "] }");
+	json_out_end(data, ']');
+	json_out_end(data, '}');
 	return command_done_err(cmd, PAY_STOPPED_RETRYING, errmsg, data);
+}
+
+static bool routehint_excluded(const struct route_info *routehint,
+			       const char **excludes)
+{
+	/* Note that we ignore direction here: in theory, we could have
+	 * found that one direction of a channel is unavailable, but they
+	 * are suggesting we use it the other way.  Very unlikely though! */
+	for (size_t i = 0; i < tal_count(excludes); i++)
+		if (channel_in_routehint(routehint,
+					 excludes[i], strlen(excludes[i])))
+			return true;
+	return false;
 }
 
 static struct command_result *next_routehint(struct command *cmd,
 					     struct pay_command *pc)
 {
-	if (tal_count(pc->routehints) > 0) {
-		pc->current_routehint = pc->routehints[0];
+	size_t num_attempts = count_sendpays(pc->ps->attempts);
+
+	while (tal_count(pc->routehints) > 0) {
+		if (!routehint_excluded(pc->routehints[0], pc->excludes)) {
+			pc->current_routehint = pc->routehints[0];
+			tal_arr_remove(&pc->routehints, 0);
+			return start_pay_attempt(cmd, pc, "Trying route hint");
+		}
+		tal_free(pc->routehints[0]);
 		tal_arr_remove(&pc->routehints, 0);
-		return start_pay_attempt(cmd, pc, "Trying route hint");
 	}
 
 	/* No (more) routehints; we're out of routes. */
@@ -199,11 +277,11 @@ static struct command_result *next_routehint(struct command *cmd,
 		return command_fail(cmd, PAY_ROUTE_TOO_EXPENSIVE,
 				    "%s", pc->expensive_route);
 
-	if (tal_count(pc->ps->attempts) > 1)
+	if (num_attempts > 0)
 		return command_fail(cmd, PAY_STOPPED_RETRYING,
 				    "Ran out of routes to try after"
-				    " %zu attempts: see paystatus",
-				    tal_count(pc->ps->attempts));
+				    " %zu attempt%s: see paystatus",
+				    num_attempts, num_attempts == 1 ? "" : "s");
 
 	return command_fail(cmd, PAY_ROUTE_NOT_FOUND,
 				    "Could not find a route");
@@ -245,7 +323,9 @@ static struct command_result *waitsendpay_error(struct command *cmd,
 	}
 
 	/* If failure is in routehint part, try next one */
-	if (channel_in_routehint(pc->current_routehint, buf, scidtok))
+	if (channel_in_routehint(pc->current_routehint,
+				 buf + scidtok->start,
+				 scidtok->end - scidtok->start))
 		return next_routehint(cmd, pc);
 
 	/* Otherwise, add erring channel to exclusion list. */
@@ -279,8 +359,8 @@ static struct command_result *sendpay_done(struct command *cmd,
 {
 	return send_outreq(cmd, "waitsendpay",
 			   waitsendpay_done, waitsendpay_error, pc,
-			   "'payment_hash': '%s'",
-			   pc->payment_hash);
+			   take(json_out_obj(NULL, "payment_hash",
+					     pc->payment_hash)));
 }
 
 /* Calculate how many millisatoshi we need at the start of this route
@@ -339,10 +419,10 @@ static const char *join_routehint(const tal_t *ctx,
 			return tal_free(ret);
 
 		tal_append_fmt(&ret, ", {"
-			       " 'id': '%s',"
-			       " 'channel': '%s',"
-			       " 'msatoshi': '%s',"
-			       " 'delay': %u }",
+			       " \"id\": \"%s\","
+			       " \"channel\": \"%s\","
+			       " \"msatoshi\": \"%s\","
+			       " \"delay\": %u }",
 			       /* pubkey of *destination* */
 			       route_pubkey(tmpctx, pc, routehint, i + 1),
 			       type_to_string(tmpctx, struct short_channel_id,
@@ -399,7 +479,8 @@ static bool maybe_exclude(struct pay_command *pc,
 
 	scid = json_get_member(buf, route, "channel");
 
-	if (channel_in_routehint(pc->current_routehint, buf, scid))
+	if (channel_in_routehint(pc->current_routehint,
+				 buf + scid->start, scid->end - scid->start))
 		return false;
 
 	dir = json_get_member(buf, route, "direction");
@@ -418,10 +499,10 @@ static struct command_result *getroute_done(struct command *cmd,
 {
 	struct pay_attempt *attempt = current_attempt(pc);
 	const jsmntok_t *t = json_get_member(buf, result, "route");
-	char *json_desc;
 	struct amount_msat fee;
 	u32 delay;
 	double feepercent;
+	struct json_out *params;
 
 	if (!t)
 		plugin_err("getroute gave no 'route'? '%.*s'",
@@ -431,8 +512,10 @@ static struct command_result *getroute_done(struct command *cmd,
 		attempt->route = join_routehint(pc->ps->attempts, buf, t,
 						pc, pc->current_routehint);
 		if (!attempt->route) {
-			attempt_failed_fmt(pc,
-					   "{ 'message': 'Joining routehint gave absurd fee' }");
+			struct json_out *failed = failed_start(pc);
+			json_out_add(failed, "message", true,
+				     "Joining routehint gave absurd fee");
+			failed_end(failed);
 			return next_routehint(cmd, pc);
 		}
 	} else
@@ -459,19 +542,22 @@ static struct command_result *getroute_done(struct command *cmd,
 	if (amount_msat_greater(fee, pc->exemptfee)
 	    && feepercent > pc->maxfeepercent) {
 		const jsmntok_t *charger;
+		struct json_out *failed;
+		char *feemsg;
 
-		attempt_failed_fmt(pc, "{ 'message': 'Route wanted fee of %s' }",
-				   type_to_string(tmpctx, struct amount_msat,
-						  &fee));
+		feemsg = tal_fmt(pc, "Route wanted fee of %s",
+				 type_to_string(tmpctx, struct amount_msat,
+						&fee));
+		failed = failed_start(pc);
+		json_out_addstr(failed, "message", feemsg);
+		failed_end(failed);
 
 		/* Remember this if we eliminating this causes us to have no
 		 * routes at all! */
 		if (!pc->expensive_route)
-			pc->expensive_route
-				= tal_fmt(pc, "Route wanted fee of %s",
-					  type_to_string(tmpctx,
-							 struct amount_msat,
-							 &fee));
+			pc->expensive_route = feemsg;
+		else
+			tal_free(feemsg);
 
 		/* Try excluding most fee-charging channel (unless it's in
 		 * routeboost). */
@@ -487,17 +573,20 @@ static struct command_result *getroute_done(struct command *cmd,
 
 	if (delay > pc->maxdelay) {
 		const jsmntok_t *delayer;
+		struct json_out *failed;
+		char *feemsg;
 
-		attempt_failed_fmt(pc,
-				   "{ 'message': 'Route wanted delay of %u blocks' }",
-				   delay);
+		feemsg = tal_fmt(pc, "Route wanted delay of %u blocks", delay);
+		failed = failed_start(pc);
+		json_out_addstr(failed, "message", feemsg);
+		failed_end(failed);
 
 		/* Remember this if we eliminating this causes us to have no
 		 * routes at all! */
 		if (!pc->expensive_route)
-			pc->expensive_route
-				= tal_fmt(pc, "Route wanted delay of %u blocks",
-					  delay);
+			pc->expensive_route = feemsg;
+		else
+			tal_free(failed);
 
 		delayer = find_worst_channel(buf, t, "delay", pc->final_cltv);
 
@@ -512,17 +601,18 @@ static struct command_result *getroute_done(struct command *cmd,
 		return next_routehint(cmd, pc);
 	}
 
+	attempt->sendpay = true;
+	params = json_out_new(NULL);
+	json_out_start(params, NULL, '{');
+	json_out_add_raw(params, "route", attempt->route);
+	json_out_add(params, "payment_hash", true, "%s", pc->payment_hash);
+	json_out_add(params, "bolt11", true, "%s", pc->ps->bolt11);
 	if (pc->label)
-		json_desc = tal_fmt(pc, ", 'label': '%s'", pc->label);
-	else
-		json_desc = "";
+		json_out_add(params, "label", true, "%s", pc->label);
+	json_out_end(params, '}');
 
 	return send_outreq(cmd, "sendpay", sendpay_done, sendpay_error, pc,
-			   "'route': %s, 'payment_hash': '%s', 'bolt11': '%s'%s",
-			   attempt->route,
-			   pc->payment_hash,
-			   pc->ps->bolt11,
-			   json_desc);
+			   take(params));
 
 }
 
@@ -562,7 +652,6 @@ static struct command_result *start_pay_attempt(struct command *cmd,
 						struct pay_command *pc,
 						const char *fmt, ...)
 {
-	char *exclude;
 	struct amount_msat msat;
 	const char *dest;
 	size_t max_hops = ROUTING_MAX_HOPS;
@@ -570,6 +659,7 @@ static struct command_result *start_pay_attempt(struct command *cmd,
 	struct pay_attempt *attempt;
 	va_list ap;
 	size_t n;
+	struct json_out *params;
 
 	n = tal_count(pc->ps->attempts);
 	tal_resize(&pc->ps->attempts, n+1);
@@ -583,21 +673,11 @@ static struct command_result *start_pay_attempt(struct command *cmd,
 	attempt->route = NULL;
 	attempt->failure = NULL;
 	attempt->result = NULL;
+	attempt->sendpay = false;
 	attempt->why = tal_vfmt(pc->ps, fmt, ap);
 	va_end(ap);
 
 	/* routehint set below. */
-
-	if (tal_count(pc->excludes) != 0) {
-		exclude = tal_strdup(tmpctx, ",'exclude': [");
-		for (size_t i = 0; i < tal_count(pc->excludes); i++)
-			/* JSON.org grammar doesn't allow trailing , */
-			tal_append_fmt(&exclude, "%s %s",
-				       i == 0 ? "" : ",",
-				       pc->excludes[i]);
-		tal_append_fmt(&exclude, "]");
-	} else
-		exclude = "";
 
 	/* If we have a routehint, try that first; we need to do extra
 	 * checks that it meets our criteria though. */
@@ -606,8 +686,12 @@ static struct command_result *start_pay_attempt(struct command *cmd,
 		if (!route_msatoshi(&msat, pc->msat,
 				    attempt->routehint,
 				    tal_count(attempt->routehint))) {
-			attempt_failed_fmt(pc,
-					   "{ 'message': 'Routehint absurd fee' }");
+			struct json_out *failed;
+
+			failed = failed_start(pc);
+			json_out_addstr(failed, "message",
+					"Routehint absurd fee");
+			failed_end(failed);
 			return next_routehint(cmd, pc);
 		}
 		dest = type_to_string(tmpctx, struct node_id,
@@ -624,15 +708,24 @@ static struct command_result *start_pay_attempt(struct command *cmd,
 	}
 
 	/* OK, ask for route to destination */
+	params = json_out_new(NULL);
+	json_out_start(params, NULL, '{');
+	json_out_addstr(params, "id", dest);
+	json_out_addstr(params, "msatoshi",
+			type_to_string(tmpctx, struct amount_msat, &msat));
+	json_out_add_u64(params, "cltv", cltv);
+	json_out_add_u64(params, "maxhops", max_hops);
+	json_out_add(params, "riskfactor", false, "%f", pc->riskfactor);
+	if (tal_count(pc->excludes) != 0) {
+		json_out_start(params, "exclude", '[');
+		for (size_t i = 0; i < tal_count(pc->excludes); i++)
+			json_out_addstr(params, NULL, pc->excludes[i]);
+		json_out_end(params, ']');
+	}
+	json_out_end(params, '}');
+
 	return send_outreq(cmd, "getroute", getroute_done, getroute_error, pc,
-			   "'id': '%s',"
-			   "'msatoshi': '%s',"
-			   "'cltv': %u,"
-			   "'maxhops': %zu,"
-			   "'riskfactor': %f%s",
-			   dest,
-			   type_to_string(tmpctx, struct amount_msat, &msat),
-			   cltv, max_hops, pc->riskfactor, exclude);
+			   take(params));
 }
 
 /* BOLT #7:
@@ -712,7 +805,7 @@ static struct command_result *shadow_route(struct command *cmd,
 
 	return send_outreq(cmd, "listchannels",
 			   add_shadow_route, forward_error, pc,
-			   "'source' : '%s'", pc->shadow_dest);
+			   take(json_out_obj(NULL, "source", pc->shadow_dest)));
 }
 
 /* gossipd doesn't know much about the current state of channels; here we
@@ -957,10 +1050,9 @@ static struct command_result *json_pay(struct command *cmd,
 	pc->routehints = filter_routehints(pc, b11->routes);
 	pc->expensive_route = NULL;
 
-	/* Get capacities of local channels. */
+	/* Get capacities of local channels (no parameters) */
 	return send_outreq(cmd, "listpeers", listpeers_done, forward_error, pc,
-			   /* gcc doesn't like zero-length format strings! */
-			   " ");
+			   take(json_out_obj(NULL, NULL, NULL)));
 }
 
 /* FIXME: Add this to ccan/time? */
@@ -975,7 +1067,7 @@ static void utc_timestring(const struct timeabs *time, char str[UTC_TIMELEN])
 		 (int) time->ts.tv_nsec / 1000000);
 }
 
-static void add_attempt(char **ret,
+static void add_attempt(struct json_out *ret,
 			const struct pay_status *ps,
 			const struct pay_attempt *attempt)
 {
@@ -983,62 +1075,56 @@ static void add_attempt(char **ret,
 
 	utc_timestring(&attempt->start, timestr);
 
-	tal_append_fmt(ret, "{ 'strategy': '%s',"
-		       " 'start_time': '%s',"
-		       " 'age_in_seconds': %"PRIu64,
-		       attempt->why,
-		       timestr,
-		       time_to_sec(time_between(time_now(), attempt->start)));
+	json_out_start(ret, NULL, '{');
+	json_out_addstr(ret, "strategy", attempt->why);
+	json_out_addstr(ret, "start_time", timestr);
+	json_out_add_u64(ret, "age_in_seconds",
+		     time_to_sec(time_between(time_now(), attempt->start)));
 	if (attempt->result || attempt->failure) {
 		utc_timestring(&attempt->end, timestr);
-		tal_append_fmt(ret, ", 'end_time': '%s'"
-			       ", 'duration_in_seconds': %"PRIu64,
-			       timestr,
-			       time_to_sec(time_between(attempt->end,
-							attempt->start)));
+		json_out_addstr(ret, "end_time", timestr);
+		json_out_add_u64(ret, "duration_in_seconds",
+				 time_to_sec(time_between(attempt->end,
+							  attempt->start)));
 	}
 	if (tal_count(attempt->routehint)) {
-		tal_append_fmt(ret, ", 'routehint': [");
+		json_out_start(ret, "routehint", '[');
 		for (size_t i = 0; i < tal_count(attempt->routehint); i++) {
-			tal_append_fmt(ret, "%s{"
-				       " 'id': '%s',"
-				       " 'channel': '%s',"
-				       " 'fee_base_msat': %u,"
-				       " 'fee_proportional_millionths': %u,"
-				       " 'cltv_expiry_delta': %u }",
-				       i == 0 ? "" : ", ",
-				       type_to_string(tmpctx, struct node_id,
-						      &attempt->routehint[i].pubkey),
-				       type_to_string(tmpctx,
-						      struct short_channel_id,
-						      &attempt->routehint[i].short_channel_id),
-				       attempt->routehint[i].fee_base_msat,
-				       attempt->routehint[i].fee_proportional_millionths,
-				       attempt->routehint[i].cltv_expiry_delta);
+			json_out_start(ret, NULL, '{');
+			json_out_addstr(ret, "id",
+					type_to_string(tmpctx, struct node_id,
+						       &attempt->routehint[i].pubkey));
+			json_out_addstr(ret, "channel",
+					type_to_string(tmpctx,
+						       struct short_channel_id,
+						       &attempt->routehint[i].short_channel_id));
+			json_out_add_u64(ret, "fee_base_msat",
+					 attempt->routehint[i].fee_base_msat);
+			json_out_add_u64(ret, "fee_proportional_millionths",
+					 attempt->routehint[i].fee_proportional_millionths);
+			json_out_add_u64(ret, "cltv_expiry_delta",
+					 attempt->routehint[i].cltv_expiry_delta);
+			json_out_end(ret, '}');
 		}
-		tal_append_fmt(ret, "]");
+		json_out_end(ret, ']');
 	}
 	if (tal_count(attempt->excludes)) {
-		for (size_t i = 0; i < tal_count(attempt->excludes); i++) {
-			if (i == 0)
-				tal_append_fmt(ret, ", 'excluded_channels': [");
-			else
-				tal_append_fmt(ret, ", ");
-			tal_append_fmt(ret, "'%s'", attempt->excludes[i]);
-		}
-		tal_append_fmt(ret, "]");
+		json_out_start(ret, "excluded_channels", '[');
+		for (size_t i = 0; i < tal_count(attempt->excludes); i++)
+			json_out_addstr(ret, NULL, attempt->excludes[i]);
+		json_out_end(ret, ']');
 	}
 
 	if (attempt->route)
-		tal_append_fmt(ret, ", 'route': %s", attempt->route);
+		json_out_add_raw(ret, "route", attempt->route);
 
 	if (attempt->failure)
-		tal_append_fmt(ret, ", 'failure': %s", attempt->failure);
+		json_out_add_splice(ret, "failure", attempt->failure);
 
 	if (attempt->result)
-		tal_append_fmt(ret, ", 'success': %s", attempt->result);
+		json_out_add_raw(ret, "success", attempt->result);
 
-	tal_append_fmt(ret, "}");
+	json_out_end(ret, '}');
 }
 
 static struct command_result *json_paystatus(struct command *cmd,
@@ -1047,72 +1133,51 @@ static struct command_result *json_paystatus(struct command *cmd,
 {
 	struct pay_status *ps;
 	const char *b11str;
-	char *ret;
-	bool some = false;
+	struct json_out *ret;
 
 	if (!param(cmd, buf, params,
 		   p_opt("bolt11", param_string, &b11str),
 		   NULL))
 		return NULL;
 
-	ret = tal_fmt(cmd, "{ 'pay': [");
+	ret = json_out_new(NULL);
+	json_out_start(ret, NULL, '{');
+	json_out_start(ret, "pay", '[');
+
 	/* FIXME: Index by bolt11 string! */
 	list_for_each(&pay_status, ps, list) {
 		if (b11str && !streq(b11str, ps->bolt11))
 			continue;
 
-		if (some)
-			tal_append_fmt(&ret, ",\n");
-		some = true;
-
-		tal_append_fmt(&ret, "{ 'bolt11': '%s',"
-			       " 'msatoshi': %"PRIu64", "
-			       " 'amount_msat': '%s', "
-			       " 'destination': '%s'",
-			       ps->bolt11,
-			       ps->msat.millisatoshis, /* Raw: JSON */
+		json_out_start(ret, NULL, '{');
+		json_out_addstr(ret, "bolt11", ps->bolt11);
+		json_out_add_u64(ret, "msatoshi",
+			     ps->msat.millisatoshis); /* Raw: JSON */
+		json_out_addstr(ret, "amount_msat",
 			       type_to_string(tmpctx, struct amount_msat,
-					      &ps->msat), ps->dest);
+					      &ps->msat));
+		json_out_addstr(ret, "destination", ps->dest);
 		if (ps->label)
-			tal_append_fmt(&ret, ", 'label': '%s'", ps->label);
+			json_out_addstr(ret, "label", ps->label);
 		if (ps->routehint_modifications)
-			tal_append_fmt(&ret, ", 'routehint_modifications': '%s'",
-				       ps->routehint_modifications);
+			json_out_addstr(ret, "routehint_modifications",
+					ps->routehint_modifications);
 		if (ps->shadow && !streq(ps->shadow, ""))
-			tal_append_fmt(&ret, ", 'shadow': '%s'", ps->shadow);
+			json_out_addstr(ret, "shadow", ps->shadow);
 		if (ps->exclusions)
-			tal_append_fmt(&ret, ", 'local_exclusions': '%s'",
-				       ps->exclusions);
+			json_out_addstr(ret, "local_exclusions", ps->exclusions);
 
 		assert(tal_count(ps->attempts));
-		for (size_t i = 0; i < tal_count(ps->attempts); i++) {
-			if (i == 0)
-				tal_append_fmt(&ret, ", 'attempts': [");
-			else
-				tal_append_fmt(&ret, ",");
-
-			add_attempt(&ret, ps, &ps->attempts[i]);
-		}
-		tal_append_fmt(&ret, "] }");
+		json_out_start(ret, "attempts", '[');
+		for (size_t i = 0; i < tal_count(ps->attempts); i++)
+			add_attempt(ret, ps, &ps->attempts[i]);
+		json_out_end(ret, ']');
+		json_out_end(ret, '}');
 	}
-	tal_append_fmt(&ret, "] }");
+	json_out_end(ret, ']');
+	json_out_end(ret, '}');
 
 	return command_success(cmd, ret);
-}
-
-static const jsmntok_t *copy_member(char **ret,
-				    const char *buf,
-				    const jsmntok_t *result,
-				    const char *membername,
-				    const char *term)
-{
-	const jsmntok_t *m = json_get_member(buf, result, membername);
-	if (m)
-		tal_append_fmt(ret, "'%s': %.*s%s",
-			       membername,
-			       json_tok_full_len(m), json_tok_full(buf, m),
-			       term);
-	return m;
 }
 
 static bool attempt_ongoing(const char *buf, const jsmntok_t *b11)
@@ -1136,33 +1201,30 @@ static struct command_result *listsendpays_done(struct command *cmd,
 {
 	size_t i;
 	const jsmntok_t *t, *arr;
-	char *ret;
-	bool some = false;
+	struct json_out *ret;
 
 	arr = json_get_member(buf, result, "payments");
 	if (!arr || arr->type != JSMN_ARRAY)
 		return command_fail(cmd, LIGHTNINGD,
 				    "Unexpected non-array result from listsendpays");
 
-	ret = tal_fmt(cmd, "{ 'pays': [");
+	ret = json_out_new(NULL);
+	json_out_start(ret, NULL, '{');
+	json_out_start(ret, "pays", '[');
 	json_for_each_arr(i, t, arr) {
 		const jsmntok_t *status, *b11;
 
-		if (some)
-			tal_append_fmt(&ret, ",\n");
-		some = true;
-
-		tal_append_fmt(&ret, "{");
+		json_out_start(ret, NULL, '{');
 		/* Old payments didn't have bolt11 field */
-		b11 = copy_member(&ret, buf, t, "bolt11", ",");
+		b11 = copy_member(ret, buf, t, "bolt11");
 		if (!b11) {
 			if (b11str) {
 				/* If it's a single query, we can fake it */
-				tal_append_fmt(&ret, "'bolt11': '%s',", b11str);
+				json_out_addstr(ret, "bolt11", b11str);
 			} else {
-				copy_member(&ret, buf, t, "payment_hash", ",");
-				copy_member(&ret, buf, t, "destination", ",");
-				copy_member(&ret, buf, t, "amount_msat", ",");
+				copy_member(ret, buf, t, "payment_hash");
+				copy_member(ret, buf, t, "destination");
+				copy_member(ret, buf, t, "amount_msat");
 			}
 		}
 
@@ -1171,19 +1233,20 @@ static struct command_result *listsendpays_done(struct command *cmd,
 		if (status) {
 			if (json_tok_streq(buf, status, "failed")
 			    && attempt_ongoing(buf, b11)) {
-				tal_append_fmt(&ret, "'status': 'pending',");
+				json_out_addstr(ret, "status", "pending");
 			} else {
-				copy_member(&ret, buf, t, "status", ",");
+				copy_member(ret, buf, t, "status");
 				if (json_tok_streq(buf, status, "complete"))
-					copy_member(&ret, buf, t,
-						    "payment_preimage", ",");
+					copy_member(ret, buf, t,
+						    "payment_preimage");
 			}
 		}
-		copy_member(&ret, buf, t, "label", ",");
-		copy_member(&ret, buf, t, "amount_sent_msat", "");
-		tal_append_fmt(&ret, "}");
+		copy_member(ret, buf, t, "label");
+		copy_member(ret, buf, t, "amount_sent_msat");
+		json_out_end(ret, '}');
 	}
-	tal_append_fmt(&ret, "] }");
+	json_out_end(ret, ']');
+	json_out_end(ret, '}');
 	return command_success(cmd, ret);
 }
 
@@ -1191,7 +1254,7 @@ static struct command_result *json_listpays(struct command *cmd,
 					    const char *buf,
 					    const jsmntok_t *params)
 {
-	const char *b11str, *paramstr;
+	const char *b11str;
 
 	/* FIXME: would be nice to parse as a bolt11 so check worked in future */
 	if (!param(cmd, buf, params,
@@ -1199,26 +1262,25 @@ static struct command_result *json_listpays(struct command *cmd,
 		   NULL))
 		return NULL;
 
-	if (b11str)
-		paramstr = tal_fmt(tmpctx, "'bolt11' : '%s'", b11str);
-	else
-		paramstr = "";
 	return send_outreq(cmd, "listsendpays",
 			   listsendpays_done, forward_error,
 			   cast_const(char *, b11str),
-			   "%s", paramstr);
+			   /* Neatly returns empty object if b11str is NULL */
+			   take(json_out_obj(NULL, "bolt11", b11str)));
 }
 
 static void init(struct plugin_conn *rpc)
 {
 	const char *field;
 
-	field = rpc_delve(tmpctx, "getinfo", "", rpc, ".id");
+	field = rpc_delve(tmpctx, "getinfo",
+			  take(json_out_obj(NULL, NULL, NULL)), rpc, ".id");
 	if (!node_id_from_hexstr(field, strlen(field), &my_id))
 		plugin_err("getinfo didn't contain valid id: '%s'", field);
 
 	field = rpc_delve(tmpctx, "listconfigs",
-			  "'config': 'max-locktime-blocks'",
+			  take(json_out_obj(NULL,
+					    "config", "max-locktime-blocks")),
 			  rpc, ".max-locktime-blocks");
 	maxdelay_default = atoi(field);
 }

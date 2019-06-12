@@ -14,6 +14,7 @@ default: lightningd-all
 
 # Common source we use.
 LIGHTNINGD_COMMON_OBJS :=			\
+	common/addr.o				\
 	common/amount.o				\
 	common/base32.o				\
 	common/bech32.o				\
@@ -31,11 +32,11 @@ LIGHTNINGD_COMMON_OBJS :=			\
 	common/gen_status_wire.o		\
 	common/hash_u5.o			\
 	common/htlc_state.o			\
+	common/htlc_trim.o			\
 	common/htlc_wire.o			\
 	common/key_derive.o			\
 	common/io_lock.o			\
 	common/json.o				\
-	common/json_escaped.o			\
 	common/json_helpers.o			\
 	common/json_tok.o			\
 	common/memleak.o			\

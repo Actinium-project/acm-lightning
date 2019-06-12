@@ -636,13 +636,14 @@ def test_cli(node_factory):
     except Exception:
         pass
 
-    # Test it escapes JSON properly in both method and params.
+    # Test it escapes JSON completely in both method and params.
+    # cli turns " into \", reply turns that into \\\".
     out = subprocess.run(['cli/lightning-cli',
                           '--lightning-dir={}'
                           .format(l1.daemon.lightning_dir),
                           'x"[]{}'],
                          stdout=subprocess.PIPE)
-    assert 'Unknown command \'x\\"[]{}\'' in out.stdout.decode('utf-8')
+    assert 'Unknown command \'x\\\\\\"[]{}\'' in out.stdout.decode('utf-8')
 
     subprocess.check_output(['cli/lightning-cli',
                              '--lightning-dir={}'
@@ -910,7 +911,7 @@ def test_htlc_send_timeout(node_factory, bitcoind):
             timedout = True
 
     inv = l3.rpc.invoice(123000, 'test_htlc_send_timeout', 'description')
-    with pytest.raises(RpcError, match=r'Ran out of routes to try after [0-9] attempts') as excinfo:
+    with pytest.raises(RpcError, match=r'Ran out of routes to try after 1 attempt: see paystatus') as excinfo:
         l1.rpc.pay(inv['bolt11'])
 
     err = excinfo.value

@@ -113,7 +113,32 @@ struct daemon {
 
 	/* What addresses we can actually announce. */
 	struct wireaddr *announcable;
+
+	/* Do we think we're missing gossip?  Contains timer to re-check */
+	struct oneshot *gossip_missing;
+
+	/* Channels we've heard about, but don't know. */
+	struct short_channel_id *unknown_scids;
 };
+
+/*~ How gossipy do we ask a peer to be? */
+enum gossip_level {
+	/* Give us everything since epoch */
+	GOSSIP_HIGH,
+	/* Give us everything from 24 hours ago. */
+	GOSSIP_MEDIUM,
+	/* Give us everything from now. */
+	GOSSIP_LOW,
+	/* Give us nothing. */
+	GOSSIP_NONE,
+};
+
+/* What are our targets for each gossip level? (including levels above).
+ *
+ * If we're missing gossip: 3 high.
+ * Otherwise, 2 medium, and 8 low.  Rest no limit..
+ */
+static const size_t gossip_level_targets[] = { 3, 2, 8, SIZE_MAX };
 
 /* This represents each peer we're gossiping with */
 struct peer {
@@ -129,7 +154,7 @@ struct peer {
 	/* The two features gossip cares about (so far) */
 	bool gossip_queries_feature, initial_routing_sync_feature;
 
-	/* Are there outstanding queries on short_channel_ids? */
+	/* Are there outstanding responses for queries on short_channel_ids? */
 	const struct short_channel_id *scid_queries;
 	size_t scid_query_idx;
 
@@ -137,8 +162,9 @@ struct peer {
 	struct node_id *scid_query_nodes;
 	size_t scid_query_nodes_idx;
 
-	/* How many query responses are we expecting? */
-	size_t num_scid_queries_outstanding;
+	/* Do we have an scid_query outstanding?  Was it internal? */
+	bool scid_query_outstanding;
+	bool scid_query_was_internal;
 
 	/* How many pongs are we expecting? */
 	size_t num_pings_outstanding;
@@ -149,6 +175,9 @@ struct peer {
 	u32 range_first_blocknum, range_end_blocknum;
 	u32 range_blocks_remaining;
 	struct short_channel_id *query_channel_scids;
+
+	/* Are we asking this peer to give us lot of gossip? */
+	enum gossip_level gossip_level;
 
 	/* The daemon_conn used to queue messages to/from the peer. */
 	struct daemon_conn *dc;
@@ -305,6 +334,22 @@ check_length:
 	return tal_count(*encoded) <= max_bytes;
 }
 
+/*~ We have different levels of gossipiness, depending on our needs. */
+static u32 gossip_start(enum gossip_level gossip_level)
+{
+	switch (gossip_level) {
+	case GOSSIP_HIGH:
+		return 0;
+	case GOSSIP_MEDIUM:
+		return time_now().ts.tv_sec - 24 * 3600;
+	case GOSSIP_LOW:
+		return time_now().ts.tv_sec;
+	case GOSSIP_NONE:
+		return UINT32_MAX;
+	}
+	abort();
+}
+
 /* BOLT #7:
  *
  * A node:
@@ -316,16 +361,23 @@ static void setup_gossip_range(struct peer *peer)
 	u8 *msg;
 
 	/*~ Without the `gossip_queries` feature, gossip flows automatically. */
-	if (!peer->gossip_queries_feature)
+	if (!peer->gossip_queries_feature) {
+		/* This peer is gossipy whether we want it or not! */
 		return;
+	}
 
-	/*~ We need to ask for something to start the gossip flowing: we ask
-	 * for everything from 1970 to 2106; this is horribly naive.  We
-	 * should be much smarter about requesting only what we don't already
-	 * have. */
+	status_trace("Setting peer %s to gossip level %s",
+		     type_to_string(tmpctx, struct node_id, &peer->id),
+		     peer->gossip_level == GOSSIP_HIGH ? "HIGH"
+		     : peer->gossip_level == GOSSIP_MEDIUM ? "MEDIUM"
+		     : peer->gossip_level == GOSSIP_LOW ? "LOW"
+		     : peer->gossip_level == GOSSIP_NONE ? "NONE"
+		     : "INVALID");
+	/*~ We need to ask for something to start the gossip flowing. */
 	msg = towire_gossip_timestamp_filter(peer,
 					     &peer->daemon->chain_hash,
-					     0, UINT32_MAX);
+					     gossip_start(peer->gossip_level),
+					     UINT32_MAX);
 	queue_peer_msg(peer, take(msg));
 }
 
@@ -513,6 +565,82 @@ static void maybe_send_own_node_announce(struct daemon *daemon)
 	daemon->rstate->local_channel_announced = false;
 }
 
+/* Query this peer for these short-channel-ids. */
+static bool query_short_channel_ids(struct daemon *daemon,
+				    struct peer *peer,
+				    const struct short_channel_id *scids,
+				    bool internal)
+{
+	u8 *encoded, *msg;
+
+	/* BOLT #7:
+	 *
+	 * 1. type: 261 (`query_short_channel_ids`) (`gossip_queries`)
+	 * 2. data:
+	 *     * [`32`:`chain_hash`]
+	 *     * [`2`:`len`]
+	 *     * [`len`:`encoded_short_ids`]
+	 */
+	const size_t reply_overhead = 32 + 2;
+	const size_t max_encoded_bytes = 65535 - 2 - reply_overhead;
+
+	/* Can't query if they don't have gossip_queries_feature */
+	if (!peer->gossip_queries_feature)
+		return false;
+
+	/* BOLT #7:
+	 *
+	 * The sender:
+	 *  - MUST NOT send `query_short_channel_ids` if it has sent a previous
+	 *   `query_short_channel_ids` to this peer and not received
+	 *   `reply_short_channel_ids_end`.
+	 */
+	if (peer->scid_query_outstanding)
+		return false;
+
+	encoded = encode_short_channel_ids_start(tmpctx);
+	for (size_t i = 0; i < tal_count(scids); i++)
+		encode_add_short_channel_id(&encoded, &scids[i]);
+
+	if (!encode_short_channel_ids_end(&encoded, max_encoded_bytes)) {
+		status_broken("query_short_channel_ids: %zu is too many",
+			      tal_count(scids));
+		return false;
+	}
+
+	msg = towire_query_short_channel_ids(NULL, &daemon->chain_hash,
+					     encoded);
+	queue_peer_msg(peer, take(msg));
+	peer->scid_query_outstanding = true;
+	peer->scid_query_was_internal = internal;
+
+	status_trace("%s: sending query for %zu scids",
+		     type_to_string(tmpctx, struct node_id, &peer->id),
+		     tal_count(scids));
+	return true;
+}
+
+/*~ This peer told us about an update to an unknown channel.  Ask it for
+ * a channel_announcement. */
+static void query_unknown_channel(struct daemon *daemon,
+				  struct peer *peer,
+				  const struct short_channel_id *id)
+{
+	/* Don't go overboard if we're already asking for a lot. */
+	if (tal_count(daemon->unknown_scids) > 1000)
+		return;
+
+	/* Check we're not already getting this one. */
+	for (size_t i = 0; i < tal_count(daemon->unknown_scids); i++)
+		if (short_channel_id_eq(&daemon->unknown_scids[i], id))
+			return;
+
+	tal_arr_expand(&daemon->unknown_scids, *id);
+
+	/* This is best effort: if peer is busy, we'll try next time. */
+	query_short_channel_ids(daemon, peer, daemon->unknown_scids, true);
+}
+
 /*~Routines to handle gossip messages from peer, forwarded by subdaemons.
  *-----------------------------------------------------------------------
  *
@@ -534,7 +662,9 @@ static const u8 *handle_channel_announcement_msg(struct peer *peer,
 	const struct short_channel_id *scid;
 	const u8 *err;
 
-	/* If it's OK, tells us the short_channel_id to lookup */
+	/* If it's OK, tells us the short_channel_id to lookup; it notes
+	 * if this is the unknown channel the peer was looking for (in
+	 * which case, it frees and NULLs that ptr) */
 	err = handle_channel_announcement(peer->daemon->rstate, msg, &scid);
 	if (err)
 		return err;
@@ -546,10 +676,18 @@ static const u8 *handle_channel_announcement_msg(struct peer *peer,
 
 static u8 *handle_channel_update_msg(struct peer *peer, const u8 *msg)
 {
+	struct short_channel_id unknown_scid;
 	/* Hand the channel_update to the routing code */
-	u8 *err = handle_channel_update(peer->daemon->rstate, msg, "subdaemon");
-	if (err)
+	u8 *err;
+
+	unknown_scid.u64 = 0;
+	err = handle_channel_update(peer->daemon->rstate, msg, "subdaemon",
+				    &unknown_scid);
+	if (err) {
+		if (unknown_scid.u64 != 0)
+			query_unknown_channel(peer->daemon, peer, &unknown_scid);
 		return err;
+	}
 
 	/*~ As a nasty compromise in the spec, we only forward channel_announce
 	 * once we have a channel_update; the channel isn't *usable* for
@@ -978,17 +1116,22 @@ static u8 *handle_reply_short_channel_ids_end(struct peer *peer, const u8 *msg)
 				       tal_hex(tmpctx, msg));
 	}
 
-	if (peer->num_scid_queries_outstanding == 0) {
+	if (!peer->scid_query_outstanding) {
 		return towire_errorfmt(peer, NULL,
 				       "unexpected reply_short_channel_ids_end: %s",
 				       tal_hex(tmpctx, msg));
 	}
 
-	peer->num_scid_queries_outstanding--;
-	/* We tell lightningd: this is because we currently only ask for
-	 * query_short_channel_ids when lightningd asks. */
-	msg = towire_gossip_scids_reply(msg, true, complete);
-	daemon_conn_send(peer->daemon->master, take(msg));
+	peer->scid_query_outstanding = false;
+
+	/* If it wasn't generated by us, it's the dev interface from lightningd
+	 */
+	if (!peer->scid_query_was_internal) {
+		msg = towire_gossip_scids_reply(msg, true, complete);
+		daemon_conn_send(peer->daemon->master, take(msg));
+	}
+
+	/* All good, no error. */
 	return NULL;
 }
 
@@ -1247,7 +1390,7 @@ static void update_local_channel(struct daemon *daemon,
 	/* We feed it into routing.c like any other channel_update; it may
 	 * discard it (eg. non-public channel), but it should not complain
 	 * about it being invalid! */
-	msg = handle_channel_update(daemon->rstate, take(update), caller);
+	msg = handle_channel_update(daemon->rstate, take(update), caller, NULL);
 	if (msg)
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "%s: rejected local channel update %s: %s",
@@ -1571,6 +1714,35 @@ done:
 	return daemon_conn_read_next(conn, peer->dc);
 }
 
+/* What gossip level do we set for this to meet our target? */
+static enum gossip_level peer_gossip_level(const struct daemon *daemon,
+					   bool gossip_queries_feature)
+{
+	struct peer *peer;
+	size_t gossip_levels[ARRAY_SIZE(gossip_level_targets)];
+	enum gossip_level glevel;
+
+	/* Old peers always give us a flood. */
+	if (!gossip_queries_feature)
+		return GOSSIP_HIGH;
+
+	/* Figure out how many we have at each level. */
+	memset(gossip_levels, 0, sizeof(gossip_levels));
+	list_for_each(&daemon->peers, peer, list)
+		gossip_levels[peer->gossip_level]++;
+
+	/* If we're missing gossip, try to fill GOSSIP_HIGH */
+	if (daemon->gossip_missing != NULL)
+		glevel = GOSSIP_HIGH;
+	else
+		glevel = GOSSIP_MEDIUM;
+
+	while (gossip_levels[glevel] >= gossip_level_targets[glevel])
+		glevel++;
+
+	return glevel;
+}
+
 /*~ This is where connectd tells us about a new peer, and we hand back an fd for
  * it to send us messages via peer_msg_in above */
 static struct io_plan *connectd_new_peer(struct io_conn *conn,
@@ -1622,9 +1794,11 @@ static struct io_plan *connectd_new_peer(struct io_conn *conn,
 	peer->scid_query_idx = 0;
 	peer->scid_query_nodes = NULL;
 	peer->scid_query_nodes_idx = 0;
-	peer->num_scid_queries_outstanding = 0;
+	peer->scid_query_outstanding = false;
 	peer->query_channel_blocks = NULL;
 	peer->num_pings_outstanding = 0;
+	peer->gossip_level = peer_gossip_level(daemon,
+					       peer->gossip_queries_feature);
 
 	/* We keep a list so we can find peer by id */
 	list_add_tail(&peer->daemon->peers, &peer->list);
@@ -1829,6 +2003,81 @@ static void gossip_disable_local_channels(struct daemon *daemon)
 		local_disable_chan(daemon->rstate, c);
 }
 
+/* Mutual recursion, so we pre-declare this. */
+static void gossip_not_missing(struct daemon *daemon);
+
+/* Pick a random peer which is not already GOSSIP_HIGH. */
+static struct peer *random_peer_to_gossip(struct daemon *daemon)
+{
+	u64 target = UINT64_MAX;
+	struct peer *best = NULL, *i;
+
+	/* Reservoir sampling */
+	list_for_each(&daemon->peers, i, list) {
+		u64 r = pseudorand_u64();
+		if (i->gossip_level != GOSSIP_HIGH && r <= target) {
+			best = i;
+			target = r;
+		}
+	}
+	return best;
+}
+
+/*~ We've found gossip is missing. */
+static void gossip_missing(struct daemon *daemon)
+{
+	if (!daemon->gossip_missing) {
+		status_info("We seem to be missing gossip messages");
+		/* FIXME: we could use query_channel_range. */
+		/* Make some peers gossip harder. */
+		for (size_t i = 0; i < gossip_level_targets[GOSSIP_HIGH]; i++) {
+			struct peer *peer = random_peer_to_gossip(daemon);
+
+			if (!peer)
+				break;
+
+			status_info("%s: gossip harder!",
+				    type_to_string(tmpctx, struct node_id,
+						   &peer->id));
+			peer->gossip_level = GOSSIP_HIGH;
+			setup_gossip_range(peer);
+		}
+	}
+
+	tal_free(daemon->gossip_missing);
+	/* Check again in 10 minutes. */
+	daemon->gossip_missing = new_reltimer(&daemon->timers, daemon,
+					      time_from_sec(600),
+					      gossip_not_missing, daemon);
+}
+
+/*~ This is a timer, which goes off 10 minutes after the last time we noticed
+ * that gossip was missing. */
+static void gossip_not_missing(struct daemon *daemon)
+{
+	/* Corner case: no peers, try again! */
+	if (list_empty(&daemon->peers))
+		gossip_missing(daemon);
+	else {
+		struct peer *peer;
+
+		daemon->gossip_missing = tal_free(daemon->gossip_missing);
+		status_info("We seem to be caught up on gossip messages");
+		/* Free any lagging/stale unknown scids. */
+		daemon->unknown_scids = tal_free(daemon->unknown_scids);
+
+		/* Reset peers we marked as HIGH */
+		list_for_each(&daemon->peers, peer, list) {
+			if (peer->gossip_level != GOSSIP_HIGH)
+				continue;
+			if (!peer->gossip_queries_feature)
+				continue;
+			peer->gossip_level = peer_gossip_level(daemon, true);
+			setup_gossip_range(peer);
+		}
+	}
+}
+
 /*~ Parse init message from lightningd: starts the daemon properly. */
 static struct io_plan *gossip_init(struct io_conn *conn,
 				   struct daemon *daemon,
@@ -1859,7 +2108,8 @@ static struct io_plan *gossip_init(struct io_conn *conn,
 					   dev_gossip_time);
 
 	/* Load stored gossip messages */
-	gossip_store_load(daemon->rstate, daemon->rstate->gs);
+	if (!gossip_store_load(daemon->rstate, daemon->rstate->gs))
+		gossip_missing(daemon);
 
 	/* Now disable all local channels, they can't be connected yet. */
 	gossip_disable_local_channels(daemon);
@@ -1880,7 +2130,7 @@ static struct io_plan *gossip_init(struct io_conn *conn,
 static struct io_plan *getroute_req(struct io_conn *conn, struct daemon *daemon,
 				    const u8 *msg)
 {
-	struct node_id source, destination;
+	struct node_id *source, destination;
 	struct amount_msat msat;
 	u32 final_cltv;
 	u64 riskfactor_by_million;
@@ -1895,7 +2145,12 @@ static struct io_plan *getroute_req(struct io_conn *conn, struct daemon *daemon,
 	 * we'll pay), how to trade off more locktime vs. more fees, and how
 	 * much cltv we need a the final node to give exact values for each
 	 * intermediate hop, as well as how much random fuzz to inject to
-	 * avoid being too predictable. */
+	 * avoid being too predictable.
+	 *
+	 * We also treat routing slightly differently if we're asking
+	 * for a route from ourselves (the usual case): in that case,
+	 * we don't have to consider fees on our own outgoing channels.
+	 */
 	if (!fromwire_gossip_getroute_request(msg, msg,
 					      &source, &destination,
 					      &msat, &riskfactor_by_million,
@@ -1905,12 +2160,13 @@ static struct io_plan *getroute_req(struct io_conn *conn, struct daemon *daemon,
 		master_badmsg(WIRE_GOSSIP_GETROUTE_REQUEST, msg);
 
 	status_trace("Trying to find a route from %s to %s for %s",
-		     type_to_string(tmpctx, struct node_id, &source),
+		     source
+		     ? type_to_string(tmpctx, struct node_id, source) : "(me)",
 		     type_to_string(tmpctx, struct node_id, &destination),
 		     type_to_string(tmpctx, struct amount_msat, &msat));
 
 	/* routing.c does all the hard work; can return NULL. */
-	hops = get_route(tmpctx, daemon->rstate, &source, &destination,
+	hops = get_route(tmpctx, daemon->rstate, source, &destination,
 			 msat, riskfactor_by_million / 1000000.0, final_cltv,
 			 fuzz, pseudorand_u64(), excluded, max_hops);
 
@@ -1948,6 +2204,8 @@ static struct gossip_halfchannel_entry *hc_entry(const tal_t *ctx,
 	e->base_fee_msat = c->base_fee;
 	e->fee_per_millionth = c->proportional_fee;
 	e->delay = c->delay;
+	e->min = c->htlc_minimum;
+	e->max = c->htlc_maximum;
 
 	return e;
 }
@@ -2262,8 +2520,6 @@ static struct io_plan *get_incoming_channels(struct io_conn *conn,
 }
 
 #if DEVELOPER
-/* FIXME: One day this will be called internally; for now it's just for
- * testing with dev_query_scids. */
 static struct io_plan *query_scids_req(struct io_conn *conn,
 				       struct daemon *daemon,
 				       const u8 *msg)
@@ -2271,17 +2527,6 @@ static struct io_plan *query_scids_req(struct io_conn *conn,
 	struct node_id id;
 	struct short_channel_id *scids;
 	struct peer *peer;
-	u8 *encoded;
-	/* BOLT #7:
-	 *
-	 * 1. type: 261 (`query_short_channel_ids`) (`gossip_queries`)
-	 * 2. data:
-	 *     * [`32`:`chain_hash`]
-	 *     * [`2`:`len`]
-	 *     * [`len`:`encoded_short_ids`]
-	 */
-	const size_t reply_overhead = 32 + 2;
-	const size_t max_encoded_bytes = 65535 - 2 - reply_overhead;
 
 	if (!fromwire_gossip_query_scids(msg, msg, &id, &scids))
 		master_badmsg(WIRE_GOSSIP_QUERY_SCIDS, msg);
@@ -2290,40 +2535,14 @@ static struct io_plan *query_scids_req(struct io_conn *conn,
 	if (!peer) {
 		status_broken("query_scids: unknown peer %s",
 			      type_to_string(tmpctx, struct node_id, &id));
-		goto fail;
-	}
-
-	if (!peer->gossip_queries_feature) {
-		status_broken("query_scids: no gossip_query support in peer %s",
-			      type_to_string(tmpctx, struct node_id, &id));
-		goto fail;
-	}
-
-	encoded = encode_short_channel_ids_start(tmpctx);
-	for (size_t i = 0; i < tal_count(scids); i++)
-		encode_add_short_channel_id(&encoded, &scids[i]);
-
-	/* Because this is a dev command, we simply say this case is
-	 * "too hard". */
-	if (!encode_short_channel_ids_end(&encoded, max_encoded_bytes)) {
-		status_broken("query_short_channel_ids: %zu is too many",
-			      tal_count(scids));
-		goto fail;
-	}
-
-	msg = towire_query_short_channel_ids(NULL, &daemon->chain_hash,
-					     encoded);
-	queue_peer_msg(peer, take(msg));
-	peer->num_scid_queries_outstanding++;
-
-	status_trace("sending query for %zu scids", tal_count(scids));
-out:
+		daemon_conn_send(daemon->master,
+				 take(towire_gossip_scids_reply(NULL,
+								false, false)));
+	} else if (!query_short_channel_ids(daemon, peer, scids, false))
+		daemon_conn_send(daemon->master,
+				 take(towire_gossip_scids_reply(NULL,
+								false, false)));
 	return daemon_conn_read_next(conn, daemon->master);
-
-fail:
-	daemon_conn_send(daemon->master,
-			 take(towire_gossip_scids_reply(NULL, false, false)));
-	goto out;
 }
 
 /* BOLT #7:
@@ -2530,12 +2749,27 @@ static struct io_plan *handle_txout_reply(struct io_conn *conn,
 	struct short_channel_id scid;
 	u8 *outscript;
 	struct amount_sat sat;
+	bool was_unknown;
 
 	if (!fromwire_gossip_get_txout_reply(msg, msg, &scid, &sat, &outscript))
 		master_badmsg(WIRE_GOSSIP_GET_TXOUT_REPLY, msg);
 
+	/* Were we looking specifically for this? */
+	was_unknown = false;
+	for (size_t i = 0; i < tal_count(daemon->unknown_scids); i++) {
+		if (short_channel_id_eq(&daemon->unknown_scids[i], &scid)) {
+			was_unknown = true;
+			tal_arr_remove(&daemon->unknown_scids, i);
+			break;
+		}
+	}
+
 	/* Outscript is NULL if it's not an unspent output */
-	handle_pending_cannouncement(daemon->rstate, &scid, sat, outscript);
+	if (handle_pending_cannouncement(daemon->rstate, &scid, sat, outscript)
+	    && was_unknown) {
+		/* It was real: we're missing gossip. */
+		gossip_missing(daemon);
+	}
 
 	/* Anywhere we might have announced a channel, we check if it's time to
 	 * announce ourselves (ie. if we just announced our own first channel) */
@@ -2799,6 +3033,8 @@ int main(int argc, char *argv[])
 
 	daemon = tal(NULL, struct daemon);
 	list_head_init(&daemon->peers);
+	daemon->unknown_scids = tal_arr(daemon, struct short_channel_id, 0);
+	daemon->gossip_missing = NULL;
 
 	/* Note the use of time_mono() here.  That's a monotonic clock, which
 	 * is really useful: it can only be used to measure relative events

@@ -2,6 +2,7 @@
 #include <bitcoin/base58.h>
 #include <bitcoin/script.h>
 #include <ccan/tal/str/str.h>
+#include <common/addr.h>
 #include <common/bech32.h>
 #include <common/json_command.h>
 #include <common/json_helpers.h>
@@ -68,10 +69,8 @@ static void wallet_withdrawal_broadcast(struct bitcoind *bitcoind UNUSED,
 		assert(amount_sat_greater_eq(change, utx->wtx->change));
 
 		struct json_stream *response = json_stream_success(cmd);
-		json_object_start(response, NULL);
 		json_add_tx(response, "tx", utx->tx);
 		json_add_string(response, "txid", output);
-		json_object_end(response);
 		was_pending(command_success(cmd, response));
 	} else {
 		was_pending(command_fail(cmd, LIGHTNINGD,
@@ -228,10 +227,8 @@ static struct command_result *json_txprepare(struct command *cmd,
 	add_unreleased_tx(cmd->ld->wallet, utx);
 
 	response = json_stream_success(cmd);
-	json_object_start(response, NULL);
 	json_add_tx(response, "unsigned_tx", utx->tx);
 	json_add_txid(response, "txid", &utx->txid);
-	json_object_end(response);
 	return command_success(cmd, response);
 }
 static const struct json_command txprepare_command = {
@@ -314,10 +311,8 @@ static struct command_result *json_txdiscard(struct command *cmd,
 	tal_steal(cmd, utx);
 
 	response = json_stream_success(cmd);
-	json_object_start(response, NULL);
 	json_add_tx(response, "unsigned_tx", utx->tx);
 	json_add_txid(response, "txid", &utx->txid);
-	json_object_end(response);
 	return command_success(cmd, response);
 }
 
@@ -425,26 +420,6 @@ encode_pubkey_to_addr(const tal_t *ctx,
 	return out;
 }
 
-/* Returns NULL if the script is not a P2WPKH */
-static char *
-encode_scriptpubkey_to_addr(const tal_t *ctx,
-			    const struct lightningd *ld,
-			    const u8 *scriptPubkey)
-{
-	char *out;
-	const char *hrp;
-	size_t scriptLen = tal_bytelen(scriptPubkey);
-	bool ok;
-	if (scriptLen != 22 || scriptPubkey[0] != 0x00 || scriptPubkey[1] != 0x14)
-		return NULL;
-	hrp = get_chainparams(ld)->bip173_name;
-	out = tal_arr(ctx, char, 73 + strlen(hrp));
-	ok = segwit_addr_encode(out, hrp, 0, scriptPubkey + 2, scriptLen - 2);
-	if (!ok)
-		return tal_free(out);
-	return out;
-}
-
 enum addrtype {
 	ADDR_P2SH_SEGWIT = 1,
 	ADDR_BECH32 = 2,
@@ -512,7 +487,6 @@ static struct command_result *json_newaddr(struct command *cmd,
 	}
 
 	response = json_stream_success(cmd);
-	json_object_start(response, NULL);
 	if (deprecated_apis && *addrtype != ADDR_ALL)
 		json_add_string(response, "address",
 				*addrtype & ADDR_BECH32 ? bech32 : p2sh);
@@ -520,7 +494,6 @@ static struct command_result *json_newaddr(struct command *cmd,
 		json_add_string(response, "bech32", bech32);
 	if (*addrtype & ADDR_P2SH_SEGWIT)
 		json_add_string(response, "p2sh-segwit", p2sh);
-	json_object_end(response);
 	return command_success(cmd, response);
 }
 
@@ -553,7 +526,6 @@ static struct command_result *json_listaddrs(struct command *cmd,
 						 "bip32_max_index", 0);
 	}
 	response = json_stream_success(cmd);
-	json_object_start(response, NULL);
 	json_array_start(response, "addresses");
 
 	for (s64 keyidx = 0; keyidx <= *bip32_max_index; keyidx++) {
@@ -595,7 +567,6 @@ static struct command_result *json_listaddrs(struct command *cmd,
 		json_object_end(response);
 	}
 	json_array_end(response);
-	json_object_end(response);
 	return command_success(cmd, response);
 }
 
@@ -625,7 +596,6 @@ static struct command_result *json_listfunds(struct command *cmd,
 
 	utxos = wallet_get_utxos(cmd, cmd->ld->wallet, output_state_available);
 	response = json_stream_success(cmd);
-	json_object_start(response, NULL);
 	json_array_start(response, "outputs");
 	for (size_t i = 0; i < tal_count(utxos); i++) {
 		json_object_start(response, NULL);
@@ -649,7 +619,8 @@ static struct command_result *json_listfunds(struct command *cmd,
 		        json_add_string(response, "address", out);
 		} else if (utxos[i]->scriptPubkey != NULL) {
 			out = encode_scriptpubkey_to_addr(
-			    cmd, cmd->ld, utxos[i]->scriptPubkey);
+			    cmd, get_chainparams(cmd->ld)->bip173_name,
+			    utxos[i]->scriptPubkey);
 			if (out)
 				json_add_string(response, "address", out);
 		}
@@ -690,7 +661,6 @@ static struct command_result *json_listfunds(struct command *cmd,
 		}
 	}
 	json_array_end(response);
-	json_object_end(response);
 
 	return command_success(cmd, response);
 }
@@ -737,7 +707,6 @@ static void process_utxo_result(struct bitcoind *bitcoind,
 	if (tal_count(rescan->utxos) == 0) {
 		/* Complete the response */
 		json_array_end(rescan->response);
-		json_object_end(rescan->response);
 		was_pending(command_success(rescan->cmd, rescan->response));
 	} else {
 		bitcoind_gettxout(
@@ -759,13 +728,11 @@ static struct command_result *json_dev_rescan_outputs(struct command *cmd,
 	rescan->response = json_stream_success(cmd);
 	rescan->cmd = cmd;
 
-	/* Open the result structure so we can incrementally add results */
-	json_object_start(rescan->response, NULL);
+	/* Open the outputs structure so we can incrementally add results */
 	json_array_start(rescan->response, "outputs");
 	rescan->utxos = wallet_get_utxos(rescan, cmd->ld->wallet, output_state_any);
 	if (tal_count(rescan->utxos) == 0) {
 		json_array_end(rescan->response);
-		json_object_end(rescan->response);
 		return command_success(cmd, rescan->response);
 	}
 	bitcoind_gettxout(cmd->ld->topology->bitcoind, &rescan->utxos[0]->txid,

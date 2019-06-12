@@ -1,7 +1,7 @@
 from fixtures import *  # noqa: F401,F403
 from flaky import flaky  # noqa: F401
 from lightning import RpcError, Millisatoshi
-from utils import DEVELOPER, wait_for, only_one, sync_blockheight, SLOW_MACHINE
+from utils import DEVELOPER, wait_for, only_one, sync_blockheight, SLOW_MACHINE, TIMEOUT
 
 
 import copy
@@ -96,13 +96,11 @@ def test_pay_limits(node_factory):
     # It should have retried (once without routehint, too)
     status = l1.rpc.call('paystatus', {'bolt11': inv['bolt11']})['pay'][0]['attempts']
 
-    # Hits weird corner case: it excludes channel, then uses routehint
-    # which reintroduces it, so then it excludes other channel.
-    assert len(status) == 4
+    # Excludes channel, then ignores routehint which includes that, then
+    # it excludes other channel.
+    assert len(status) == 2
     assert status[0]['strategy'] == "Initial attempt"
     assert status[1]['strategy'].startswith("Excluded expensive channel ")
-    assert status[2]['strategy'] == "Trying route hint"
-    assert status[3]['strategy'].startswith("Excluded expensive channel ")
 
     # Delay too high.
     with pytest.raises(RpcError, match=r'Route wanted delay of .* blocks') as err:
@@ -111,11 +109,9 @@ def test_pay_limits(node_factory):
     assert err.value.error['code'] == PAY_ROUTE_TOO_EXPENSIVE
     # Should also have retried.
     status = l1.rpc.call('paystatus', {'bolt11': inv['bolt11']})['pay'][1]['attempts']
-    assert len(status) == 4
+    assert len(status) == 2
     assert status[0]['strategy'] == "Initial attempt"
     assert status[1]['strategy'].startswith("Excluded delaying channel ")
-    assert status[2]['strategy'] == "Trying route hint"
-    assert status[3]['strategy'].startswith("Excluded delaying channel ")
 
     # This works, because fee is less than exemptfee.
     l1.rpc.call('pay', {'bolt11': inv['bolt11'], 'msatoshi': 100000, 'maxfeepercent': 0.0001, 'exemptfee': 2000})
@@ -1489,8 +1485,13 @@ def test_pay_retry(node_factory, bitcoind):
     # This should make it fail.
     exhaust_channel(l4, l5, scid45, 10**8)
 
-    with pytest.raises(RpcError, match=r'5 attempts'):
-        l1.rpc.pay(l5.rpc.invoice(10**8, 'test_retry2', 'test_retry2')['bolt11'])
+    # It won't try l1->l5, since it knows that's under capacity.
+    # It will try l1->l2->l5, which fails.
+    # It will try l1->l2->l3->l5, which fails.
+    # It will try l1->l2->l3->l4->l5, which fails.
+    inv = l5.rpc.invoice(10**8, 'test_retry2', 'test_retry2')['bolt11']
+    with pytest.raises(RpcError, match=r'3 attempts'):
+        l1.rpc.pay(inv)
 
 
 @unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1 otherwise gossip takes 5 minutes!")
@@ -2045,3 +2046,144 @@ def test_setchannelfee_all(node_factory, bitcoind):
     assert result['channels'][0]['short_channel_id'] == scid2
     assert result['channels'][1]['peer_id'] == l3.info['id']
     assert result['channels'][1]['short_channel_id'] == scid3
+
+
+def test_channel_spendable(node_factory, bitcoind):
+    """Test that spendable_msat is accurate"""
+    sats = 10**6
+    l1, l2 = node_factory.line_graph(2, fundamount=sats, wait_for_announce=True,
+                                     opts={'plugin': 'tests/plugins/hold_invoice.py', 'holdtime': str(TIMEOUT / 2)})
+
+    payment_hash = l2.rpc.invoice('any', 'inv', 'for testing')['payment_hash']
+
+    # We should be able to spend this much, and not one msat more!
+    amount = l1.rpc.listpeers()['peers'][0]['channels'][0]['spendable_msat']
+    route = l1.rpc.getroute(l2.info['id'], amount + 1, riskfactor=1, fuzzpercent=0)['route']
+    l1.rpc.sendpay(route, payment_hash)
+
+    # This should fail locally with "capacity exceeded"
+    with pytest.raises(RpcError, match=r"Capacity exceeded.*'erring_index': 0"):
+        l1.rpc.waitsendpay(payment_hash, TIMEOUT)
+
+    # Exact amount should succeed.
+    route = l1.rpc.getroute(l2.info['id'], amount, riskfactor=1, fuzzpercent=0)['route']
+    l1.rpc.sendpay(route, payment_hash)
+
+    # Amount should drop to 0 once HTLC is sent; we have time, thanks to
+    # hold_invoice.py plugin.
+    wait_for(lambda: len(l1.rpc.listpeers()['peers'][0]['channels'][0]['htlcs']) == 1)
+    assert l1.rpc.listpeers()['peers'][0]['channels'][0]['spendable_msat'] == Millisatoshi(0)
+    l1.rpc.waitsendpay(payment_hash, TIMEOUT)
+
+    # Make sure l2 thinks it's all over.
+    wait_for(lambda: len(l2.rpc.listpeers()['peers'][0]['channels'][0]['htlcs']) == 0)
+    # Now, reverse should work similarly.
+    payment_hash = l1.rpc.invoice('any', 'inv', 'for testing')['payment_hash']
+    amount = l2.rpc.listpeers()['peers'][0]['channels'][0]['spendable_msat']
+
+    # Turns out we this won't route, as it's over max - reserve:
+    route = l2.rpc.getroute(l1.info['id'], amount + 1, riskfactor=1, fuzzpercent=0)['route']
+    l2.rpc.sendpay(route, payment_hash)
+
+    # This should fail locally with "capacity exceeded"
+    with pytest.raises(RpcError, match=r"Capacity exceeded.*'erring_index': 0"):
+        l2.rpc.waitsendpay(payment_hash, TIMEOUT)
+
+    # Exact amount should succeed.
+    route = l2.rpc.getroute(l1.info['id'], amount, riskfactor=1, fuzzpercent=0)['route']
+    l2.rpc.sendpay(route, payment_hash)
+
+    # Amount should drop to 0 once HTLC is sent; we have time, thanks to
+    # hold_invoice.py plugin.
+    wait_for(lambda: len(l2.rpc.listpeers()['peers'][0]['channels'][0]['htlcs']) == 1)
+    assert l2.rpc.listpeers()['peers'][0]['channels'][0]['spendable_msat'] == Millisatoshi(0)
+    l2.rpc.waitsendpay(payment_hash, TIMEOUT)
+
+
+def test_channel_spendable_large(node_factory, bitcoind):
+    """Test that spendable_msat is accurate for large channels"""
+    # This is almost the max allowable spend.
+    sats = 4294967
+    l1, l2 = node_factory.line_graph(2, fundamount=sats, wait_for_announce=True,
+                                     opts={'plugin': 'tests/plugins/hold_invoice.py', 'holdtime': str(TIMEOUT / 2)})
+
+    payment_hash = l2.rpc.invoice('any', 'inv', 'for testing')['payment_hash']
+
+    # We should be able to spend this much, and not one msat more!
+    amount = l1.rpc.listpeers()['peers'][0]['channels'][0]['spendable_msat']
+
+    # route or waitsendpay fill fail.
+    with pytest.raises(RpcError):
+        route = l1.rpc.getroute(l2.info['id'], amount + 1, riskfactor=1, fuzzpercent=0)['route']
+        l1.rpc.sendpay(route, payment_hash)
+        l1.rpc.waitsendpay(payment_hash, TIMEOUT)
+
+    print(l2.rpc.listchannels())
+    # Exact amount should succeed.
+    route = l1.rpc.getroute(l2.info['id'], amount, riskfactor=1, fuzzpercent=0)['route']
+    l1.rpc.sendpay(route, payment_hash)
+    l1.rpc.waitsendpay(payment_hash, TIMEOUT)
+
+
+def test_channel_spendable_capped(node_factory, bitcoind):
+    """Test that spendable_msat is capped at 2^32-1"""
+    sats = 16777215
+    l1, l2 = node_factory.line_graph(2, fundamount=sats, wait_for_announce=False)
+    assert l1.rpc.listpeers()['peers'][0]['channels'][0]['spendable_msat'] == Millisatoshi(0xFFFFFFFF)
+
+
+def test_channel_drainage(node_factory, bitcoind):
+    """Test channel drainage.
+
+    Test to drains a channels as much as possible,
+    especially in regards to commitment fee:
+
+    [l1] <=> [l2]
+    """
+    sats = 10**6
+    l1, l2 = node_factory.line_graph(2, fundamount=sats, wait_for_announce=True)
+
+    # wait for everyone to see every channel as active
+    for n in [l1, l2]:
+        wait_for(lambda: [c['active'] for c in n.rpc.listchannels()['channels']] == [True] * 2 * 1)
+
+    # This first HTLC drains the channel.
+    amount = Millisatoshi("976559200msat")
+    payment_hash = l2.rpc.invoice('any', 'inv', 'for testing')['payment_hash']
+    route = l1.rpc.getroute(l2.info['id'], amount, riskfactor=1, fuzzpercent=0)['route']
+    l1.rpc.sendpay(route, payment_hash)
+    l1.rpc.waitsendpay(payment_hash, 10)
+
+    # wait until totally settled
+    wait_for(lambda: len(l1.rpc.listpeers()['peers'][0]['channels'][0]['htlcs']) == 0)
+    wait_for(lambda: len(l2.rpc.listpeers()['peers'][0]['channels'][0]['htlcs']) == 0)
+
+    # But we can get more!  By using a trimmed htlc output; this doesn't cause
+    # an increase in tx fee, so it's allowed.
+    amount = Millisatoshi("2580800msat")
+    payment_hash = l2.rpc.invoice('any', 'inv2', 'for testing')['payment_hash']
+    route = l1.rpc.getroute(l2.info['id'], amount, riskfactor=1, fuzzpercent=0)['route']
+    l1.rpc.sendpay(route, payment_hash)
+    l1.rpc.waitsendpay(payment_hash, TIMEOUT)
+
+    # wait until totally settled
+    wait_for(lambda: len(l1.rpc.listpeers()['peers'][0]['channels'][0]['htlcs']) == 0)
+    wait_for(lambda: len(l2.rpc.listpeers()['peers'][0]['channels'][0]['htlcs']) == 0)
+
+    # Now, l1 is paying fees, but it can't afford a larger tx, so any
+    # attempt to add an HTLC which is not trimmed will fail.
+    payment_hash = l1.rpc.invoice('any', 'inv', 'for testing')['payment_hash']
+
+    # feerate_per_kw = 15000, so htlc_timeout_fee = 663 * 15000 / 1000 = 9945.
+    # dust_limit is 546.  So it's trimmed if < 9945 + 546.
+    amount = Millisatoshi("10491sat")
+    route = l2.rpc.getroute(l1.info['id'], amount, riskfactor=1, fuzzpercent=0)['route']
+    l2.rpc.sendpay(route, payment_hash)
+    with pytest.raises(RpcError, match=r"Capacity exceeded.*'erring_index': 0"):
+        l2.rpc.waitsendpay(payment_hash, TIMEOUT)
+
+    # But if it's trimmed, we're ok.
+    amount -= 1
+    route = l2.rpc.getroute(l1.info['id'], amount, riskfactor=1, fuzzpercent=0)['route']
+    l2.rpc.sendpay(route, payment_hash)
+    l2.rpc.waitsendpay(payment_hash, TIMEOUT)

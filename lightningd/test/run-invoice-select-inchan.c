@@ -112,6 +112,13 @@ const struct chainparams *get_chainparams(const struct lightningd *ld UNNEEDED)
 /* Generated stub for get_log_level */
 enum log_level get_log_level(struct log_book *lr UNNEEDED)
 { fprintf(stderr, "get_log_level called!\n"); abort(); }
+/* Generated stub for htlc_is_trimmed */
+bool htlc_is_trimmed(enum side htlc_owner UNNEEDED,
+		     struct amount_msat htlc_amount UNNEEDED,
+		     u32 feerate_per_kw UNNEEDED,
+		     struct amount_sat dust_limit UNNEEDED,
+		     enum side side UNNEEDED)
+{ fprintf(stderr, "htlc_is_trimmed called!\n"); abort(); }
 /* Generated stub for htlcs_reconnect */
 void htlcs_reconnect(struct lightningd *ld UNNEEDED,
 		     struct htlc_in_map *htlcs_in UNNEEDED,
@@ -147,7 +154,7 @@ void json_add_bool(struct json_stream *result UNNEEDED, const char *fieldname UN
 /* Generated stub for json_add_escaped_string */
 void json_add_escaped_string(struct json_stream *result UNNEEDED,
 			     const char *fieldname UNNEEDED,
-			     const struct json_escaped *esc TAKES UNNEEDED)
+			     const struct json_escape *esc TAKES UNNEEDED)
 { fprintf(stderr, "json_add_escaped_string called!\n"); abort(); }
 /* Generated stub for json_add_hex */
 void json_add_hex(struct json_stream *result UNNEEDED, const char *fieldname UNNEEDED,
@@ -162,10 +169,6 @@ void json_add_hex_talarr(struct json_stream *result UNNEEDED,
 void json_add_log(struct json_stream *result UNNEEDED,
 		  const struct log_book *lr UNNEEDED, enum log_level minlevel UNNEEDED)
 { fprintf(stderr, "json_add_log called!\n"); abort(); }
-/* Generated stub for json_add_member */
-void json_add_member(struct json_stream *js UNNEEDED, const char *fieldname UNNEEDED,
-		     const char *fmt UNNEEDED, ...)
-{ fprintf(stderr, "json_add_member called!\n"); abort(); }
 /* Generated stub for json_add_node_id */
 void json_add_node_id(struct json_stream *response UNNEEDED,
 				const char *fieldname UNNEEDED,
@@ -284,9 +287,6 @@ void notify_connect(struct lightningd *ld UNNEEDED, struct node_id *nodeid UNNEE
 /* Generated stub for notify_disconnect */
 void notify_disconnect(struct lightningd *ld UNNEEDED, struct node_id *nodeid UNNEEDED)
 { fprintf(stderr, "notify_disconnect called!\n"); abort(); }
-/* Generated stub for null_response */
-struct json_stream *null_response(struct command *cmd UNNEEDED)
-{ fprintf(stderr, "null_response called!\n"); abort(); }
 /* Generated stub for onchaind_funding_spent */
 enum watch_result onchaind_funding_spent(struct channel *channel UNNEEDED,
 					 const struct bitcoin_tx *tx UNNEEDED,
@@ -316,7 +316,7 @@ struct command_result *param_escaped_string(struct command *cmd UNNEEDED,
 /* Generated stub for param_label */
 struct command_result *param_label(struct command *cmd UNNEEDED, const char *name UNNEEDED,
 				   const char * buffer UNNEEDED, const jsmntok_t *tok UNNEEDED,
-				   struct json_escaped **label UNNEEDED)
+				   struct json_escape **label UNNEEDED)
 { fprintf(stderr, "param_label called!\n"); abort(); }
 /* Generated stub for param_loglevel */
 struct command_result *param_loglevel(struct command *cmd UNNEEDED,
@@ -488,7 +488,7 @@ bool wallet_htlcs_load_for_channel(struct wallet *wallet UNNEEDED,
 bool wallet_invoice_create(struct wallet *wallet UNNEEDED,
 			   struct invoice *pinvoice UNNEEDED,
 			   const struct amount_msat *msat TAKES UNNEEDED,
-			   const struct json_escaped *label TAKES UNNEEDED,
+			   const struct json_escape *label TAKES UNNEEDED,
 			   u64 expiry UNNEEDED,
 			   const char *b11enc UNNEEDED,
 			   const char *description UNNEEDED,
@@ -511,7 +511,7 @@ const struct invoice_details *wallet_invoice_details(const tal_t *ctx UNNEEDED,
 /* Generated stub for wallet_invoice_find_by_label */
 bool wallet_invoice_find_by_label(struct wallet *wallet UNNEEDED,
 				  struct invoice *pinvoice UNNEEDED,
-				  const struct json_escaped *label UNNEEDED)
+				  const struct json_escape *label UNNEEDED)
 { fprintf(stderr, "wallet_invoice_find_by_label called!\n"); abort(); }
 /* Generated stub for wallet_invoice_find_by_rhash */
 bool wallet_invoice_find_by_rhash(struct wallet *wallet UNNEEDED,

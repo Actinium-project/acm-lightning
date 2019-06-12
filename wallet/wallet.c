@@ -380,6 +380,36 @@ const struct utxo **wallet_select_coins(const tal_t *ctx, struct wallet *w,
 	return utxo;
 }
 
+const struct utxo **wallet_select_specific(const tal_t *ctx, struct wallet *w,
+					struct bitcoin_txid **txids,
+                    u32 **outnums)
+{
+	size_t i, j;
+	struct utxo **available;
+	const struct utxo **utxos = tal_arr(ctx, const struct utxo*, 0);
+	tal_add_destructor2(utxos, destroy_utxos, w);
+
+	available = wallet_get_utxos(ctx, w, output_state_available);
+	for (i = 0; i < tal_count(txids); i++) {
+		for (j = 0; j < tal_count(available); j++) {
+
+			if (bitcoin_txid_eq(&available[j]->txid, txids[i])
+					&& available[j]->outnum == *outnums[i]) {
+				struct utxo *u = tal_steal(utxos, available[j]);
+				tal_arr_expand(&utxos, u);
+
+				if (!wallet_update_output_status(
+					w, &available[j]->txid, available[j]->outnum,
+					output_state_available, output_state_reserved))
+					fatal("Unable to reserve output");
+			}
+		}
+	}
+	tal_free(available);
+
+	return utxos;
+}
+
 const struct utxo **wallet_select_all(const tal_t *ctx, struct wallet *w,
 				      const u32 feerate_per_kw,
 				      size_t outscriptlen,
@@ -1599,7 +1629,7 @@ bool wallet_htlcs_load_for_channel(struct wallet *wallet,
 bool wallet_invoice_create(struct wallet *wallet,
 			   struct invoice *pinvoice,
 			   const struct amount_msat *msat TAKES,
-			   const struct json_escaped *label TAKES,
+			   const struct json_escape *label TAKES,
 			   u64 expiry,
 			   const char *b11enc,
 			   const char *description,
@@ -1610,7 +1640,7 @@ bool wallet_invoice_create(struct wallet *wallet,
 }
 bool wallet_invoice_find_by_label(struct wallet *wallet,
 				  struct invoice *pinvoice,
-				  const struct json_escaped *label)
+				  const struct json_escape *label)
 {
 	return invoices_find_by_label(wallet->invoices, pinvoice, label);
 }

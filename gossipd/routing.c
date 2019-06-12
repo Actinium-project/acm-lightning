@@ -517,6 +517,7 @@ static bool fuzz_fee(u64 *fee,
  * sets newtotal and newrisk */
 static bool can_reach(const struct half_chan *c,
 		      const struct short_channel_id *scid,
+		      bool no_charge,
 		      struct amount_msat total,
 		      struct amount_msat risk,
 		      double riskfactor,
@@ -530,18 +531,29 @@ static bool can_reach(const struct half_chan *c,
 	if (!amount_msat_fee(&fee, total, c->base_fee, c->proportional_fee))
 		return false;
 
-	if (!fuzz_fee(&fee.millisatoshis, scid, fuzz, base_seed)) /* Raw: double manipulation */
+  	if (!fuzz_fee(&fee.millisatoshis, scid, fuzz, base_seed)) /* Raw: double manipulation */
 		return false;
 
-	if (!amount_msat_add(newtotal, total, fee))
-		return false;
+	if (no_charge) {
+		*newtotal = total;
+
+		/* We still want to consider the "charge", since it's indicative
+		 * of a bias (we discounted one channel for a reason), but we
+		 * don't pay it.  So we count it as additional risk. */
+		if (!amount_msat_add(newrisk, risk, fee))
+			return false;
+	} else {
+		*newrisk = risk;
+
+		if (!amount_msat_add(newtotal, total, fee))
+			return false;
+	}
 
 	/* Skip a channel if it indicated that it won't route the
 	 * requested amount. */
 	if (!hc_can_carry(c, *newtotal))
 		return false;
 
-	*newrisk = risk;
 	if (!risk_add_fee(newrisk, *newtotal, c->delay, riskfactor, riskbias))
 		return false;
 
@@ -736,6 +748,7 @@ static void remove_unvisited(struct node *node, struct unvisited *unvisited,
 
 static void update_unvisited_neighbors(struct routing_state *rstate,
 				       struct node *cur,
+				       const struct node *me,
 				       double riskfactor,
 				       u64 riskbias,
 				       double fuzz,
@@ -772,7 +785,9 @@ static void update_unvisited_neighbors(struct routing_state *rstate,
 			continue;
 		}
 
-		if (!can_reach(&chan->half[idx], &chan->scid,
+		/* We're looking at channels *backwards*, so peer == me
+		 * is the right test here for whether we don't charge fees. */
+		if (!can_reach(&chan->half[idx], &chan->scid, peer == me,
 			       cur->dijkstra.total, cur->dijkstra.risk,
 			       riskfactor, riskbias, fuzz, base_seed,
 			       &total, &risk)) {
@@ -819,6 +834,7 @@ static struct node *first_unvisited(struct unvisited *unvisited)
 
 static void dijkstra(struct routing_state *rstate,
 		     const struct node *dst,
+		     const struct node *me,
 		     double riskfactor,
 		     u64 riskbias,
 		     double fuzz, const struct siphash_seed *base_seed,
@@ -828,7 +844,8 @@ static void dijkstra(struct routing_state *rstate,
 	struct node *cur;
 
 	while ((cur = first_unvisited(unvisited)) != NULL) {
-		update_unvisited_neighbors(rstate, cur, riskfactor, riskbias,
+		update_unvisited_neighbors(rstate, cur, me,
+					   riskfactor, riskbias,
 					   fuzz, base_seed, unvisited, costfn);
 		remove_unvisited(cur, unvisited, costfn);
 		if (cur == dst)
@@ -842,6 +859,7 @@ static struct chan **build_route(const tal_t *ctx,
 				 struct routing_state *rstate,
 				 const struct node *from,
 				 const struct node *to,
+				 const struct node *me,
 				 double riskfactor,
 				 u64 riskbias,
 				 double fuzz,
@@ -888,7 +906,7 @@ static struct chan **build_route(const tal_t *ctx,
 				continue;
 			}
 
-			if (!can_reach(hc, &chan->scid,
+			if (!can_reach(hc, &chan->scid, i == me,
 				       peer->dijkstra.total, peer->dijkstra.risk,
 				       riskfactor,
 				       riskbias,
@@ -984,6 +1002,7 @@ static void dijkstra_cleanup(struct unvisited *unvisited)
 static struct chan **
 find_shorter_route(const tal_t *ctx, struct routing_state *rstate,
 		   struct node *src, struct node *dst,
+		   const struct node *me,
 		   struct amount_msat msat,
 		   size_t max_hops,
 		   double fuzz, const struct siphash_seed *base_seed,
@@ -1017,12 +1036,12 @@ find_shorter_route(const tal_t *ctx, struct routing_state *rstate,
 	SUPERVERBOSE("Running shortest path from %s -> %s",
 		     type_to_string(tmpctx, struct node_id, &dst->id),
 		     type_to_string(tmpctx, struct node_id, &src->id));
-	dijkstra(rstate, dst, riskfactor, 1, fuzz, base_seed,
+	dijkstra(rstate, dst, NULL, riskfactor, 1, fuzz, base_seed,
 		 unvisited, shortest_cost_function);
 	dijkstra_cleanup(unvisited);
 
 	/* This must succeed, since we found a route before */
-	short_route = build_route(ctx, rstate, dst, src, riskfactor, 1,
+	short_route = build_route(ctx, rstate, dst, src, me, riskfactor, 1,
 				  fuzz, base_seed, fee);
 	assert(short_route);
 	if (!amount_msat_sub(&short_cost,
@@ -1064,11 +1083,12 @@ find_shorter_route(const tal_t *ctx, struct routing_state *rstate,
 
 		unvisited = dijkstra_prepare(tmpctx, rstate, src, msat,
 					     normal_cost_function);
-		dijkstra(rstate, dst, riskfactor, riskbias, fuzz, base_seed,
+		dijkstra(rstate, dst, me, riskfactor, riskbias, fuzz, base_seed,
 			 unvisited, normal_cost_function);
 		dijkstra_cleanup(unvisited);
 
-		route = build_route(ctx, rstate, dst, src, riskfactor, riskbias,
+		route = build_route(ctx, rstate, dst, src, me,
+				    riskfactor, riskbias,
 				    fuzz, base_seed, &this_fee);
 
 		SUPERVERBOSE("riskbias %"PRIu64" rlen %zu",
@@ -1111,20 +1131,28 @@ find_route(const tal_t *ctx, struct routing_state *rstate,
 	   struct amount_msat *fee)
 {
 	struct node *src, *dst;
+	const struct node *me;
 	struct unvisited *unvisited;
 	struct chan **route;
 
 	/* Note: we map backwards, since we know the amount of satoshi we want
 	 * at the end, and need to derive how much we need to send. */
-	dst = get_node(rstate, from);
 	src = get_node(rstate, to);
+
+	/* If from is NULL, that's means it's us. */
+	if (!from)
+		me = dst = get_node(rstate, &rstate->local_id);
+	else {
+		dst = get_node(rstate, from);
+		me = NULL;
+	}
 
 	if (!src) {
 		status_info("find_route: cannot find %s",
 			    type_to_string(tmpctx, struct node_id, to));
 		return NULL;
 	} else if (!dst) {
-		status_info("find_route: cannot find myself (%s)",
+		status_info("find_route: cannot find source (%s)",
 			    type_to_string(tmpctx, struct node_id, to));
 		return NULL;
 	} else if (dst == src) {
@@ -1135,17 +1163,17 @@ find_route(const tal_t *ctx, struct routing_state *rstate,
 
 	unvisited = dijkstra_prepare(tmpctx, rstate, src, msat,
 				     normal_cost_function);
-	dijkstra(rstate, dst, riskfactor, 1, fuzz, base_seed,
+	dijkstra(rstate, dst, me, riskfactor, 1, fuzz, base_seed,
 		 unvisited, normal_cost_function);
 	dijkstra_cleanup(unvisited);
 
-	route = build_route(ctx, rstate, dst, src, riskfactor, 1,
+	route = build_route(ctx, rstate, dst, src, me, riskfactor, 1,
 			    fuzz, base_seed, fee);
 	if (tal_count(route) <= max_hops)
 		return route;
 
 	/* This is the far more unlikely case */
-	return find_shorter_route(ctx, rstate, src, dst, msat,
+	return find_shorter_route(ctx, rstate, src, dst, me, msat,
 				  max_hops, fuzz, base_seed, route, fee);
 }
 
@@ -1618,7 +1646,7 @@ static void process_pending_channel_update(struct routing_state *rstate,
 		return;
 
 	/* FIXME: We don't remember who sent us updates, so can't error them */
-	err = handle_channel_update(rstate, cupdate, "pending update");
+	err = handle_channel_update(rstate, cupdate, "pending update", NULL);
 	if (err) {
 		status_trace("Pending channel_update for %s: %s",
 			     type_to_string(tmpctx, struct short_channel_id, scid),
@@ -1627,7 +1655,7 @@ static void process_pending_channel_update(struct routing_state *rstate,
 	}
 }
 
-void handle_pending_cannouncement(struct routing_state *rstate,
+bool handle_pending_cannouncement(struct routing_state *rstate,
 				  const struct short_channel_id *scid,
 				  struct amount_sat sat,
 				  const u8 *outscript)
@@ -1637,7 +1665,7 @@ void handle_pending_cannouncement(struct routing_state *rstate,
 
 	pending = find_pending_cannouncement(rstate, scid);
 	if (!pending)
-		return;
+		return false;
 
 	/* BOLT #7:
 	 *
@@ -1652,7 +1680,7 @@ void handle_pending_cannouncement(struct routing_state *rstate,
 					    scid));
 		tal_free(pending);
 		uintmap_add(&rstate->txout_failures, scid->u64, true);
-		return;
+		return false;
 	}
 
 	/* BOLT #7:
@@ -1675,7 +1703,7 @@ void handle_pending_cannouncement(struct routing_state *rstate,
 					    scid),
 			     tal_hex(tmpctx, s), tal_hex(tmpctx, outscript));
 		tal_free(pending);
-		return;
+		return false;
 	}
 
 	/* Remove pending now, so below functions don't see it. */
@@ -1691,6 +1719,7 @@ void handle_pending_cannouncement(struct routing_state *rstate,
 	process_pending_channel_update(rstate, scid, pending->updates[1]);
 
 	tal_free(pending);
+	return true;
 }
 
 static void update_pending(struct pending_cannouncement *pending,
@@ -1935,7 +1964,8 @@ void remove_channel_from_store(struct routing_state *rstate,
 }
 
 u8 *handle_channel_update(struct routing_state *rstate, const u8 *update TAKES,
-			  const char *source)
+			  const char *source,
+			  struct short_channel_id *unknown_scid)
 {
 	u8 *serialized;
 	const struct node_id *owner;
@@ -2003,6 +2033,8 @@ u8 *handle_channel_update(struct routing_state *rstate, const u8 *update TAKES,
 
 	owner = get_channel_owner(rstate, &short_channel_id, direction);
 	if (!owner) {
+		if (unknown_scid)
+			*unknown_scid = short_channel_id;
 		bad_gossip_order(serialized,
 				 source,
 				 tal_fmt(tmpctx, "%s/%u",
@@ -2334,7 +2366,7 @@ struct route_hop *get_route(const tal_t *ctx, struct routing_state *rstate,
 		total_delay += c->delay;
 		n = other_node(n, route[i]);
 	}
-	assert(node_id_eq(&n->id, source));
+	assert(node_id_eq(&n->id, source ? source : &rstate->local_id));
 
 	return hops;
 }
@@ -2358,7 +2390,8 @@ void routing_failure(struct routing_state *rstate,
 
 	/* lightningd will only extract this if UPDATE is set. */
 	if (channel_update) {
-		u8 *err = handle_channel_update(rstate, channel_update, "error");
+		u8 *err = handle_channel_update(rstate, channel_update, "error",
+						NULL);
 		if (err) {
 			status_unusual("routing_failure: "
 				       "bad channel_update %s",

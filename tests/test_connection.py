@@ -3,13 +3,15 @@ from fixtures import *  # noqa: F401,F403
 from flaky import flaky  # noqa: F401
 from lightning import RpcError
 from utils import DEVELOPER, only_one, wait_for, sync_blockheight, VALGRIND
+from bitcoin.core import CMutableTransaction, CMutableTxOut
 
-
+import binascii
 import os
 import pytest
-import time
 import random
+import re
 import shutil
+import time
 import unittest
 
 
@@ -784,6 +786,122 @@ def test_funding_toolarge(node_factory, bitcoind):
     # This should work.
     amount = amount - 1
     l1.rpc.fundchannel(l2.info['id'], amount)
+
+
+def test_funding_by_utxos(node_factory, bitcoind):
+    """Fund a channel with specific utxos"""
+    l1, l2, l3 = node_factory.line_graph(3, fundchannel=False)
+
+    # Get 3 differents utxo
+    l1.fundwallet(0.01 * 10**8)
+    l1.fundwallet(0.01 * 10**8)
+    l1.fundwallet(0.01 * 10**8)
+    wait_for(lambda: len(l1.rpc.listfunds()["outputs"]) == 3)
+
+    utxos = [utxo["txid"] + ":" + str(utxo["output"]) for utxo in l1.rpc.listfunds()["outputs"]]
+
+    # Fund with utxos we don't own
+    with pytest.raises(RpcError, match=r"No matching utxo was found from the wallet"):
+        l3.rpc.fundchannel(l2.info["id"], int(0.01 * 10**8), utxos=utxos)
+
+    # Fund with an empty array
+    with pytest.raises(RpcError, match=r"Please specify an array of \\'txid:output_index\\', not \"*\""):
+        l1.rpc.fundchannel(l2.info["id"], int(0.01 * 10**8), utxos=[])
+
+    # Fund a channel from some of the utxos, without change
+    l1.rpc.fundchannel(l2.info["id"], "all", utxos=utxos[0:2])
+
+    # Fund a channel from the rest of utxos, with change
+    l1.rpc.connect(l3.info["id"], "localhost", l3.port)
+    l1.rpc.fundchannel(l3.info["id"], int(0.007 * 10**8), utxos=[utxos[2]])
+
+    # Fund another channel with already spent utxos
+    with pytest.raises(RpcError, match=r"No matching utxo was found from the wallet"):
+        l1.rpc.fundchannel(l3.info["id"], int(0.01 * 10**8), utxos=utxos)
+
+
+def test_funding_external_wallet_corners(node_factory, bitcoind):
+    l1 = node_factory.get_node()
+    l2 = node_factory.get_node()
+
+    amount = 2**24
+    # Fail to open (too large)
+    with pytest.raises(RpcError, match=r'Amount exceeded 16777215'):
+        l1.rpc.fundchannel_start(l2.info['id'], amount)
+
+    amount = amount - 1
+    fake_txid = '929764844a8f9938b669a60a1d51a11c9e2613c7eb4776e4126f1f20c0a685c3'
+    fake_txout = 0
+
+    with pytest.raises(RpcError, match=r'Unknown peer'):
+        l1.rpc.fundchannel_start(l2.info['id'], amount)
+
+    with pytest.raises(RpcError, match=r'Unknown peer'):
+        l1.rpc.fundchannel_complete(l2.info['id'], fake_txid, fake_txout)
+
+    # Should not be able to continue without being in progress.
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    with pytest.raises(RpcError, match=r'No channel funding in progress.'):
+        l1.rpc.fundchannel_complete(l2.info['id'], fake_txid, fake_txout)
+
+    l1.rpc.fundchannel_start(l2.info['id'], amount)
+    with pytest.raises(RpcError, match=r'Already funding channel'):
+        l1.rpc.fundchannel(l2.info['id'], amount)
+
+    l1.rpc.fundchannel_cancel(l2.info['id'])
+    # Should be able to 'restart' after canceling
+    l1.rpc.fundchannel_start(l2.info['id'], amount)
+
+
+def test_funding_external_wallet(node_factory, bitcoind):
+    l1 = node_factory.get_node()
+    l2 = node_factory.get_node()
+
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    assert(l1.rpc.listpeers()['peers'][0]['id'] == l2.info['id'])
+
+    amount = 2**24 - 1
+    address = l1.rpc.fundchannel_start(l2.info['id'], amount)['funding_address']
+    assert len(address) > 0
+
+    peer = l1.rpc.listpeers()['peers'][0]
+    # Peer should still be connected and in state waiting for funding_txid
+    assert peer['id'] == l2.info['id']
+    r = re.compile('Funding channel start: awaiting funding_txid with output to .*')
+    assert any(r.match(line) for line in peer['channels'][0]['status'])
+    assert 'OPENINGD' in peer['channels'][0]['state']
+
+    # Trying to start a second funding should not work, it's in progress.
+    with pytest.raises(RpcError, match=r'Already funding channel'):
+        l1.rpc.fundchannel_start(l2.info['id'], amount)
+
+    # 'Externally' fund the address from fundchannel_start
+    addr_scriptpubkey = bitcoind.rpc.getaddressinfo(address)['scriptPubKey']
+    txout = CMutableTxOut(amount, bytearray.fromhex(addr_scriptpubkey))
+    unfunded_tx = CMutableTransaction([], [txout])
+    hextx = binascii.hexlify(unfunded_tx.serialize()).decode('utf8')
+
+    funded_tx_obj = bitcoind.rpc.fundrawtransaction(hextx)
+    raw_funded_tx = funded_tx_obj['hex']
+    txid = bitcoind.rpc.decoderawtransaction(raw_funded_tx)['txid']
+    txout = 1 if funded_tx_obj['changepos'] == 0 else 0
+
+    assert l1.rpc.fundchannel_complete(l2.info['id'], txid, txout)['commitments_secured']
+
+    # Broadcast the transaction manually and confirm that channel locks in
+    signed_tx = bitcoind.rpc.signrawtransactionwithwallet(raw_funded_tx)['hex']
+    assert txid == bitcoind.rpc.decoderawtransaction(signed_tx)['txid']
+
+    bitcoind.rpc.sendrawtransaction(signed_tx)
+    bitcoind.generate_block(1)
+
+    l1.daemon.wait_for_log(r'Funding tx {} depth 1 of 1'.format(txid))
+    l1.daemon.wait_for_log(r'State changed from CHANNELD_AWAITING_LOCKIN to CHANNELD_NORMAL')
+
+    for node in [l1, l2]:
+        channel = node.rpc.listpeers()['peers'][0]['channels'][0]
+        assert 'CHANNELD_NORMAL' == channel['state']
+        assert amount * 1000 == channel['msatoshi_total']
 
 
 def test_lockin_between_restart(node_factory, bitcoind):

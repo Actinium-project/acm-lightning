@@ -46,6 +46,7 @@
 #include <ccan/err/err.h>
 #include <ccan/io/fdpass/fdpass.h>
 #include <ccan/io/io.h>
+#include <ccan/json_escape/json_escape.h>
 #include <ccan/noerr/noerr.h>
 #include <ccan/pipecmd/pipecmd.h>
 #include <ccan/read_write_all/read_write_all.h>
@@ -57,7 +58,6 @@
 /*~ This is common code: routines shared by one or more executables
  *  (separate daemons, or the lightning-cli program). */
 #include <common/daemon.h>
-#include <common/json_escaped.h>
 #include <common/timeout.h>
 #include <common/utils.h>
 #include <common/version.h>
@@ -216,6 +216,9 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	 *the plugins.
 	 */
 	ld->plugins = plugins_new(ld, ld->log_book, ld);
+
+	/*~ This is set when a JSON RPC command comes in to shut us down. */
+	ld->stop_conn = NULL;
 
 	return ld;
 }
@@ -615,6 +618,8 @@ int main(int argc, char *argv[])
 	struct lightningd *ld;
 	u32 min_blockheight, max_blockheight;
 	int connectd_gossipd_fd, pid_fd;
+	int stop_fd;
+	const char *stop_response;
 
 	/*~ What happens in strange locales should stay there. */
 	setup_locale();
@@ -826,9 +831,15 @@ int main(int argc, char *argv[])
 	 */
 	assert(io_loop_ret == ld);
 
+	/* Keep this fd around, to write final response at the end. */
+	stop_fd = io_conn_fd(ld->stop_conn);
+	io_close_taken_fd(ld->stop_conn);
+	stop_response = tal_steal(NULL, ld->stop_response);
+
 	shutdown_subdaemons(ld);
 
-	tal_free(ld->plugins);
+	/* Remove plugins. */
+	ld->plugins = tal_free(ld->plugins);
 
 	/* Clean up the JSON-RPC. This needs to happen in a DB transaction since
 	 * it might actually be touching the DB in some destructors, e.g.,
@@ -847,6 +858,11 @@ int main(int argc, char *argv[])
 	opt_free_table();
 
 	daemon_shutdown();
+
+	/* Finally, send response to shutdown command */
+	write_all(stop_fd, stop_response, strlen(stop_response));
+	close(stop_fd);
+	tal_free(stop_response);
 
 	/*~ Farewell.  Next stop: hsmd/hsmd.c. */
 	return 0;

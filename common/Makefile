@@ -1,4 +1,5 @@
 COMMON_SRC_NOGEN :=				\
+	common/addr.c				\
 	common/amount.c				\
 	common/base32.c				\
 	common/bech32.c				\
@@ -21,13 +22,13 @@ COMMON_SRC_NOGEN :=				\
 	common/gossip_store.c			\
 	common/hash_u5.c			\
 	common/htlc_state.c			\
+	common/htlc_trim.c			\
 	common/htlc_tx.c			\
 	common/htlc_wire.c			\
 	common/initial_channel.c		\
 	common/initial_commit_tx.c		\
 	common/io_lock.c			\
 	common/json.c				\
-	common/json_escaped.c			\
 	common/json_helpers.c			\
 	common/json_tok.c			\
 	common/key_derive.c			\

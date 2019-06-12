@@ -4,7 +4,7 @@ import logging
 from math import floor, log10
 import socket
 
-__version__ = "0.0.7.2"
+__version__ = "0.0.7.3"
 
 
 class RpcError(ValueError):
@@ -165,39 +165,11 @@ class UnixDomainSocketRpc(object):
         self.executor = executor
         self.logger = logger
 
-        # Do we require the compatibility mode?
-        self._compat = True
         self.next_id = 0
 
     def _writeobj(self, sock, obj):
         s = json.dumps(obj, cls=self.encoder_cls)
         sock.sendall(bytearray(s, 'UTF-8'))
-
-    def _readobj_compat(self, sock, buff=b''):
-        if not self._compat:
-            return self._readobj(sock, buff)
-        while True:
-            try:
-                b = sock.recv(max(1024, len(buff)))
-                buff += b
-
-                if b'\n\n' in buff:
-                    # The next read will use the non-compatible read instead
-                    self._compat = False
-
-                if len(b) == 0:
-                    return {'error': 'Connection to RPC server lost.'}
-                if b' }\n' not in buff:
-                    continue
-                # Convert late to UTF-8 so glyphs split across recvs do not
-                # impact us
-                buff = buff.decode("UTF-8")
-                objs, len_used = self.decoder.raw_decode(buff)
-                buff = buff[len_used:].lstrip().encode("UTF-8")
-                return objs, buff
-            except ValueError:
-                # Probably didn't read enough
-                buff = buff.lstrip().encode("UTF-8")
 
     def _readobj(self, sock, buff=b''):
         """Read a JSON object, starting with buff; returns object and any buffer left over"""
@@ -249,7 +221,7 @@ class UnixDomainSocketRpc(object):
             "id": self.next_id,
         })
         self.next_id += 1
-        resp, _ = self._readobj_compat(sock)
+        resp, _ = self._readobj(sock)
         sock.close()
 
         self.logger.debug("Received response for %s call: %r", method, resp)
@@ -490,12 +462,14 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("feerates", payload)
 
-    def fundchannel(self, node_id, satoshi, feerate=None, announce=True, minconf=None):
+    def fundchannel(self, node_id, satoshi, feerate=None, announce=True, minconf=None, utxos=None):
         """
-        Fund channel with {id} using {satoshi} satoshis
-        with feerate of {feerate} (uses default feerate if unset).
+        Fund channel with {id} using {satoshi} satoshis with feerate
+        of {feerate} (uses default feerate if unset).
         If {announce} is False, don't send channel announcements.
-        Only select outputs with {minconf} confirmations
+        Only select outputs with {minconf} confirmations.
+        If {utxos} is specified (as a list of 'txid:vout' strings),
+        fund a channel from these specifics utxos.
         """
         payload = {
             "id": node_id,
@@ -503,8 +477,47 @@ class LightningRpc(UnixDomainSocketRpc):
             "feerate": feerate,
             "announce": announce,
             "minconf": minconf,
+            "utxos": utxos
         }
         return self.call("fundchannel", payload)
+
+    def fundchannel_start(self, node_id, satoshi, feerate=None, announce=True):
+        """
+        Start channel funding with {id} for {satoshi} satoshis
+        with feerate of {feerate} (uses default feerate if unset).
+        If {announce} is False, don't send channel announcements.
+        Returns a Bech32 {funding_address} for an external wallet
+        to create a funding transaction for. Requires a call to
+        'fundchannel_complete' to complete channel establishment
+        with peer.
+        """
+        payload = {
+            "id": node_id,
+            "satoshi": satoshi,
+            "feerate": feerate,
+            "announce": announce,
+        }
+        return self.call("fundchannel_start", payload)
+
+    def fundchannel_cancel(self, node_id):
+        """
+        Cancel a 'started' fundchannel with node {id}.
+        """
+        payload = {
+            "id": node_id,
+        }
+        return self.call("fundchannel_cancel", payload)
+
+    def fundchannel_complete(self, node_id, funding_txid, funding_txout):
+        """
+        Complete channel establishment with {id}, using {funding_txid} at {funding_txout}
+        """
+        payload = {
+            "id": node_id,
+            "txid": funding_txid,
+            "txout": funding_txout,
+        }
+        return self.call("fundchannel_complete", payload)
 
     def getinfo(self):
         """
