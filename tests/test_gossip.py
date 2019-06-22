@@ -922,7 +922,7 @@ def test_gossip_store_load_announce_before_update(node_factory):
 
     l1.start()
     # May preceed the Started msg waited for in 'start'.
-    wait_for(lambda: l1.daemon.is_in_log(r'gossip_store: Read 1/1/1/0 cannounce/cupdate/nannounce/cdelete from store \(1 deleted\) in 912 bytes'))
+    wait_for(lambda: l1.daemon.is_in_log(r'gossip_store: Read 1/1/1/0 cannounce/cupdate/nannounce/cdelete from store \(0 deleted\) in 770 bytes'))
     assert not l1.daemon.is_in_log('gossip_store.*truncating')
 
     # Extra sanity check if we can.
@@ -945,9 +945,9 @@ def test_gossip_store_load_amount_truncated(node_factory):
 
     l1.start()
     # May preceed the Started msg waited for in 'start'.
-    wait_for(lambda: l1.daemon.is_in_log(r'Deleting un-amounted channel_announcement @1'))
-    wait_for(lambda: l1.daemon.is_in_log(r'gossip_store: Read 0/0/0/0 cannounce/cupdate/nannounce/cdelete from store \(1 deleted\) in 445 bytes'))
-    assert not l1.daemon.is_in_log('gossip_store.*truncating')
+    wait_for(lambda: l1.daemon.is_in_log(r'gossip_store: dangling channel_announcement. Moving to gossip_store.corrupt and truncating'))
+    wait_for(lambda: l1.daemon.is_in_log(r'gossip_store: Read 0/0/0/0 cannounce/cupdate/nannounce/cdelete from store \(0 deleted\) in 1 bytes'))
+    assert os.path.exists(os.path.join(l1.daemon.lightning_dir, 'gossip_store.corrupt'))
 
     # Extra sanity check if we can.
     if DEVELOPER:
@@ -1266,16 +1266,29 @@ def test_gossip_store_load_no_channel_update(node_factory):
                                   "00000000"  # timestamp
                                   "1005"      # WIRE_GOSSIP_STORE_CHANNEL_AMOUNT
                                   "0000000001000000"
-                                  "00000082"  # len
-                                  "fd421aeb"  # csum
-                                  "5b8d9b44"  # timestamp
+                                  "00000095"  # len
+                                  "f036515e"  # csum
+                                  "5aab817c"  # timestamp
                                   "0101"      # WIRE_NODE_ANNOUNCEMENT
                                   "cf5d870bc7ecabcb7cd16898ef66891e5f0c6c5851bd85b670f03d325bc44d7544d367cd852e18ec03f7f4ff369b06860a3b12b07b29f36fb318ca11348bf8ec00005aab817c03f113414ebdc6c1fb0f33c99cd5a1d09dd79e7fdf2468cf1fe1af6674361695d23974b250757a7a6c6549544300000000000000000000000000000000000000000000000007010566933e2607"))
 
     l1.start()
+
+    # May preceed the Started msg waited for in 'start'.
+    wait_for(lambda: l1.daemon.is_in_log('gossip_store: Unupdated channel_announcement at 1. Moving to gossip_store.corrupt and truncating'))
+    assert os.path.exists(os.path.join(l1.daemon.lightning_dir, 'gossip_store.corrupt'))
 
     # This should actually result in an empty store.
     l1.rpc.call('dev-compact-gossip-store')
 
     with open(os.path.join(l1.daemon.lightning_dir, 'gossip_store'), "rb") as f:
         assert bytearray(f.read()) == bytearray.fromhex("07")
+
+
+def test_gossip_store_compact_on_load(node_factory, bitcoind):
+    l2 = setup_gossip_store_test(node_factory, bitcoind)
+
+    l2.restart()
+
+    wait_for(lambda: l2.daemon.is_in_log('gossip_store_compact_offline: 9 deleted, 9 copied'))
+    wait_for(lambda: l2.daemon.is_in_log(r'gossip_store: Read 1/4/2/0 cannounce/cupdate/nannounce/cdelete from store \(0 deleted\) in 1446 bytes'))
