@@ -114,7 +114,6 @@ struct peer *new_peer(struct lightningd *ld, u64 dbid,
 	peer->globalfeatures = peer->localfeatures = NULL;
 	list_head_init(&peer->channels);
 	peer->direction = node_id_idx(&peer->ld->id, &peer->id);
-
 #if DEVELOPER
 	peer->ignore_htlcs = false;
 #endif
@@ -336,7 +335,7 @@ register_close_command(struct lightningd *ld,
 	tal_add_destructor2(channel,
 			    &destroy_close_command_on_channel_destroy,
 			    cc);
-	new_reltimer(&ld->timers, cc, time_from_sec(timeout),
+	new_reltimer(ld->timers, cc, time_from_sec(timeout),
 		     &close_command_timeout, cc);
 }
 
@@ -842,7 +841,10 @@ peer_connected_hook_cb(struct peer_connected_hook_payload *payload,
 		case ONCHAIN:
 		case FUNDING_SPEND_SEEN:
 		case CLOSINGD_COMPLETE:
-			/* Channel is supposed to be active! */
+			/* Channel is supposed to be active!*/
+			abort();
+		case CLOSED:
+			/* Channel should not have been loaded */
 			abort();
 
 		/* We consider this "active" but we only send an error */
