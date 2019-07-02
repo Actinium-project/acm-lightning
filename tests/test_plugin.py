@@ -435,7 +435,7 @@ def test_htlc_accepted_hook_forward_restart(node_factory, executor):
 def test_warning_notification(node_factory):
     """ test 'warning' notifications
     """
-    l1 = node_factory.get_node(options={'plugin': 'tests/plugins/pretend_badlog.py'})
+    l1 = node_factory.get_node(options={'plugin': 'tests/plugins/pretend_badlog.py'}, allow_broken_log=True)
 
     # 1. test 'warn' level
     event = "Test warning notification(for unusual event)"
@@ -454,7 +454,7 @@ def test_warning_notification(node_factory):
     # 2. test 'error' level, steps like above
     event = "Test warning notification(for broken event)"
     l1.rpc.call('pretendbad', {'event': event, 'level': 'error'})
-    l1.daemon.wait_for_log('plugin-pretend_badlog.py Test warning notification\\(for broken event\\)')
+    l1.daemon.wait_for_log(r'\*\*BROKEN\*\* plugin-pretend_badlog.py Test warning notification\(for broken event\)')
 
     l1.daemon.wait_for_log('plugin-pretend_badlog.py Received warning')
     l1.daemon.wait_for_log('plugin-pretend_badlog.py level: error')
