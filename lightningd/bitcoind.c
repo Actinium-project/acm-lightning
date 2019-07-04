@@ -111,22 +111,30 @@ static struct io_plan *output_init(struct io_conn *conn, struct bitcoin_cli *bcl
 static void next_bcli(struct bitcoind *bitcoind, enum bitcoind_prio prio);
 
 /* For printing: simple string of args. */
-static char *bcli_args(const tal_t *ctx, struct bitcoin_cli *bcli)
+/* bcli_args_direct() will be used in wat_for_bitcoind(), where
+ * we send bitcoin-cli a "getblockchaininfo" command without
+ * struct bitcoin_cli */
+static char *bcli_args_direct(const tal_t *ctx, const char **args)
 {
 	size_t i;
-	char *ret = tal_strdup(ctx, bcli->args[0]);
+	char *ret = tal_strdup(ctx, args[0]);
 
-	for (i = 1; bcli->args[i]; i++) {
+	for (i = 1; args[i]; i++) {
             ret = tal_strcat(ctx, take(ret), " ");
-            if (strstarts(bcli->args[i], "-rpcpassword")) {
+            if (strstarts(args[i], "-rpcpassword")) {
                     ret = tal_strcat(ctx, take(ret), "-rpcpassword=...");
-            } else if (strstarts(bcli->args[i], "-rpcuser")) {
+            } else if (strstarts(args[i], "-rpcuser")) {
                     ret = tal_strcat(ctx, take(ret), "-rpcuser=...");
             } else {
-                ret = tal_strcat(ctx, take(ret), bcli->args[i]);
+                ret = tal_strcat(ctx, take(ret), args[i]);
             }
 	}
 	return ret;
+}
+
+static char *bcli_args(const tal_t *ctx, struct bitcoin_cli *bcli)
+{
+    return bcli_args_direct(ctx, bcli->args);
 }
 
 static void retry_bcli(struct bitcoin_cli *bcli)
@@ -806,12 +814,57 @@ static void fatal_bitcoind_failure(struct bitcoind *bitcoind, const char *error_
 	exit(1);
 }
 
+/* This function is used to check "chain" field from
+ * bitcoin-cli "getblockchaininfo" API */
+static char* check_blockchain_from_bitcoincli(const tal_t *ctx,
+				struct bitcoind *bitcoind,
+				char* output, const char **cmd)
+{
+	size_t output_bytes;
+	const jsmntok_t *tokens, *valuetok;
+	bool valid;
+
+	if (!output)
+		return tal_fmt(ctx, "Reading from %s failed: %s",
+			       bcli_args_direct(tmpctx, cmd), strerror(errno));
+
+	output_bytes = tal_count(output);
+
+	tokens = json_parse_input(cmd, output, output_bytes,
+			          &valid);
+
+	if (!tokens)
+		return tal_fmt(ctx, "%s: %s response",
+			       bcli_args_direct(tmpctx, cmd),
+			       valid ? "partial" : "invalid");
+
+	if (tokens[0].type != JSMN_OBJECT)
+		return tal_fmt(ctx, "%s: gave non-object (%.*s)?",
+			       bcli_args_direct(tmpctx, cmd),
+			       (int)output_bytes, output);
+
+	valuetok = json_get_member(output, tokens, "chain");
+	if (!valuetok)
+		return tal_fmt(ctx, "%s: had no chain member (%.*s)?",
+			       bcli_args_direct(tmpctx, cmd),
+			       (int)output_bytes, output);
+
+	if(!json_tok_streq(output, valuetok,
+			   bitcoind->chainparams->bip70_name))
+		return tal_fmt(ctx, "Error blockchain for bitcoin-cli?"
+			       " Should be: %s",
+			       bitcoind->chainparams->bip70_name);
+
+	return NULL;
+}
+
 void wait_for_bitcoind(struct bitcoind *bitcoind)
 {
 	int from, status, ret;
 	pid_t child;
-	const char **cmd = cmdarr(bitcoind, bitcoind, "echo", NULL);
+	const char **cmd = cmdarr(bitcoind, bitcoind, "getblockchaininfo", NULL);
 	bool printed = false;
+	char *errstr;
 
 	for (;;) {
 		child = pipecmdarr(NULL, &from, &from, cast_const2(char **,cmd));
@@ -823,9 +876,10 @@ void wait_for_bitcoind(struct bitcoind *bitcoind)
 		}
 
 		char *output = grab_fd(cmd, from);
-		if (!output)
-			fatal("Reading from %s failed: %s",
-			      cmd[0], strerror(errno));
+
+		errstr = check_blockchain_from_bitcoincli(tmpctx, bitcoind, output, cmd);
+		if(errstr)
+			fatal("%s", errstr);
 
 		while ((ret = waitpid(child, &status, 0)) < 0 && errno == EINTR);
 		if (ret != child)
