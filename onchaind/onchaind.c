@@ -514,12 +514,10 @@ static void proposal_meets_depth(struct tracked_output *out)
 		onchain_txtype_to_wallet_txtype(out->proposal->tx_type))));
 
 	/* Don't wait for this if we're ignoring the tiny payment. */
-	if (out->proposal->tx_type == IGNORING_TINY_PAYMENT) {
+	if (out->proposal->tx_type == IGNORING_TINY_PAYMENT)
 		ignore_output(out);
-		out->proposal = tal_free(out->proposal);
-	}
 
-	/* We will get a callback when it's in a block. */
+	/* Otherwise we will get a callback when it's in a block. */
 }
 
 static void propose_resolution(struct tracked_output *out,
@@ -612,8 +610,6 @@ static bool resolved_by_proposal(struct tracked_output *out,
 	if (!out->proposal->tx)
 		return false;
 
-	out->resolved = tal(out, struct resolution);
-
 	/* Our proposal can change as feerates change.  Input
 	 * comparison (ignoring signatures) works pretty well.
 	 *
@@ -628,6 +624,7 @@ static bool resolved_by_proposal(struct tracked_output *out,
 			return false;
 	}
 
+	out->resolved = tal(out, struct resolution);
 	bitcoin_txid(tx, &out->resolved->txid);
 	status_trace("Resolved %s/%s by our proposal %s (%s)",
 		     tx_type_name(out->tx_type),
@@ -638,9 +635,6 @@ static bool resolved_by_proposal(struct tracked_output *out,
 
 	out->resolved->depth = 0;
 	out->resolved->tx_type = out->proposal->tx_type;
-
-	/* Don't need proposal any more */
-	out->proposal = tal_free(out->proposal);
 	return true;
 }
 
@@ -761,7 +755,7 @@ static void billboard_update(struct tracked_output **outs)
 
 	/* Highest priority is to report on proposals we have */
 	for (size_t i = 0; i < tal_count(outs); i++) {
-		if (!outs[i]->proposal)
+		if (!outs[i]->proposal || outs[i]->resolved)
 			continue;
 		if (!best || prop_blockheight(outs[i]) < prop_blockheight(best))
 			best = outs[i];
