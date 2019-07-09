@@ -88,6 +88,9 @@ struct funding_channel {
 
 	/* Whether or not this is in the middle of getting funded */
 	bool inflight;
+
+	/* Any commands trying to cancel us. */
+	struct command **cancels;
 };
 
 static void uncommitted_channel_disconnect(struct uncommitted_channel *uc,
@@ -265,6 +268,11 @@ static void funding_success(struct channel *channel)
 	struct funding_channel *fc = channel->peer->uncommitted_channel->fc;
 	struct command *cmd = fc->cmd;
 
+	/* Well, those cancels didn't work! */
+	for (size_t i = 0; i < tal_count(fc->cancels); i++)
+		was_pending(command_fail(fc->cancels[i], LIGHTNINGD,
+					 "Funding succeeded before cancel"));
+
 	response = json_stream_success(cmd);
 	json_add_string(response, "channel_id",
 			type_to_string(tmpctx, struct channel_id, &fc->cid));
@@ -312,6 +320,9 @@ static void funding_started_success(struct funding_channel *fc,
 					  scriptPubkey);
 	if (out)
 		json_add_string(response, "funding_address", out);
+
+	/* Clear this so cancel doesn't think it's still in progress */
+	fc->cmd = NULL;
 	was_pending(command_success(cmd, response));
 }
 
@@ -667,11 +678,8 @@ static void opening_funder_failed(struct subd *openingd, const u8 *msg,
 				  struct uncommitted_channel *uc)
 {
 	char *desc;
-	bool is_err;
 
-	struct json_stream *response;
-
-	if (!fromwire_opening_funder_failed(msg, msg, &desc, &is_err)) {
+	if (!fromwire_opening_funder_failed(msg, msg, &desc)) {
 		log_broken(uc->log,
 			   "bad OPENING_FUNDER_FAILED %s",
 			   tal_hex(tmpctx, msg));
@@ -682,13 +690,18 @@ static void opening_funder_failed(struct subd *openingd, const u8 *msg,
 		return;
 	}
 
-	if (is_err)
-		was_pending(command_fail(uc->fc->cmd, LIGHTNINGD, "%s", desc));
-	else {
-		response = json_stream_success(uc->fc->cmd);
+	/* Tell anyone who was trying to cancel */
+	for (size_t i = 0; i < tal_count(uc->fc->cancels); i++) {
+		struct json_stream *response;
+
+		response = json_stream_success(uc->fc->cancels[i]);
 		json_add_string(response, "cancelled", desc);
-		was_pending(command_success(uc->fc->cmd, response));
+		was_pending(command_success(uc->fc->cancels[i], response));
 	}
+
+	/* Tell any fundchannel_complete or fundchannel command */
+	if (uc->fc->cmd)
+		was_pending(command_fail(uc->fc->cmd, LIGHTNINGD, "%s", desc));
 
 	/* Clear uc->fc, so we can try again, and so we don't fail twice
 	 * if they close. */
@@ -992,7 +1005,7 @@ static unsigned int openingd_msg(struct subd *openingd,
 		return 0;
 	case WIRE_OPENING_FUNDER_FAILED:
 		if (!uc->fc) {
-			log_broken(openingd->log, "Unexpected FUNDER_FAILED %s",
+			log_unusual(openingd->log, "Unexpected FUNDER_FAILED %s",
 				   tal_hex(tmpctx, msg));
 			tal_free(openingd);
 			return 0;
@@ -1133,8 +1146,10 @@ static struct command_result *json_fund_channel_complete(struct command *cmd,
 
 	if (!peer->uncommitted_channel->fc || !peer->uncommitted_channel->fc->inflight)
 		return command_fail(cmd, LIGHTNINGD, "No channel funding in progress.");
+	if (peer->uncommitted_channel->fc->cmd)
+		return command_fail(cmd, LIGHTNINGD, "Channel funding in progress.");
 
-	/* Update the cmd to the new cmd */
+	/* Set the cmd to this new cmd */
 	peer->uncommitted_channel->fc->cmd = cmd;
 	msg = towire_opening_funder_complete(NULL,
 					     funding_txid,
@@ -1195,8 +1210,8 @@ static struct command_result *json_fund_channel_cancel(struct command *cmd,
 	 * question about 'how long cancelable'.
 	 */
 
-	/* Update the cmd to the new cmd */
-	peer->uncommitted_channel->fc->cmd = cmd;
+	/* Make sure this gets notified if we succeed or cancel */
+	tal_arr_expand(&peer->uncommitted_channel->fc->cancels, cmd);
 	msg = towire_opening_funder_cancel(NULL);
 	subd_send_msg(peer->uncommitted_channel->openingd, take(msg));
 	return command_still_pending(cmd);
@@ -1222,6 +1237,7 @@ static struct command_result *json_fund_channel_start(struct command *cmd,
 
 	max_funding_satoshi = get_chainparams(cmd->ld)->max_funding;
 	fc->cmd = cmd;
+	fc->cancels = tal_arr(fc, struct command *, 0);
 	fc->uc = NULL;
 	fc->inflight = false;
 	if (!param(fc->cmd, buffer, params,
@@ -1316,6 +1332,7 @@ static struct command_result *json_fund_channel(struct command *cmd,
 	max_funding_satoshi = get_chainparams(cmd->ld)->max_funding;
 
 	fc->cmd = cmd;
+	fc->cancels = tal_arr(fc, struct command *, 0);
 	fc->uc = NULL;
 	fc->inflight = false;
 	fc->wtx = tal(fc, struct wallet_tx);
