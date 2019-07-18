@@ -205,6 +205,16 @@ struct lightningd {
 
 	/* Things we've marked as not leaking. */
 	const void **notleaks;
+
+	/* This is the forced private key for the node. */
+	struct privkey *dev_force_privkey;
+
+	/* This is the forced bip32 seed for the node. */
+	struct secret *dev_force_bip32_seed;
+
+	/* These are the forced channel secrets for the node. */
+	struct secrets *dev_force_channel_secrets;
+	struct sha256 *dev_force_channel_secrets_shaseed;
 #endif /* DEVELOPER */
 
 	/* tor support */

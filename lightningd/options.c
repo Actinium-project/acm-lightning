@@ -7,10 +7,12 @@
 #include <ccan/opt/private.h>
 #include <ccan/read_write_all/read_write_all.h>
 #include <ccan/short_types/short_types.h>
+#include <ccan/str/hex/hex.h>
 #include <ccan/tal/grab_file/grab_file.h>
 #include <ccan/tal/path/path.h>
 #include <ccan/tal/str/str.h>
 #include <common/configdir.h>
+#include <common/derive_basepoints.h>
 #include <common/json_command.h>
 #include <common/jsonrpc_errors.h>
 #include <common/memleak.h>
@@ -438,6 +440,63 @@ static char *opt_subprocess_debug(const char *optarg, struct lightningd *ld)
 	return NULL;
 }
 
+static char *opt_force_privkey(const char *optarg, struct lightningd *ld)
+{
+	tal_free(ld->dev_force_privkey);
+	ld->dev_force_privkey = tal(ld, struct privkey);
+	if (!hex_decode(optarg, strlen(optarg),
+			ld->dev_force_privkey, sizeof(*ld->dev_force_privkey)))
+		return tal_fmt(NULL, "Unable to parse privkey '%s'", optarg);
+	return NULL;
+}
+
+static char *opt_force_bip32_seed(const char *optarg, struct lightningd *ld)
+{
+	tal_free(ld->dev_force_bip32_seed);
+	ld->dev_force_bip32_seed = tal(ld, struct secret);
+	if (!hex_decode(optarg, strlen(optarg),
+			ld->dev_force_bip32_seed,
+			sizeof(*ld->dev_force_bip32_seed)))
+		return tal_fmt(NULL, "Unable to parse secret '%s'", optarg);
+	return NULL;
+}
+
+static char *opt_force_channel_secrets(const char *optarg,
+				       struct lightningd *ld)
+{
+	char **strs;
+	tal_free(ld->dev_force_channel_secrets);
+	tal_free(ld->dev_force_channel_secrets_shaseed);
+	ld->dev_force_channel_secrets = tal(ld, struct secrets);
+	ld->dev_force_channel_secrets_shaseed = tal(ld, struct sha256);
+
+	strs = tal_strsplit(tmpctx, optarg, "/", STR_EMPTY_OK);
+	if (tal_count(strs) != 7) /* Last is NULL */
+		return "Expected 6 hex secrets separated by /";
+
+	if (!hex_decode(strs[0], strlen(strs[0]),
+			&ld->dev_force_channel_secrets->funding_privkey,
+			sizeof(ld->dev_force_channel_secrets->funding_privkey))
+	    || !hex_decode(strs[1], strlen(strs[1]),
+			   &ld->dev_force_channel_secrets->revocation_basepoint_secret,
+			   sizeof(ld->dev_force_channel_secrets->revocation_basepoint_secret))
+	    || !hex_decode(strs[2], strlen(strs[2]),
+			   &ld->dev_force_channel_secrets->payment_basepoint_secret,
+			   sizeof(ld->dev_force_channel_secrets->payment_basepoint_secret))
+	    || !hex_decode(strs[3], strlen(strs[3]),
+			   &ld->dev_force_channel_secrets->delayed_payment_basepoint_secret,
+			   sizeof(ld->dev_force_channel_secrets->delayed_payment_basepoint_secret))
+	    || !hex_decode(strs[4], strlen(strs[4]),
+			   &ld->dev_force_channel_secrets->htlc_basepoint_secret,
+			   sizeof(ld->dev_force_channel_secrets->htlc_basepoint_secret))
+	    || !hex_decode(strs[5], strlen(strs[5]),
+			   ld->dev_force_channel_secrets_shaseed,
+			   sizeof(*ld->dev_force_channel_secrets_shaseed)))
+		return "Expected 6 hex secrets separated by /";
+
+	return NULL;
+}
+
 static void dev_register_opts(struct lightningd *ld)
 {
 	opt_register_noarg("--dev-no-reconnect", opt_set_invbool,
@@ -474,7 +533,13 @@ static void dev_register_opts(struct lightningd *ld)
 	opt_register_arg("--dev-gossip-time", opt_set_u32, opt_show_u32,
 			 &ld->dev_gossip_time,
 			 "UNIX time to override gossipd to use.");
- }
+	opt_register_arg("--dev-force-privkey", opt_force_privkey, NULL, ld,
+			 "Force HSM to use this as node private key");
+	opt_register_arg("--dev-force-bip32-seed", opt_force_bip32_seed, NULL, ld,
+			 "Force HSM to use this as bip32 seed");
+	opt_register_arg("--dev-force-channel-secrets", opt_force_channel_secrets, NULL, ld,
+			 "Force HSM to use these for all per-channel secrets");
+}
 #endif
 
 static const struct config testnet_config = {

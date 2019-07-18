@@ -1,4 +1,5 @@
 #include "wire.h"
+#include <assert.h>
 #include <bitcoin/chainparams.h>
 #include <bitcoin/preimage.h>
 #include <bitcoin/pubkey.h>
@@ -13,6 +14,10 @@
 #include <common/node_id.h>
 #include <common/type_to_string.h>
 #include <common/utils.h>
+
+#ifndef SUPERVERBOSE
+#define SUPERVERBOSE(...)
+#endif
 
 /* Sets *cursor to NULL and returns NULL when extraction fails. */
 const void *fromwire_fail(const u8 **cursor, size_t *max)
@@ -30,6 +35,8 @@ const u8 *fromwire(const u8 **cursor, size_t *max, void *copy, size_t n)
 		/* Just make sure we don't leak uninitialized mem! */
 		if (copy)
 			memset(copy, 0, n);
+		if (*cursor)
+			SUPERVERBOSE("less than encoding length");
 		return fromwire_fail(cursor, max);
 	}
 	*cursor += n;
@@ -86,6 +93,60 @@ u64 fromwire_u64(const u8 **cursor, size_t *max)
 	return be64_to_cpu(ret);
 }
 
+static u64 fromwire_tlv_uint(const u8 **cursor, size_t *max, size_t maxlen)
+{
+	u8 bytes[8];
+	size_t length;
+	be64 val;
+
+	assert(maxlen <= sizeof(bytes));
+
+	/* BOLT-EXPERIMENTAL #1:
+	 *
+	 * - if `length` is not exactly equal to that required for the
+	 *   known encoding for `type`:
+	 *      - MUST fail to parse the `tlv_stream`.
+	 */
+	length = *max;
+	if (length > maxlen) {
+		SUPERVERBOSE("greater than encoding length");
+		fromwire_fail(cursor, max);
+		return 0;
+	}
+
+	memset(bytes, 0, sizeof(bytes));
+	fromwire(cursor, max, bytes + sizeof(bytes) - length, length);
+
+	/* BOLT-EXPERIMENTAL #1:
+	 * - if variable-length fields within the known encoding for `type` are
+	 *   not minimal:
+	 *    - MUST fail to parse the `tlv_stream`.
+	 */
+	if (length > 0 && bytes[sizeof(bytes) - length] == 0) {
+		SUPERVERBOSE("not minimal");
+		fromwire_fail(cursor, max);
+		return 0;
+	}
+	BUILD_ASSERT(sizeof(val) == sizeof(bytes));
+	memcpy(&val, bytes, sizeof(bytes));
+	return be64_to_cpu(val);
+}
+
+u16 fromwire_tu16(const u8 **cursor, size_t *max)
+{
+	return fromwire_tlv_uint(cursor, max, 2);
+}
+
+u32 fromwire_tu32(const u8 **cursor, size_t *max)
+{
+	return fromwire_tlv_uint(cursor, max, 4);
+}
+
+u64 fromwire_tu64(const u8 **cursor, size_t *max)
+{
+	return fromwire_tlv_uint(cursor, max, 8);
+}
+
 void fromwire_double(const u8 **cursor, size_t *max, double *ret)
 {
 	fromwire(cursor, max, ret, sizeof(*ret));
@@ -102,20 +163,37 @@ bool fromwire_bool(const u8 **cursor, size_t *max)
 	return ret;
 }
 
-u64 fromwire_var_int(const u8 **cursor, size_t *max)
+u64 fromwire_bigsize(const u8 **cursor, size_t *max)
 {
 	u8 flag = fromwire_u8(cursor, max);
+	u64 ret;
 
 	switch(flag) {
 	case 0xff:
-		return fromwire_u64(cursor, max);
+		ret = fromwire_u64(cursor, max);
+		if ((ret >> 32) == 0) {
+			SUPERVERBOSE("not minimal encoded");
+			fromwire_fail(cursor, max);
+		}
+		break;
 	case 0xfe:
-		return (u64)fromwire_u32(cursor, max);
+		ret = fromwire_u32(cursor, max);
+		if ((ret >> 16) == 0) {
+			SUPERVERBOSE("not minimal encoded");
+			fromwire_fail(cursor, max);
+		}
+		break;
 	case 0xfd:
-		return (u64)fromwire_u16(cursor, max);
+		ret = fromwire_u16(cursor, max);
+		if (ret < 0xfd) {
+			SUPERVERBOSE("not minimal encoded");
+			fromwire_fail(cursor, max);
+		}
+		break;
 	default:
-		return (u64)flag;
+		ret = flag;
 	}
+	return ret;
 }
 
 void fromwire_pubkey(const u8 **cursor, size_t *max, struct pubkey *pubkey)
@@ -125,8 +203,10 @@ void fromwire_pubkey(const u8 **cursor, size_t *max, struct pubkey *pubkey)
 	if (!fromwire(cursor, max, der, sizeof(der)))
 		return;
 
-	if (!pubkey_from_der(der, sizeof(der), pubkey))
+	if (!pubkey_from_der(der, sizeof(der), pubkey)) {
+		SUPERVERBOSE("not a valid point");
 		fromwire_fail(cursor, max);
+	}
 }
 
 void fromwire_node_id(const u8 **cursor, size_t *max, struct node_id *id)

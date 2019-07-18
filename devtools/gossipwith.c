@@ -1,14 +1,17 @@
 /* Simple tool to route gossip from a peer. */
+#include <ccan/array_size/array_size.h>
 #include <ccan/err/err.h>
 #include <ccan/io/io.h>
 #include <ccan/opt/opt.h>
 #include <ccan/read_write_all/read_write_all.h>
+#include <ccan/str/hex/hex.h>
 #include <common/crypto_sync.h>
 #include <common/dev_disconnect.h>
 #include <common/peer_failed.h>
 #include <common/per_peer_state.h>
 #include <common/status.h>
 #include <netdb.h>
+#include <poll.h>
 #include <secp256k1_ecdh.h>
 #include <wire/peer_wire.h>
 
@@ -16,6 +19,7 @@
 #define io_read_ simple_read
 #define io_close simple_close
 static bool stream_stdin = false;
+static bool no_init = false;
 
 static struct io_plan *simple_write(struct io_conn *conn,
 				    const void *data, size_t len,
@@ -118,6 +122,7 @@ static struct io_plan *handshake_success(struct io_conn *conn,
 	u8 *msg;
 	struct per_peer_state *pps = new_per_peer_state(conn, orig_cs);
 	u8 *localfeatures;
+	struct pollfd pollfd[2];
 
 	pps->peer_fd = io_conn_fd(conn);
 	if (initial_sync) {
@@ -126,25 +131,21 @@ static struct io_plan *handshake_success(struct io_conn *conn,
 	} else
 		localfeatures = NULL;
 
-	msg = towire_init(NULL, NULL, localfeatures);
+	if (!no_init) {
+		msg = towire_init(NULL, NULL, localfeatures);
 
-	sync_crypto_write(pps, take(msg));
-	/* Ignore their init message. */
-	tal_free(sync_crypto_read(NULL, pps));
-
-	/* Did they ask us to send any messages?  Do so now. */
-	if (stream_stdin) {
-		beint16_t be_inlen;
-
-		while (read_all(STDIN_FILENO, &be_inlen, sizeof(be_inlen))) {
-			u32 msglen = be16_to_cpu(be_inlen);
-			u8 *msg = tal_arr(NULL, u8, msglen);
-
-			if (!read_all(STDIN_FILENO, msg, msglen))
-				err(1, "Only read partial message");
-			sync_crypto_write(pps, take(msg));
-		}
+		sync_crypto_write(pps, take(msg));
+		/* Ignore their init message. */
+		tal_free(sync_crypto_read(NULL, pps));
 	}
+
+	if (stream_stdin)
+		pollfd[0].fd = STDIN_FILENO;
+	else
+		pollfd[0].fd = -1;
+	pollfd[0].events = POLLIN;
+	pollfd[1].fd = pps->peer_fd;
+	pollfd[1].events = POLLIN;
 
 	while (*args) {
 		u8 *m = tal_hexdata(NULL, *args, strlen(*args));
@@ -154,19 +155,49 @@ static struct io_plan *handshake_success(struct io_conn *conn,
 		args++;
 	}
 
-	/* Now write out whatever we get. */
-	while ((msg = sync_crypto_read(NULL, pps)) != NULL) {
-		be16 len = cpu_to_be16(tal_bytelen(msg));
+	for (;;) {
+		beint16_t belen;
+		u8 *msg;
 
-		if (!write_all(STDOUT_FILENO, &len, sizeof(len))
-		    || !write_all(STDOUT_FILENO, msg, tal_bytelen(msg)))
-			err(1, "Writing out msg");
-		tal_free(msg);
+		poll(pollfd, ARRAY_SIZE(pollfd), -1);
 
-		if (--max_messages == 0)
-			exit(0);
+		/* We always to stdin first if we can */
+		if (pollfd[0].revents & POLLIN) {
+			if (!read_all(STDIN_FILENO, &belen, sizeof(belen)))
+				pollfd[0].fd = -1;
+			else {
+				msg = tal_arr(NULL, u8, be16_to_cpu(belen));
+
+				if (!read_all(STDIN_FILENO, msg, tal_bytelen(msg)))
+					err(1, "Only read partial message");
+				sync_crypto_write(pps, take(msg));
+			}
+		} else if (pollfd[1].revents & POLLIN) {
+			msg = sync_crypto_read(NULL, pps);
+			if (!msg)
+				break;
+			belen = cpu_to_be16(tal_bytelen(msg));
+			if (!write_all(STDOUT_FILENO, &belen, sizeof(belen))
+			    || !write_all(STDOUT_FILENO, msg, tal_bytelen(msg)))
+				err(1, "Writing out msg");
+			tal_free(msg);
+			if (--max_messages == 0)
+				exit(0);
+		}
 	}
 	err(1, "Reading msg");
+}
+
+static char *opt_set_secret(const char *arg, struct secret *s)
+{
+	if (!hex_decode(arg, strlen(arg), s->data, sizeof(s->data)))
+		return "secret must be 64 hex digits";
+	return NULL;
+}
+
+static void opt_show_secret(char buf[OPT_SHOW_LEN], const struct secret *s)
+{
+	hex_encode(s->data, sizeof(s->data), buf, OPT_SHOW_LEN);
 }
 
 int main(int argc, char *argv[])
@@ -183,6 +214,8 @@ int main(int argc, char *argv[])
 	secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY |
 						 SECP256K1_CONTEXT_SIGN);
 
+	memset(&notsosecret, 0x42, sizeof(notsosecret));
+
 	opt_register_noarg("--initial-sync", opt_set_bool, &initial_sync,
 			   "Stream complete gossip history at start");
 	opt_register_arg("--max-messages", opt_set_ulongval, opt_show_ulongval,
@@ -190,6 +223,11 @@ int main(int argc, char *argv[])
 			 "Terminate after reading this many messages (> 0)");
 	opt_register_noarg("--stdin", opt_set_bool, &stream_stdin,
 			   "Stream gossip messages from stdin.");
+	opt_register_noarg("--no-init", opt_set_bool, &no_init,
+			   "Don't send or swallow init messages.");
+	opt_register_arg("--privkey", opt_set_secret, opt_show_secret,
+			 &notsosecret,
+			 "Secret key to use for our identity");
 	opt_register_noarg("--help|-h", opt_usage_and_exit,
 			   "id@addr[:port] [hex-msg-tosend...]\n"
 			   "Connect to a lightning peer and relay gossip messages from it",
@@ -243,7 +281,6 @@ int main(int argc, char *argv[])
 	if (conn->fd < 0)
 		err(1, "Creating socket");
 
-	memset(&notsosecret, 0x42, sizeof(notsosecret));
 	if (!pubkey_from_secret(&notsosecret, &us))
 		errx(1, "Creating pubkey");
 
