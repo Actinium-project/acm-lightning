@@ -184,8 +184,8 @@ ALL_GEN_HEADERS += gen_version.h
 
 CDUMP_OBJS := ccan-cdump.o ccan-strmap.o
 
-WIRE_GEN := tools/generate-wire.py
-BOLT_GEN := tools/generate-bolts.py
+BOLT_GEN := tools/generate-wire.py
+WIRE_GEN := $(BOLT_GEN)
 BOLT_DEPS := $(BOLT_GEN)
 
 ALL_PROGRAMS =
@@ -227,6 +227,7 @@ include lightningd/Makefile
 include cli/Makefile
 include doc/Makefile
 include devtools/Makefile
+include tools/Makefile
 include plugins/Makefile
 
 # Git doesn't maintain timestamps, so we only regen if git says we should.
@@ -281,9 +282,16 @@ check-bolt-dependency:
 
 BOLT_DEPS += check-bolt-dependency
 
+# Experimental quotes quote the exact version.
+ifeq ($(EXPERIMENTAL_FEATURES),1)
+CHECK_BOLT_PREFIX=--prefix="BOLT-$(BOLTVERSION)"
+else
+CHECK_BOLT_PREFIX=
+endif
+
 # Any mention of BOLT# must be followed by an exact quote, modulo whitespace.
 bolt-check/%: % bolt-precheck tools/check-bolt
-	@if [ -d .tmp.lightningrfc ]; then tools/check-bolt .tmp.lightningrfc $<; else echo "Not checking BOLTs: BOLTDIR $(BOLTDIR) does not exist" >&2; fi
+	@if [ -d .tmp.lightningrfc ]; then tools/check-bolt $(CHECK_BOLT_PREFIX) .tmp.lightningrfc $<; else echo "Not checking BOLTs: BOLTDIR $(BOLTDIR) does not exist" >&2; fi
 
 LOCAL_BOLTDIR=.tmp.lightningrfc
 
