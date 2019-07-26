@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Lightningd: add support for `signet` networks using the `--network=signet` or `--signet` startup option
+- JSON API: `listfunds` now returns also `funding_output` for `channels`
 
 ### Changed
 
@@ -25,6 +26,8 @@ changes.
 ### Fixed
 
 - Plugin: `pay` no longer crashes on timeout.
+- Plugin: `disconnect` notifier now called if remote side disconnects.
+- channeld: ignore, and simply try reconnecting if lnd sends "sync error".
 
 ### Security
 

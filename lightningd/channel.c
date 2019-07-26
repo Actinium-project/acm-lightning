@@ -23,8 +23,7 @@ static bool connects_to_peer(struct subd *owner)
 	return owner && owner->talks_to_peer;
 }
 
-void channel_set_owner(struct channel *channel, struct subd *owner,
-		       bool reconnect)
+void channel_set_owner(struct channel *channel, struct subd *owner)
 {
 	struct subd *old_owner = channel->owner;
 	channel->owner = owner;
@@ -45,12 +44,6 @@ void channel_set_owner(struct channel *channel, struct subd *owner,
 				subd_send_msg(channel->peer->ld->connectd,
 					      take(msg));
 			}
-		}
-
-		if (reconnect) {
-			/* Reconnect after 1 second: prevents some spurious
-			 * reconnects during tests. */
-			delay_then_reconnect(channel, 1, &channel->peer->addr);
 		}
 	}
 	channel->connected = connects_to_peer(owner);
@@ -105,7 +98,7 @@ static void destroy_channel(struct channel *channel)
 		      htlc_state_name(hin->hstate));
 
 	/* Free any old owner still hanging around. */
-	channel_set_owner(channel, NULL, false);
+	channel_set_owner(channel, NULL);
 
 	list_del_from(&channel->peer->channels, &channel->list);
 }
@@ -379,7 +372,7 @@ void channel_fail_permanent(struct channel *channel, const char *fmt, ...)
 		channel->error = towire_errorfmt(channel, &cid, "%s", why);
 	}
 
-	channel_set_owner(channel, NULL, false);
+	channel_set_owner(channel, NULL);
 	/* Drop non-cooperatively (unilateral) to chain. */
 	drop_to_chain(ld, channel, false);
 
@@ -427,17 +420,12 @@ void channel_set_billboard(struct channel *channel, bool perm, const char *str)
 	}
 }
 
-void channel_fail_transient(struct channel *channel, const char *fmt, ...)
+static void err_and_reconnect(struct channel *channel,
+			      const char *why,
+			      u32 seconds_before_reconnect)
 {
-	va_list ap;
-	const char *why;
-
-	va_start(ap, fmt);
-	why = tal_vfmt(channel, fmt, ap);
-	va_end(ap);
 	log_info(channel->log, "Peer transient failure in %s: %s",
 		 channel_state_name(channel), why);
-	tal_free(why);
 
 #if DEVELOPER
 	if (dev_disconnect_permanent(channel->peer->ld)) {
@@ -446,5 +434,26 @@ void channel_fail_transient(struct channel *channel, const char *fmt, ...)
 	}
 #endif
 
-	channel_set_owner(channel, NULL, true);
+	channel_set_owner(channel, NULL);
+
+	delay_then_reconnect(channel, seconds_before_reconnect,
+			     &channel->peer->addr);
+}
+
+void channel_fail_reconnect_later(struct channel *channel, const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	err_and_reconnect(channel, tal_vfmt(tmpctx, fmt, ap), 60);
+	va_end(ap);
+}
+
+void channel_fail_reconnect(struct channel *channel, const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	err_and_reconnect(channel, tal_vfmt(tmpctx, fmt, ap), 1);
+	va_end(ap);
 }

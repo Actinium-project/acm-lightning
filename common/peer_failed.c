@@ -42,7 +42,7 @@ void peer_failed(struct per_peer_state *pps,
 
 	/* Tell master the error so it can re-xmit. */
 	msg = towire_status_peer_error(NULL, channel_id,
-				       desc, pps,
+				       desc, false, pps,
 				       err);
 	peer_billboard(true, desc);
 	tal_free(desc);
@@ -56,10 +56,22 @@ void peer_failed_received_errmsg(struct per_peer_state *pps,
 {
 	static const struct channel_id all_channels;
 	u8 *msg;
+	bool sync_error;
+
+	/* <+roasbeef> rusty: sync error can just be a timing thing
+	 * <+roasbeef> andn doesn't always mean that we can't continue forwrd,
+	 *             or y'all sent the wrong info
+	 */
+	/* So while LND is sitting in the corner eating paint, back off. */
+	sync_error = strstr(desc, "sync error");
+	if (sync_error)
+		status_unusual("Peer said '%s' so we'll come back later",
+			       desc);
 
 	if (!channel_id)
 		channel_id = &all_channels;
-	msg = towire_status_peer_error(NULL, channel_id, desc, pps, NULL);
+	msg = towire_status_peer_error(NULL, channel_id, desc, sync_error, pps,
+				       NULL);
 	peer_billboard(true, "Received error from peer: %s", desc);
 	peer_fatal_continue(take(msg), pps);
 }
