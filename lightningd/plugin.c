@@ -1,8 +1,4 @@
-#include "lightningd/plugin.h"
-
 #include <ccan/array_size/array_size.h>
-#include <ccan/intmap/intmap.h>
-#include <ccan/io/io.h>
 #include <ccan/list/list.h>
 #include <ccan/opt/opt.h>
 #include <ccan/pipecmd/pipecmd.h>
@@ -21,6 +17,7 @@
 #include <lightningd/lightningd.h>
 #include <lightningd/notification.h>
 #include <lightningd/options.h>
+#include <lightningd/plugin.h>
 #include <lightningd/plugin_hook.h>
 #include <signal.h>
 #include <sys/stat.h>
@@ -34,70 +31,6 @@
  * willing to wait. Plugins shouldn't do any initialization in the
  * `getmanifest` call anyway, that's what `init `is for. */
 #define PLUGIN_MANIFEST_TIMEOUT 60
-
-struct plugin {
-	struct list_node list;
-
-	pid_t pid;
-	char *cmd;
-	struct io_conn *stdin_conn, *stdout_conn;
-	bool stop;
-	struct plugins *plugins;
-	const char **plugin_path;
-
-	/* Stuff we read */
-	char *buffer;
-	size_t used, len_read;
-
-	/* Our json_streams. Since multiple streams could start
-	 * returning data at once, we always service these in order,
-	 * freeing once empty. */
-	struct json_stream **js_arr;
-
-	struct log *log;
-
-	/* List of options that this plugin registered */
-	struct list_head plugin_opts;
-
-	const char **methods;
-
-	/* Timer to add a timeout to some plugin RPC calls. Used to
-	 * guarantee that `getmanifest` doesn't block indefinitely. */
-	const struct oneshot *timeout_timer;
-
-	/* An array of subscribed topics */
-	char **subscriptions;
-};
-
-struct plugins {
-	struct list_head plugins;
-	size_t pending_manifests;
-
-	/* Currently pending requests by their request ID */
-	UINTMAP(struct jsonrpc_request *) pending_requests;
-	struct log *log;
-	struct log_book *log_book;
-
-	struct lightningd *ld;
-};
-
-/* The value of a plugin option, which can have different types.
- * The presence of the integer and boolean values will depend of
- * the option type, but the string value will always be filled.
- */
-struct plugin_opt_value {
-	char *as_str;
-	int *as_int;
-	bool *as_bool;
-};
-
-struct plugin_opt {
-	struct list_node list;
-	const char *name;
-	const char *type;
-	const char *description;
-	struct plugin_opt_value *value;
-};
 
 struct plugins *plugins_new(const tal_t *ctx, struct log_book *log_book,
 			    struct lightningd *ld)
@@ -118,13 +51,25 @@ static void destroy_plugin(struct plugin *p)
 
 void plugin_register(struct plugins *plugins, const char* path TAKES)
 {
-	struct plugin *p;
+	struct plugin *p, *p_temp;
+
+	/* Don't register an already registered plugin */
+	list_for_each(&plugins->plugins, p_temp, list) {
+		if (streq(path, p_temp->cmd)) {
+			if (taken(path))
+				tal_free(path);
+			return;
+		}
+	}
+
 	p = tal(plugins, struct plugin);
 	list_add_tail(&plugins->plugins, &p->list);
 	p->plugins = plugins;
 	p->cmd = tal_strdup(p, path);
+	p->configured = false;
 	p->js_arr = tal_arr(p, struct json_stream *, 0);
 	p->used = 0;
+	p->signal_startup = false;
 
 	p->log = new_log(p, plugins->log_book, "plugin-%s",
 			 path_basename(tmpctx, p->cmd));
@@ -133,7 +78,7 @@ void plugin_register(struct plugins *plugins, const char* path TAKES)
 	tal_add_destructor(p, destroy_plugin);
 }
 
-static bool paths_match(const char *cmd, const char *name)
+bool plugin_paths_match(const char *cmd, const char *name)
 {
 	if (strchr(name, PATH_SEP)) {
 		const char *cmd_canon, *name_canon;
@@ -159,7 +104,7 @@ bool plugin_remove(struct plugins *plugins, const char *name)
 	bool removed = false;
 
 	list_for_each_safe(&plugins->plugins, p, next, list) {
-		if (paths_match(p->cmd, name)) {
+		if (plugin_paths_match(p->cmd, name)) {
 			list_del_from(&plugins->plugins, &p->list);
 			tal_free(p);
 			removed = true;
@@ -168,10 +113,7 @@ bool plugin_remove(struct plugins *plugins, const char *name)
 	return removed;
 }
 
-/**
- * Kill a plugin process, with an error message.
- */
-static void PRINTF_FMT(2,3) plugin_kill(struct plugin *plugin, char *fmt, ...)
+void PRINTF_FMT(2,3) plugin_kill(struct plugin *plugin, char *fmt, ...)
 {
 	char *msg;
 	va_list ap;
@@ -180,7 +122,7 @@ static void PRINTF_FMT(2,3) plugin_kill(struct plugin *plugin, char *fmt, ...)
 	msg = tal_vfmt(plugin, fmt, ap);
 	va_end(ap);
 
-	log_broken(plugin->log, "Killing plugin: %s", msg);
+	log_info(plugin->log, "Killing plugin: %s", msg);
 	plugin->stop = true;
 	io_wake(plugin);
 	kill(plugin->pid, SIGKILL);
@@ -848,12 +790,13 @@ static void plugin_manifest_cb(const char *buffer,
 			       const jsmntok_t *idtok,
 			       struct plugin *plugin)
 {
-	const jsmntok_t *resulttok;
+	const jsmntok_t *resulttok, *dynamictok;
+	bool dynamic_plugin;
 
 	/* Check if all plugins have replied to getmanifest, and break
-	 * if they are */
+	 * if they have and this is the startup init */
 	plugin->plugins->pending_manifests--;
-	if (plugin->plugins->pending_manifests == 0)
+	if (plugin->plugins->startup && plugin->plugins->pending_manifests == 0)
 		io_break(plugin->plugins);
 
 	resulttok = json_get_member(buffer, toks, "result");
@@ -865,6 +808,12 @@ static void plugin_manifest_cb(const char *buffer,
 		return;
 	}
 
+	dynamictok = json_get_member(buffer, resulttok, "dynamic");
+	if (dynamictok && json_to_bool(buffer, dynamictok, &dynamic_plugin)) {
+		plugin->signal_startup = true;
+		plugin->dynamic = dynamic_plugin;
+	}
+
 	if (!plugin_opts_add(plugin, buffer, resulttok) ||
 	    !plugin_rpcmethods_add(plugin, buffer, resulttok) ||
 	    !plugin_subscriptions_add(plugin, buffer, resulttok) ||
@@ -872,6 +821,12 @@ static void plugin_manifest_cb(const char *buffer,
 		plugin_kill(
 		    plugin,
 		    "Failed to register options, methods, hooks, or subscriptions.");
+
+	/* If all plugins have replied to getmanifest and this is not
+	 * the startup init, configure them */
+	if (!plugin->plugins->startup && plugin->plugins->pending_manifests == 0)
+		plugins_config(plugin->plugins);
+
 	/* Reset timer, it'd kill us otherwise. */
 	tal_free(plugin->timeout_timer);
 }
@@ -963,20 +918,17 @@ void plugins_add_default_dir(struct plugins *plugins, const char *default_dir)
 	}
 }
 
-void plugins_init(struct plugins *plugins, const char *dev_plugin_debug)
+void plugins_start(struct plugins *plugins, const char *dev_plugin_debug)
 {
 	struct plugin *p;
 	char **cmd;
 	int stdin, stdout;
 	struct jsonrpc_request *req;
-	plugins->pending_manifests = 0;
-	uintmap_init(&plugins->pending_requests);
 
-	plugins_add_default_dir(plugins, path_join(tmpctx, plugins->ld->config_dir, "plugins"));
-
-	setenv("LIGHTNINGD_PLUGIN", "1", 1);
-	/* Spawn the plugin processes before entering the io_loop */
 	list_for_each(&plugins->plugins, p, list) {
+		if (p->configured)
+			continue;
+
 		bool debug;
 
 		debug = dev_plugin_debug && strends(p->cmd, dev_plugin_debug);
@@ -1015,9 +967,24 @@ void plugins_init(struct plugins *plugins, const char *dev_plugin_debug)
 		}
 		tal_free(cmd);
 	}
+}
+
+void plugins_init(struct plugins *plugins, const char *dev_plugin_debug)
+{
+	plugins->pending_manifests = 0;
+	uintmap_init(&plugins->pending_requests);
+
+	plugins_add_default_dir(plugins,
+				path_join(tmpctx, plugins->ld->config_dir, "plugins"));
+
+	setenv("LIGHTNINGD_PLUGIN", "1", 1);
+	/* Spawn the plugin processes before entering the io_loop */
+	plugins_start(plugins, dev_plugin_debug);
 
 	if (plugins->pending_manifests > 0)
 		io_loop_with_timers(plugins->ld);
+	// There won't be io_loop anymore to wait for plugins
+	plugins->startup = false;
 }
 
 static void plugin_config_cb(const char *buffer,
@@ -1025,7 +992,7 @@ static void plugin_config_cb(const char *buffer,
 			     const jsmntok_t *idtok,
 			     struct plugin *plugin)
 {
-	/* Nothing to be done here, this is just a report */
+	plugin->configured = true;
 }
 
 /* FIXME(cdecker) This just builds a string for the request because
@@ -1055,6 +1022,7 @@ static void plugin_config(struct plugin *plugin)
 	json_object_start(req->stream, "configuration");
 	json_add_string(req->stream, "lightning-dir", ld->config_dir);
 	json_add_string(req->stream, "rpc-file", ld->rpc_filename);
+	json_add_bool(req->stream, "startup", plugin->plugins->startup);
 	json_object_end(req->stream);
 
 	jsonrpc_request_end(req);
@@ -1065,7 +1033,8 @@ void plugins_config(struct plugins *plugins)
 {
 	struct plugin *p;
 	list_for_each(&plugins->plugins, p, list) {
-		plugin_config(p);
+		if (!p->configured)
+			plugin_config(p);
 	}
 }
 

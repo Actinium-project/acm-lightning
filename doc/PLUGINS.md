@@ -85,7 +85,8 @@ this example:
 	"hooks": [
 		"openchannel",
 		"htlc_accepted"
-	]
+	],
+	"dynamic": true
 }
 ```
 
@@ -101,6 +102,10 @@ through verbatim. Notice that the `name`, `description` and `usage` fields
 are mandatory, while the `long_description` can be omitted (it'll be
 set to `description` if it was not provided). `usage` should surround optional
 parameter names in `[]`.
+
+The `dynamic` indicates if the plugin can be managed after `lightningd`
+has been started. Critical plugins that should not be stop should set it
+to false.
 
 Plugins are free to register any `name` for their `rpcmethod` as long
 as the name was not previously registered. This includes both built-in
@@ -122,7 +127,8 @@ simple JSON object containing the options:
 	},
 	"configuration": {
 		 "lightning-dir": "/home/user/.lightning",
-		 "rpc-file": "lightning-rpc"
+		 "rpc-file": "lightning-rpc",
+		 "startup": true
 	}
 }
 ```
@@ -131,6 +137,9 @@ The plugin must respond to `init` calls, however the response can be
 arbitrary and will currently be discarded by `lightningd`. JSON-RPC
 commands were chosen over notifications in order not to force plugins
 to implement notifications which are not that well supported.
+
+The `startup` field allows a plugin to detect if it was started at
+`lightningd` startup (true), or at runtime (false).
 
 ## JSON-RPC passthrough
 
@@ -172,6 +181,10 @@ the JSON-RPC call `id`, which is internally remapped to a unique
 integer instead, in order to avoid collisions. When passing the result
 back the `id` field is restored to its original value.
 
+Note that if your `result` for an RPC call includes `"format-hint":
+"simple"`, then `lightning-cli` will default to printing your output
+in "human-readable" flat form.
+
 ## Event notifications
 
 Event notifications allow a plugin to subscribe to events in
@@ -199,6 +212,23 @@ above for example subscribes to the two topics `connect` and
 corresponding payloads are listed below.
 
 ### Notification Types
+
+#### `channel_opened`
+
+A notification for topic `channel_opened` is sent if a peer successfully funded a channel
+with us. It contains the peer id, the funding amount (in millisatoshis), the funding
+transaction id, and a boolean indicating if the funding transaction has been included
+into a block.
+```
+{
+	"channel_opened": {
+		"id": "03864ef025fde8fb587d989186ce6a4a186895ee44a926bfc370e2c366597a3f8f",
+		"funding_satoshis": "100000000msat",
+		"funding_txid": "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
+		"funding_locked": false
+	}
+}
+```
 
 #### `connect`
 
@@ -237,7 +267,6 @@ A notification for topic `invoice_payment` is sent every time an invoie is paid.
 }
 ```
 
-
 #### `warning`
 
 A notification for topic `warning` is sent every time a new `BROKEN`
@@ -265,6 +294,7 @@ forms:
 `plugin-<plugin_name>:`, `<daemon_name>(<daemon_pid>):`, `jsonrpc:`,
 `jcon fd <error_fd_to_jsonrpc>:`, `plugin-manager`;
 4. `log` is the context of the original log entry.
+
 
 ## Hooks
 

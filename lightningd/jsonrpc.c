@@ -425,6 +425,9 @@ static struct command_result *json_help(struct command *cmd,
 	}
 	json_array_end(response);
 
+	/* Tell cli this is simple enough to be formatted flat for humans */
+	json_add_string(response, "format-hint", "simple");
+
 	return command_success(cmd, response);
 }
 
@@ -1193,7 +1196,7 @@ static struct command_result *json_check(struct command *cmd,
 	if (params->type == JSMN_OBJECT)
 		name_tok--;
 
-	json_tok_remove(&mod_params, (jsmntok_t *)name_tok, 1);
+	json_tok_remove(&mod_params, mod_params, name_tok, 1);
 
 	cmd->mode = CMD_CHECK;
 	failed = false;
