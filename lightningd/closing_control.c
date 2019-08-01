@@ -92,6 +92,7 @@ static void peer_received_closing_signature(struct channel *channel,
 				       tal_hex(msg, msg));
 		return;
 	}
+	tx->chainparams = get_chainparams(channel->peer->ld);
 
 	/* FIXME: Make sure signature is correct! */
 	if (better_closing_fee(ld, channel, tx)) {
@@ -264,6 +265,7 @@ void peer_start_closingd(struct channel *channel,
 		return;
 	}
 	initmsg = towire_closing_init(tmpctx,
+				      &get_chainparams(ld)->genesis_blockhash,
 				      pps,
 				      &channel->funding_txid,
 				      channel->funding_outnum,

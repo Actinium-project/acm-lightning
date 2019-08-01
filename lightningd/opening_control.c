@@ -370,6 +370,7 @@ static bool compose_and_broadcast_tx(struct lightningd *ld,
 	struct bitcoin_tx *fundingtx;
 	struct amount_sat change;
 	struct bitcoin_txid funding_txid;
+	const struct chainparams *chainparams = get_chainparams(ld);
 
 	/* Generate the funding tx. */
 	if (!amount_sat_eq(fc->wtx->change, AMOUNT_SAT(0))
@@ -377,7 +378,7 @@ static bool compose_and_broadcast_tx(struct lightningd *ld,
 			     &changekey, fc->wtx->change_key_index))
 		fatal("Error deriving change key %u", fc->wtx->change_key_index);
 
-	fundingtx = funding_tx(tmpctx, &funding_outnum,
+	fundingtx = funding_tx(tmpctx, chainparams, &funding_outnum,
 			       fc->wtx->utxos, fc->wtx->amount,
 			       &fc->uc->local_funding_pubkey,
 			       &channel_info->remote_fundingkey,
@@ -453,6 +454,7 @@ static bool compose_and_broadcast_tx(struct lightningd *ld,
 	if (!fromwire_hsm_sign_funding_reply(tmpctx, msg, &fundingtx))
 		fatal("HSM gave bad sign_funding_reply %s",
 		      tal_hex(msg, resp));
+	fundingtx->chainparams = chainparams;
 
 	/* Extract the change output and add it to the DB */
 	wallet_extract_owned_outputs(ld->wallet, fundingtx, NULL, &change);
@@ -520,6 +522,7 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 					 tal_hex(fc->cmd, resp)));
 		goto cleanup;
 	}
+	remote_commit->chainparams = get_chainparams(openingd->ld);
 	per_peer_state_set_fds_arr(pps, fds);
 
 	log_debug(ld->log,
@@ -627,6 +630,8 @@ static void opening_fundee_finished(struct subd *openingd,
 		uncommitted_channel_disconnect(uc, "bad OPENING_FUNDEE_REPLY");
 		goto failed;
 	}
+
+	remote_commit->chainparams = get_chainparams(openingd->ld);
 	per_peer_state_set_fds_arr(pps, fds);
 
 	/* openingd should never accept them funding channel in this case. */

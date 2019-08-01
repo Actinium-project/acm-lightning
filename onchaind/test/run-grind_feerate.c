@@ -43,7 +43,7 @@ bool fromwire_onchain_dev_memleak(const void *p UNNEEDED)
 bool fromwire_onchain_htlc(const void *p UNNEEDED, struct htlc_stub *htlc UNNEEDED, bool *tell_if_missing UNNEEDED, bool *tell_immediately UNNEEDED)
 { fprintf(stderr, "fromwire_onchain_htlc called!\n"); abort(); }
 /* Generated stub for fromwire_onchain_init */
-bool fromwire_onchain_init(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, struct shachain *shachain UNNEEDED, struct amount_sat *funding_amount_satoshi UNNEEDED, struct pubkey *old_remote_per_commitment_point UNNEEDED, struct pubkey *remote_per_commitment_point UNNEEDED, u32 *local_to_self_delay UNNEEDED, u32 *remote_to_self_delay UNNEEDED, u32 *feerate_per_kw UNNEEDED, struct amount_sat *local_dust_limit_satoshi UNNEEDED, struct bitcoin_txid *our_broadcast_txid UNNEEDED, u8 **local_scriptpubkey UNNEEDED, u8 **remote_scriptpubkey UNNEEDED, struct pubkey *ourwallet_pubkey UNNEEDED, enum side *funder UNNEEDED, struct basepoints *local_basepoints UNNEEDED, struct basepoints *remote_basepoints UNNEEDED, struct bitcoin_tx **tx UNNEEDED, u32 *tx_blockheight UNNEEDED, u32 *reasonable_depth UNNEEDED, secp256k1_ecdsa_signature **htlc_signature UNNEEDED, u64 *num_htlcs UNNEEDED, u32 *min_possible_feerate UNNEEDED, u32 *max_possible_feerate UNNEEDED, struct pubkey **possible_remote_per_commit_point UNNEEDED)
+bool fromwire_onchain_init(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, struct shachain *shachain UNNEEDED, struct bitcoin_blkid *chain_hash UNNEEDED, struct amount_sat *funding_amount_satoshi UNNEEDED, struct pubkey *old_remote_per_commitment_point UNNEEDED, struct pubkey *remote_per_commitment_point UNNEEDED, u32 *local_to_self_delay UNNEEDED, u32 *remote_to_self_delay UNNEEDED, u32 *feerate_per_kw UNNEEDED, struct amount_sat *local_dust_limit_satoshi UNNEEDED, struct bitcoin_txid *our_broadcast_txid UNNEEDED, u8 **local_scriptpubkey UNNEEDED, u8 **remote_scriptpubkey UNNEEDED, struct pubkey *ourwallet_pubkey UNNEEDED, enum side *funder UNNEEDED, struct basepoints *local_basepoints UNNEEDED, struct basepoints *remote_basepoints UNNEEDED, struct bitcoin_tx **tx UNNEEDED, u32 *tx_blockheight UNNEEDED, u32 *reasonable_depth UNNEEDED, secp256k1_ecdsa_signature **htlc_signature UNNEEDED, u64 *num_htlcs UNNEEDED, u32 *min_possible_feerate UNNEEDED, u32 *max_possible_feerate UNNEEDED, struct pubkey **possible_remote_per_commit_point UNNEEDED)
 { fprintf(stderr, "fromwire_onchain_init called!\n"); abort(); }
 /* Generated stub for fromwire_onchain_known_preimage */
 bool fromwire_onchain_known_preimage(const void *p UNNEEDED, struct preimage *preimage UNNEEDED)
@@ -64,6 +64,7 @@ u8 *htlc_received_wscript(const tal_t *ctx UNNEEDED,
 { fprintf(stderr, "htlc_received_wscript called!\n"); abort(); }
 /* Generated stub for htlc_success_tx */
 struct bitcoin_tx *htlc_success_tx(const tal_t *ctx UNNEEDED,
+				   const struct chainparams *chainparams UNNEEDED,
 				   const struct bitcoin_txid *commit_txid UNNEEDED,
 				   unsigned int commit_output_number UNNEEDED,
 				   struct amount_msat htlc_msatoshi UNNEEDED,
@@ -73,6 +74,7 @@ struct bitcoin_tx *htlc_success_tx(const tal_t *ctx UNNEEDED,
 { fprintf(stderr, "htlc_success_tx called!\n"); abort(); }
 /* Generated stub for htlc_timeout_tx */
 struct bitcoin_tx *htlc_timeout_tx(const tal_t *ctx UNNEEDED,
+				   const struct chainparams *chainparams UNNEEDED,
 				   const struct bitcoin_txid *commit_txid UNNEEDED,
 				   unsigned int commit_output_number UNNEEDED,
 				   struct amount_msat htlc_msatoshi UNNEEDED,
@@ -205,6 +207,7 @@ int main(int argc, char *argv[])
 				 strlen("0200000001e1ebca08cf1c301ac563580a1126d5c8fcb0e5e2043230b852c726553caf1e1d0000000000000000000160ae0a000000000022002082e03c5a9cb79c82cd5a0572dc175290bc044609aabe9cc852d61927436041796d000000"));
 	tx->input_amounts[0] = tal(tx, struct amount_sat);
 	*tx->input_amounts[0] = AMOUNT_SAT(700000);
+	tx->chainparams = chainparams_for_network("bitcoin");
 	der = tal_hexdata(tmpctx, "30450221009b2e0eef267b94c3899fb0dc7375012e2cee4c10348a068fe78d1b82b4b14036022077c3fad3adac2ddf33f415e45f0daf6658b7a0b09647de4443938ae2dbafe2b9" "01",
 			  strlen("30450221009b2e0eef267b94c3899fb0dc7375012e2cee4c10348a068fe78d1b82b4b14036022077c3fad3adac2ddf33f415e45f0daf6658b7a0b09647de4443938ae2dbafe2b9" "01"));
 	if (!signature_from_der(der, tal_count(der), &sig))
