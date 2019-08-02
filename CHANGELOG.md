@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Lightningd: add support for `signet` networks using the `--network=signet` or `--signet` startup option
 - JSON API: `listfunds` now returns also `funding_output` for `channels`
 - plugins: plugins can now suggest `lightning-cli` default to -H for responses.
+- Plugin: new notification `forward_event` offered/settled/failed/local_failed.
 
 ### Changed
 
@@ -23,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - plugins: a new boolean field can be added to a plugin manifest, `dynamic`. It allows a plugin to tell if it can be started or stopped "on-the-fly".
 - lightningd: check bitcoind version when setup topology and confirm the version not older than v0.15.0.
 - startup: space out reconnections on startup if we have more than 5 peers.
+- JSON API: `listforwards` includes the 'payment_hash' field.
 
 ### Deprecated
 

@@ -10,6 +10,7 @@
 #include <inttypes.h>
 #include <lightningd/bitcoind.h>
 #include <lightningd/lightningd.h>
+#include <lightningd/notification.h>
 #include <lightningd/peer_control.h>
 #include <lightningd/peer_htlcs.h>
 #include <onchaind/gen_onchain_wire.h>
@@ -2655,6 +2656,7 @@ void wallet_forwarded_payment_add(struct wallet *w, const struct htlc_in *in,
 				  enum onion_type failcode)
 {
 	sqlite3_stmt *stmt;
+	struct timeabs *resolved_time;
 	stmt = db_prepare(
 		w->db,
 		"INSERT OR REPLACE INTO forwarded_payments ("
@@ -2691,10 +2693,14 @@ void wallet_forwarded_payment_add(struct wallet *w, const struct htlc_in *in,
 	sqlite3_bind_int(stmt, 7, wallet_forward_status_in_db(state));
 	sqlite3_bind_timeabs(stmt, 8, in->received_time);
 
-	if (state == FORWARD_SETTLED || state == FORWARD_FAILED)
-		sqlite3_bind_timeabs(stmt, 9, time_now());
-	else
+	if (state == FORWARD_SETTLED || state == FORWARD_FAILED) {
+		resolved_time = tal(tmpctx, struct timeabs);
+		*resolved_time = time_now();
+		sqlite3_bind_timeabs(stmt, 9, *resolved_time);
+	} else {
+		resolved_time = NULL;
 		sqlite3_bind_null(stmt, 9);
+	}
 
 	if(failcode != 0) {
 		assert(state == FORWARD_FAILED || state == FORWARD_LOCAL_FAILED);
@@ -2704,6 +2710,8 @@ void wallet_forwarded_payment_add(struct wallet *w, const struct htlc_in *in,
 	}
 
 	db_exec_prepared(w->db, stmt);
+
+	notify_forward_event(w->ld, in, out, state, failcode, resolved_time);
 }
 
 struct amount_msat wallet_total_forward_fees(struct wallet *w)
@@ -2753,20 +2761,23 @@ const struct forwarding *wallet_forwarded_payments_get(struct wallet *w,
 		cur->status = sqlite3_column_int(stmt, 0);
 		cur->msat_in = sqlite3_column_amount_msat(stmt, 1);
 
-		if (sqlite3_column_type(stmt, 2) != SQLITE_NULL)
+		if (sqlite3_column_type(stmt, 2) != SQLITE_NULL) {
 			cur->msat_out = sqlite3_column_amount_msat(stmt, 2);
+			if (!amount_msat_sub(&cur->fee, cur->msat_in, cur->msat_out)) {
+				log_broken(w->log, "Forwarded in %s less than out %s!",
+					   type_to_string(tmpctx, struct amount_msat,
+							  &cur->msat_in),
+					   type_to_string(tmpctx, struct amount_msat,
+							  &cur->msat_out));
+				cur->fee = AMOUNT_MSAT(0);
+			}
+		}
 		else {
 			assert(cur->status == FORWARD_LOCAL_FAILED);
 			cur->msat_out = AMOUNT_MSAT(0);
-		}
-
-		if (!amount_msat_sub(&cur->fee, cur->msat_in, cur->msat_out)) {
-			log_broken(w->log, "Forwarded in %s less than out %s!",
-				   type_to_string(tmpctx, struct amount_msat,
-						  &cur->msat_in),
-				   type_to_string(tmpctx, struct amount_msat,
-						  &cur->msat_out));
-			cur->fee = AMOUNT_MSAT(0);
+			/* For this case, this forward_payment doesn't have out channel,
+			 * so the fee should be set as 0.*/
+			cur->fee =  AMOUNT_MSAT(0);
 		}
 
 		if (sqlite3_column_type(stmt, 3) != SQLITE_NULL) {
@@ -2795,7 +2806,8 @@ const struct forwarding *wallet_forwarded_payments_get(struct wallet *w,
 		}
 
 		if (sqlite3_column_type(stmt, 8) != SQLITE_NULL) {
-			assert(cur->status == FORWARD_FAILED || cur->status == FORWARD_LOCAL_FAILED);
+			assert(cur->status == FORWARD_FAILED ||
+			       cur->status == FORWARD_LOCAL_FAILED);
 			cur->failcode = sqlite3_column_int(stmt, 8);
 		} else {
 			cur->failcode = 0;
