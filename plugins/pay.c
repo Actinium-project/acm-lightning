@@ -1271,7 +1271,8 @@ static struct command_result *json_listpays(struct command *cmd,
 			   take(json_out_obj(NULL, "bolt11", b11str)));
 }
 
-static void init(struct plugin_conn *rpc)
+static void init(struct plugin_conn *rpc,
+		  const char *buf UNUSED, const jsmntok_t *config UNUSED)
 {
 	const char *field;
 
@@ -1311,5 +1312,5 @@ static const struct plugin_command commands[] = { {
 int main(int argc, char *argv[])
 {
 	setup_locale();
-	plugin_main(argv, init, commands, ARRAY_SIZE(commands), NULL);
+	plugin_main(argv, init, PLUGIN_RESTARTABLE, commands, ARRAY_SIZE(commands), NULL);
 }
