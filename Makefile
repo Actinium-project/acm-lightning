@@ -15,7 +15,7 @@ CCANDIR := ccan
 
 # Where we keep the BOLT RFCs
 BOLTDIR := ../lightning-rfc/
-BOLTVERSION := ffeece3dab1c52efdb9b53ae476539320fa44938
+BOLTVERSION := 8b2cf0054660bece9e1004f42a500c6a1a77efd3
 
 -include config.vars
 
@@ -330,7 +330,7 @@ check-includes:
 
 # cppcheck gets confused by list_for_each(head, i, list): thinks i is uninit.
 .cppcheck-suppress:
-	@git ls-files -- "*.c" "*.h" | grep -vE '^ccan/' | xargs grep -n 'list_for_each' | sed 's/\([^:]*:.*\):.*/uninitvar:\1/' > $@
+	@git ls-files -- "*.c" "*.h" | grep -vE '^ccan/' | xargs grep -n '_for_each' | sed 's/\([^:]*:.*\):.*/uninitvar:\1/' > $@
 
 check-cppcheck: .cppcheck-suppress
 	@trap 'rm -f .cppcheck-suppress' 0; git ls-files -- "*.c" "*.h" | grep -vE '^ccan/' | xargs cppcheck -q --language=c --std=c11 --error-exitcode=1 --suppressions-list=.cppcheck-suppress --inline-suppr

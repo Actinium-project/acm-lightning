@@ -357,9 +357,9 @@ void drop_to_chain(struct lightningd *ld, struct channel *channel,
 	struct bitcoin_txid txid;
 	/* BOLT #2:
 	 *
-	 * - if `next_remote_revocation_number` is greater than expected
+	 * - if `next_revocation_number` is greater than expected
 	 *   above, AND `your_last_per_commitment_secret` is correct for that
-	 *   `next_remote_revocation_number` minus 1:
+	 *   `next_revocation_number` minus 1:
 	 *      - MUST NOT broadcast its commitment transaction.
 	 */
 	if (channel->future_per_commitment_point && !cooperative) {
@@ -1223,8 +1223,7 @@ static struct command_result *json_close(struct command *cmd,
 {
 	const jsmntok_t *idtok;
 	struct peer *peer;
-	/* FIXME: gcc 7.3.0 thinks this might not be initialized. */
-	struct channel *channel = NULL;
+	struct channel *channel COMPILER_WANTS_INIT("gcc 7.3.0 fails, 8.3 OK");
 	unsigned int *timeout;
 	bool *force;
 

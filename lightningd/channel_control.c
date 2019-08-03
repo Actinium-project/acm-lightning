@@ -344,7 +344,7 @@ void peer_start_channeld(struct channel *channel,
 	/* BOLT #2:
 	 *
  	 *   - if it supports `option_data_loss_protect`:
-	 *     - if `next_remote_revocation_number` equals 0:
+	 *     - if `next_revocation_number` equals 0:
 	 *       - MUST set `your_last_per_commitment_secret` to all zeroes
 	 *     - otherwise:
 	 *       - MUST set `your_last_per_commitment_secret` to the last
@@ -424,7 +424,10 @@ void peer_start_channeld(struct channel *channel,
 				      channel->peer->localfeatures,
 				      channel->remote_upfront_shutdown_script,
 				      remote_ann_node_sig,
-				      remote_ann_bitcoin_sig);
+				      remote_ann_bitcoin_sig,
+				      /* Delay announce by 60 seconds after
+				       * seeing block (adjustable if dev) */
+				      ld->topology->poll_seconds * 2);
 
 	/* We don't expect a response: we are triggered by funding_depth_cb. */
 	subd_send_msg(channel->owner, take(initmsg));
