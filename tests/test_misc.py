@@ -683,6 +683,10 @@ def test_daemon_option(node_factory):
                     '--lightning-dir={}'.format(l1.daemon.lightning_dir),
                     'stop'], check=True)
 
+    # It should not complain that subdaemons aren't children.
+    with open('{}/log-daemon'.format(l1.daemon.lightning_dir), 'r') as f:
+        assert 'No child process' not in f.read()
+
 
 @flaky
 @unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1")

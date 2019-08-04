@@ -42,7 +42,6 @@
 #include <ccan/array_size/array_size.h>
 #include <ccan/cast/cast.h>
 #include <ccan/crypto/hkdf_sha256/hkdf_sha256.h>
-#include <ccan/daemonize/daemonize.h>
 #include <ccan/err/err.h>
 #include <ccan/io/fdpass/fdpass.h>
 #include <ccan/io/io.h>
@@ -77,6 +76,7 @@
 #include <lightningd/options.h>
 #include <onchaind/onchain_wire.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -198,7 +198,7 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 
 	/*~ This is detailed in chaintopology.c */
 	ld->topology = new_topology(ld, ld->log);
-	ld->daemon = false;
+	ld->daemon_parent_fd = -1;
 	ld->config_filename = NULL;
 	ld->pidfile = NULL;
 	ld->proxyaddr = NULL;
@@ -501,42 +501,51 @@ static void init_txfilter(struct wallet *w, struct txfilter *filter)
  * don't prevent unmounting whatever filesystem you happen to start in.
  *
  * But we define every path relative to our (~/.lightning) data dir, so we
- * make sure we stay there.
+ * make sure we stay there.  The rest of this is taken from ccan/daemonize,
+ * which was based on W. Richard Steven's advice in Programming in The Unix
+ * Environment.
  */
-static void daemonize_but_keep_dir(struct lightningd *ld)
+static void complete_daemonize(struct lightningd *ld)
 {
-	/* daemonize moves us into /, but we want to be here */
-	const char *cwd = path_cwd(NULL);
+	int ok_status = 0;
 
-	/*~ SQLite3 does NOT like being open across fork(), a.k.a. daemonize() */
-	db_close_for_fork(ld->wallet->db);
-	if (!cwd)
-		fatal("Could not get current directory: %s", strerror(errno));
-	if (!daemonize())
-		fatal("Could not become a daemon: %s", strerror(errno));
+	/* Don't hold files open. */
+	close(STDIN_FILENO);
+	close(STDOUT_FILENO);
+	close(STDERR_FILENO);
 
-	/*~ Move back: important, since lightning dir may be relative! */
-	if (chdir(cwd) != 0)
-		fatal("Could not return to directory %s: %s",
-		      cwd, strerror(errno));
+	/* Many routines write to stderr; that can cause chaos if used
+	 * for something else, so set it here. */
+	if (open("/dev/null", O_WRONLY) != 0)
+		fatal("Could not open /dev/null: %s", strerror(errno));
+	if (dup2(0, STDERR_FILENO) != STDERR_FILENO)
+		fatal("Could not dup /dev/null for stderr: %s", strerror(errno));
+	close(0);
 
-	db_reopen_after_fork(ld->wallet->db);
+	/* Session leader so ^C doesn't whack us. */
+	if (setsid() == (pid_t)-1)
+		fatal("Could not setsid: %s", strerror(errno));
 
-	/*~ Why not allocate cwd off tmpctx?  Probably because this code predates
-	 * tmpctx.  So we free manually here. */
-	tal_free(cwd);
+	/* Discard our parent's old-fashioned umask prejudices. */
+	umask(0);
+
+	/* OK, parent, you can exit(0) now. */
+	write_all(ld->daemon_parent_fd, &ok_status, sizeof(ok_status));
+	close(ld->daemon_parent_fd);
 }
 
 /*~ It's pretty standard behaviour (especially for daemons) to create and
  * file-lock a pidfile.  This not only prevents accidentally running multiple
  * daemons on the same database at once, but lets nosy sysadmins see what pid
  * the currently-running daemon is supposed to be. */
-static int pidfile_create(const struct lightningd *ld)
+static void pidfile_create(const struct lightningd *ld)
 {
 	int pid_fd;
+	char *pid;
 
-	/* Create PID file */
-	pid_fd = open(ld->pidfile, O_WRONLY|O_CREAT, 0640);
+	/* Create PID file: relative to .config dir unless absolute. */
+	pid_fd = open(path_join(tmpctx, ld->config_dir, ld->pidfile),
+		      O_WRONLY|O_CREAT, 0640);
 	if (pid_fd < 0)
 		err(1, "Failed to open PID file");
 
@@ -547,15 +556,6 @@ static int pidfile_create(const struct lightningd *ld)
 
 	/*~ As closing the file will remove the lock, we need to keep it open;
 	 * the OS will close it implicitly when we exit for any reason. */
-	return pid_fd;
-}
-
-/*~ Writing the pid into the lockfile provides a useful clue to users as to
- * what created it; however, we can't do that until we've got a stable process
- * id, and if --daemon is specified, that's quite late. */
-static void pidfile_write(const struct lightningd *ld, int pid_fd)
-{
-	char *pid;
 
 	/*~ Note that tal_fmt() is what asprintf() dreams of being. */
 	pid = tal_fmt(tmpctx, "%d\n", getpid());
@@ -628,7 +628,7 @@ int main(int argc, char *argv[])
 {
 	struct lightningd *ld;
 	u32 min_blockheight, max_blockheight;
-	int connectd_gossipd_fd, pid_fd;
+	int connectd_gossipd_fd;
 	int stop_fd;
 	struct timers *timers;
 	const char *stop_response;
@@ -668,8 +668,13 @@ int main(int argc, char *argv[])
 	/*~ Handle early options, but don't move to --lightning-dir
 	 *  just yet. Plugins may add new options, which is why we are
 	 *  splitting between early args (including --plugin
-	 *  registration) and non-early opts. */
+	 *  registration) and non-early opts.  This also forks if they
+	 *  say --daemonize. */
 	handle_early_opts(ld, argc, argv);
+
+	/*~ Now create the PID file: this errors out if there's already a
+	 * daemon running, so we call before doing almost anything else. */
+	pidfile_create(ld);
 
 	/*~ Initialize all the plugins we just registered, so they can
 	 *  do their thing and tell us about themselves (including
@@ -768,10 +773,6 @@ int main(int argc, char *argv[])
 	load_channels_from_wallet(ld);
 	db_commit_transaction(ld->wallet->db);
 
-	/*~ Now create the PID file: this errors out if there's already a
-	 * daemon running, so we call before trying to create an RPC socket. */
-	pid_fd = pidfile_create(ld);
-
 	/*~ Create RPC socket: now lightning-cli can send us JSON RPC commands
 	 *  over a UNIX domain socket specified by `ld->rpc_filename`. */
 	jsonrpc_listen(ld->jsonrpc, ld);
@@ -779,21 +780,6 @@ int main(int argc, char *argv[])
 	/*~ Now that the rpc path exists, we can start the plugins and they
 	 * can start talking to us. */
 	plugins_config(ld->plugins);
-
-	/*~ Setting this (global) activates the crash log: we don't usually need
-	 * a backtrace if we fail during startup.  We do this before daemonize,
-	 * in case that runs into trouble. */
-	crashlog = ld->log;
-
-	/*~ We defer --daemon until we've completed most initialization: that
-	 *  way we'll exit with an error rather than silently exiting 0, then
-	 *  realizing we can't start and forcing the confused user to read the
-	 *  logs. */
-	if (ld->daemon)
-		daemonize_but_keep_dir(ld);
-
-	/*~ We have to do this after daemonize, since that changes our pid! */
-	pidfile_write(ld, pid_fd);
 
 	/*~ Activate connect daemon.  Needs to be after the initialization of
 	 * chaintopology, otherwise peers may connect and ask for
@@ -829,6 +815,20 @@ int main(int argc, char *argv[])
 	/*~ Now that all the notifications for transactions are in place, we
 	 *  can start the poll loop which queries bitcoind for new blocks. */
 	begin_topology(ld->topology);
+
+	/*~ To handle --daemon, we fork the daemon early (otherwise we hit
+	 * issues with our pid changing), but keep the parent around until
+	 * we've completed most initialization: that way we'll exit with an
+	 * error rather than silently exiting 0, then realizing we can't start
+	 * and forcing the confused user to read the logs.
+	 *
+	 * But we're all initialized, so detach and have parent exit now. */
+	if (ld->daemon_parent_fd != -1)
+		complete_daemonize(ld);
+
+	/*~ Setting this (global) activates the crash log: we don't usually need
+	 * a backtrace if we fail during startup. */
+	crashlog = ld->log;
 
 	/*~ The root of every backtrace (almost).  This is our main event
 	 *  loop. */
