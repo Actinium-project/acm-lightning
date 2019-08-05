@@ -126,6 +126,8 @@ const struct chainparams networks[] = {
      .max_funding = AMOUNT_SAT(128 * ((1 << 24) - 1)),
      .max_payment = AMOUNT_MSAT(128 * 0xFFFFFFFFULL),
      .when_lightning_became_cool = 79250,
+     .p2pkh_version = 53,
+     .p2sh_version = 55,
      .testnet = false,
      .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_MAIN_PUBLIC, .bip32_privkey_version = BIP32_VER_MAIN_PRIVATE}},
     {.network_name = "actinium-testnet",
@@ -139,6 +141,8 @@ const struct chainparams networks[] = {
      .max_funding = AMOUNT_SAT(128 * ((1 << 24) - 1)),
      .max_payment = AMOUNT_MSAT(128 * 0xFFFFFFFFULL),
      .when_lightning_became_cool = 1,
+     .p2pkh_version = 43,
+     .p2sh_version = 58,
      .testnet = true,
      .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_TEST_PUBLIC, .bip32_privkey_version = BIP32_VER_TEST_PRIVATE}}
 };
