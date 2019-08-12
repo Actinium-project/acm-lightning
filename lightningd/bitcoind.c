@@ -2,6 +2,7 @@
 #include "bitcoin/base58.h"
 #include "bitcoin/block.h"
 #include "bitcoin/feerate.h"
+#include "bitcoin/script.h"
 #include "bitcoin/shadouble.h"
 #include "bitcoind.h"
 #include "lightningd.h"
@@ -554,8 +555,6 @@ static bool process_gettxout(struct bitcoin_cli *bcli)
 	/* As of at least v0.15.1.0, bitcoind returns "success" but an empty
 	   string on a spent gettxout */
 	if (*bcli->exitstatus != 0 || bcli->output_bytes == 0) {
-		log_debug(bcli->bitcoind->log, "%s: not unspent output?",
-			  bcli_args(tmpctx, bcli));
 		cb(bcli->bitcoind, NULL, bcli->cb_arg);
 		return true;
 	}
@@ -784,6 +783,160 @@ void bitcoind_gettxout(struct bitcoind *bitcoind,
 			  NULL);
 }
 
+/* Context for the getfilteredblock call. Wraps the actual arguments while we
+ * process the various steps. */
+struct filteredblock_call {
+	struct list_node list;
+	void (*cb)(struct bitcoind *bitcoind, const struct filteredblock *fb,
+		   void *arg);
+	void *arg;
+
+	struct filteredblock *result;
+	struct filteredblock_outpoint **outpoints;
+	size_t current_outpoint;
+	struct timeabs start_time;
+};
+
+/* Declaration for recursion in process_getfilteredblock_step1 */
+static void
+process_getfiltered_block_final(struct bitcoind *bitcoind,
+				const struct filteredblock_call *call);
+
+static void
+process_getfilteredblock_step3(struct bitcoind *bitcoind,
+			       const struct bitcoin_tx_output *output,
+			       void *arg)
+{
+	struct filteredblock_call *call = (struct filteredblock_call *)arg;
+	struct filteredblock_outpoint *o = call->outpoints[call->current_outpoint];
+
+	/* If this output is unspent, add it to the filteredblock result. */
+	if (output)
+		tal_arr_expand(&call->result->outpoints, tal_steal(call->result, o));
+
+	call->current_outpoint++;
+	if (call->current_outpoint < tal_count(call->outpoints)) {
+		o = call->outpoints[call->current_outpoint];
+		bitcoind_gettxout(bitcoind, &o->txid, o->outnum,
+				  process_getfilteredblock_step3, call);
+	} else {
+		/* If there were no more outpoints to check, we call the callback. */
+		process_getfiltered_block_final(bitcoind, call);
+	}
+}
+
+static void process_getfilteredblock_step2(struct bitcoind *bitcoind,
+					   struct bitcoin_block *block,
+					   struct filteredblock_call *call)
+{
+	struct filteredblock_outpoint *o;
+	struct bitcoin_tx *tx;
+	call->result->prev_hash = block->hdr.prev_hash;
+
+	/* Allocate an array containing all the potentially interesting
+	 * outpoints. We will later copy the ones we're interested in into the
+	 * call->result if they are unspent. */
+
+	call->outpoints = tal_arr(call, struct filteredblock_outpoint *, 0);
+	for (size_t i = 0; i < tal_count(block->tx); i++) {
+		tx = block->tx[i];
+		for (size_t j = 0; j < tx->wtx->num_outputs; j++) {
+			const u8 *script = bitcoin_tx_output_get_script(NULL, tx, j);
+			if (is_p2wsh(script, NULL)) {
+				/* This is an interesting output, remember it. */
+				o = tal(call->outpoints, struct filteredblock_outpoint);
+				bitcoin_txid(tx, &o->txid);
+				o->amount = bitcoin_tx_output_get_amount(tx, j);
+				o->txindex = i;
+				o->outnum = j;
+				o->scriptPubKey = tal_steal(o, script);
+				tal_arr_expand(&call->outpoints, o);
+			} else {
+				tal_free(script);
+			}
+		}
+	}
+
+	if (tal_count(call->outpoints) == 0) {
+		/* If there were no outpoints to check, we can short-circuit
+		 * and just call the callback. */
+		process_getfiltered_block_final(bitcoind, call);
+	} else {
+
+		/* Otherwise we start iterating through call->outpoints and
+		 * store the one's that are unspent in
+		 * call->result->outpoints. */
+		o = call->outpoints[call->current_outpoint];
+		bitcoind_gettxout(bitcoind, &o->txid, o->outnum,
+				  process_getfilteredblock_step3, call);
+	}
+}
+
+static void process_getfilteredblock_step1(struct bitcoind *bitcoind,
+					   const struct bitcoin_blkid *blkid,
+					   struct filteredblock_call *call)
+{
+	/* So we have the first piece of the puzzle, the block hash */
+	call->result->id = *blkid;
+
+	/* Now get the raw block to get all outpoints that were created in
+	 * this block. */
+	bitcoind_getrawblock(bitcoind, blkid, process_getfilteredblock_step2, call);
+}
+
+/* Takes a call, dispatches it to all queued requests that match the same
+ * height, and then kicks off the next call. */
+static void
+process_getfiltered_block_final(struct bitcoind *bitcoind,
+				const struct filteredblock_call *call)
+{
+	struct filteredblock_call *c, *next;
+	u32 height = call->result->height;
+	/* Need to steal so we don't accidentally free it while iterating through the list below. */
+	struct filteredblock *fb = tal_steal(NULL, call->result);
+	list_for_each_safe(&bitcoind->pending_getfilteredblock, c, next, list) {
+		if (c->result->height == height) {
+			c->cb(bitcoind, fb, c->arg);
+			list_del(&c->list);
+			tal_free(c);
+		}
+	}
+	tal_free(fb);
+
+	/* Nothing to free here, since `*call` was already deleted during the
+	 * iteration above. It was also removed from the list, so no need to
+	 * pop here. */
+	if (!list_empty(&bitcoind->pending_getfilteredblock)) {
+		c = list_top(&bitcoind->pending_getfilteredblock, struct filteredblock_call, list);
+		bitcoind_getblockhash(bitcoind, c->result->height, process_getfilteredblock_step1, c);
+	}
+}
+
+void bitcoind_getfilteredblock_(struct bitcoind *bitcoind, u32 height,
+				void (*cb)(struct bitcoind *bitcoind,
+					   const struct filteredblock *fb,
+					   void *arg),
+				void *arg)
+{
+	/* Stash the call context for when we need to call the callback after
+	 * all the bitcoind calls we need to perform. */
+	struct filteredblock_call *call = tal(bitcoind, struct filteredblock_call);
+	/* If this is the first request, we should start processing it. */
+	bool start = list_empty(&bitcoind->pending_getfilteredblock);
+	call->cb = cb;
+	call->arg = arg;
+	call->result = tal(call, struct filteredblock);
+	assert(call->cb != NULL);
+	call->start_time = time_now();
+	call->result->height = height;
+	call->result->outpoints = tal_arr(call->result, struct filteredblock_outpoint *, 0);
+	call->current_outpoint = 0;
+
+	list_add_tail(&bitcoind->pending_getfilteredblock, &call->list);
+	if (start)
+		bitcoind_getblockhash(bitcoind, height, process_getfilteredblock_step1, call);
+}
+
 static bool extract_numeric_version(struct bitcoin_cli *bcli,
 			    const char *output, size_t output_bytes,
 			    u64 *version)
@@ -842,6 +995,103 @@ void bitcoind_getclientversion(struct bitcoind *bitcoind)
 			  BITCOIND_HIGH_PRIO,
 			  NULL, NULL,
 			  "getnetworkinfo", NULL);
+}
+
+/* Mutual recursion */
+static bool process_getblockchaininfo(struct bitcoin_cli *bcli);
+
+static void retry_getblockchaininfo(struct bitcoind *bitcoind)
+{
+	assert(!bitcoind->synced);
+	start_bitcoin_cli(bitcoind, NULL,
+			  process_getblockchaininfo,
+			  false, BITCOIND_LOW_PRIO, NULL, NULL,
+			  "getblockchaininfo", NULL);
+}
+
+/* Given JSON object from getblockchaininfo, are we synced?  Poll if not. */
+static void is_bitcoind_synced_yet(struct bitcoind *bitcoind,
+				   const char *output, size_t output_len,
+				   const jsmntok_t *obj,
+				   bool initial)
+{
+	const jsmntok_t *t;
+	unsigned int headers, blocks;
+	bool ibd;
+
+	t = json_get_member(output, obj, "headers");
+	if (!t || !json_to_number(output, t, &headers))
+		fatal("Invalid 'headers' field in getblockchaininfo '%.*s'",
+		      (int)output_len, output);
+
+	t = json_get_member(output, obj, "blocks");
+	if (!t || !json_to_number(output, t, &blocks))
+		fatal("Invalid 'blocks' field in getblockchaininfo '%.*s'",
+		      (int)output_len, output);
+
+	t = json_get_member(output, obj, "initialblockdownload");
+	if (!t || !json_to_bool(output, t, &ibd))
+		fatal("Invalid 'initialblockdownload' field in getblockchaininfo '%.*s'",
+		      (int)output_len, output);
+
+	if (ibd) {
+		if (initial)
+			log_unusual(bitcoind->log,
+				    "Waiting for initial block download"
+				    " (this can take a while!)");
+		else
+			log_debug(bitcoind->log,
+				  "Still waiting for initial block download");
+	} else if (headers != blocks) {
+		if (initial)
+			log_unusual(bitcoind->log,
+				    "Waiting for bitcoind to catch up"
+				    " (%u blocks of %u)",
+				    blocks, headers);
+		else
+			log_debug(bitcoind->log,
+				  "Waiting for bitcoind to catch up"
+				  " (%u blocks of %u)",
+				  blocks, headers);
+	} else {
+		if (!initial)
+			log_info(bitcoind->log, "Bitcoind now synced.");
+		bitcoind->synced = true;
+		return;
+	}
+
+	bitcoind->synced = false;
+	notleak(new_reltimer(bitcoind->ld->timers, bitcoind,
+			     /* Be 4x more aggressive in this case. */
+			     time_divide(time_from_sec(bitcoind->ld->topology
+						       ->poll_seconds), 4),
+			     retry_getblockchaininfo, bitcoind));
+}
+
+static bool process_getblockchaininfo(struct bitcoin_cli *bcli)
+{
+	const jsmntok_t *tokens;
+	bool valid;
+
+	tokens = json_parse_input(bcli, bcli->output, bcli->output_bytes,
+				  &valid);
+	if (!tokens)
+		fatal("%s: %s response (%.*s)",
+		      bcli_args(tmpctx, bcli),
+		      valid ? "partial" : "invalid",
+		      (int)bcli->output_bytes, bcli->output);
+
+	if (tokens[0].type != JSMN_OBJECT) {
+		log_unusual(bcli->bitcoind->log,
+			    "%s: gave non-object (%.*s)?",
+			    bcli_args(tmpctx, bcli),
+			    (int)bcli->output_bytes, bcli->output);
+		return false;
+	}
+
+	is_bitcoind_synced_yet(bcli->bitcoind, bcli->output, bcli->output_bytes,
+			       tokens, false);
+	return true;
 }
 
 static void destroy_bitcoind(struct bitcoind *bitcoind)
@@ -920,6 +1170,7 @@ static char* check_blockchain_from_bitcoincli(const tal_t *ctx,
 			       " Should be: %s",
 			       bitcoind->chainparams->bip70_name);
 
+	is_bitcoind_synced_yet(bitcoind, output, output_bytes, tokens, true);
 	return NULL;
 }
 
@@ -995,6 +1246,7 @@ struct bitcoind *new_bitcoind(const tal_t *ctx,
 		bitcoind->num_requests[i] = 0;
 		list_head_init(&bitcoind->pending[i]);
 	}
+	list_head_init(&bitcoind->pending_getfilteredblock);
 	bitcoind->shutdown = false;
 	bitcoind->error_count = 0;
 	bitcoind->retry_timeout = 60;

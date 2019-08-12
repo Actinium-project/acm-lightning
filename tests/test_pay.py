@@ -1202,7 +1202,7 @@ def test_forward_local_failed_stats(node_factory, bitcoind, executor):
     payment_hash = l3.rpc.invoice(amount, "first", "desc")['payment_hash']
     route = l1.rpc.getroute(l3.info['id'], amount, 1)['route']
 
-    l2.rpc.close(c23, True, 0)
+    l2.rpc.close(c23, 1)
 
     with pytest.raises(RpcError):
         l1.rpc.sendpay(route, payment_hash)
@@ -1849,7 +1849,7 @@ def test_setchannelfee_state(node_factory, bitcoind):
     # Disconnect and unilaterally close from l2 to l1
     l2.rpc.disconnect(l1.info['id'], force=True)
     l1.rpc.disconnect(l2.info['id'], force=True)
-    result = l2.rpc.close(scid, True, 0)
+    result = l2.rpc.close(scid, 1)
     assert result['type'] == 'unilateral'
 
     # wait for l1 to see unilateral close via bitcoin network

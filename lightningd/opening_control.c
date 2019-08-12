@@ -99,7 +99,7 @@ static void uncommitted_channel_disconnect(struct uncommitted_channel *uc,
 	u8 *msg = towire_connectctl_peer_disconnected(tmpctx, &uc->peer->id);
 	log_info(uc->log, "%s", desc);
 	subd_send_msg(uc->peer->ld->connectd, msg);
-	if (uc->fc)
+	if (uc->fc && uc->fc->cmd)
 		was_pending(command_fail(uc->fc->cmd, LIGHTNINGD, "%s", desc));
 	notify_disconnect(uc->peer->ld, &uc->peer->id);
 }
@@ -835,13 +835,7 @@ static void channel_config(struct lightningd *ld,
 	 */
 	 ours->to_self_delay = ld->config.locktime_blocks;
 
-	 /* BOLT #2:
-	  *
-	  * The receiving node MUST fail the channel if:
-	  *...
-	  *   - `max_accepted_htlcs` is greater than 483.
-	  */
-	 ours->max_accepted_htlcs = 483;
+	 ours->max_accepted_htlcs = ld->config.max_concurrent_htlcs;
 
 	 /* This is filled in by lightning_openingd, for consistency. */
 	 ours->channel_reserve = AMOUNT_SAT(UINT64_MAX);
@@ -1279,6 +1273,11 @@ static struct command_result *json_fund_channel_start(struct command *cmd,
 				    "Feerate below feerate floor");
 	}
 
+	if (!topology_synced(cmd->ld->topology)) {
+		return command_fail(cmd, FUNDING_STILL_SYNCING_BITCOIN,
+				    "Still syncing with bitcoin network");
+	}
+
 	peer = peer_by_id(cmd->ld, id);
 	if (!peer) {
 		return command_fail(cmd, LIGHTNINGD, "Unknown peer");
@@ -1369,6 +1368,11 @@ static struct command_result *json_fund_channel(struct command *cmd,
 	if (*feerate_per_kw < feerate_floor()) {
 		return command_fail(cmd, LIGHTNINGD,
 				    "Feerate below feerate floor");
+	}
+
+	if (!topology_synced(cmd->ld->topology)) {
+		return command_fail(cmd, FUNDING_STILL_SYNCING_BITCOIN,
+				    "Still syncing with bitcoin network");
 	}
 
 	peer = peer_by_id(cmd->ld, id);

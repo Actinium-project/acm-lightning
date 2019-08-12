@@ -325,6 +325,9 @@ char *json_strdup(const tal_t *ctx UNNEEDED, const char *buffer UNNEEDED, const 
 /* Generated stub for json_stream_success */
 struct json_stream *json_stream_success(struct command *cmd UNNEEDED)
 { fprintf(stderr, "json_stream_success called!\n"); abort(); }
+/* Generated stub for json_to_bool */
+bool json_to_bool(const char *buffer UNNEEDED, const jsmntok_t *tok UNNEEDED, bool *b UNNEEDED)
+{ fprintf(stderr, "json_to_bool called!\n"); abort(); }
 /* Generated stub for json_tok_bin_from_hex */
 u8 *json_tok_bin_from_hex(const tal_t *ctx UNNEEDED, const char *buffer UNNEEDED, const jsmntok_t *tok UNNEEDED)
 { fprintf(stderr, "json_tok_bin_from_hex called!\n"); abort(); }
@@ -524,6 +527,13 @@ void subd_req_(const tal_t *ctx UNNEEDED,
 /* Generated stub for subd_send_msg */
 void subd_send_msg(struct subd *sd UNNEEDED, const u8 *msg_out UNNEEDED)
 { fprintf(stderr, "subd_send_msg called!\n"); abort(); }
+/* Generated stub for topology_add_sync_waiter_ */
+void topology_add_sync_waiter_(const tal_t *ctx UNNEEDED,
+			       struct chain_topology *topo UNNEEDED,
+			       void (*cb)(struct chain_topology *topo UNNEEDED,
+					  void *arg) UNNEEDED,
+			       void *arg UNNEEDED)
+{ fprintf(stderr, "topology_add_sync_waiter_ called!\n"); abort(); }
 /* Generated stub for towire_channel_dev_memleak */
 u8 *towire_channel_dev_memleak(const tal_t *ctx UNNEEDED)
 { fprintf(stderr, "towire_channel_dev_memleak called!\n"); abort(); }
@@ -934,7 +944,7 @@ static struct channel *wallet_channel_load(struct wallet *w, const u64 dbid)
 	struct channel *channel;
 
 	/* We expect only one peer, but reuse same code */
-	if (!wallet_channels_load_active(w))
+	if (!wallet_init_channels(w))
 		return NULL;
 	peer = list_top(&w->ld->peers, struct peer, list);
 	CHECK(peer);

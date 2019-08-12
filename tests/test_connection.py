@@ -586,9 +586,8 @@ def test_shutdown_reconnect(node_factory):
 
     assert l1.bitcoin.rpc.getmempoolinfo()['size'] == 0
 
-    # This should return with an error, then close.
-    with pytest.raises(RpcError, match=r'Channel close negotiation not finished'):
-        l1.rpc.close(chan, False, 0)
+    # This should wait until we're closed.
+    l1.rpc.close(chan)
 
     l1.daemon.wait_for_log(' to CHANNELD_SHUTTING_DOWN')
     l2.daemon.wait_for_log(' to CHANNELD_SHUTTING_DOWN')
@@ -648,9 +647,7 @@ def test_shutdown_awaiting_lockin(node_factory, bitcoind):
     l1.daemon.wait_for_log('sendrawtx exit 0')
     bitcoind.generate_block(1)
 
-    # This should return with an error, then close.
-    with pytest.raises(RpcError, match=r'Channel close negotiation not finished'):
-        l1.rpc.close(chanid, False, 0)
+    l1.rpc.close(chanid)
 
     l1.daemon.wait_for_log('CHANNELD_AWAITING_LOCKIN to CHANNELD_SHUTTING_DOWN')
     l2.daemon.wait_for_log('CHANNELD_AWAITING_LOCKIN to CHANNELD_SHUTTING_DOWN')
@@ -923,6 +920,7 @@ def test_funding_cancel_race(node_factory, bitcoind, executor):
 def test_funding_external_wallet(node_factory, bitcoind):
     l1 = node_factory.get_node()
     l2 = node_factory.get_node()
+    l3 = node_factory.get_node()
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     assert(l1.rpc.listpeers()['peers'][0]['id'] == l2.info['id'])
@@ -968,6 +966,11 @@ def test_funding_external_wallet(node_factory, bitcoind):
         node.daemon.wait_for_log(r'State changed from CHANNELD_AWAITING_LOCKIN to CHANNELD_NORMAL')
         channel = node.rpc.listpeers()['peers'][0]['channels'][0]
         assert amount * 1000 == channel['msatoshi_total']
+
+    # Test that we don't crash if peer disconnects after fundchannel_start
+    l2.connect(l3)
+    l2.rpc.fundchannel_start(l3.info["id"], amount)
+    l3.rpc.close(l2.info["id"])
 
 
 def test_lockin_between_restart(node_factory, bitcoind):
@@ -1145,8 +1148,7 @@ def test_update_fee(node_factory, bitcoind):
     l2.pay(l1, 100000000)
 
     # Now shutdown cleanly.
-    with pytest.raises(RpcError, match=r'Channel close negotiation not finished'):
-        l1.rpc.close(chanid, False, 0)
+    l1.rpc.close(chanid)
 
     l1.daemon.wait_for_log(' to CLOSINGD_COMPLETE')
     l2.daemon.wait_for_log(' to CLOSINGD_COMPLETE')
@@ -1345,8 +1347,7 @@ def test_peerinfo(node_factory, bitcoind):
     assert l2.rpc.getpeer(l1.info['id'])['localfeatures'] == lfeatures
 
     # Close the channel to forget the peer
-    with pytest.raises(RpcError, match=r'Channel close negotiation not finished'):
-        l1.rpc.close(chan, False, 0)
+    l1.rpc.close(chan)
 
     wait_for(lambda: not only_one(l1.rpc.listpeers(l2.info['id'])['peers'])['connected'])
     wait_for(lambda: not only_one(l2.rpc.listpeers(l1.info['id'])['peers'])['connected'])

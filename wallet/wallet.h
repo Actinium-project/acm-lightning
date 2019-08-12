@@ -12,6 +12,7 @@
 #include <common/channel_config.h>
 #include <common/utxo.h>
 #include <common/wallet.h>
+#include <lightningd/bitcoind.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/htlc_end.h>
 #include <lightningd/invoice.h>
@@ -470,14 +471,15 @@ bool wallet_channel_config_load(struct wallet *w, const u64 id,
 				struct channel_config *cc);
 
 /**
- * wlalet_channels_load_active -- Load persisted active channels into the peers
+ * wallet_init_channels -- Loads active channels into peers
+ *    and inits the dbid counter for next channel.
  *
- * @w: wallet to load from
+ *    @w: wallet to load from
  *
  * Be sure to call this only once on startup since it'll append peers
  * loaded from the database to the list without checking.
  */
-bool wallet_channels_load_active(struct wallet *w);
+bool wallet_init_channels(struct wallet *w);
 
 /**
  * wallet_channel_stats_incr_* - Increase channel statistics.
@@ -1024,6 +1026,11 @@ void wallet_block_remove(struct wallet *w, struct block *b);
 void wallet_blocks_rollback(struct wallet *w, u32 height);
 
 /**
+ * Return whether we have a block for the given height.
+ */
+bool wallet_have_block(struct wallet *w, u32 blockheight);
+
+/**
  * Mark an outpoint as spent, both in the owned as well as the UTXO set
  *
  * Given the outpoint (txid, outnum), and the blockheight, mark the
@@ -1158,5 +1165,12 @@ void free_unreleased_txs(struct wallet *w);
  * @return A tal_arr of wallet transactions
  */
 struct wallet_transaction *wallet_transactions_get(struct wallet *w, const tal_t *ctx);
+
+/**
+ * Add a filteredblock to the blocks and utxoset tables.
+ *
+ * This can be used to backfill the blocks and still unspent UTXOs that were before our wallet birth height.
+ */
+void wallet_filteredblock_add(struct wallet *w, const struct filteredblock *fb);
 
 #endif /* LIGHTNING_WALLET_WALLET_H */

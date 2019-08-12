@@ -1,10 +1,10 @@
-# This dockerfile is meant to cross compile with a x64 machine for a arm32v7 host
+# This dockerfile is meant to cross compile with a x64 machine for a arm64v8 host
 # It is using multi stage build: 
 # * downloader: Download litecoin/bitcoin and qemu binaries needed for c-lightning
 # * builder: Cross compile c-lightning dependencies, then c-lightning itself with static linking
 # * final: Copy the binaries required at runtime
 # The resulting image uploaded to dockerhub will only contain what is needed for runtime.
-# From the root of the repository, run "docker build -t yourimage:yourtag -f contrib/linuxarm32v7.Dockerfile ."
+# From the root of the repository, run "docker build -t yourimage:yourtag -f contrib/linuxarm64v8.Dockerfile ."
 FROM debian:stretch-slim as downloader
 
 RUN set -ex \
@@ -14,12 +14,12 @@ RUN set -ex \
 
 WORKDIR /opt
 
-RUN wget -qO /opt/tini "https://github.com/krallin/tini/releases/download/v0.18.0/tini-armhf" \
-    && echo "01b54b934d5f5deb32aa4eb4b0f71d0e76324f4f0237cc262d59376bf2bdc269 /opt/tini" | sha256sum -c - \
+RUN wget -qO /opt/tini "https://github.com/krallin/tini/releases/download/v0.18.0/tini-arm64" \
+    && echo "7c5463f55393985ee22357d976758aaaecd08defb3c5294d353732018169b019 /opt/tini" | sha256sum -c - \
     && chmod +x /opt/tini
 
 ARG BITCOIN_VERSION=0.17.0
-ENV BITCOIN_TARBALL bitcoin-$BITCOIN_VERSION-arm-linux-gnueabihf.tar.gz
+ENV BITCOIN_TARBALL bitcoin-$BITCOIN_VERSION-aarch64-linux-gnu.tar.gz
 ENV BITCOIN_URL https://bitcoincore.org/bin/bitcoin-core-$BITCOIN_VERSION/$BITCOIN_TARBALL
 ENV BITCOIN_ASC_URL https://bitcoincore.org/bin/bitcoin-core-$BITCOIN_VERSION/SHA256SUMS.asc
 
@@ -33,9 +33,9 @@ RUN mkdir /opt/bitcoin && cd /opt/bitcoin \
     && rm $BITCOIN_TARBALL
 
 ENV LITECOIN_VERSION 0.14.2
-ENV LITECOIN_TARBALL litecoin-$LITECOIN_VERSION-arm-linux-gnueabihf.tar.gz
+ENV LITECOIN_TARBALL litecoin-$LITECOIN_VERSION-aarch64-linux-gnu.tar.gz
 ENV LITECOIN_URL https://download.litecoin.org/litecoin-$LITECOIN_VERSION/linux/$LITECOIN_TARBALL
-ENV LITECOIN_SHA256 e79f2a8e8e1b9920d07cff8482237b56aa4be2623103d3d2825ce09a2cc2f6d7
+ENV LITECOIN_SHA256 69449c3c8206f75cfdef929562b323326f1d0496f77f82608f9a974cbb2fd373
 
 # install litecoin binaries
 RUN mkdir /opt/litecoin && cd /opt/litecoin \
@@ -49,9 +49,9 @@ FROM debian:stretch-slim as builder
 
 ENV LIGHTNINGD_VERSION=master
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates autoconf automake build-essential git libtool python python3 python3-mako wget gnupg dirmngr git \
-  libc6-armhf-cross gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
+  libc6-arm64-cross gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
-ENV target_host=arm-linux-gnueabihf
+ENV target_host=aarch64-linux-gnu
 
 ENV AR=${target_host}-ar \
 AS=${target_host}-as \
@@ -70,12 +70,12 @@ RUN wget -q https://zlib.net/zlib-1.2.11.tar.gz \
 && make install && cd .. && rm zlib-1.2.11.tar.gz && rm -rf zlib-1.2.11
 
 RUN apt-get install -y --no-install-recommends unzip tclsh \
-&& wget -q https://www.sqlite.org/2018/sqlite-src-3260000.zip \
-&& unzip sqlite-src-3260000.zip \
-&& cd sqlite-src-3260000 \
+&& wget -q https://www.sqlite.org/2019/sqlite-src-3290000.zip \
+&& unzip sqlite-src-3290000.zip \
+&& cd sqlite-src-3290000 \
 && ./configure --enable-static --disable-readline --disable-threadsafe --disable-load-extension --host=${target_host} --prefix=$QEMU_LD_PREFIX \
 && make \
-&& make install && cd .. && rm sqlite-src-3260000.zip && rm -rf sqlite-src-3260000
+&& make install && cd .. && rm sqlite-src-3290000.zip && rm -rf sqlite-src-3290000
 
 RUN wget -q https://gmplib.org/download/gmp/gmp-6.1.2.tar.xz \
 && tar xvf gmp-6.1.2.tar.xz \
@@ -83,8 +83,7 @@ RUN wget -q https://gmplib.org/download/gmp/gmp-6.1.2.tar.xz \
 && ./configure --disable-assembly --prefix=$QEMU_LD_PREFIX --host=${target_host} \
 && make \
 && make install && cd .. && rm gmp-6.1.2.tar.xz && rm -rf gmp-6.1.2
-
-COPY --from=downloader /usr/bin/qemu-arm-static /usr/bin/qemu-arm-static
+COPY --from=downloader /usr/bin/qemu-aarch64-static /usr/bin/qemu-aarch64-static
 WORKDIR /opt/lightningd
 COPY . /tmp/lightning
 RUN git clone --recursive /tmp/lightning . && \
@@ -93,14 +92,15 @@ RUN git clone --recursive /tmp/lightning . && \
 ARG DEVELOPER=0
 RUN ./configure --prefix=/tmp/lightning_install --enable-static && make -j3 DEVELOPER=${DEVELOPER} && make install
 
-FROM arm32v7/debian:stretch-slim as final
-COPY --from=downloader /usr/bin/qemu-arm-static /usr/bin/qemu-arm-static
+FROM arm64v8/debian:stretch-slim as final
+COPY --from=downloader /usr/bin/qemu-aarch64-static /usr/bin/qemu-aarch64-static
 COPY --from=downloader /opt/tini /usr/bin/tini
 RUN apt-get update && apt-get install -y --no-install-recommends socat inotify-tools \
     && rm -rf /var/lib/apt/lists/* 
 
 ENV LIGHTNINGD_DATA=/root/.lightning
-ENV LIGHTNINGD_PORT=9835
+ENV LIGHTNINGD_RPC_PORT=9835
+ENV LIGHTNINGD_PORT=9735
 
 RUN mkdir $LIGHTNINGD_DATA && \
     touch $LIGHTNINGD_DATA/config

@@ -1,7 +1,9 @@
+from bitcoin.rpc import RawProxy
 from fixtures import *  # noqa: F401,F403
 from flaky import flaky  # noqa: F401
 from lightning import RpcError
-from utils import DEVELOPER, VALGRIND, sync_blockheight, only_one, wait_for, TailableProc
+from threading import Event
+from utils import DEVELOPER, TIMEOUT, VALGRIND, sync_blockheight, only_one, wait_for, TailableProc
 from ephemeral_port_reserve import reserve
 
 import json
@@ -110,6 +112,94 @@ def test_bitcoin_failure(node_factory, bitcoind):
 
     bitcoind.generate_block(5)
     sync_blockheight(bitcoind, [l1])
+
+
+def test_bitcoin_ibd(node_factory, bitcoind):
+    """Test that we recognize bitcoin in initial download mode"""
+    info = bitcoind.rpc.getblockchaininfo()
+    info['initialblockdownload'] = True
+
+    l1 = node_factory.get_node(start=False)
+    l1.daemon.rpcproxy.mock_rpc('getblockchaininfo', info)
+
+    l1.start(wait_for_bitcoind_sync=False)
+
+    # This happens before the Starting message start() waits for.
+    assert l1.daemon.is_in_log('Waiting for initial block download')
+    assert 'warning_bitcoind_sync' in l1.rpc.getinfo()
+
+    # "Finish" IDB.
+    l1.daemon.rpcproxy.mock_rpc('getblockchaininfo', None)
+
+    l1.daemon.wait_for_log('Bitcoind now synced')
+    assert 'warning_bitcoind_sync' not in l1.rpc.getinfo()
+
+
+def test_lightningd_still_loading(node_factory, bitcoind, executor):
+    """Test that we recognize we haven't got all blocks from bitcoind"""
+
+    mock_release = Event()
+
+    # This is slow enough that we're going to notice.
+    def mock_getblock(r):
+        conf_file = os.path.join(bitcoind.bitcoin_dir, 'bitcoin.conf')
+        brpc = RawProxy(btc_conf_file=conf_file)
+        if r['params'][0] == slow_blockid:
+            mock_release.wait(TIMEOUT)
+        return {
+            "result": brpc._call(r['method'], *r['params']),
+            "error": None,
+            "id": r['id']
+        }
+
+    # Start it, establish channel, get extra funds.
+    l1, l2 = node_factory.line_graph(2, opts={'may_reconnect': True, 'wait_for_bitcoind_sync': False})
+    # Extra funds, for second channel attempt.
+    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'], 1.0)
+    # Balance l1<->l2 channel
+    l1.pay(l2, 10**9 // 2)
+
+    l1.stop()
+
+    # Start extra node.
+    l3 = node_factory.get_node()
+
+    # Now make sure it's behind.
+    bitcoind.generate_block(2)
+    # Make sure l2/l3 are synced
+    sync_blockheight(bitcoind, [l2, l3])
+
+    # Make it slow grabbing the final block.
+    slow_blockid = bitcoind.rpc.getblockhash(bitcoind.rpc.getblockcount())
+    l1.daemon.rpcproxy.mock_rpc('getblock', mock_getblock)
+
+    l1.start(wait_for_bitcoind_sync=False)
+
+    # It will warn about being out-of-sync.
+    assert 'warning_bitcoind_sync' not in l1.rpc.getinfo()
+    assert 'warning_lightningd_sync' in l1.rpc.getinfo()
+
+    # Payments will fail.  FIXME: More informative msg?
+    with pytest.raises(RpcError, match=r'TEMPORARY_CHANNEL_FAILURE'):
+        l1.pay(l2, 1000)
+
+    # Can't fund a new channel, either.
+    l1.rpc.connect(l3.info['id'], 'localhost', l3.port)
+    with pytest.raises(RpcError, match=r'304'):
+        l1.rpc.fundchannel(l3.info['id'], 'all')
+
+    # This will work, but will be delayed until synced.
+    fut = executor.submit(l2.pay, l1, 1000)
+    l1.daemon.wait_for_log("Deferring incoming commit until we sync")
+
+    # Release the mock.
+    mock_release.set()
+    fut.result()
+
+    assert 'warning_lightningd_sync' not in l1.rpc.getinfo()
+
+    # This will now work normally.
+    l1.pay(l2, 1000)
 
 
 def test_ping(node_factory):
@@ -657,6 +747,20 @@ def test_cli(node_factory):
                                    'listinvoices', 'label=l"[]{}']).decode('utf-8')
     j = json.loads(out)
     assert only_one(j['invoices'])['label'] == 'l"[]{}'
+
+    # For those using shell scripts (you know who you are Rene), make sure we're maintaining whitespace
+    lines = [l for l in out.splitlines() if '"bolt11"' not in l and '"payment_hash"' not in l and '"expires_at"' not in l]
+    assert lines == ['{',
+                     '   "invoices": [',
+                     '      {',
+                     r'         "label": "l\"[]{}",',
+                     '         "msatoshi": 123000,',
+                     '         "amount_msat": "123000msat",',
+                     '         "status": "unpaid",',
+                     r'         "description": "d\"[]{}",',
+                     '      }',
+                     '   ]',
+                     '}']
 
 
 def test_daemon_option(node_factory):
