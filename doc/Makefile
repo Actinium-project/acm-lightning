@@ -30,6 +30,7 @@ MANPAGES := doc/lightning-cli.1 \
 	doc/lightning-listsendpays.7 \
 	doc/lightning-newaddr.7 \
 	doc/lightning-pay.7 \
+	doc/lightning-plugin.7 \
 	doc/lightning-sendpay.7 \
 	doc/lightning-setchannelfee.7 \
 	doc/lightning-txprepare.7 \
@@ -40,10 +41,10 @@ MANPAGES := doc/lightning-cli.1 \
 	doc/lightning-waitsendpay.7 \
 	doc/lightning-withdraw.7 
 
-doc-all: $(MANPAGES)
+doc-all: $(MANPAGES) doc/index.rst
 
-$(MANPAGES): doc/%: doc/%.txt
-	@if $(CHANGED_FROM_GIT); then echo a2x --format=manpage $<; a2x --format=manpage $<; else touch $@; fi
+$(MANPAGES): doc/%: doc/%.md
+	@if $(CHANGED_FROM_GIT); then echo mrkd $<; mrkd $<; else touch $@; fi
 
 doc/protocol-%.svg: test/test_protocol
 	test/test_protocol --svg < test/commits/$*.script > $@
@@ -78,8 +79,8 @@ clean: doc-clean
 check: check-manpages
 
 check-manpages: cli/lightning-cli lightningd/lightningd
-	@tools/check-manpage.sh cli/lightning-cli doc/lightning-cli.1.txt
-	@tools/check-manpage.sh "lightningd/lightningd --lightning-dir=/tmp/" doc/lightningd-config.5.txt
+	@tools/check-manpage.sh cli/lightning-cli doc/lightning-cli.1.md
+	@tools/check-manpage.sh "lightningd/lightningd --lightning-dir=/tmp/" doc/lightningd-config.5.md
 
 doc-maintainer-clean:
 	$(RM) doc/deployable-lightning.pdf
@@ -88,3 +89,7 @@ doc-maintainer-clean:
 doc-clean:
 	$(RM) doc/deployable-lightning.{aux,bbl,blg,dvi,log,out,tex}
 
+doc/index.rst:
+	(grep -v '^   lightning.*\.[0-9]\.md$$' $@; for m in $$(cd doc && ls lightning*.[0-9].md); do echo "   $$m"; done) > $@.tmp.$$$$ && mv $@.tmp.$$$$ $@
+
+.PHONY: doc/index.rst
