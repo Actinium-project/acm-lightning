@@ -47,7 +47,7 @@ static struct bitcoin_tx *htlc_tx(const tal_t *ctx,
 	 *    * `txin[0]` sequence: `0`
 	 */
 	amount = amount_msat_to_sat_round_down(msat);
-	bitcoin_tx_add_input(tx, commit_txid, commit_output_number, 0, &amount,
+	bitcoin_tx_add_input(tx, commit_txid, commit_output_number, 0, amount,
 			     NULL);
 
 	/* BOLT #3:
@@ -62,7 +62,7 @@ static struct bitcoin_tx *htlc_tx(const tal_t *ctx,
 
 	wscript = bitcoin_wscript_htlc_tx(tx, to_self_delay, revocation_pubkey,
 					  local_delayedkey);
-	bitcoin_tx_add_output(tx, scriptpubkey_p2wsh(tx, wscript), &amount);
+	bitcoin_tx_add_output(tx, scriptpubkey_p2wsh(tx, wscript), amount);
 	tal_free(wscript);
 
 	return tx;
@@ -109,7 +109,7 @@ void htlc_success_tx_add_witness(struct bitcoin_tx *htlc_success,
 	witness = bitcoin_witness_htlc_success_tx(htlc_success,
 						  localhtlcsig, remotehtlcsig,
 						  payment_preimage, wscript);
-	bitcoin_tx_input_set_witness(htlc_success, 0, witness);
+	bitcoin_tx_input_set_witness(htlc_success, 0, take(witness));
 	tal_free(wscript);
 }
 
@@ -149,7 +149,7 @@ void htlc_timeout_tx_add_witness(struct bitcoin_tx *htlc_timeout,
 
 	witness = bitcoin_witness_htlc_timeout_tx(htlc_timeout, localhtlcsig,
 						  remotehtlcsig, wscript);
-	bitcoin_tx_input_set_witness(htlc_timeout, 0, witness);
+	bitcoin_tx_input_set_witness(htlc_timeout, 0, take(witness));
 	tal_free(wscript);
 }
 
