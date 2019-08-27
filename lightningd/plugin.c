@@ -10,6 +10,7 @@
 #include <common/memleak.h>
 #include <common/param.h>
 #include <common/timeout.h>
+#include <common/version.h>
 #include <dirent.h>
 #include <errno.h>
 #include <lightningd/io_loop_with_timers.h>
@@ -1012,13 +1013,12 @@ void plugins_init(struct plugins *plugins, const char *dev_plugin_debug)
 				path_join(tmpctx, plugins->ld->config_dir, "plugins"));
 
 	setenv("LIGHTNINGD_PLUGIN", "1", 1);
+	setenv("LIGHTNINGD_VERSION", version(), 1);
 	/* Spawn the plugin processes before entering the io_loop */
 	plugins_start(plugins, dev_plugin_debug);
 
 	if (plugins->pending_manifests > 0)
 		io_loop_with_timers(plugins->ld);
-	// There won't be io_loop anymore to wait for plugins
-	plugins->startup = false;
 }
 
 static void plugin_config_cb(const char *buffer,
@@ -1072,6 +1072,8 @@ void plugins_config(struct plugins *plugins)
 			plugin_config(p);
 		}
 	}
+
+	plugins->startup = false;
 }
 
 void json_add_opt_plugins(struct json_stream *response,
