@@ -344,6 +344,7 @@ void peer_start_channeld(struct channel *channel,
 	/* BOLT #2:
 	 *
  	 *   - if it supports `option_data_loss_protect`:
+	 *...
 	 *     - if `next_revocation_number` equals 0:
 	 *       - MUST set `your_last_per_commitment_secret` to all zeroes
 	 *     - otherwise:
@@ -409,6 +410,9 @@ void peer_start_channeld(struct channel *channel,
 				      htlcs, htlc_states,
 				      fulfilled_htlcs, fulfilled_sides,
 				      failed_htlcs, failed_sides,
+				      /* This is an approximation, but failing
+				       * on restart is a corner case */
+				      get_block_height(ld->topology),
 				      channel->scid != NULL,
 				      channel->remote_funding_locked,
 				      &scid,

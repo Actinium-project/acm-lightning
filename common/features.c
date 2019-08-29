@@ -1,13 +1,17 @@
 #include "features.h"
 #include <assert.h>
 #include <ccan/array_size/array_size.h>
+#include <common/utils.h>
 #include <wire/peer_wire.h>
 
 static const u32 our_localfeatures[] = {
-	LOCAL_DATA_LOSS_PROTECT,
-	LOCAL_INITIAL_ROUTING_SYNC,
-	LOCAL_UPFRONT_SHUTDOWN_SCRIPT,
-	LOCAL_GOSSIP_QUERIES
+	OPTIONAL_FEATURE(LOCAL_DATA_LOSS_PROTECT),
+	OPTIONAL_FEATURE(LOCAL_INITIAL_ROUTING_SYNC),
+	OPTIONAL_FEATURE(LOCAL_UPFRONT_SHUTDOWN_SCRIPT),
+	OPTIONAL_FEATURE(LOCAL_GOSSIP_QUERIES),
+#if EXPERIMENTAL_FEATURES
+	OPTIONAL_FEATURE(LOCAL_GOSSIP_QUERIES_EX)
+#endif
 };
 
 static const u32 our_globalfeatures[] = {
@@ -37,13 +41,12 @@ static bool test_bit(const u8 *features, size_t byte, unsigned int bit)
 	return features[tal_count(features) - 1 - byte] & (1 << (bit % 8));
 }
 
-/* We don't insist on anything, it's all optional. */
 static u8 *mkfeatures(const tal_t *ctx, const u32 *arr, size_t n)
 {
 	u8 *f = tal_arr(ctx, u8, 0);
 
 	for (size_t i = 0; i < n; i++)
-		set_bit(&f, OPTIONAL_FEATURE(arr[i]));
+		set_bit(&f, arr[i]);
 	return f;
 }
 
@@ -71,9 +74,7 @@ static bool feature_set(const u8 *features, size_t bit)
 
 bool feature_offered(const u8 *features, size_t f)
 {
-	assert(f % 2 == 0);
-
-	return feature_set(features, f)
+	return feature_set(features, COMPULSORY_FEATURE(f))
 		|| feature_set(features, OPTIONAL_FEATURE(f));
 }
 
@@ -82,7 +83,8 @@ static bool feature_supported(int feature_bit,
 			      size_t num_supported)
 {
 	for (size_t i = 0; i < num_supported; i++) {
-		if (supported[i] == feature_bit)
+		if (OPTIONAL_FEATURE(supported[i])
+		    == OPTIONAL_FEATURE(feature_bit))
 			return true;
 	}
 	return false;
@@ -148,4 +150,31 @@ bool global_feature_negotiated(const u8 *gfeatures, size_t f)
 		return false;
 	return feature_supported(f, our_globalfeatures,
 				 ARRAY_SIZE(our_globalfeatures));
+}
+
+static const char *feature_name(const tal_t *ctx, size_t f)
+{
+	static const char *fnames[] = {
+		"option_data_loss_protect",
+		"option_initial_routing_sync",
+		"option_upfront_shutdown_script",
+		"option_gossip_queries",
+		"option_var_onion_optin",
+		"option_gossip_queries_ex" };
+
+	assert(f / 2 < ARRAY_SIZE(fnames));
+	return tal_fmt(ctx, "%s/%s",
+		       fnames[f / 2], (f & 1) ? "odd" : "even");
+}
+
+const char **list_supported_features(const tal_t *ctx)
+{
+	const char **list = tal_arr(ctx, const char *, 0);
+
+	/* The local/global number spaces are to be distinct, so this works */
+	for (size_t i = 0; i < ARRAY_SIZE(our_localfeatures); i++)
+		tal_arr_expand(&list, feature_name(list, our_localfeatures[i]));
+	for (size_t i = 0; i < ARRAY_SIZE(our_globalfeatures); i++)
+		tal_arr_expand(&list, feature_name(list, our_globalfeatures[i]));
+	return list;
 }
