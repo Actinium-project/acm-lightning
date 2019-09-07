@@ -357,8 +357,7 @@ bool json_to_preimage(const char *buffer UNNEEDED, const jsmntok_t *tok UNNEEDED
 { fprintf(stderr, "json_to_preimage called!\n"); abort(); }
 /* Generated stub for json_to_short_channel_id */
 bool json_to_short_channel_id(const char *buffer UNNEEDED, const jsmntok_t *tok UNNEEDED,
-			      struct short_channel_id *scid UNNEEDED,
-			      bool may_be_deprecated_form UNNEEDED)
+			      struct short_channel_id *scid UNNEEDED)
 { fprintf(stderr, "json_to_short_channel_id called!\n"); abort(); }
 /* Generated stub for kill_uncommitted_channel */
 void kill_uncommitted_channel(struct uncommitted_channel *uc UNNEEDED,
@@ -541,7 +540,7 @@ u8 *towire_channel_dev_memleak(const tal_t *ctx UNNEEDED)
 u8 *towire_channel_dev_reenable_commit(const tal_t *ctx UNNEEDED)
 { fprintf(stderr, "towire_channel_dev_reenable_commit called!\n"); abort(); }
 /* Generated stub for towire_channel_fail_htlc */
-u8 *towire_channel_fail_htlc(const tal_t *ctx UNNEEDED, const struct failed_htlc *failed_htlc UNNEEDED, u32 failheight UNUSED)
+u8 *towire_channel_fail_htlc(const tal_t *ctx UNNEEDED, const struct failed_htlc *failed_htlc UNNEEDED, u32 failheight UNNEEDED)
 { fprintf(stderr, "towire_channel_fail_htlc called!\n"); abort(); }
 /* Generated stub for towire_channel_fulfill_htlc */
 u8 *towire_channel_fulfill_htlc(const tal_t *ctx UNNEEDED, const struct fulfilled_htlc *fulfilled_htlc UNNEEDED)
@@ -1126,6 +1125,7 @@ static bool test_channel_config_crud(struct lightningd *ld, const tal_t *ctx)
 
 static bool test_htlc_crud(struct lightningd *ld, const tal_t *ctx)
 {
+	struct db_stmt *stmt;
 	struct htlc_in in, *hin;
 	struct htlc_out out, *hout;
 	struct preimage payment_key;
@@ -1136,8 +1136,13 @@ static bool test_htlc_crud(struct lightningd *ld, const tal_t *ctx)
 	struct htlc_out_map *htlcs_out = tal(ctx, struct htlc_out_map);
 
 	/* Make sure we have our references correct */
-	CHECK(transaction_wrap(w->db,
-			       db_exec(__func__, w->db, "INSERT INTO channels (id) VALUES (1);")));
+	db_begin_transaction(w->db);
+	char *query = SQL("INSERT INTO channels (id) VALUES (1);");
+	stmt = db_prepare_v2(w->db, query);
+	db_exec_prepared_v2(stmt);
+	tal_free(stmt);
+	db_commit_transaction(w->db);
+
 	chan->dbid = 1;
 	chan->peer = peer;
 

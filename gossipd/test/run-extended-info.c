@@ -220,10 +220,6 @@ struct htable *memleak_enter_allocations(const tal_t *ctx UNNEEDED,
 /* Generated stub for memleak_remove_referenced */
 void memleak_remove_referenced(struct htable *memtable UNNEEDED, const void *root UNNEEDED)
 { fprintf(stderr, "memleak_remove_referenced called!\n"); abort(); }
-/* Generated stub for memleak_remove_routing_tables */
-void memleak_remove_routing_tables(struct htable *memtable UNNEEDED,
-				   const struct routing_state *rstate UNNEEDED)
-{ fprintf(stderr, "memleak_remove_routing_tables called!\n"); abort(); }
 /* Generated stub for new_reltimer_ */
 struct oneshot *new_reltimer_(struct timers *timers UNNEEDED,
 			      const tal_t *ctx UNNEEDED,
@@ -567,7 +563,7 @@ static u8 *get_scid_array(const tal_t *ctx,
 	encoding = json_get_member(test_vector, scids, "encoding");
 	json_for_each_arr(i, t, arr) {
 		struct short_channel_id scid;
-		assert(json_to_short_channel_id(test_vector, t, &scid, false));
+		assert(json_to_short_channel_id(test_vector, t, &scid));
 		encoding_add_short_channel_id(&encoded, &scid);
 	}
 	if (json_tok_streq(test_vector, encoding, "UNCOMPRESSED")) {

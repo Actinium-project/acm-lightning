@@ -506,11 +506,6 @@ def test_gossip_no_empty_announcements(node_factory, bitcoind):
     # 0x0100 = channel_announcement, which goes to l2 before l3 dies.
     l2.daemon.wait_for_log(r'\[IN\] 0100')
 
-    # l3 actually disconnects from l4 *and* l2!  That means we never see
-    # the (delayed) channel_update from l4.
-    wait_for(lambda: not l3.rpc.listpeers(l4.info['id'])['peers'][0]['connected'])
-    l3.rpc.connect(l4.info['id'], 'localhost', l4.port)
-
     # But it never goes to l1, as there's no channel_update.
     time.sleep(2)
     assert not l1.daemon.is_in_log(r'\[IN\] 0100')
@@ -978,8 +973,13 @@ def test_node_reannounce(node_factory, bitcoind):
     nannouncement = l2.daemon.wait_for_log(r'{}.*\[IN\] 0101.*{}'.format(l1.info['id'], l1.info['id'])).split('[IN] ')[1]
     wait_for(lambda: only_one(l2.rpc.listnodes(l1.info['id'])['nodes'])['alias'] == 'SENIORBEAM')
 
-    # Restart should re-xmit exact same update on reconnect.
-    l1.restart()
+    # Restart should re-xmit exact same update on reconnect, but make sure
+    # l2 doesn't send it first!
+    l1.stop()
+    l2.stop()
+    os.remove(os.path.join(l2.daemon.lightning_dir, 'gossip_store'))
+    l2.start()
+    l1.start()
 
     # l1 should retransmit it exactly the same (no timestamp change!)
     l2.daemon.wait_for_log(r'{}.*\[IN\] {}'.format(l1.info['id'], nannouncement))
@@ -1375,3 +1375,21 @@ def test_gossip_announce_unknown_block(node_factory, bitcoind):
 
     # Make sure it's OK once it's caught up.
     sync_blockheight(bitcoind, [l1])
+
+
+@unittest.skipIf(not DEVELOPER, "gossip without DEVELOPER=1 is slow")
+def test_gossip_no_backtalk(node_factory):
+    l1, l2 = node_factory.line_graph(2, wait_for_announce=True)
+
+    # This connects, gets gossip, but should *not* play it back.
+    l3 = node_factory.get_node(log_all_io=True)
+
+    l3.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    # Will get channel_announce, then two channel_update and two node_announcement
+    l3.daemon.wait_for_logs([r'\[IN\] 0100',
+                             r'\[IN\] 0102', r'\[IN\] 0102',
+                             r'\[IN\] 0101', r'\[IN\] 0101'])
+
+    # With DEVELOPER, this is long enough for gossip flush.
+    time.sleep(2)
+    assert not l3.daemon.is_in_log(r'\[OUT\] 0100')

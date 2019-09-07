@@ -1514,11 +1514,11 @@ static struct io_plan *handle_sign_withdrawal_tx(struct io_conn *conn,
 	struct utxo **utxos;
 	struct bitcoin_tx *tx;
 	struct pubkey changekey;
-	u8 *scriptpubkey;
+	struct bitcoin_tx_output **outputs;
 
 	if (!fromwire_hsm_sign_withdrawal(tmpctx, msg_in, &satoshi_out,
 					  &change_out, &change_keyindex,
-					  &scriptpubkey, &utxos))
+					  &outputs, &utxos))
 		return bad_req(conn, c, msg_in);
 
 	if (!bip32_pubkey(&secretstuff.bip32, &changekey, change_keyindex))
@@ -1526,8 +1526,8 @@ static struct io_plan *handle_sign_withdrawal_tx(struct io_conn *conn,
 				   "Failed to get key %u", change_keyindex);
 
 	tx = withdraw_tx(tmpctx, c->chainparams,
-			 cast_const2(const struct utxo **, utxos), scriptpubkey,
-			 satoshi_out, &changekey, change_out, NULL, NULL);
+			 cast_const2(const struct utxo **, utxos), outputs,
+			 &changekey, change_out, NULL, NULL);
 
 	sign_all_inputs(tx, utxos);
 

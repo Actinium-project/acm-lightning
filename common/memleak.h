@@ -3,7 +3,10 @@
 #include "config.h"
 #include <ccan/cast/cast.h>
 #include <ccan/tal/tal.h>
+#include <ccan/typesafe_cb/typesafe_cb.h>
 #include <inttypes.h>
+
+struct htable;
 
 #if HAVE_TYPEOF
 #define memleak_typeof(var) typeof(var)
@@ -17,16 +20,26 @@
 /* Mark a pointer and all its tal children as not being leaked. */
 #define notleak_with_children(p) ((memleak_typeof(p))notleak_((p), true))
 
-#if DEVELOPER
 void *notleak_(const void *ptr, bool plus_children);
 
-struct htable;
+/* Mark a helper to be called to scan this structure for mem references */
+/* For update-mock: memleak_add_helper_ mock empty */
+void memleak_add_helper_(const tal_t *p, void (*cb)(struct htable *memtable,
+						    const tal_t *));
+
+#if DEVELOPER
+#define memleak_add_helper(p, cb)					\
+	memleak_add_helper_((p),					\
+			    typesafe_cb_preargs(void, const tal_t *,	\
+						(cb), (p),		\
+						struct htable *))
+#else
+/* Don't refer to cb at all if !DEVELOPER */
+#define memleak_add_helper(p, cb)
+#endif
 
 /* Initialize memleak detection */
 void memleak_init(void);
-
-/* Free memleak detection. */
-void memleak_cleanup(void);
 
 /* Allocate a htable with all the memory we've allocated. */
 struct htable *memleak_enter_allocations(const tal_t *ctx,
@@ -52,12 +65,5 @@ void memleak_scan_region(struct htable *memtable,
 
 /* Get (and remove) a leak from memtable, or NULL */
 const void *memleak_get(struct htable *memtable, const uintptr_t **backtrace);
-
-#else /* ... !DEVELOPER */
-static inline void *notleak_(const void *ptr, bool plus_children UNNEEDED)
-{
-	return cast_const(void *, ptr);
-}
-#endif /* !DEVELOPER */
 
 #endif /* LIGHTNING_COMMON_MEMLEAK_H */

@@ -27,6 +27,9 @@ bool fromwire_gossip_store_private_update(const tal_t *ctx UNNEEDED, const void 
 /* Generated stub for fromwire_wireaddr */
 bool fromwire_wireaddr(const u8 **cursor UNNEEDED, size_t *max UNNEEDED, struct wireaddr *addr UNNEEDED)
 { fprintf(stderr, "fromwire_wireaddr called!\n"); abort(); }
+/* Generated stub for memleak_add_helper_ */
+void memleak_add_helper_(const tal_t *p UNNEEDED, void (*cb)(struct htable *memtable UNNEEDED,
+						    const tal_t *)){ }
 /* Generated stub for onion_type_name */
 const char *onion_type_name(int e UNNEEDED)
 { fprintf(stderr, "onion_type_name called!\n"); abort(); }
@@ -76,8 +79,7 @@ get_or_make_connection(struct routing_state *rstate,
 	struct chan *chan;
 	const int idx = node_id_idx(from_id, to_id);
 
-	if (!short_channel_id_from_str(shortid, strlen(shortid), &scid,
-				       false))
+	if (!short_channel_id_from_str(shortid, strlen(shortid), &scid))
 		abort();
 	chan = get_channel(rstate, &scid);
 	if (!chan)

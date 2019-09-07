@@ -9,7 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - JSON API: `listfunds` now lists a blockheight for confirmed transactions
 
+- bolt11: support for parsing feature bits (field `9`).
+
 ### Changed
+
+- JSON API: `txprepare` now uses `outputs` as parameter other than `destination` and `satoshi`
 
 ### Deprecated
 
@@ -18,7 +22,14 @@ changes.
 
 ### Removed
 
+- JSON API: `short_channel_id` parameters in JSON commands with `:` separators (deprecated since 0.7.0).
+- JSON API: `description` parameters in `pay` and `sendpay` (deprecated since 0.7.0).
+- JSON API: `description` output field in `waitsendpay` and `sendpay` (deprecated since 0.7.0).
+- JSON API: `listpayments` (deprecated since 0.7.0).
+
 ### Fixed
+
+- Relative `--lightning_dir` is now working again.
 
 ### Security
 

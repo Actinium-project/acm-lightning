@@ -6,24 +6,42 @@
 #include <bitcoin/pubkey.h>
 #include <bitcoin/short_channel_id.h>
 #include <bitcoin/tx.h>
+#include <ccan/autodata/autodata.h>
+#include <ccan/json_escape/json_escape.h>
 #include <ccan/short_types/short_types.h>
 #include <ccan/tal/tal.h>
 #include <ccan/time/time.h>
 #include <common/amount.h>
 #include <secp256k1_ecdh.h>
-#include <sqlite3.h>
 #include <stdbool.h>
 
 struct lightningd;
 struct log;
 struct node_id;
+struct db_stmt;
+struct db;
 
-struct db {
-	char *filename;
-	const char *in_transaction;
-	sqlite3 *sql;
-	const char **changes;
-};
+/**
+ * Macro to annotate a named SQL query.
+ *
+ * This macro is used to annotate SQL queries that might need rewriting for
+ * different SQL dialects. It is used both as a marker for the query
+ * extraction logic in devtools/sql-rewrite.py to identify queries, as well as
+ * a way to swap out the query text with it's name so that the query execution
+ * engine can then look up the rewritten query using its name.
+ *
+ */
+#define NAMED_SQL(name,x) x
+
+/**
+ * Simple annotation macro that auto-generates names for NAMED_SQL
+ *
+ * If this macro is changed it is likely that the extraction logic in
+ * devtools/sql-rewrite.py needs to change as well, since they need to
+ * generate identical names to work correctly.
+ */
+#define SQL(x) NAMED_SQL( __FILE__ ":" stringify(__LINE__) ":" stringify(__COUNTER__), x)
+
 
 /**
  * db_setup - Open a the lightningd database and update the schema
@@ -40,16 +58,6 @@ struct db {
 struct db *db_setup(const tal_t *ctx, struct lightningd *ld, struct log *log);
 
 /**
- * db_select - Prepare and execute a SELECT, and return the result
- *
- * A simpler version of db_select_prepare.
- */
-sqlite3_stmt *PRINTF_FMT(3, 4)
-	db_select_(const char *location, struct db *db, const char *fmt, ...);
-#define db_select(db, ...) \
-	db_select_(__FILE__ ":" stringify(__LINE__), db, __VA_ARGS__)
-
-/**
  * db_begin_transaction - Begin a transaction
  *
  * Begin a new DB transaction.  fatal() on database error.
@@ -57,6 +65,8 @@ sqlite3_stmt *PRINTF_FMT(3, 4)
 #define db_begin_transaction(db) \
 	db_begin_transaction_((db), __FILE__ ":" stringify(__LINE__))
 void db_begin_transaction_(struct db *db, const char *location);
+
+bool db_in_transaction(struct db *db);
 
 /**
  * db_commit_transaction - Commit a running transaction
@@ -82,136 +92,130 @@ void db_set_intvar(struct db *db, char *varname, s64 val);
  */
 s64 db_get_intvar(struct db *db, char *varname, s64 defval);
 
-/**
- * db_select_prepare -- Prepare a DB select statement (read-only!)
- *
- * Tiny wrapper around `sqlite3_prepare_v2` that checks and sets
- * errors like `db_query` and `db_exec` do.  It calls fatal if
- * the stmt is not valid.
- *
- * Call db_select_step() until it returns false (which will also consume
- * the stmt).
- *
- * @db: Database to query/exec
- * @query: The SELECT SQL statement to compile
- */
-#define db_select_prepare(db, query) \
-	db_select_prepare_(__FILE__ ":" stringify(__LINE__), db, query)
-sqlite3_stmt *db_select_prepare_(const char *location,
-				 struct db *db, const char *query);
+void db_bind_null(struct db_stmt *stmt, int pos);
+void db_bind_int(struct db_stmt *stmt, int pos, int val);
+void db_bind_u64(struct db_stmt *stmt, int pos, u64 val);
+void db_bind_blob(struct db_stmt *stmt, int pos, const u8 *val, size_t len);
+void db_bind_text(struct db_stmt *stmt, int pos, const char *val);
+void db_bind_preimage(struct db_stmt *stmt, int pos, const struct preimage *p);
+void db_bind_sha256(struct db_stmt *stmt, int pos, const struct sha256 *s);
+void db_bind_sha256d(struct db_stmt *stmt, int pos, const struct sha256_double *s);
+void db_bind_secret(struct db_stmt *stmt, int pos, const struct secret *s);
+void db_bind_secret_arr(struct db_stmt *stmt, int col, const struct secret *s);
+void db_bind_txid(struct db_stmt *stmt, int pos, const struct bitcoin_txid *t);
+void db_bind_node_id(struct db_stmt *stmt, int pos, const struct node_id *ni);
+void db_bind_node_id_arr(struct db_stmt *stmt, int col,
+			 const struct node_id *ids);
+void db_bind_pubkey(struct db_stmt *stmt, int pos, const struct pubkey *p);
+void db_bind_short_channel_id(struct db_stmt *stmt, int col,
+			      const struct short_channel_id *id);
+void db_bind_short_channel_id_arr(struct db_stmt *stmt, int col,
+				  const struct short_channel_id *id);
+void db_bind_signature(struct db_stmt *stmt, int col,
+		       const secp256k1_ecdsa_signature *sig);
+void db_bind_timeabs(struct db_stmt *stmt, int col, struct timeabs t);
+void db_bind_tx(struct db_stmt *stmt, int col, const struct bitcoin_tx *tx);
+void db_bind_amount_msat(struct db_stmt *stmt, int pos,
+			 const struct amount_msat *msat);
+void db_bind_amount_sat(struct db_stmt *stmt, int pos,
+			const struct amount_sat *sat);
+void db_bind_json_escape(struct db_stmt *stmt, int pos,
+			 const struct json_escape *esc);
 
-/**
- * db_select_step -- iterate through db results.
- *
- * Returns false and frees stmt if we've reached end, otherwise
- * it means sqlite3_step has returned SQLITE_ROW.
- */
-#define db_select_step(db, stmt)					\
-	db_select_step_(__FILE__ ":" stringify(__LINE__), db, stmt)
-bool db_select_step_(const char *location,
-		     struct db *db, struct sqlite3_stmt *stmt);
+bool db_step(struct db_stmt *stmt);
+u64 db_column_u64(struct db_stmt *stmt, int col);
+int db_column_int(struct db_stmt *stmt, int col);
+size_t db_column_bytes(struct db_stmt *stmt, int col);
+int db_column_is_null(struct db_stmt *stmt, int col);
+const void* db_column_blob(struct db_stmt *stmt, int col);
+const unsigned char *db_column_text(struct db_stmt *stmt, int col);
+void db_column_preimage(struct db_stmt *stmt, int col, struct preimage *preimage);
+void db_column_amount_msat(struct db_stmt *stmt, int col, struct amount_msat *msat);
+void db_column_amount_sat(struct db_stmt *stmt, int col, struct amount_sat *sat);
+struct json_escape *db_column_json_escape(const tal_t *ctx, struct db_stmt *stmt, int col);
+void db_column_sha256(struct db_stmt *stmt, int col, struct sha256 *sha);
+void db_column_sha256d(struct db_stmt *stmt, int col, struct sha256_double *shad);
+void db_column_secret(struct db_stmt *stmt, int col, struct secret *s);
+struct secret *db_column_secret_arr(const tal_t *ctx, struct db_stmt *stmt,
+				    int col);
+void db_column_txid(struct db_stmt *stmt, int pos, struct bitcoin_txid *t);
+void db_column_node_id(struct db_stmt *stmt, int pos, struct node_id *ni);
+struct node_id *db_column_node_id_arr(const tal_t *ctx, struct db_stmt *stmt,
+				      int col);
+void db_column_pubkey(struct db_stmt *stmt, int pos, struct pubkey *p);
+bool db_column_short_channel_id(struct db_stmt *stmt, int col,
+				struct short_channel_id *dest);
+struct short_channel_id *
+db_column_short_channel_id_arr(const tal_t *ctx, struct db_stmt *stmt, int col);
+bool db_column_signature(struct db_stmt *stmt, int col,
+			 secp256k1_ecdsa_signature *sig);
+struct timeabs db_column_timeabs(struct db_stmt *stmt, int col);
+struct bitcoin_tx *db_column_tx(const tal_t *ctx, struct db_stmt *stmt, int col);
 
-/**
- * db_prepare -- Prepare a DB query/command
- *
- * Tiny wrapper around `sqlite3_prepare_v2` that checks and sets
- * errors like `db_query` and `db_exec` do. It returns a statement
- * `stmt` if the given query/command was successfully compiled into a
- * statement, `NULL` otherwise. On failure `db->err` will be set with
- * the human readable error.
- *
- * @db: Database to query/exec
- * @query: The SQL statement to compile
- */
-#define db_prepare(db,query) \
-	db_prepare_(__FILE__ ":" stringify(__LINE__), db, query)
-sqlite3_stmt *db_prepare_(const char *location, struct db *db, const char *query);
+#define db_column_arr(ctx, stmt, col, type)			\
+	((type *)db_column_arr_((ctx), (stmt), (col),		\
+				sizeof(type), TAL_LABEL(type, "[]"),	\
+				__func__))
+void *db_column_arr_(const tal_t *ctx, struct db_stmt *stmt, int col,
+		     size_t bytes, const char *label, const char *caller);
 
 /**
  * db_exec_prepared -- Execute a prepared statement
  *
- * After preparing a statement using `db_prepare`, and after binding
- * all non-null variables using the `sqlite3_bind_*` functions, it can
- * be executed with this function. It is a small, transaction-aware,
- * wrapper around `sqlite3_step`, that calls fatal() if the execution
- * fails. This will take ownership of `stmt` and will free
- * it before returning.
+ * After preparing a statement using `db_prepare`, and after binding all
+ * non-null variables using the `db_bind_*` functions, it can be executed with
+ * this function. It is a small, transaction-aware, wrapper around `db_step`,
+ * that calls fatal() if the execution fails. This may take ownership of
+ * `stmt` if annotated with `take()`and will free it before returning.
  *
- * @db: The database to execute on
+ * If you'd like to issue a query and access the rows returned by the query
+ * please use `db_query_prepared` instead, since this function will not expose
+ * returned results, and the `stmt` can only be used for calls to
+ * `db_count_changes` and `db_last_insert_id` after executing.
+ *
  * @stmt: The prepared statement to execute
  */
-#define db_exec_prepared(db,stmt) db_exec_prepared_(__func__,db,stmt)
-void db_exec_prepared_(const char *caller, struct db *db, sqlite3_stmt *stmt);
+bool db_exec_prepared_v2(struct db_stmt *stmt TAKES);
 
-/* Wrapper around sqlite3_finalize(), for tracking statements. */
-void db_stmt_done(sqlite3_stmt *stmt);
+/**
+ * db_query_prepared -- Execute a prepared query
+ *
+ * After preparing a query using `db_prepare`, and after binding all non-null
+ * variables using the `db_bind_*` functions, it can be executed with this
+ * function. This function must be called before calling `db_step` or any of
+ * the `db_column_*` column access functions.
+ *
+ * If you are not executing a read-only statement, please use
+ * `db_exec_prepared` instead.
+ *
+ * @stmt: The prepared statement to execute
+ */
+bool db_query_prepared(struct db_stmt *stmt);
+size_t db_count_changes(struct db_stmt *stmt);
+u64 db_last_insert_id_v2(struct db_stmt *stmt);
 
-/* Call when you know there should be no outstanding db statements. */
-void db_assert_no_outstanding_statements(void);
+/**
+ * db_prepare -- Prepare a DB query/command
+ *
+ * Create an instance of `struct db_stmt` that encapsulates a SQL query or command.
+ *
+ * @query MUST be wrapped in a `SQL()` macro call, since that allows the
+ * extraction and translation of the query into the target SQL dialect.
+ *
+ * It does not execute the query and does not check its validity, but
+ * allocates the placeholders detected in the query. The placeholders in the
+ * `stmt` can then be bound using the `db_bind_*` functions, and executed
+ * using `db_exec_prepared` for write-only statements and `db_query_prepared`
+ * for read-only statements.
+ *
+ * @db: Database to query/exec
+ * @query: The SQL statement to compile
+ */
+struct db_stmt *db_prepare_v2_(const char *location, struct db *db,
+			       const char *query_id);
 
-#define sqlite3_column_arr(ctx, stmt, col, type)			\
-	((type *)sqlite3_column_arr_((ctx), (stmt), (col),		\
-				     sizeof(type), TAL_LABEL(type, "[]"), \
-				     __func__))
-void *sqlite3_column_arr_(const tal_t *ctx, sqlite3_stmt *stmt, int col,
-			  size_t bytes, const char *label, const char *caller);
-
-bool sqlite3_bind_short_channel_id(sqlite3_stmt *stmt, int col,
-				   const struct short_channel_id *id);
-WARN_UNUSED_RESULT bool sqlite3_column_short_channel_id(sqlite3_stmt *stmt, int col,
-							struct short_channel_id *dest);
-bool sqlite3_bind_short_channel_id_array(sqlite3_stmt *stmt, int col,
-					 const struct short_channel_id *id);
-struct short_channel_id *
-sqlite3_column_short_channel_id_array(const tal_t *ctx,
-				      sqlite3_stmt *stmt, int col);
-bool sqlite3_bind_tx(sqlite3_stmt *stmt, int col, const struct bitcoin_tx *tx);
-struct bitcoin_tx *sqlite3_column_tx(const tal_t *ctx, sqlite3_stmt *stmt,
-				     int col);
-bool sqlite3_bind_signature(sqlite3_stmt *stmt, int col, const secp256k1_ecdsa_signature *sig);
-bool sqlite3_column_signature(sqlite3_stmt *stmt, int col, secp256k1_ecdsa_signature *sig);
-
-bool sqlite3_column_pubkey(sqlite3_stmt *stmt, int col,  struct pubkey *dest);
-bool sqlite3_bind_pubkey(sqlite3_stmt *stmt, int col, const struct pubkey *pk);
-
-bool sqlite3_column_node_id(sqlite3_stmt *stmt, int col, struct node_id *dest);
-bool sqlite3_bind_node_id(sqlite3_stmt *stmt, int col, const struct node_id *id);
-
-bool sqlite3_bind_pubkey_array(sqlite3_stmt *stmt, int col,
-			       const struct pubkey *pks);
-struct pubkey *sqlite3_column_pubkey_array(const tal_t *ctx,
-					   sqlite3_stmt *stmt, int col);
-
-bool sqlite3_bind_node_id_array(sqlite3_stmt *stmt, int col,
-				const struct node_id *ids);
-struct node_id *sqlite3_column_node_id_array(const tal_t *ctx,
-					     sqlite3_stmt *stmt, int col);
-
-bool sqlite3_column_preimage(sqlite3_stmt *stmt, int col,  struct preimage *dest);
-bool sqlite3_bind_preimage(sqlite3_stmt *stmt, int col, const struct preimage *p);
-
-bool sqlite3_column_sha256(sqlite3_stmt *stmt, int col,  struct sha256 *dest);
-bool sqlite3_bind_sha256(sqlite3_stmt *stmt, int col, const struct sha256 *p);
-
-bool sqlite3_column_sha256_double(sqlite3_stmt *stmt, int col,  struct sha256_double *dest);
-bool sqlite3_bind_sha256_double(sqlite3_stmt *stmt, int col, const struct sha256_double *p);
-struct secret *sqlite3_column_secrets(const tal_t *ctx,
-				      sqlite3_stmt *stmt, int col);
-
-struct json_escape *sqlite3_column_json_escape(const tal_t *ctx,
-					       sqlite3_stmt *stmt, int col);
-bool sqlite3_bind_json_escape(sqlite3_stmt *stmt, int col,
-			      const struct json_escape *esc);
-
-struct amount_msat sqlite3_column_amount_msat(sqlite3_stmt *stmt, int col);
-struct amount_sat sqlite3_column_amount_sat(sqlite3_stmt *stmt, int col);
-void sqlite3_bind_amount_msat(sqlite3_stmt *stmt, int col,
-			      struct amount_msat msat);
-void sqlite3_bind_amount_sat(sqlite3_stmt *stmt, int col,
-			     struct amount_sat sat);
-
-/* Helpers to read and write absolute times from and to the database. */
-void sqlite3_bind_timeabs(sqlite3_stmt *stmt, int col, struct timeabs t);
-struct timeabs sqlite3_column_timeabs(sqlite3_stmt *stmt, int col);
+/* TODO(cdecker) Remove the v2 suffix after finishing the migration */
+#define db_prepare_v2(db,query)						\
+	db_prepare_v2_(__FILE__ ":" stringify(__LINE__), db, query)
 
 #endif /* LIGHTNING_WALLET_DB_H */

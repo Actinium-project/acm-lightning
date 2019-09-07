@@ -58,8 +58,8 @@ struct unreleased_tx {
 	struct list_node list;
 	/* All the utxos. */
 	struct wallet_tx *wtx;
-	/* Scriptpubkey this pays to. */
-	const u8 *destination;
+	/* Outputs(scriptpubkey and satoshi) this pays to. */
+	struct bitcoin_tx_output **outputs;
 	/* The tx itself (unsigned initially) */
 	struct bitcoin_tx *tx;
 	struct bitcoin_txid txid;
@@ -300,7 +300,7 @@ struct wallet_transaction {
 };
 
 /**
- * wallet_new - Constructor for a new sqlite3 based wallet
+ * wallet_new - Constructor for a new DB based wallet
  *
  * This is guaranteed to either return a valid wallet, or abort with
  * `fatal` if it cannot be initialized.

@@ -567,8 +567,7 @@ static struct route_info *unpack_route(const tal_t *ctx,
 
 		if (!json_to_node_id(buffer, pubkey, &r->pubkey)
 		    || !json_to_short_channel_id(buffer, scid,
-						 &r->short_channel_id,
-						 deprecated_apis)
+						 &r->short_channel_id)
 		    || !json_to_number(buffer, fee_base, &r->fee_base_msat)
 		    || !json_to_number(buffer, fee_prop,
 				       &r->fee_proportional_millionths)
@@ -1086,6 +1085,8 @@ static struct command_result *json_decodepay(struct command *cmd,
                                 b11->description_hash);
 	json_add_num(response, "min_final_cltv_expiry",
 		     b11->min_final_cltv_expiry);
+	if (b11->features)
+		json_add_hex_talarr(response, "features", b11->features);
         if (tal_count(b11->fallbacks)) {
 		json_array_start(response, "fallbacks");
 		for (size_t i = 0; i < tal_count(b11->fallbacks); i++)
