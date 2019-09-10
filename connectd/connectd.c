@@ -297,7 +297,7 @@ static bool get_gossipfds(struct daemon *daemon,
 	gossip_queries_feature
 		= local_feature_negotiated(localfeatures, LOCAL_GOSSIP_QUERIES);
 
-	/*~ `initial_routing_sync is supported by every node, since it was in
+	/*~ `initial_routing_sync` is supported by every node, since it was in
 	 * the initial lightning specification: it means the peer wants the
 	 * backlog of existing gossip. */
 	initial_routing_sync
@@ -318,7 +318,7 @@ static bool get_gossipfds(struct daemon *daemon,
 			      "Failed parsing msg gossipctl: %s",
 			      tal_hex(tmpctx, msg));
 
-	/* Gossipd might run out of file descriptors, so it tell us, and we
+	/* Gossipd might run out of file descriptors, so it tells us, and we
 	 * give up on connecting this peer. */
 	if (!success) {
 		status_broken("Gossipd did not give us an fd: losing peer %s",
@@ -353,7 +353,7 @@ static struct io_plan *retry_peer_connected(struct io_conn *conn,
 	struct io_plan *plan;
 
 	/*~ As you can see, we've had issues with this code before :( */
-	status_trace("peer %s: processing now old peer gone",
+	status_debug("peer %s: processing now old peer gone",
 		     type_to_string(tmpctx, struct node_id, &pr->id));
 
 	/*~ Usually the pattern is to return this directly, but we have to free
@@ -378,7 +378,7 @@ static struct io_plan *peer_reconnected(struct io_conn *conn,
 	u8 *msg;
 	struct peer_reconnected *pr;
 
-	status_trace("peer %s: reconnect",
+	status_debug("peer %s: reconnect",
 		     type_to_string(tmpctx, struct node_id, id));
 
 	/* Tell master to kill it: will send peer_disconnect */
@@ -404,10 +404,10 @@ static struct io_plan *peer_reconnected(struct io_conn *conn,
 	 * the peer set.  When someone calls `io_wake()` on that address, it
 	 * will call retry_peer_connected above. */
 	return io_wait(conn, node_set_get(&daemon->peers, id),
-		       /*~ The notleak() wrapper is a DEVELOPER-mode hack so
-			* that our memory leak detection doesn't consider 'pr'
-			* (which is not referenced from our code) to be a
-			* memory leak. */
+			/*~ The notleak() wrapper is a DEVELOPER-mode hack so
+			 * that our memory leak detection doesn't consider 'pr'
+			 * (which is not referenced from our code) to be a
+			 * memory leak. */
 		       retry_peer_connected, notleak(pr));
 }
 
@@ -454,7 +454,7 @@ struct io_plan *peer_connected(struct io_conn *conn,
 
 	/*~ daemon_conn is a message queue for inter-daemon communication: we
 	 * queue up the `connect_peer_connected` message to tell lightningd
-	 * we have connected, and give the the peer and gossip fds. */
+	 * we have connected, and give the peer and gossip fds. */
 	daemon_conn_send(daemon->master, take(msg));
 	/* io_conn_fd() extracts the fd from ccan/io's io_conn */
 	daemon_conn_send_fd(daemon->master, io_conn_fd(conn));
@@ -484,7 +484,7 @@ static struct io_plan *handshake_in_success(struct io_conn *conn,
 {
 	struct node_id id;
 	node_id_from_pubkey(&id, id_key);
-	status_trace("Connect IN from %s",
+	status_debug("Connect IN from %s",
 		     type_to_string(tmpctx, struct node_id, &id));
 	return peer_exchange_initmsg(conn, daemon, cs, &id, addr);
 }
@@ -499,7 +499,7 @@ static struct io_plan *connection_in(struct io_conn *conn, struct daemon *daemon
 
 	/* The cast here is a weird Berkeley sockets API feature... */
 	if (getpeername(io_conn_fd(conn), (struct sockaddr *)&s, &len) != 0) {
-		status_trace("Failed to get peername for incoming conn: %s",
+		status_debug("Failed to get peername for incoming conn: %s",
 			     strerror(errno));
 		return io_close(conn);
 	}
@@ -545,7 +545,7 @@ static struct io_plan *handshake_out_success(struct io_conn *conn,
 
 	node_id_from_pubkey(&id, key);
 	connect->connstate = "Exchanging init messages";
-	status_trace("Connect OUT to %s",
+	status_debug("Connect OUT to %s",
 		     type_to_string(tmpctx, struct node_id, &id));
 	return peer_exchange_initmsg(conn, connect->daemon, cs, &id, addr);
 }
@@ -563,7 +563,7 @@ struct io_plan *connection_out(struct io_conn *conn, struct connecting *connect)
 	}
 
 	/* FIXME: Timeout */
-	status_trace("Connected out for %s",
+	status_debug("Connected out for %s",
 		     type_to_string(tmpctx, struct node_id, &connect->id));
 
 	connect->connstate = "Cryptographic handshake";
@@ -604,7 +604,7 @@ static void PRINTF_FMT(5,6)
 					       addrhint);
 	daemon_conn_send(daemon->master, take(msg));
 
-	status_trace("Failed connected out for %s: %s",
+	status_debug("Failed connected out for %s: %s",
 		     type_to_string(tmpctx, struct node_id, id),
 		     err);
 }
@@ -840,7 +840,7 @@ static int make_listen_fd(int domain, void *addr, socklen_t len, bool mayfail)
 			status_failed(STATUS_FAIL_INTERNAL_ERROR,
 				      "Failed to create %u socket: %s",
 				      domain, strerror(errno));
-		status_trace("Failed to create %u socket: %s",
+		status_debug("Failed to create %u socket: %s",
 			     domain, strerror(errno));
 		return -1;
 	}
@@ -856,7 +856,7 @@ static int make_listen_fd(int domain, void *addr, socklen_t len, bool mayfail)
 			status_failed(STATUS_FAIL_INTERNAL_ERROR,
 				      "Failed to bind on %u socket: %s",
 				      domain, strerror(errno));
-		status_trace("Failed to create %u socket: %s",
+		status_debug("Failed to create %u socket: %s",
 			     domain, strerror(errno));
 		goto fail;
 	}
@@ -887,7 +887,7 @@ static bool handle_wireaddr_listen(struct daemon *daemon,
 		/* We might fail if IPv6 bound to port first */
 		fd = make_listen_fd(AF_INET, &addr, sizeof(addr), mayfail);
 		if (fd >= 0) {
-			status_trace("Created IPv4 listener on port %u",
+			status_debug("Created IPv4 listener on port %u",
 				     wireaddr->port);
 			add_listen_fd(daemon, fd, mayfail);
 			return true;
@@ -897,7 +897,7 @@ static bool handle_wireaddr_listen(struct daemon *daemon,
 		wireaddr_to_ipv6(wireaddr, &addr6);
 		fd = make_listen_fd(AF_INET6, &addr6, sizeof(addr6), mayfail);
 		if (fd >= 0) {
-			status_trace("Created IPv6 listener on port %u",
+			status_debug("Created IPv6 listener on port %u",
 				     wireaddr->port);
 			add_listen_fd(daemon, fd, mayfail);
 			return true;
@@ -1041,7 +1041,7 @@ static struct wireaddr_internal *setup_listeners(const tal_t *ctx,
 			unlink(wa.u.sockname);
 			fd = make_listen_fd(AF_UNIX, &addrun, sizeof(addrun),
 					    false);
-			status_trace("Created socket listener on file %s",
+			status_debug("Created socket listener on file %s",
 				     addrun.sun_path);
 			add_listen_fd(daemon, fd, false);
 			/* We don't announce socket names, though we allow
@@ -1172,7 +1172,7 @@ static struct io_plan *connect_init(struct io_conn *conn,
 	/* Resolve Tor proxy address if any: we need an addrinfo to connect()
 	 * to. */
 	if (proxyaddr) {
-		status_trace("Proxy address: %s",
+		status_debug("Proxy address: %s",
 			     fmt_wireaddr(tmpctx, proxyaddr));
 		daemon->proxyaddr = wireaddr_to_addrinfo(daemon, proxyaddr);
 		tal_free(proxyaddr);
@@ -1180,7 +1180,7 @@ static struct io_plan *connect_init(struct io_conn *conn,
 		daemon->proxyaddr = NULL;
 
 	if (broken_resolver(daemon)) {
-		status_trace("Broken DNS resolver detected, will check for "
+		status_debug("Broken DNS resolver detected, will check for "
 			     "dummy replies");
 	}
 
@@ -1243,14 +1243,17 @@ static struct io_plan *connect_activate(struct io_conn *conn,
 }
 
 /*~ This is where we'd put a BOLT #10 reference, but it doesn't exist :( */
-static const char *seedname(const tal_t *ctx, const struct node_id *id)
+static const char **seednames(const tal_t *ctx, const struct node_id *id)
 {
 	char bech32[100];
 	u5 *data = tal_arr(ctx, u5, 0);
+	const char **seednames = tal_arr(ctx, const char *, 0);
 
 	bech32_push_bits(&data, id->k, ARRAY_SIZE(id->k)*8);
 	bech32_encode(bech32, "ln", data, tal_count(data), sizeof(bech32));
-	return tal_fmt(ctx, "%s.lseed.bitcoinstats.com", bech32);
+	/* This is cdecker's seed */
+	tal_arr_expand(&seednames, tal_fmt(seednames, "%s.lseed.bitcoinstats.com", bech32));
+	return seednames;
 }
 
 /*~ As a last resort, we do a DNS lookup to the lightning DNS seed to
@@ -1264,22 +1267,28 @@ static void add_seed_addrs(struct wireaddr_internal **addrs,
 			   const struct node_id *id,
 			   struct sockaddr *broken_reply)
 {
-	struct wireaddr_internal a;
-	const char *addr;
+	struct wireaddr **new_addrs;
+	const char **hostnames;
 
-	addr = seedname(tmpctx, id);
-	status_trace("Resolving %s", addr);
+	new_addrs = tal_arr(tmpctx, struct wireaddr *, 0);
+	hostnames = seednames(tmpctx, id);
 
-	a.itype = ADDR_INTERNAL_WIREADDR;
-	/* FIXME: wireaddr_from_hostname should return multiple addresses. */
-	if (!wireaddr_from_hostname(&a.u.wireaddr, addr, DEFAULT_PORT, NULL,
-				    broken_reply, NULL)) {
-		status_trace("Could not resolve %s", addr);
-	} else {
-		status_trace("Resolved %s to %s", addr,
-			     type_to_string(tmpctx, struct wireaddr,
-					    &a.u.wireaddr));
-		tal_arr_expand(addrs, a);
+	for (size_t i = 0; i < tal_count(hostnames); i++) {
+		status_debug("Resolving %s", hostnames[i]);
+		if (!wireaddr_from_hostname(new_addrs, hostnames[i], DEFAULT_PORT, NULL,
+				    	broken_reply, NULL)) {
+			status_debug("Could not resolve %s", hostnames[i]);
+		} else {
+			for (size_t i = 0; i < tal_count(new_addrs); i++) {
+				struct wireaddr_internal a;
+				a.itype = ADDR_INTERNAL_WIREADDR;
+				a.u.wireaddr = *new_addrs[i];
+				status_debug("Resolved %s to %s", hostnames[i],
+				     	type_to_string(tmpctx, struct wireaddr,
+						    	&a.u.wireaddr));
+				tal_arr_expand(addrs, a);
+			}
+		}
 	}
 }
 
@@ -1350,10 +1359,13 @@ static void try_connect_peer(struct daemon *daemon,
 			/* You're allowed to use names with proxies; in fact it's
 			 * a good idea. */
 			struct wireaddr_internal unresolved;
-			wireaddr_from_unresolved(&unresolved,
-						 seedname(tmpctx, id),
-						 DEFAULT_PORT);
-			tal_arr_expand(&addrs, unresolved);
+			const char **hostnames = seednames(tmpctx, id);
+			for (size_t i = 0; i < tal_count(hostnames); i++) {
+				wireaddr_from_unresolved(&unresolved,
+				                         hostnames[i],
+				                         DEFAULT_PORT);
+				tal_arr_expand(&addrs, unresolved);
+			}
 		} else if (daemon->use_dns) {
 			add_seed_addrs(&addrs, id,
 				       daemon->broken_resolver_response);
@@ -1385,7 +1397,7 @@ static void try_connect_peer(struct daemon *daemon,
 	list_add_tail(&daemon->connecting, &connect->list);
 	tal_add_destructor(connect, destroy_connecting);
 
-	/* Now we kick it off by trying connect->addrs[connect->addrnum] */
+	/* Now we kick it off by recursively trying connect->addrs[connect->addrnum] */
 	try_connect_one_addr(connect);
 }
 
