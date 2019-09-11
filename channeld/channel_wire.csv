@@ -69,6 +69,7 @@ msgdata,channel_init,upfront_shutdown_script,u8,upfront_shutdown_script_len
 msgdata,channel_init,remote_ann_node_sig,?secp256k1_ecdsa_signature,
 msgdata,channel_init,remote_ann_bitcoin_sig,?secp256k1_ecdsa_signature,
 msgdata,channel_init,announce_delay,u32,
+msgdata,channel_init,option_static_remotekey,bool,
 
 # master->channeld funding hit new depth(funding locked if >= lock depth)
 msgtype,channel_funding_depth,1002
@@ -185,7 +186,8 @@ msgdata,channel_dev_memleak_reply,leak,bool,
 
 # Peer presented proof it was from the future.
 msgtype,channel_fail_fallen_behind,1028
-msgdata,channel_fail_fallen_behind,remote_per_commitment_point,pubkey,
+# This is NULL if option_static_remotekey.
+msgdata,channel_fail_fallen_behind,remote_per_commitment_point,?pubkey,
 
 # Handle a channel specific feerate base ppm configuration
 msgtype,channel_specific_feerates,1029

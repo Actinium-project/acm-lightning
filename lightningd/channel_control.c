@@ -1,6 +1,8 @@
 #include <bitcoin/pubkey.h>
 #include <bitcoin/script.h>
+#include <ccan/cast/cast.h>
 #include <channeld/gen_channel_wire.h>
+#include <common/features.h>
 #include <common/memleak.h>
 #include <common/per_peer_state.h>
 #include <common/timeout.h>
@@ -182,17 +184,29 @@ static void peer_got_shutdown(struct channel *channel, const u8 *msg)
 
 static void channel_fail_fallen_behind(struct channel *channel, const u8 *msg)
 {
-	struct pubkey per_commitment_point;
-
-	if (!fromwire_channel_fail_fallen_behind(msg, &per_commitment_point)) {
+	if (!fromwire_channel_fail_fallen_behind(channel, msg,
+						 cast_const2(struct pubkey **,
+							    &channel->future_per_commitment_point))) {
 		channel_internal_error(channel,
 				       "bad channel_fail_fallen_behind %s",
 				       tal_hex(tmpctx, msg));
 		return;
 	}
 
-	channel->future_per_commitment_point
-		= tal_dup(channel, struct pubkey, &per_commitment_point);
+	/* per_commitment_point is NULL if option_static_remotekey, but we
+	 * use its presence as a flag so set it any valid key in that case. */
+	if (!channel->future_per_commitment_point) {
+		struct pubkey *any = tal(channel, struct pubkey);
+		if (!channel->option_static_remotekey) {
+			channel_internal_error(channel,
+					       "bad channel_fail_fallen_behind %s",
+					       tal_hex(tmpctx, msg));
+			return;
+		}
+		if (!pubkey_from_node_id(any, &channel->peer->ld->id))
+			fatal("Our own id invalid?");
+		channel->future_per_commitment_point = any;
+	}
 
 	/* Peer sees this, so send a generic msg about unilateral close. */
 	channel_fail_permanent(channel,	"Awaiting unilateral close");
@@ -431,7 +445,10 @@ void peer_start_channeld(struct channel *channel,
 				      remote_ann_bitcoin_sig,
 				      /* Delay announce by 60 seconds after
 				       * seeing block (adjustable if dev) */
-				      ld->topology->poll_seconds * 2);
+				      ld->topology->poll_seconds * 2,
+				      /* Set at channel open, even if not
+				       * negotiated now! */
+				      channel->option_static_remotekey);
 
 	/* We don't expect a response: we are triggered by funding_depth_cb. */
 	subd_send_msg(channel->owner, take(initmsg));

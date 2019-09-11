@@ -35,6 +35,7 @@ msgdata,onchain_init,num_htlcs,u64,
 msgdata,onchain_init,min_possible_feerate,u32,
 msgdata,onchain_init,max_possible_feerate,u32,
 msgdata,onchain_init,possible_remote_per_commit_point,?pubkey,
+msgdata,onchain_init,option_static_remotekey,bool,
 
 #include <onchaind/onchain_wire.h>
 # This is all the HTLCs: one per message
@@ -90,7 +91,7 @@ msgtype,onchain_all_irrevocably_resolved,5011
 msgtype,onchain_add_utxo,5012
 msgdata,onchain_add_utxo,prev_out_tx,bitcoin_txid,
 msgdata,onchain_add_utxo,prev_out_index,u32,
-msgdata,onchain_add_utxo,per_commit_point,pubkey,
+msgdata,onchain_add_utxo,per_commit_point,?pubkey,
 msgdata,onchain_add_utxo,value,amount_sat,
 msgdata,onchain_add_utxo,blockheight,u32,
 msgdata,onchain_add_utxo,len,u16,

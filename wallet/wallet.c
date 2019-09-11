@@ -111,7 +111,10 @@ bool wallet_add_utxo(struct wallet *w, struct utxo *utxo,
 	if (utxo->close_info) {
 		db_bind_u64(stmt, 6, utxo->close_info->channel_id);
 		db_bind_node_id(stmt, 7, &utxo->close_info->peer_id);
-		db_bind_pubkey(stmt, 8, &utxo->close_info->commitment_point);
+		if (utxo->close_info->commitment_point)
+			db_bind_pubkey(stmt, 8, utxo->close_info->commitment_point);
+		else
+			db_bind_null(stmt, 8);
 	} else {
 		db_bind_null(stmt, 6);
 		db_bind_null(stmt, 7);
@@ -155,7 +158,13 @@ static struct utxo *wallet_stmt2output(const tal_t *ctx, struct db_stmt *stmt)
 		utxo->close_info = tal(utxo, struct unilateral_close_info);
 		utxo->close_info->channel_id = db_column_u64(stmt, 6);
 		db_column_node_id(stmt, 7, &utxo->close_info->peer_id);
-		db_column_pubkey(stmt, 8, &utxo->close_info->commitment_point);
+		if (!db_column_is_null(stmt, 8)) {
+			utxo->close_info->commitment_point
+				= tal(utxo->close_info, struct pubkey);
+			db_column_pubkey(stmt, 8,
+					 utxo->close_info->commitment_point);
+		} else
+			utxo->close_info->commitment_point = NULL;
 	} else {
 		utxo->close_info = NULL;
 	}
@@ -909,7 +918,8 @@ static struct channel *wallet_stmt2channel(struct wallet *w, struct db_stmt *stm
 			   future_per_commitment_point,
 			   db_column_int(stmt, 42),
 			   db_column_int(stmt, 43),
-			   db_column_arr(tmpctx, stmt, 44, u8));
+			   db_column_arr(tmpctx, stmt, 44, u8),
+			   db_column_int(stmt, 45));
 	return chan;
 }
 
@@ -980,6 +990,7 @@ static bool wallet_channels_load_active(struct wallet *w)
 					", feerate_base"
 					", feerate_ppm"
 					", remote_upfront_shutdown_script"
+					", option_static_remotekey"
 					" FROM channels WHERE state < ?;"));
 	db_bind_int(stmt, 0, CLOSED);
 	db_query_prepared(stmt);
@@ -1241,7 +1252,8 @@ void wallet_channel_save(struct wallet *w, struct channel *chan)
 					"  msatoshi_to_us_max=?,"
 					"  feerate_base=?,"
 					"  feerate_ppm=?,"
-					"  remote_upfront_shutdown_script=?"
+					"  remote_upfront_shutdown_script=?,"
+					"  option_static_remotekey=?"
 					" WHERE id=?"));
 	db_bind_u64(stmt, 0, chan->their_shachain.id);
 	if (chan->scid)
@@ -1288,7 +1300,8 @@ void wallet_channel_save(struct wallet *w, struct channel *chan)
 		    tal_count(chan->remote_upfront_shutdown_script));
 	else
 		db_bind_null(stmt, 27);
-	db_bind_u64(stmt, 28, chan->dbid);
+	db_bind_int(stmt, 28, chan->option_static_remotekey);
+	db_bind_u64(stmt, 29, chan->dbid);
 	db_exec_prepared_v2(take(stmt));
 
 	wallet_channel_config_save(w, &chan->channel_info.their_config);
