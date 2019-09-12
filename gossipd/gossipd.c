@@ -360,6 +360,8 @@ static bool encoding_end_zlib(u8 **encoded, size_t off)
 	/* Successful: copy over and trim */
 	tal_resize(encoded, off + tal_count(z));
 	memcpy(*encoded + off, z, tal_count(z));
+
+	tal_free(z);
 	return true;
 }
 
@@ -403,15 +405,16 @@ static UNNEEDED bool encoding_end_external_type(u8 **encoded, u8 *type, size_t m
 }
 
 /*~ We have different levels of gossipiness, depending on our needs. */
-static u32 gossip_start(enum gossip_level gossip_level)
+static u32 gossip_start(const struct routing_state *rstate,
+			enum gossip_level gossip_level)
 {
 	switch (gossip_level) {
 	case GOSSIP_HIGH:
 		return 0;
 	case GOSSIP_MEDIUM:
-		return time_now().ts.tv_sec - 24 * 3600;
+		return gossip_time_now(rstate).ts.tv_sec - 24 * 3600;
 	case GOSSIP_LOW:
-		return time_now().ts.tv_sec;
+		return gossip_time_now(rstate).ts.tv_sec;
 	case GOSSIP_NONE:
 		return UINT32_MAX;
 	}
@@ -444,7 +447,8 @@ static void setup_gossip_range(struct peer *peer)
 	/*~ We need to ask for something to start the gossip flowing. */
 	msg = towire_gossip_timestamp_filter(peer,
 					     &peer->daemon->chain_hash,
-					     gossip_start(peer->gossip_level),
+					     gossip_start(peer->daemon->rstate,
+							  peer->gossip_level),
 					     UINT32_MAX);
 	queue_peer_msg(peer, take(msg));
 }
@@ -482,7 +486,7 @@ static u8 *create_node_announcement(const tal_t *ctx, struct daemon *daemon,
  * (to prevent spam), so we only call this once we've announced a channel. */
 static void send_node_announcement(struct daemon *daemon)
 {
-	u32 timestamp = time_now().ts.tv_sec;
+	u32 timestamp = gossip_time_now(daemon->rstate).ts.tv_sec;
 	secp256k1_ecdsa_signature sig;
 	u8 *msg, *nannounce, *err;
 	struct node *self = get_node(daemon->rstate, &daemon->id);
@@ -1642,7 +1646,7 @@ static void update_local_channel(struct daemon *daemon,
 {
 	secp256k1_ecdsa_signature dummy_sig;
 	u8 *update, *msg;
-	u32 timestamp = time_now().ts.tv_sec;
+	u32 timestamp = gossip_time_now(daemon->rstate).ts.tv_sec;
 	u8 message_flags, channel_flags;
 
 	/* So valgrind doesn't complain */
@@ -2287,7 +2291,7 @@ static void gossip_send_keepalive_update(struct daemon *daemon,
  */
 static void gossip_refresh_network(struct daemon *daemon)
 {
-	u64 now = time_now().ts.tv_sec;
+	u64 now = gossip_time_now(daemon->rstate).ts.tv_sec;
 	/* Anything below this highwater mark could be pruned if not refreshed */
 	s64 highwater = now - daemon->rstate->prune_timeout / 2;
 	struct node *n;
@@ -2451,7 +2455,7 @@ static struct io_plan *gossip_init(struct io_conn *conn,
 					   &daemon->id,
 					   update_channel_interval * 2,
 					   &daemon->peers,
-					   dev_gossip_time);
+					   take(dev_gossip_time));
 
 	/* Load stored gossip messages */
 	if (!gossip_store_load(daemon->rstate, daemon->rstate->gs))
@@ -3061,6 +3065,22 @@ static struct io_plan *dev_compact_store(struct io_conn *conn,
 								    done)));
 	return daemon_conn_read_next(conn, daemon->master);
 }
+
+static struct io_plan *dev_gossip_set_time(struct io_conn *conn,
+					   struct daemon *daemon,
+					   const u8 *msg)
+{
+	u32 time;
+
+	if (!fromwire_gossip_dev_set_time(msg, &time))
+		master_badmsg(WIRE_GOSSIP_DEV_SET_TIME, msg);
+	if (!daemon->rstate->gossip_time)
+		daemon->rstate->gossip_time = tal(daemon->rstate, struct timeabs);
+	daemon->rstate->gossip_time->ts.tv_sec = time;
+	daemon->rstate->gossip_time->ts.tv_nsec = 0;
+
+	return daemon_conn_read_next(conn, daemon->master);
+}
 #endif /* DEVELOPER */
 
 /*~ lightningd: so, tell me about this channel, so we can forward to it. */
@@ -3335,6 +3355,8 @@ static struct io_plan *recv_req(struct io_conn *conn,
 		return dev_gossip_memleak(conn, daemon, msg);
 	case WIRE_GOSSIP_DEV_COMPACT_STORE:
 		return dev_compact_store(conn, daemon, msg);
+	case WIRE_GOSSIP_DEV_SET_TIME:
+		return dev_gossip_set_time(conn, daemon, msg);
 #else
 	case WIRE_GOSSIP_QUERY_SCIDS:
 	case WIRE_GOSSIP_SEND_TIMESTAMP_FILTER:
@@ -3343,6 +3365,7 @@ static struct io_plan *recv_req(struct io_conn *conn,
 	case WIRE_GOSSIP_DEV_SUPPRESS:
 	case WIRE_GOSSIP_DEV_MEMLEAK:
 	case WIRE_GOSSIP_DEV_COMPACT_STORE:
+	case WIRE_GOSSIP_DEV_SET_TIME:
 		break;
 #endif /* !DEVELOPER */
 

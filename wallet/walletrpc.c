@@ -165,6 +165,7 @@ static struct command_result *json_prepare_tx(struct command *cmd,
 	const jsmntok_t *outputstok, *t;
 	const u8 *destination = NULL;
 	size_t out_len, i;
+	const struct utxo **chosen_utxos;
 
 	*utx = tal(cmd, struct unreleased_tx);
 	(*utx)->wtx = tal(*utx, struct wallet_tx);
@@ -177,6 +178,7 @@ static struct command_result *json_prepare_tx(struct command *cmd,
 			   p_req("outputs", param_array, &outputstok),
 			   p_opt("feerate", param_feerate, &feerate_per_kw),
 			   p_opt_def("minconf", param_number, &minconf, 1),
+			   p_opt("utxos", param_utxos, &chosen_utxos),
 			   NULL)) {
 
 			/* For generating help, give new-style. */
@@ -204,6 +206,7 @@ static struct command_result *json_prepare_tx(struct command *cmd,
 			   p_req("satoshi", param_wtx, (*utx)->wtx),
 			   p_opt("feerate", param_feerate, &feerate_per_kw),
 			   p_opt_def("minconf", param_number, &minconf, 1),
+			   p_opt("utxos", param_utxos, &chosen_utxos),
 			   NULL))
 		return command_param_failed();
 	}
@@ -297,8 +300,15 @@ static struct command_result *json_prepare_tx(struct command *cmd,
 
 create_tx:
 	(*utx)->outputs = tal_steal(*utx, outputs);
-	res = wtx_select_utxos((*utx)->wtx, *feerate_per_kw,
-			       out_len, maxheight);
+
+	if (chosen_utxos)
+		res = wtx_from_utxos((*utx)->wtx, *feerate_per_kw,
+				     out_len, maxheight,
+				     chosen_utxos);
+	else
+		res = wtx_select_utxos((*utx)->wtx, *feerate_per_kw,
+				       out_len, maxheight);
+
 	if (res)
 		return res;
 
@@ -397,6 +407,10 @@ static struct command_result *json_txsend(struct command *cmd,
 	/* We're the owning cmd now. */
 	utx->wtx->cmd = cmd;
 
+	wallet_transaction_add(cmd->ld->wallet, utx->tx, 0, 0);
+	wallet_transaction_annotate(cmd->ld->wallet, &utx->txid,
+				    TX_UNKNOWN, 0);
+
 	return broadcast_and_wait(cmd, utx);
 }
 
@@ -454,16 +468,14 @@ static struct command_result *json_withdraw(struct command *cmd,
 {
 	struct unreleased_tx *utx;
 	struct command_result *res;
-	struct bitcoin_txid txid;
 
 	res = json_prepare_tx(cmd, buffer, params, &utx, true);
 	if (res)
 		return res;
 
 	/* Store the transaction in the DB and annotate it as a withdrawal */
-	bitcoin_txid(utx->tx, &txid);
 	wallet_transaction_add(cmd->ld->wallet, utx->tx, 0, 0);
-	wallet_transaction_annotate(cmd->ld->wallet, &txid,
+	wallet_transaction_annotate(cmd->ld->wallet, &utx->txid,
 				    TX_WALLET_WITHDRAWAL, 0);
 
 	return broadcast_and_wait(cmd, utx);

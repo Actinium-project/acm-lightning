@@ -82,6 +82,9 @@ bool fromwire_gossipctl_init(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, 
 /* Generated stub for fromwire_gossip_dev_set_max_scids_encode_size */
 bool fromwire_gossip_dev_set_max_scids_encode_size(const void *p UNNEEDED, u32 *max UNNEEDED)
 { fprintf(stderr, "fromwire_gossip_dev_set_max_scids_encode_size called!\n"); abort(); }
+/* Generated stub for fromwire_gossip_dev_set_time */
+bool fromwire_gossip_dev_set_time(const void *p UNNEEDED, u32 *dev_gossip_time UNNEEDED)
+{ fprintf(stderr, "fromwire_gossip_dev_set_time called!\n"); abort(); }
 /* Generated stub for fromwire_gossip_dev_suppress */
 bool fromwire_gossip_dev_suppress(const void *p UNNEEDED)
 { fprintf(stderr, "fromwire_gossip_dev_suppress called!\n"); abort(); }
@@ -180,6 +183,9 @@ bool gossip_store_load(struct routing_state *rstate UNNEEDED, struct gossip_stor
 /* Generated stub for gossip_store_readonly_fd */
 int gossip_store_readonly_fd(struct gossip_store *gs UNNEEDED)
 { fprintf(stderr, "gossip_store_readonly_fd called!\n"); abort(); }
+/* Generated stub for gossip_time_now */
+struct timeabs gossip_time_now(const struct routing_state *rstate UNNEEDED)
+{ fprintf(stderr, "gossip_time_now called!\n"); abort(); }
 /* Generated stub for got_pong */
 const char *got_pong(const u8 *pong UNNEEDED, size_t *num_pings_outstanding UNNEEDED)
 { fprintf(stderr, "got_pong called!\n"); abort(); }
@@ -602,6 +608,7 @@ static u8 *test_query_channel_range(const char *test_vector, const jsmntok_t *ob
 	}
 	msg = towire_query_channel_range(NULL, &chain_hash, firstBlockNum, numberOfBlocks, tlvs);
 
+	tal_free(tlvs);
 	return msg;
 }
 
@@ -613,15 +620,17 @@ static u8 *test_reply_channel_range(const char *test_vector, const jsmntok_t *ob
 	size_t i;
 	u8 *msg;
 	u8 *encoded_scids;
+
+	u8 *ctx = tal(NULL, u8);
 	struct tlv_reply_channel_range_tlvs *tlvs
-		= tlv_reply_channel_range_tlvs_new(NULL);
+		= tlv_reply_channel_range_tlvs_new(ctx);
 
 	get_chainhash(test_vector, obj, &chain_hash);
 	assert(json_to_number(test_vector, json_get_member(test_vector, obj, "firstBlockNum"), &firstBlockNum));
 	assert(json_to_number(test_vector, json_get_member(test_vector, obj, "numberOfBlocks"), &numberOfBlocks));
 	assert(json_to_number(test_vector, json_get_member(test_vector, obj, "complete"), &complete));
 
-	encoded_scids = get_scid_array(NULL, test_vector, obj);
+	encoded_scids = get_scid_array(ctx, test_vector, obj);
 
 	opt = json_get_member(test_vector, obj, "timestamps");
 	if (opt) {
@@ -686,7 +695,7 @@ static u8 *test_reply_channel_range(const char *test_vector, const jsmntok_t *ob
 	msg = towire_reply_channel_range(
 		NULL, &chain_hash, firstBlockNum, numberOfBlocks,
 		complete, encoded_scids, tlvs);
-	tal_free(tlvs);
+	tal_free(ctx);
 	return msg;
 }
 

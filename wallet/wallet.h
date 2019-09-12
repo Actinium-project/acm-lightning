@@ -358,6 +358,7 @@ struct utxo **wallet_get_unconfirmed_closeinfo_utxos(const tal_t *ctx,
 						     struct wallet *w);
 
 const struct utxo **wallet_select_coins(const tal_t *ctx, struct wallet *w,
+					bool with_change,
 					struct amount_sat value,
 					const u32 feerate_per_kw,
 					size_t outscriptlen,
@@ -1065,6 +1066,16 @@ void wallet_transaction_add(struct wallet *w, const struct bitcoin_tx *tx,
 void wallet_transaction_annotate(struct wallet *w,
 				 const struct bitcoin_txid *txid,
 				 enum wallet_tx_type type, u64 channel_id);
+
+/**
+ * Get the type of a transaction we are watching by its
+ * txid.
+ *
+ * Returns false if the transaction was not stored in DB.
+ * Returns true if the transaction exists and sets the `type` parameter.
+ */
+bool wallet_transaction_type(struct wallet *w, const struct bitcoin_txid *txid,
+			     enum wallet_tx_type *type);
 
 /**
  * Get the confirmation height of a transaction we are watching by its

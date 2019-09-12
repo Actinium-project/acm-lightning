@@ -152,10 +152,20 @@ struct command_result *wtx_select_utxos(struct wallet_tx *tx,
 	}
 
 	tx->utxos = wallet_select_coins(tx, tx->cmd->ld->wallet,
-					tx->amount,
+					true, tx->amount,
 					fee_rate_per_kw, out_len,
 					maxheight,
 					&fee_estimate, &tx->change);
+	if (!tx->utxos) {
+		/* Try again, without change this time */
+		tx->utxos = wallet_select_coins(tx, tx->cmd->ld->wallet,
+						false, tx->amount,
+						fee_rate_per_kw, out_len,
+						maxheight,
+						&fee_estimate, &tx->change);
+
+	}
+
 	res = check_amount(tx, tx->amount);
 	if (res)
 		return res;
@@ -201,13 +211,13 @@ struct command_result *wtx_from_utxos(struct wallet_tx *tx,
 		if (!amount_sat_add(&total_amount, total_amount, utxos[i]->amount))
 			fatal("Overflow when computing input amount");
 	}
-	tx->utxos = utxos;
+	tx->utxos = tal_steal(tx, utxos);
 
 	if (!tx->all_funds && amount_sat_less(tx->amount, total_amount)
 			&& !amount_sat_sub(&tx->change, total_amount, tx->amount))
 		fatal("Overflow when computing change");
+
 	if (amount_sat_greater_eq(tx->change, get_chainparams(tx->cmd->ld)->dust_limit)) {
-		tx->change_key_index = wallet_get_newindex(tx->cmd->ld);
 		/* Add the change output's weight */
 		weight += (8 + 1 + out_len) * 4;
 	}
@@ -222,11 +232,20 @@ struct command_result *wtx_from_utxos(struct wallet_tx *tx,
 								type_to_string(tmpctx, struct amount_sat,
 									&fee_estimate));
 	} else {
-		if (!amount_sat_sub(&tx->change, tx->change, fee_estimate))
-			return command_fail(tx->cmd, FUND_CANNOT_AFFORD,
-								"Cannot afford transaction with %s sats of fees",
-								type_to_string(tmpctx, struct amount_sat,
-									&fee_estimate));
+		if (!amount_sat_sub(&tx->change, tx->change, fee_estimate)) {
+			/* Try again without a change output */
+			weight -= (8 + 1 + out_len) * 4;
+			fee_estimate = amount_tx_fee(fee_rate_per_kw, weight);
+			if (!amount_sat_sub(&tx->change, tx->change, fee_estimate))
+				return command_fail(tx->cmd, FUND_CANNOT_AFFORD,
+						    "Cannot afford transaction with %s sats of fees",
+						    type_to_string(tmpctx, struct amount_sat,
+								   &fee_estimate));
+			tx->change = AMOUNT_SAT(0);
+		} else {
+			tx->change_key_index = wallet_get_newindex(tx->cmd->ld);
+		}
 	}
+
 	return check_amount(tx, tx->amount);
 }

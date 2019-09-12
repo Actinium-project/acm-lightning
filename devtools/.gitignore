@@ -5,3 +5,6 @@ dump-gossipstore
 gossipwith
 mkcommit
 mkfunding
+mkclose
+mkgossip
+mkencoded

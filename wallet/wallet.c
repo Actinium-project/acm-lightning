@@ -433,6 +433,7 @@ static const struct utxo **wallet_select(const tal_t *ctx, struct wallet *w,
 }
 
 const struct utxo **wallet_select_coins(const tal_t *ctx, struct wallet *w,
+					bool with_change,
 					struct amount_sat sat,
 					const u32 feerate_per_kw,
 					size_t outscriptlen,
@@ -444,13 +445,16 @@ const struct utxo **wallet_select_coins(const tal_t *ctx, struct wallet *w,
 	const struct utxo **utxo;
 
 	utxo = wallet_select(ctx, w, sat, feerate_per_kw,
-			     outscriptlen, true, maxheight,
+			     outscriptlen, with_change, maxheight,
 			     &satoshi_in, fee_estimate);
 
 	/* Couldn't afford it? */
 	if (!amount_sat_sub(change, satoshi_in, sat)
 	    || !amount_sat_sub(change, *change, *fee_estimate))
 		return tal_free(utxo);
+
+	if (!with_change)
+		*change = AMOUNT_SAT(0);
 
 	return utxo;
 }
@@ -2845,6 +2849,23 @@ void wallet_transaction_annotate(struct wallet *w,
 
 	db_bind_txid(stmt, 2, txid);
 	db_exec_prepared_v2(take(stmt));
+}
+
+bool wallet_transaction_type(struct wallet *w, const struct bitcoin_txid *txid,
+			     enum wallet_tx_type *type)
+{
+	struct db_stmt *stmt = db_prepare_v2(w->db, SQL("SELECT type FROM transactions WHERE id=?"));
+	db_bind_sha256(stmt, 0, &txid->shad.sha);
+	db_query_prepared(stmt);
+
+	if (!db_step(stmt)) {
+		tal_free(stmt);
+		return false;
+	}
+
+	*type = db_column_int(stmt, 0);
+	tal_free(stmt);
+	return true;
 }
 
 u32 wallet_transaction_height(struct wallet *w, const struct bitcoin_txid *txid)

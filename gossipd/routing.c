@@ -190,7 +190,7 @@ struct routing_state *new_routing_state(const tal_t *ctx,
 					const struct node_id *local_id,
 					u32 prune_timeout,
 					struct list_head *peers,
-					const u32 *dev_gossip_time)
+					const u32 *dev_gossip_time TAKES)
 {
 	struct routing_state *rstate = tal(ctx, struct routing_state);
 	rstate->nodes = new_node_map(rstate);
@@ -220,6 +220,9 @@ struct routing_state *new_routing_state(const tal_t *ctx,
 #endif
 	tal_add_destructor(rstate, destroy_routing_state);
 	memleak_add_helper(rstate, memleak_help_routing_tables);
+
+	if (taken(dev_gossip_time))
+		tal_free(dev_gossip_time);
 
 	return rstate;
 }
@@ -381,6 +384,14 @@ static void remove_chan_from_node(struct routing_state *rstate,
 	}
 }
 
+#if DEVELOPER
+/* We make sure that free_chan is called on this chan! */
+static void destroy_chan_check(struct chan *chan)
+{
+	assert(chan->scid.u64 == (u64)chan);
+}
+#endif
+
 /* We used to make this a tal_add_destructor2, but that costs 40 bytes per
  * chan, and we only ever explicitly free it anyway. */
 void free_chan(struct routing_state *rstate, struct chan *chan)
@@ -392,6 +403,10 @@ void free_chan(struct routing_state *rstate, struct chan *chan)
 
 	/* Remove from local_disabled_map if it's there. */
 	chan_map_del(&rstate->local_disabled_map, chan);
+
+#if DEVELOPER
+	chan->scid.u64 = (u64)chan;
+#endif
 	tal_free(chan);
 }
 
@@ -426,6 +441,9 @@ struct chan *new_chan(struct routing_state *rstate,
 	int n1idx = node_id_idx(id1, id2);
 	struct node *n1, *n2;
 
+#if DEVELOPER
+	tal_add_destructor(chan, destroy_chan_check);
+#endif
 	/* We should never add a channel twice */
 	assert(!uintmap_get(&rstate->chanmap, scid->u64));
 
@@ -1481,7 +1499,7 @@ bool routing_add_channel_announcement(struct routing_state *rstate,
 
 	uc = tal(rstate, struct unupdated_channel);
 	uc->channel_announce = tal_dup_arr(uc, u8, msg, tal_count(msg), 0);
-	uc->added = time_now();
+	uc->added = gossip_time_now(rstate);
 	uc->index = index;
 	uc->sat = sat;
 	uc->scid = scid;
@@ -2094,10 +2112,7 @@ u8 *handle_channel_update(struct routing_state *rstate, const u8 *update TAKES,
 		     channel_flags & ROUTING_FLAGS_DISABLED ? "DISABLED" : "ACTIVE",
 		     source);
 
-	if (!routing_add_channel_update(rstate, serialized, 0))
-		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			      "Failed adding channel_update");
-
+	routing_add_channel_update(rstate, take(serialized), 0);
 	return NULL;
 }
 
