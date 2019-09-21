@@ -478,12 +478,10 @@ void peer_start_channeld(struct channel *channel,
 				      channel->remote_upfront_shutdown_script,
 				      remote_ann_node_sig,
 				      remote_ann_bitcoin_sig,
-				      /* Delay announce by 60 seconds after
-				       * seeing block (adjustable if dev) */
-				      ld->topology->poll_seconds * 2,
 				      /* Set at channel open, even if not
 				       * negotiated now! */
-				      channel->option_static_remotekey);
+				      channel->option_static_remotekey,
+				      IFDEV(ld->dev_fast_gossip, false));
 
 	/* We don't expect a response: we are triggered by funding_depth_cb. */
 	subd_send_msg(channel->owner, take(initmsg));
@@ -614,11 +612,47 @@ void channel_notify_new_block(struct lightningd *ld,
 	tal_free(to_forget);
 }
 
-static void process_check_funding_broadcast(struct bitcoind *bitcoind UNUSED,
+static struct channel *find_channel_by_id(const struct peer *peer,
+					  const struct channel_id *cid)
+{
+	struct channel *c;
+
+	list_for_each(&peer->channels, c, list) {
+		struct channel_id this_cid;
+
+		derive_channel_id(&this_cid,
+				  &c->funding_txid, c->funding_outnum);
+		if (channel_id_eq(&this_cid, cid))
+			return c;
+	}
+	return NULL;
+}
+
+/* Since this could vanish while we're checking with bitcoind, we need to save
+ * the details and re-lookup.
+ *
+ * channel_id *should* be unique, but it can be set by the counterparty, so
+ * we cannot rely on that! */
+struct channel_to_cancel {
+	struct node_id peer;
+	struct channel_id cid;
+};
+
+static void process_check_funding_broadcast(struct bitcoind *bitcoind,
 					    const struct bitcoin_tx_output *txout,
 					    void *arg)
 {
-	struct channel *cancel = arg;
+	struct channel_to_cancel *cc = arg;
+	struct peer *peer;
+	struct channel *cancel;
+
+	/* Peer could have errored out while we were waiting */
+	peer = peer_by_id(bitcoind->ld, &cc->peer);
+	if (!peer)
+		return;
+	cancel = find_channel_by_id(peer, &cc->cid);
+	if (!cancel)
+		return;
 
 	if (txout != NULL) {
 		for (size_t i = 0; i < tal_count(cancel->forgets); i++)
@@ -645,10 +679,14 @@ struct command_result *cancel_channel_before_broadcast(struct command *cmd,
 						       struct peer *peer,
 						       const jsmntok_t *cidtok)
 {
-	struct channel *cancel_channel, *channel;
+	struct channel *cancel_channel;
+	struct channel_to_cancel *cc = tal(cmd, struct channel_to_cancel);
 
-	cancel_channel = NULL;
+	cc->peer = peer->id;
 	if (!cidtok) {
+		struct channel *channel;
+
+		cancel_channel = NULL;
 		list_for_each(&peer->channels, channel, list) {
 			if (cancel_channel) {
 				return command_fail(cmd, LIGHTNINGD,
@@ -660,28 +698,17 @@ struct command_result *cancel_channel_before_broadcast(struct command *cmd,
 		if (!cancel_channel)
 			return command_fail(cmd, LIGHTNINGD,
 					    "No channels matching that peer_id");
+		derive_channel_id(&cc->cid,
+				  &cancel_channel->funding_txid,
+				  cancel_channel->funding_outnum);
 	} else {
-		struct channel_id channel_cid;
-		struct channel_id cid;
-		if (!json_tok_channel_id(buffer, cidtok, &cid))
+		if (!json_tok_channel_id(buffer, cidtok, &cc->cid))
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "Invalid channel_id parameter.");
 
-		list_for_each(&peer->channels, channel, list) {
-			if (!channel)
-				return command_fail(cmd, LIGHTNINGD,
-						    "No channels matching "
-						    "that peer_id");
-			derive_channel_id(&channel_cid,
-					  &channel->funding_txid,
-					  channel->funding_outnum);
-			if (channel_id_eq(&channel_cid, &cid)) {
-				cancel_channel = channel;
-				break;
-			}
-		}
+		cancel_channel = find_channel_by_id(peer, &cc->cid);
 		if (!cancel_channel)
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			return command_fail(cmd, LIGHTNINGD,
 					    "Channel ID not found: '%.*s'",
 					    cidtok->end - cidtok->start,
 					    buffer + cidtok->start);
@@ -716,6 +743,6 @@ struct command_result *cancel_channel_before_broadcast(struct command *cmd,
 			  &cancel_channel->funding_txid,
 			  cancel_channel->funding_outnum,
 			  process_check_funding_broadcast,
-			  cancel_channel);
+			  notleak(cc));
 	return command_still_pending(cmd);
 }

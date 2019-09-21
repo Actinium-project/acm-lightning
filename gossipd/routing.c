@@ -16,6 +16,7 @@
 #include <gossipd/gen_gossip_peerd_wire.h>
 #include <gossipd/gen_gossip_store.h>
 #include <gossipd/gen_gossip_wire.h>
+#include <gossipd/gossip_generation.h>
 #include <inttypes.h>
 #include <wire/gen_peer_wire.h>
 
@@ -34,6 +35,33 @@ struct pending_node_announce {
 	u32 timestamp;
 	u32 index;
 };
+
+/* We consider a reasonable gossip rate to be 1 per day, with burst of
+ * 4 per day.  So we use a granularity of one hour. */
+#define TOKENS_PER_MSG 24
+#define TOKEN_MAX (24 * 4)
+
+static bool ratelimit(const struct routing_state *rstate,
+		      u8 *tokens, u32 prev_timestamp, u32 new_timestamp)
+{
+	u64 num_tokens;
+
+	assert(new_timestamp >= prev_timestamp);
+
+	/* First, top up tokens, avoiding overflow. */
+	num_tokens = *tokens + ((new_timestamp - prev_timestamp)
+				/ GOSSIP_TOKEN_TIME(rstate->dev_fast_gossip));
+	if (num_tokens > TOKEN_MAX)
+		num_tokens = TOKEN_MAX;
+	*tokens = num_tokens;
+
+	/* Now, if we can afford it, pass this message. */
+	if (*tokens >= TOKENS_PER_MSG) {
+		*tokens -= TOKENS_PER_MSG;
+		return true;
+	}
+	return false;
+}
 
 static const struct node_id *
 pending_node_announce_keyof(const struct pending_node_announce *a)
@@ -163,6 +191,25 @@ static void destroy_routing_state(struct routing_state *rstate)
 	     chan;
 	     chan = uintmap_after(&rstate->chanmap, &idx))
 		free_chan(rstate, chan);
+
+	/* Free up our htables */
+	pending_cannouncement_map_clear(&rstate->pending_cannouncements);
+	local_chan_map_clear(&rstate->local_chan_map);
+}
+
+/* We don't check this when loading from the gossip_store: that would break
+ * our canned tests, and usually old gossip is better than no gossip */
+static bool timestamp_reasonable(struct routing_state *rstate, u32 timestamp)
+{
+	u64 now = gossip_time_now(rstate).ts.tv_sec;
+
+	/* More than one day ahead? */
+	if (timestamp > now + 24*60*60)
+		return false;
+	/* More than 2 weeks behind? */
+	if (timestamp < now - GOSSIP_PRUNE_INTERVAL(rstate->dev_fast_gossip))
+		return false;
+	return true;
 }
 
 #if DEVELOPER
@@ -175,6 +222,7 @@ static void memleak_help_routing_tables(struct htable *memtable,
 	memleak_remove_htable(memtable, &rstate->nodes->raw);
 	memleak_remove_htable(memtable, &rstate->pending_node_map->raw);
 	memleak_remove_htable(memtable, &rstate->pending_cannouncements.raw);
+	memleak_remove_htable(memtable, &rstate->local_chan_map.raw);
 
 	for (n = node_map_first(rstate->nodes, &nit);
 	     n;
@@ -188,23 +236,22 @@ static void memleak_help_routing_tables(struct htable *memtable,
 struct routing_state *new_routing_state(const tal_t *ctx,
 					const struct chainparams *chainparams,
 					const struct node_id *local_id,
-					u32 prune_timeout,
 					struct list_head *peers,
-					const u32 *dev_gossip_time TAKES)
+					const u32 *dev_gossip_time TAKES,
+					bool dev_fast_gossip)
 {
 	struct routing_state *rstate = tal(ctx, struct routing_state);
 	rstate->nodes = new_node_map(rstate);
 	rstate->gs = gossip_store_new(rstate, peers);
 	rstate->chainparams = chainparams;
 	rstate->local_id = *local_id;
-	rstate->prune_timeout = prune_timeout;
 	rstate->local_channel_announced = false;
 
 	pending_cannouncement_map_init(&rstate->pending_cannouncements);
 
 	uintmap_init(&rstate->chanmap);
 	uintmap_init(&rstate->unupdated_chanmap);
-	chan_map_init(&rstate->local_disabled_map);
+	local_chan_map_init(&rstate->local_chan_map);
 	uintmap_init(&rstate->txout_failures);
 
 	rstate->pending_node_map = tal(ctx, struct pending_node_map);
@@ -217,6 +264,7 @@ struct routing_state *new_routing_state(const tal_t *ctx,
 		rstate->gossip_time->ts.tv_nsec = 0;
 	} else
 		rstate->gossip_time = NULL;
+	rstate->dev_fast_gossip = dev_fast_gossip;
 #endif
 	tal_add_destructor(rstate, destroy_routing_state);
 	memleak_add_helper(rstate, memleak_help_routing_tables);
@@ -276,6 +324,7 @@ static struct node *new_node(struct routing_state *rstate,
 	n->id = *id;
 	memset(n->chans.arr, 0, sizeof(n->chans.arr));
 	broadcastable_init(&n->bcast);
+	n->tokens = TOKEN_MAX;
 	node_map_add(rstate->nodes, n);
 	tal_add_destructor2(n, destroy_node, rstate);
 
@@ -388,7 +437,7 @@ static void remove_chan_from_node(struct routing_state *rstate,
 /* We make sure that free_chan is called on this chan! */
 static void destroy_chan_check(struct chan *chan)
 {
-	assert(chan->scid.u64 == (u64)chan);
+	assert(chan->sat.satoshis == (u64)chan); /* Raw: dev-hack */
 }
 #endif
 
@@ -401,11 +450,8 @@ void free_chan(struct routing_state *rstate, struct chan *chan)
 
 	uintmap_del(&rstate->chanmap, chan->scid.u64);
 
-	/* Remove from local_disabled_map if it's there. */
-	chan_map_del(&rstate->local_disabled_map, chan);
-
 #if DEVELOPER
-	chan->scid.u64 = (u64)chan;
+	chan->sat.satoshis = (u64)chan; /* Raw: dev-hack */
 #endif
 	tal_free(chan);
 }
@@ -421,6 +467,7 @@ static void init_half_chan(struct routing_state *rstate,
 	// TODO: wireup message_flags
 	c->message_flags = 0;
 	broadcastable_init(&c->bcast);
+	c->tokens = TOKEN_MAX;
 }
 
 static void bad_gossip_order(const u8 *msg, const char *source,
@@ -429,6 +476,36 @@ static void bad_gossip_order(const u8 *msg, const char *source,
 	status_debug("Bad gossip order from %s: %s before announcement %s",
 		     source, wire_type_name(fromwire_peektype(msg)),
 		     details);
+}
+
+static void destroy_local_chan(struct local_chan *local_chan,
+			       struct routing_state *rstate)
+{
+	if (!local_chan_map_del(&rstate->local_chan_map, local_chan))
+		abort();
+}
+
+static void maybe_add_local_chan(struct routing_state *rstate,
+				 struct chan *chan)
+{
+	int direction;
+	struct local_chan *local_chan;
+
+	if (node_id_eq(&chan->nodes[0]->id, &rstate->local_id))
+		direction = 0;
+	else if (node_id_eq(&chan->nodes[1]->id, &rstate->local_id))
+		direction = 1;
+	else
+		return;
+
+	local_chan = tal(chan, struct local_chan);
+	local_chan->chan = chan;
+	local_chan->direction = direction;
+	local_chan->local_disabled = false;
+	local_chan->channel_update_timer = NULL;
+
+	local_chan_map_add(&rstate->local_chan_map, local_chan);
+	tal_add_destructor2(local_chan, destroy_local_chan, rstate);
 }
 
 struct chan *new_chan(struct routing_state *rstate,
@@ -471,6 +548,9 @@ struct chan *new_chan(struct routing_state *rstate,
 	init_half_chan(rstate, chan, !n1idx);
 
 	uintmap_add(&rstate->chanmap, scid->u64, chan);
+
+	/* Initialize shadow structure if it's local */
+	maybe_add_local_chan(rstate, chan);
 	return chan;
 }
 
@@ -1885,6 +1965,17 @@ bool routing_add_channel_update(struct routing_state *rstate,
 		}
 	}
 
+	/* Check timestamp is sane (unless from store). */
+	if (!index && !timestamp_reasonable(rstate, timestamp)) {
+		status_debug("Ignoring update timestamp %u for %s/%u",
+			     timestamp,
+			     type_to_string(tmpctx,
+					    struct short_channel_id,
+					    &short_channel_id),
+			     direction);
+		return false;
+	}
+
 	/* OK, we're going to accept this, so create chan if doesn't exist */
 	if (uc) {
 		assert(!chan);
@@ -1895,17 +1986,45 @@ bool routing_add_channel_update(struct routing_state *rstate,
 	/* Discard older updates */
 	hc = &chan->half[direction];
 
-	/* If we're loading from store, duplicate entries are a bug. */
-	if (is_halfchan_defined(hc) && index != 0) {
-		status_broken("gossip_store channel_update %u replaces %u!",
-			      index, hc->bcast.index);
-		return false;
-	}
+	if (is_halfchan_defined(hc)) {
+		/* If we're loading from store, duplicate entries are a bug. */
+		if (index != 0) {
+			status_broken("gossip_store channel_update %u replaces %u!",
+				      index, hc->bcast.index);
+			return false;
+		}
 
-	if (is_halfchan_defined(hc) && timestamp <= hc->bcast.timestamp) {
-		SUPERVERBOSE("Ignoring outdated update.");
-		/* Ignoring != failing */
-		return true;
+		if (timestamp <= hc->bcast.timestamp) {
+			SUPERVERBOSE("Ignoring outdated update.");
+			/* Ignoring != failing */
+			return true;
+		}
+
+		/* Allow redundant updates once every 7 days */
+		if (timestamp < hc->bcast.timestamp + GOSSIP_PRUNE_INTERVAL(rstate->dev_fast_gossip) / 2
+		    && !cupdate_different(rstate->gs, hc, update)) {
+			status_debug("Ignoring redundant update for %s/%u"
+				     " (last %u, now %u)",
+				     type_to_string(tmpctx,
+						    struct short_channel_id,
+						    &short_channel_id),
+				     direction, hc->bcast.timestamp, timestamp);
+			/* Ignoring != failing */
+			return true;
+		}
+
+		/* Make sure it's not spamming us. */
+		if (!ratelimit(rstate,
+			       &hc->tokens, hc->bcast.timestamp, timestamp)) {
+			status_debug("Ignoring spammy update for %s/%u"
+				     " (last %u, now %u)",
+				     type_to_string(tmpctx,
+						    struct short_channel_id,
+						    &short_channel_id),
+				     direction, hc->bcast.timestamp, timestamp);
+			/* Ignoring != failing */
+			return true;
+		}
 	}
 
 	/* FIXME: https://github.com/lightningnetwork/lightning-rfc/pull/512
@@ -2176,6 +2295,14 @@ bool routing_add_node_announcement(struct routing_state *rstate,
 		status_debug("Received node_announcement for node %s",
 			     type_to_string(tmpctx, struct node_id, &node_id));
 
+	/* Check timestamp is sane (unless from gossip_store). */
+	if (!index && !timestamp_reasonable(rstate, timestamp)) {
+		status_debug("Ignoring node_announcement timestamp %u for %s",
+			     timestamp,
+			     type_to_string(tmpctx, struct node_id, &node_id));
+		return false;
+	}
+
 	node = get_node(rstate, &node_id);
 
 	if (node == NULL || !node_has_broadcastable_channels(node)) {
@@ -2212,15 +2339,44 @@ bool routing_add_node_announcement(struct routing_state *rstate,
 		return true;
 	}
 
-	if (node->bcast.index && index != 0) {
-		status_broken("gossip_store node_announcement %u replaces %u!",
-			      index, node->bcast.index);
-		return false;
-	}
-	if (node->bcast.index && node->bcast.timestamp >= timestamp) {
-		SUPERVERBOSE("Ignoring node announcement, it's outdated.");
-		/* OK unless we're loading from store */
-		return index == 0;
+	if (node->bcast.index) {
+		if (index != 0) {
+			status_broken("gossip_store node_announcement %u replaces %u!",
+				      index, node->bcast.index);
+			return false;
+		}
+
+		if (node->bcast.timestamp >= timestamp) {
+			SUPERVERBOSE("Ignoring node announcement, it's outdated.");
+			/* OK unless we're loading from store */
+			return index == 0;
+		}
+
+		/* Allow redundant updates once every 7 days */
+		if (timestamp < node->bcast.timestamp + GOSSIP_PRUNE_INTERVAL(rstate->dev_fast_gossip) / 2
+		    && !nannounce_different(rstate->gs, node, msg)) {
+			status_debug("Ignoring redundant nannounce for %s"
+				     " (last %u, now %u)",
+				     type_to_string(tmpctx,
+						    struct node_id,
+						    &node_id),
+				     node->bcast.timestamp, timestamp);
+			/* Ignoring != failing */
+			return true;
+		}
+
+		/* Make sure it's not spamming us. */
+		if (!ratelimit(rstate,
+			       &node->tokens, node->bcast.timestamp, timestamp)) {
+			status_debug("Ignoring spammy nannounce for %s"
+				     " (last %u, now %u)",
+				     type_to_string(tmpctx,
+						    struct node_id,
+						    &node_id),
+				     node->bcast.timestamp, timestamp);
+			/* Ignoring != failing */
+			return true;
+		}
 	}
 
 	/* Harmless if it was never added */
@@ -2545,7 +2701,7 @@ void route_prune(struct routing_state *rstate)
 {
 	u64 now = gossip_time_now(rstate).ts.tv_sec;
 	/* Anything below this highwater mark ought to be pruned */
-	const s64 highwater = now - rstate->prune_timeout;
+	const s64 highwater = now - GOSSIP_PRUNE_INTERVAL(rstate->dev_fast_gossip);
 	struct chan **pruned = tal_arr(tmpctx, struct chan *, 0);
 	u64 idx;
 
@@ -2678,9 +2834,6 @@ void remove_all_gossip(struct routing_state *rstate)
 	/* Now free all the channels. */
 	while ((c = uintmap_first(&rstate->chanmap, &index)) != NULL) {
 		uintmap_del(&rstate->chanmap, index);
-
-		/* Remove from local_disabled_map if it's there. */
-		chan_map_del(&rstate->local_disabled_map, c);
 		tal_free(c);
 	}
 

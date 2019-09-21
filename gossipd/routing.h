@@ -36,6 +36,9 @@ struct half_chan {
 	 * optional fields.  */
 	u8 message_flags;
 
+	/* Token bucket */
+	u8 tokens;
+
 	/* Minimum and maximum number of msatoshi in an HTLC */
 	struct amount_msat htlc_minimum, htlc_maximum;
 };
@@ -55,6 +58,20 @@ struct chan {
 	struct broadcastable bcast;
 
 	struct amount_sat sat;
+};
+
+/* Shadow structure for local channels: owned by the chan above, but kept
+ * separately to keep `struct chan` minimal since there may be millions
+ * of non-local channels. */
+struct local_chan {
+	struct chan *chan;
+	int direction;
+
+	/* We soft-disable local channels when a peer disconnects */
+	bool local_disabled;
+
+	/* Timer if we're deferring an update. */
+	struct oneshot *channel_update_timer;
 };
 
 /* Use this instead of tal_free(chan)! */
@@ -78,7 +95,7 @@ static inline bool is_halfchan_enabled(const struct half_chan *hc)
 }
 
 /* Container for per-node channel pointers.  Better cache performance
-* than uintmap, and we don't need ordering. */
+ * than uintmap, and we don't need ordering. */
 static inline const struct short_channel_id *chan_map_scid(const struct chan *c)
 {
 	return &c->scid;
@@ -98,6 +115,22 @@ static inline bool chan_eq_scid(const struct chan *c,
 
 HTABLE_DEFINE_TYPE(struct chan, chan_map_scid, hash_scid, chan_eq_scid, chan_map);
 
+/* Container for local channel pointers. */
+static inline const struct short_channel_id *local_chan_map_scid(const struct local_chan *local_chan)
+{
+	return &local_chan->chan->scid;
+}
+
+static inline bool local_chan_eq_scid(const struct local_chan *local_chan,
+				      const struct short_channel_id *scid)
+{
+	return short_channel_id_eq(scid, &local_chan->chan->scid);
+}
+
+HTABLE_DEFINE_TYPE(struct local_chan,
+		   local_chan_map_scid, hash_scid, local_chan_eq_scid,
+		   local_chan_map);
+
 /* For a small number of channels (by far the most common) we use a simple
  * array, with empty buckets NULL.  For larger, we use a proper hash table,
  * with the extra allocation that implies. */
@@ -108,6 +141,9 @@ struct node {
 
 	/* Timestamp and index into store file */
 	struct broadcastable bcast;
+
+	/* Token bucket */
+	u8 tokens;
 
 	/* Channels connecting us to other nodes */
 	union {
@@ -227,9 +263,6 @@ struct routing_state {
 	/* Our own ID so we can identify local channels */
 	struct node_id local_id;
 
-	/* How old does a channel have to be before we prune it? */
-	u32 prune_timeout;
-
         /* A map of channels indexed by short_channel_ids */
 	UINTMAP(struct chan *) chanmap;
 
@@ -244,12 +277,15 @@ struct routing_state {
 	 * checks if we get another announcement for the same scid. */
 	UINTMAP(bool) txout_failures;
 
-        /* A map of (local) disabled channels by short_channel_ids */
-	struct chan_map local_disabled_map;
+        /* A map of local channels by short_channel_ids */
+	struct local_chan_map local_chan_map;
 
 #if DEVELOPER
 	/* Override local time for gossip messages */
 	struct timeabs *gossip_time;
+
+	/* Speed up gossip. */
+	bool dev_fast_gossip;
 #endif
 };
 
@@ -284,9 +320,9 @@ struct exclude_entry {
 struct routing_state *new_routing_state(const tal_t *ctx,
 					const struct chainparams *chainparams,
 					const struct node_id *local_id,
-					u32 prune_timeout,
 					struct list_head *peers,
-					const u32 *dev_gossip_time TAKES);
+					const u32 *dev_gossip_time TAKES,
+					bool dev_fast_gossip);
 
 /**
  * Add a new bidirectional channel from id1 to id2 with the given
@@ -416,26 +452,34 @@ bool handle_local_add_channel(struct routing_state *rstate, const u8 *msg,
  */
 struct timeabs gossip_time_now(const struct routing_state *rstate);
 
+static inline struct local_chan *is_local_chan(struct routing_state *rstate,
+					       const struct chan *chan)
+{
+	return local_chan_map_get(&rstate->local_chan_map, &chan->scid);
+}
+
 /* Because we can have millions of channels, and we only want a local_disable
  * flag on ones connected to us, we keep a separate hashtable for that flag.
  */
 static inline bool is_chan_local_disabled(struct routing_state *rstate,
 					  const struct chan *chan)
 {
-	return chan_map_get(&rstate->local_disabled_map, &chan->scid) != NULL;
+	struct local_chan *local_chan = is_local_chan(rstate, chan);
+	return local_chan && local_chan->local_disabled;
 }
 
 static inline void local_disable_chan(struct routing_state *rstate,
 				      const struct chan *chan)
 {
-	if (!is_chan_local_disabled(rstate, chan))
-		chan_map_add(&rstate->local_disabled_map, chan);
+	struct local_chan *local_chan = is_local_chan(rstate, chan);
+	local_chan->local_disabled = true;
 }
 
 static inline void local_enable_chan(struct routing_state *rstate,
 				     const struct chan *chan)
 {
-	chan_map_del(&rstate->local_disabled_map, chan);
+	struct local_chan *local_chan = is_local_chan(rstate, chan);
+	local_chan->local_disabled = false;
 }
 
 /* Helper to convert on-wire addresses format to wireaddrs array */

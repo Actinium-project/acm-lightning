@@ -18,12 +18,11 @@ with open('config.vars') as configfile:
 DEVELOPER = os.getenv("DEVELOPER", config['DEVELOPER']) == "1"
 
 
-@unittest.skipIf(not DEVELOPER, "needs --dev-broadcast-interval, --dev-channelupdate-interval")
+@unittest.skipIf(not DEVELOPER, "needs --dev-fast-gossip for fast pruning")
 def test_gossip_pruning(node_factory, bitcoind):
     """ Create channel and see it being updated in time before pruning
     """
-    opts = {'dev-channel-update-interval': 5}
-    l1, l2, l3 = node_factory.get_nodes(3, opts)
+    l1, l2, l3 = node_factory.get_nodes(3)
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     l2.rpc.connect(l3.info['id'], 'localhost', l3.port)
@@ -38,10 +37,10 @@ def test_gossip_pruning(node_factory, bitcoind):
     wait_for(lambda: [c['active'] for c in l2.rpc.listchannels()['channels']] == [True] * 4)
     wait_for(lambda: [c['active'] for c in l3.rpc.listchannels()['channels']] == [True] * 4)
 
-    # All of them should send a keepalive message
+    # All of them should send a keepalive message (after ~60 seconds)
     l1.daemon.wait_for_logs([
         'Sending keepalive channel_update for {}'.format(scid1),
-    ])
+    ], timeout=90)
     l2.daemon.wait_for_logs([
         'Sending keepalive channel_update for {}'.format(scid1),
         'Sending keepalive channel_update for {}'.format(scid2),
@@ -50,26 +49,21 @@ def test_gossip_pruning(node_factory, bitcoind):
         'Sending keepalive channel_update for {}'.format(scid2),
     ])
 
-    # Now kill l3, so that l2 and l1 can prune it from their view after 10 seconds
+    # Now kill l2, so that l1 and l3 will prune from their view after 90 seconds
+    l2.stop()
 
-    # FIXME: This sleep() masks a real bug: that channeld sends a
-    # channel_update message (to disable the channel) with same
-    # timestamp as the last keepalive, and thus is ignored.  The minimal
-    # fix is to backdate the keepalives 1 second, but maybe we should
-    # simply have gossipd generate all updates?
-    time.sleep(1)
-    l3.stop()
-
-    l1.daemon.wait_for_log("Pruning channel {} from network view".format(scid2))
-    l2.daemon.wait_for_log("Pruning channel {} from network view".format(scid2))
+    # We check every 90/4 seconds, and takes 90 seconds since last update.
+    l1.daemon.wait_for_log("Pruning channel {} from network view".format(scid2),
+                           timeout=120)
+    l3.daemon.wait_for_log("Pruning channel {} from network view".format(scid1))
 
     assert scid2 not in [c['short_channel_id'] for c in l1.rpc.listchannels()['channels']]
-    assert scid2 not in [c['short_channel_id'] for c in l2.rpc.listchannels()['channels']]
+    assert scid1 not in [c['short_channel_id'] for c in l3.rpc.listchannels()['channels']]
     assert l3.info['id'] not in [n['nodeid'] for n in l1.rpc.listnodes()['nodes']]
-    assert l3.info['id'] not in [n['nodeid'] for n in l2.rpc.listnodes()['nodes']]
+    assert l1.info['id'] not in [n['nodeid'] for n in l3.rpc.listnodes()['nodes']]
 
 
-@unittest.skipIf(not DEVELOPER, "needs --dev-broadcast-interval, --dev-no-reconnect")
+@unittest.skipIf(not DEVELOPER, "needs --dev-fast-gossip, --dev-no-reconnect")
 def test_gossip_disable_channels(node_factory, bitcoind):
     """Simple test to check that channels get disabled correctly on disconnect and
     reenabled upon reconnecting
@@ -145,7 +139,8 @@ def test_gossip_timestamp_filter(node_factory, bitcoind):
     subprocess.run(['kill', '-USR1', l1.subd_pid('connectd')])
     subprocess.run(['kill', '-USR1', l2.subd_pid('connectd')])
 
-    before_anything = int(time.time() - 1.0)
+    # Updates get backdated 300 seconds.
+    before_anything = int(time.time() - 301.0)
 
     # Make a public channel.
     chan12 = l1.fund_channel(l2, 10**5)
@@ -325,7 +320,7 @@ def test_gossip_jsonrpc(node_factory):
     assert [c['public'] for c in l2.rpc.listchannels()['channels']] == [True, True]
 
 
-@unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1 for --dev-broadcast-interval")
+@unittest.skipIf(not DEVELOPER, "Too slow without --dev-fast-gossip")
 def test_gossip_badsig(node_factory):
     """Make sure node announcement signatures are ok.
 
@@ -516,7 +511,7 @@ def test_gossip_no_empty_announcements(node_factory, bitcoind):
     wait_for(lambda: len(l1.rpc.listchannels()['channels']) == 2)
 
 
-@unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1 for --dev-broadcast-interval")
+@unittest.skipIf(not DEVELOPER, "Too slow without --dev-fast-gossip")
 def test_routing_gossip(node_factory, bitcoind):
     nodes = node_factory.get_nodes(5)
 
@@ -967,6 +962,8 @@ def test_node_reannounce(node_factory, bitcoind):
 
     l1.stop()
     l1.daemon.opts['alias'] = 'SENIORBEAM'
+    # It won't update within 5 seconds, so sleep.
+    time.sleep(5)
     l1.start()
 
     # Wait for l1 to send us its own node_announcement.
@@ -983,6 +980,9 @@ def test_node_reannounce(node_factory, bitcoind):
 
     # l1 should retransmit it exactly the same (no timestamp change!)
     l2.daemon.wait_for_log(r'{}.*\[IN\] {}'.format(l1.info['id'], nannouncement))
+
+    # Won't have queued up another one, either.
+    assert not l1.daemon.is_in_log('node_announcement: delaying')
 
 
 def test_gossipwith(node_factory):
@@ -1262,13 +1262,20 @@ def setup_gossip_store_test(node_factory, bitcoind):
     l2.rpc.setchannelfee(l1.info['id'], 20, 1000)
     wait_for(lambda: [c['base_fee_millisatoshi'] for c in l2.rpc.listchannels(scid12)['channels']] == [20, 20])
 
-    # Active records in store now looks like:
+    # Records in store now looks (something) like:
+    #    DELETED: local-add-channel (scid23)
+    #    DELETED: private channel_update (scid23/0)
+    #    DELETED: private channel_update (scid23/1)
     #  channel_announcement (scid23)
     #  channel_amount
+    #    DELETED: channel_update (scid23/0)
+    #    DELETED: channel_update (scid23/1)
     #  node_announcement
     #  node_announcement
     #  channel_update (scid23)
     #  local_add_channel (scid12)
+    #    DELETED: private channel_update (scid12/0)
+    #    DELETED: private channel_update (scid12/1)
     #  channel_update (scid23)
     #  private_channel_update (scid12)
     #  private_channel_update (scid12)
@@ -1289,6 +1296,7 @@ def test_gossip_store_compact_noappend(node_factory, bitcoind):
     assert not l2.daemon.is_in_log('gossip_store:.*truncate')
 
 
+@unittest.skipIf(not DEVELOPER, "updates are delayed without --dev-fast-gossip")
 def test_gossip_store_load_complex(node_factory, bitcoind):
     l2 = setup_gossip_store_test(node_factory, bitcoind)
 
@@ -1368,7 +1376,7 @@ def test_gossip_store_compact_on_load(node_factory, bitcoind):
 
     l2.restart()
 
-    wait_for(lambda: l2.daemon.is_in_log('gossip_store_compact_offline: 9 deleted, 9 copied'))
+    wait_for(lambda: l2.daemon.is_in_log(r'gossip_store_compact_offline: [5-8] deleted, 9 copied'))
     wait_for(lambda: l2.daemon.is_in_log(r'gossip_store: Read 1/4/2/0 cannounce/cupdate/nannounce/cdelete from store \(0 deleted\) in 1446 bytes'))
 
 
@@ -1446,3 +1454,51 @@ def test_gossip_no_backtalk(node_factory):
     # With DEVELOPER, this is long enough for gossip flush.
     time.sleep(2)
     assert not l3.daemon.is_in_log(r'\[OUT\] 0100')
+
+
+@unittest.skipIf(not DEVELOPER, "Needs --dev-gossip")
+def test_gossip_ratelimit(node_factory):
+    # These make the channel exist, but we use our own gossip.
+    l1, l2 = node_factory.line_graph(2, wait_for_announce=True)
+
+    # Here are some ones I generated earlier (by removing gossip
+    # ratelimiting)
+    l3 = node_factory.get_node(options={'dev-gossip-time': 1568096251})
+    subprocess.run(['devtools/gossipwith',
+                    '--max-messages=0',
+                    '{}@localhost:{}'.format(l3.info['id'], l3.port),
+                    # announcement
+                    '0100987b271fc95a37dbed78e6159e0ab792cda64603780454ce80832b4e31f63a6760abc8fdc53be35bb7cfccd125ee3d15b4fbdfb42165098970c19c7822bb413f46390e0c043c777226927eacd2186a03f064e4bdc30f891cb6e4990af49967d34b338755e99d728987e3d49227815e17f3ab40092434a59e33548e870071176db7d44d8c8f4c4cac27ae6554eb9350e97d47617e3a1355296c78e8234446fa2f138ad1b03439f18520227fb9e9eb92689b3a0ed36e6764f5a41777e9a2a4ce1026d19a4e4d8f7715c13ac2d6bf3238608a1ccf9afd91f774d84d170d9edddebf7460c54d49bd6cd81410bc3eeeba2b7278b1b5f7e748d77d793f31086847d582000006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f0000670000010001022d223620a359a47ff7f7ac447c85c46c923da53389221a0054c11c1e3ca31d590266e4598d1d3c415f572a8488830b60f7e744ed9235eb0b1ba93283b315c0351802e3bd38009866c9da8ec4aa99cc4ea9c6c0dd46df15c61ef0ce1f271291714e5702324266de8403b3ab157a09f1f784d587af61831c998c151bcc21bb74c2b2314b',
+                    # first update is free
+                    '010225bfd9c5e2c5660188a14deb4002cd645ee67f00ad3b82146e46711ec460cb0c6819fdd1c680cb6d24e3906679ef071f13243a04a123e4b83310ebf0518ffd4206226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f00006700000100015d773ffb010100060000000000000000000000010000000a000000003b023380'],
+                   check=True, timeout=TIMEOUT)
+
+    # Wait for it to process channel.
+    wait_for(lambda: [c['fee_per_millionth'] for c in l3.rpc.listchannels()['channels']] == [10])
+
+    subprocess.run(['devtools/gossipwith',
+                    '--max-messages=0',
+                    '{}@localhost:{}'.format(l3.info['id'], l3.port),
+                    # next 4 are let through...
+                    '01023a892ad9c9953a54ad3b8e2e03a93d1c973241b62f9a5cd1f17d5cdf08de0e8b4fcd24aa8bd45a48b788fe9dab3d416f28dfa390bc900ec0176ec5bd1afd435706226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f00006700000100015d77400001010006000000000000000000000014000003e9000000003b023380',
+                    '010245966763623ebc16796165263d4b21711ef04ebf3929491e695ff89ed2b8ccc0668ceb9e35e0ff5b8901d95732a119c1ed84ac99861daa2de462118f7b70049f06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f00006700000100015d77400101010006000000000000000000000014000003ea000000003b023380',
+                    '0102c479b7684b9db496b844f6925f4ffd8a27c5840a020d1b537623c1545dcd8e195776381bbf51213e541a853a4a49a0faf84316e7ccca5e7074901a96bbabe04e06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f00006700000100015d77400201010006000000000000000000000014000003eb000000003b023380',
+                    # timestamp=1568096259, fee_proportional_millionths=1004
+                    '01024b866012d995d3d7aec7b7218a283de2d03492dbfa21e71dd546ec2e36c3d4200453420aa02f476f99c73fe1e223ea192f5fa544b70a8319f2a216f1513d503d06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f00006700000100015d77400301010006000000000000000000000014000003ec000000003b023380',
+                    # update 5 marks you as a nasty spammer!
+                    '01025b5b5a0daed874ab02bd3356d38190ff46bbaf5f10db5067da70f3ca203480ca78059e6621c6143f3da4e454d0adda6d01a9980ed48e71ccd0c613af73570a7106226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f00006700000100015d77400401010006000000000000000000000014000003ed000000003b023380'],
+                   check=True, timeout=TIMEOUT)
+
+    wait_for(lambda: [c['fee_per_millionth'] for c in l3.rpc.listchannels()['channels']] == [1004])
+
+    # 24 seconds later, it will accept another.
+    l3.rpc.call('dev-gossip-set-time', [1568096251 + 24])
+
+    subprocess.run(['devtools/gossipwith',
+                    '--max-messages=0',
+                    '{}@localhost:{}'.format(l3.info['id'], l3.port),
+                    # update 6: timestamp=1568096284 fee_proportional_millionths=1006
+                    '010282d24bcd984956bd9b891848404ee59d89643923b21641d2c2c0770a51b8f5da00cef82458add970f0b654aa4c8d54f68a9a1cc6470a35810303b09437f1f73d06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f00006700000100015d77401c01010006000000000000000000000014000003ee000000003b023380'],
+                   check=True, timeout=TIMEOUT)
+
+    wait_for(lambda: [c['fee_per_millionth'] for c in l3.rpc.listchannels()['channels']] == [1006])
