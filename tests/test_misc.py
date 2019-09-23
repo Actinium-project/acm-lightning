@@ -61,6 +61,7 @@ def test_names(node_factory):
                                   .format(key, alias, color))
 
 
+@unittest.skipIf(os.getenv('TEST_DB_PROVIDER', 'sqlite3') != 'sqlite3', "This migration is based on a sqlite3 snapshot")
 def test_db_upgrade(node_factory):
     l1 = node_factory.get_node()
     l1.stop()
@@ -969,12 +970,11 @@ def test_reserve_enforcement(node_factory, executor):
     l2.stop()
 
     # They should both aim for 1%.
-    reserves = l2.db_query('SELECT channel_reserve_satoshis FROM channel_configs')
+    reserves = l2.db.query('SELECT channel_reserve_satoshis FROM channel_configs')
     assert reserves == [{'channel_reserve_satoshis': 10**6 // 100}] * 2
 
     # Edit db to reduce reserve to 0 so it will try to violate it.
-    l2.db_query('UPDATE channel_configs SET channel_reserve_satoshis=0',
-                use_copy=False)
+    l2.db.execute('UPDATE channel_configs SET channel_reserve_satoshis=0')
 
     l2.start()
     wait_for(lambda: only_one(l2.rpc.listpeers(l1.info['id'])['peers'])['connected'])
@@ -1446,8 +1446,8 @@ def test_list_features_only(node_factory):
     expected = ['option_data_loss_protect/odd',
                 'option_initial_routing_sync/odd',
                 'option_upfront_shutdown_script/odd',
-                'option_gossip_queries/odd']
+                'option_gossip_queries/odd',
+                'option_gossip_queries_ex/odd']
     if EXPERIMENTAL_FEATURES:
-        expected += ['option_gossip_queries_ex/odd',
-                     'option_static_remotekey/odd']
+        expected += ['option_static_remotekey/odd']
     assert features == expected

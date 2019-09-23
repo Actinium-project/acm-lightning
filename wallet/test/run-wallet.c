@@ -431,10 +431,10 @@ struct command_result *param_msat(struct command *cmd UNNEEDED, const char *name
 { fprintf(stderr, "param_msat called!\n"); abort(); }
 /* Generated stub for param_node_id */
 struct command_result *param_node_id(struct command *cmd UNNEEDED,
-					       const char *name UNNEEDED,
-					       const char *buffer UNNEEDED,
-					       const jsmntok_t *tok UNNEEDED,
-					       struct node_id **id UNNEEDED)
+				     const char *name UNNEEDED,
+				     const char *buffer UNNEEDED,
+				     const jsmntok_t *tok UNNEEDED,
+				     struct node_id **id UNNEEDED)
 { fprintf(stderr, "param_node_id called!\n"); abort(); }
 /* Generated stub for param_number */
 struct command_result *param_number(struct command *cmd UNNEEDED, const char *name UNNEEDED,
@@ -727,14 +727,16 @@ static void cleanup_test_wallet(struct wallet *w, char *filename)
 
 static struct wallet *create_test_wallet(struct lightningd *ld, const tal_t *ctx)
 {
-	char *filename = tal_fmt(ctx, "/tmp/ldb-XXXXXX");
+	char *dsn, *filename = tal_fmt(ctx, "/tmp/ldb-XXXXXX");
 	int fd = mkstemp(filename);
 	struct wallet *w = tal(ctx, struct wallet);
 	static unsigned char badseed[BIP32_ENTROPY_LEN_128];
 	CHECK_MSG(fd != -1, "Unable to generate temp filename");
 	close(fd);
 
-	w->db = db_open(w, filename);
+	dsn = tal_fmt(NULL, "sqlite3://%s", filename);
+	w->db = db_open(w, dsn);
+	tal_free(dsn);
 	tal_add_destructor2(w, cleanup_test_wallet, filename);
 
 	list_head_init(&w->unstored_payments);

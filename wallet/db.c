@@ -10,7 +10,6 @@
 #include <lightningd/plugin_hook.h>
 #include <wallet/db_common.h>
 
-#define DB_FILE "lightningd.sqlite3"
 #define NSEC_IN_SEC 1000000000
 
 struct migration {
@@ -27,9 +26,9 @@ static struct migration dbmigrations[] = {
     {SQL("CREATE TABLE version (version INTEGER)"), NULL},
     {SQL("INSERT INTO version VALUES (1)"), NULL},
     {SQL("CREATE TABLE outputs ("
-	 "  prev_out_tx CHAR(64)"
+	 "  prev_out_tx BLOB"
 	 ", prev_out_index INTEGER"
-	 ", value INTEGER"
+	 ", value BIGINT"
 	 ", type INTEGER"
 	 ", status INTEGER"
 	 ", keyindex INTEGER"
@@ -42,39 +41,46 @@ static struct migration dbmigrations[] = {
 	 ");"),
      NULL},
     {SQL("CREATE TABLE shachains ("
-	 "  id INTEGER"
-	 ", min_index INTEGER"
-	 ", num_valid INTEGER"
+	 "  id BIGSERIAL"
+	 ", min_index BIGINT"
+	 ", num_valid BIGINT"
 	 ", PRIMARY KEY (id)"
 	 ");"),
      NULL},
     {SQL("CREATE TABLE shachain_known ("
-	 "  shachain_id INTEGER REFERENCES shachains(id) ON DELETE CASCADE"
+	 "  shachain_id BIGINT REFERENCES shachains(id) ON DELETE CASCADE"
 	 ", pos INTEGER"
-	 ", idx INTEGER"
+	 ", idx BIGINT"
 	 ", hash BLOB"
 	 ", PRIMARY KEY (shachain_id, pos)"
 	 ");"),
      NULL},
+    {SQL("CREATE TABLE peers ("
+	 "  id BIGSERIAL"
+	 ", node_id BLOB UNIQUE" /* pubkey */
+	 ", address TEXT"
+	 ", PRIMARY KEY (id)"
+	 ");"),
+     NULL},
     {SQL("CREATE TABLE channels ("
-	 "  id INTEGER," /* chan->id */
-	 "  peer_id INTEGER REFERENCES peers(id) ON DELETE CASCADE,"
-	 "  short_channel_id BLOB,"
-	 "  channel_config_local INTEGER,"
-	 "  channel_config_remote INTEGER,"
+	 "  id BIGSERIAL," /* chan->id */
+	 "  peer_id BIGINT REFERENCES peers(id) ON DELETE CASCADE,"
+	 "  short_channel_id TEXT,"
+	 "  channel_config_local BIGINT,"
+	 "  channel_config_remote BIGINT,"
 	 "  state INTEGER,"
 	 "  funder INTEGER,"
 	 "  channel_flags INTEGER,"
 	 "  minimum_depth INTEGER,"
-	 "  next_index_local INTEGER,"
-	 "  next_index_remote INTEGER,"
-	 "  next_htlc_id INTEGER, "
+	 "  next_index_local BIGINT,"
+	 "  next_index_remote BIGINT,"
+	 "  next_htlc_id BIGINT,"
 	 "  funding_tx_id BLOB,"
 	 "  funding_tx_outnum INTEGER,"
-	 "  funding_satoshi INTEGER,"
+	 "  funding_satoshi BIGINT,"
 	 "  funding_locked_remote INTEGER,"
-	 "  push_msatoshi INTEGER,"
-	 "  msatoshi_local INTEGER," /* our_msatoshi */
+	 "  push_msatoshi BIGINT,"
+	 "  msatoshi_local BIGINT," /* our_msatoshi */
 	 /* START channel_info */
 	 "  fundingkey_remote BLOB,"
 	 "  revocation_basepoint_remote BLOB,"
@@ -86,10 +92,10 @@ static struct migration dbmigrations[] = {
 	 "  local_feerate_per_kw INTEGER,"
 	 "  remote_feerate_per_kw INTEGER,"
 	 /* END channel_info */
-	 "  shachain_remote_id INTEGER,"
+	 "  shachain_remote_id BIGINT,"
 	 "  shutdown_scriptpubkey_remote BLOB,"
-	 "  shutdown_keyidx_local INTEGER,"
-	 "  last_sent_commit_state INTEGER,"
+	 "  shutdown_keyidx_local BIGINT,"
+	 "  last_sent_commit_state BIGINT,"
 	 "  last_sent_commit_id INTEGER,"
 	 "  last_tx BLOB,"
 	 "  last_sig BLOB,"
@@ -98,31 +104,24 @@ static struct migration dbmigrations[] = {
 	 "  PRIMARY KEY (id)"
 	 ");"),
      NULL},
-    {SQL("CREATE TABLE peers ("
-	 "  id INTEGER"
-	 ", node_id BLOB UNIQUE" /* pubkey */
-	 ", address TEXT"
-	 ", PRIMARY KEY (id)"
-	 ");"),
-     NULL},
     {SQL("CREATE TABLE channel_configs ("
-	 "  id INTEGER,"
-	 "  dust_limit_satoshis INTEGER,"
-	 "  max_htlc_value_in_flight_msat INTEGER,"
-	 "  channel_reserve_satoshis INTEGER,"
-	 "  htlc_minimum_msat INTEGER,"
+	 "  id BIGSERIAL,"
+	 "  dust_limit_satoshis BIGINT,"
+	 "  max_htlc_value_in_flight_msat BIGINT,"
+	 "  channel_reserve_satoshis BIGINT,"
+	 "  htlc_minimum_msat BIGINT,"
 	 "  to_self_delay INTEGER,"
 	 "  max_accepted_htlcs INTEGER,"
 	 "  PRIMARY KEY (id)"
 	 ");"),
      NULL},
     {SQL("CREATE TABLE channel_htlcs ("
-	 "  id INTEGER,"
-	 "  channel_id INTEGER REFERENCES channels(id) ON DELETE CASCADE,"
-	 "  channel_htlc_id INTEGER,"
+	 "  id BIGSERIAL,"
+	 "  channel_id BIGINT REFERENCES channels(id) ON DELETE CASCADE,"
+	 "  channel_htlc_id BIGINT,"
 	 "  direction INTEGER,"
-	 "  origin_htlc INTEGER,"
-	 "  msatoshi INTEGER,"
+	 "  origin_htlc BIGINT,"
+	 "  msatoshi BIGINT,"
 	 "  cltv_expiry INTEGER,"
 	 "  payment_hash BLOB,"
 	 "  payment_key BLOB,"
@@ -136,9 +135,9 @@ static struct migration dbmigrations[] = {
 	 ");"),
      NULL},
     {SQL("CREATE TABLE invoices ("
-	 "  id INTEGER,"
+	 "  id BIGSERIAL,"
 	 "  state INTEGER,"
-	 "  msatoshi INTEGER,"
+	 "  msatoshi BIGINT,"
 	 "  payment_hash BLOB,"
 	 "  payment_key BLOB,"
 	 "  label TEXT,"
@@ -148,28 +147,28 @@ static struct migration dbmigrations[] = {
 	 ");"),
      NULL},
     {SQL("CREATE TABLE payments ("
-	 "  id INTEGER,"
+	 "  id BIGSERIAL,"
 	 "  timestamp INTEGER,"
 	 "  status INTEGER,"
 	 "  payment_hash BLOB,"
 	 "  direction INTEGER,"
 	 "  destination BLOB,"
-	 "  msatoshi INTEGER,"
+	 "  msatoshi BIGINT,"
 	 "  PRIMARY KEY (id),"
 	 "  UNIQUE (payment_hash)"
 	 ");"),
      NULL},
     /* Add expiry field to invoices (effectively infinite). */
-    {SQL("ALTER TABLE invoices ADD expiry_time INTEGER;"), NULL},
+    {SQL("ALTER TABLE invoices ADD expiry_time BIGINT;"), NULL},
     {SQL("UPDATE invoices SET expiry_time=9223372036854775807;"), NULL},
     /* Add pay_index field to paid invoices (initially, same order as id). */
-    {SQL("ALTER TABLE invoices ADD pay_index INTEGER;"), NULL},
+    {SQL("ALTER TABLE invoices ADD pay_index BIGINT;"), NULL},
     {SQL("CREATE UNIQUE INDEX invoices_pay_index ON invoices(pay_index);"),
      NULL},
     {SQL("UPDATE invoices SET pay_index=id WHERE state=1;"),
      NULL}, /* only paid invoice */
     /* Create next_pay_index variable (highest pay_index). */
-    {SQL("INSERT OR REPLACE INTO vars(name, val)"
+    {SQL("INSERT INTO vars(name, val)"
 	 "  VALUES('next_pay_index', "
 	 "    COALESCE((SELECT MAX(pay_index) FROM invoices WHERE state=1), 0) "
 	 "+ 1"
@@ -178,14 +177,13 @@ static struct migration dbmigrations[] = {
     /* Create first_block field; initialize from channel id if any.
      * This fails for channels still awaiting lockin, but that only applies to
      * pre-release software, so it's forgivable. */
-    {SQL("ALTER TABLE channels ADD first_blocknum INTEGER;"), NULL},
-    {SQL("UPDATE channels SET first_blocknum=CAST(short_channel_id AS INTEGER) "
-	 "WHERE short_channel_id IS NOT NULL;"),
+    {SQL("ALTER TABLE channels ADD first_blocknum BIGINT;"), NULL},
+    {SQL("UPDATE channels SET first_blocknum=1 WHERE short_channel_id IS NOT NULL;"),
      NULL},
-    {SQL("ALTER TABLE outputs ADD COLUMN channel_id INTEGER;"), NULL},
+    {SQL("ALTER TABLE outputs ADD COLUMN channel_id BIGINT;"), NULL},
     {SQL("ALTER TABLE outputs ADD COLUMN peer_id BLOB;"), NULL},
     {SQL("ALTER TABLE outputs ADD COLUMN commitment_point BLOB;"), NULL},
-    {SQL("ALTER TABLE invoices ADD COLUMN msatoshi_received INTEGER;"), NULL},
+    {SQL("ALTER TABLE invoices ADD COLUMN msatoshi_received BIGINT;"), NULL},
     /* Normally impossible, so at least we'll know if databases are ancient. */
     {SQL("UPDATE invoices SET msatoshi_received=0 WHERE state=1;"), NULL},
     {SQL("ALTER TABLE channels ADD COLUMN last_was_revoke INTEGER;"), NULL},
@@ -194,12 +192,12 @@ static struct migration dbmigrations[] = {
      * rename & copy, which works because there are no triggers etc. */
     {SQL("ALTER TABLE payments RENAME TO temp_payments;"), NULL},
     {SQL("CREATE TABLE payments ("
-	 "  id INTEGER,"
+	 "  id BIGSERIAL,"
 	 "  timestamp INTEGER,"
 	 "  status INTEGER,"
 	 "  payment_hash BLOB,"
 	 "  destination BLOB,"
-	 "  msatoshi INTEGER,"
+	 "  msatoshi BIGINT,"
 	 "  PRIMARY KEY (id),"
 	 "  UNIQUE (payment_hash)"
 	 ");"),
@@ -214,9 +212,9 @@ static struct migration dbmigrations[] = {
     {SQL("ALTER TABLE payments ADD COLUMN path_secrets BLOB;"), NULL},
     /* Create time-of-payment of invoice, default already-paid
      * invoices to current time. */
-    {SQL("ALTER TABLE invoices ADD paid_timestamp INTEGER;"), NULL},
+    {SQL("ALTER TABLE invoices ADD paid_timestamp BIGINT;"), NULL},
     {SQL("UPDATE invoices"
-	 "   SET paid_timestamp = strftime('%s', 'now')"
+	 "   SET paid_timestamp = CURRENT_TIMESTAMP()"
 	 " WHERE state = 1;"),
      NULL},
     /* We need to keep the route node pubkeys and short channel ids to
@@ -224,7 +222,7 @@ static struct migration dbmigrations[] = {
      * because we cannot safely save them as blobs due to byteorder
      * concerns. */
     {SQL("ALTER TABLE payments ADD COLUMN route_nodes BLOB;"), NULL},
-    {SQL("ALTER TABLE payments ADD COLUMN route_channels TEXT;"), NULL},
+    {SQL("ALTER TABLE payments ADD COLUMN route_channels BLOB;"), NULL},
     {SQL("CREATE TABLE htlc_sigs (channelid INTEGER REFERENCES channels(id) ON "
 	 "DELETE CASCADE, signature BLOB);"),
      NULL},
@@ -297,7 +295,7 @@ static struct migration dbmigrations[] = {
      NULL}, /* erring_index */
     {SQL("ALTER TABLE payments ADD failcode INTEGER;"), NULL}, /* failcode */
     {SQL("ALTER TABLE payments ADD failnode BLOB;"), NULL},    /* erring_node */
-    {SQL("ALTER TABLE payments ADD failchannel BLOB;"),
+    {SQL("ALTER TABLE payments ADD failchannel TEXT;"),
      NULL}, /* erring_channel */
     {SQL("ALTER TABLE payments ADD failupdate BLOB;"),
      NULL}, /* channel_update - can be NULL*/
@@ -310,14 +308,14 @@ static struct migration dbmigrations[] = {
 	 " WHERE status <> 0;"),
      NULL}, /* PAYMENT_PENDING */
     /* -- Routing statistics -- */
-    {SQL("ALTER TABLE channels ADD in_payments_offered INTEGER;"), NULL},
-    {SQL("ALTER TABLE channels ADD in_payments_fulfilled INTEGER;"), NULL},
-    {SQL("ALTER TABLE channels ADD in_msatoshi_offered INTEGER;"), NULL},
-    {SQL("ALTER TABLE channels ADD in_msatoshi_fulfilled INTEGER;"), NULL},
-    {SQL("ALTER TABLE channels ADD out_payments_offered INTEGER;"), NULL},
-    {SQL("ALTER TABLE channels ADD out_payments_fulfilled INTEGER;"), NULL},
-    {SQL("ALTER TABLE channels ADD out_msatoshi_offered INTEGER;"), NULL},
-    {SQL("ALTER TABLE channels ADD out_msatoshi_fulfilled INTEGER;"), NULL},
+    {SQL("ALTER TABLE channels ADD in_payments_offered INTEGER DEFAULT 0;"), NULL},
+    {SQL("ALTER TABLE channels ADD in_payments_fulfilled INTEGER DEFAULT 0;"), NULL},
+    {SQL("ALTER TABLE channels ADD in_msatoshi_offered BIGINT DEFAULT 0;"), NULL},
+    {SQL("ALTER TABLE channels ADD in_msatoshi_fulfilled BIGINT DEFAULT 0;"), NULL},
+    {SQL("ALTER TABLE channels ADD out_payments_offered INTEGER DEFAULT 0;"), NULL},
+    {SQL("ALTER TABLE channels ADD out_payments_fulfilled INTEGER DEFAULT 0;"), NULL},
+    {SQL("ALTER TABLE channels ADD out_msatoshi_offered BIGINT DEFAULT 0;"), NULL},
+    {SQL("ALTER TABLE channels ADD out_msatoshi_fulfilled BIGINT DEFAULT 0;"), NULL},
     {SQL("UPDATE channels"
 	 "   SET  in_payments_offered = 0,  in_payments_fulfilled = 0"
 	 "     ,  in_msatoshi_offered = 0,  in_msatoshi_fulfilled = 0"
@@ -327,12 +325,12 @@ static struct migration dbmigrations[] = {
      NULL},
     /* -- Routing statistics ends --*/
     /* Record the msatoshi actually sent in a payment. */
-    {SQL("ALTER TABLE payments ADD msatoshi_sent INTEGER;"), NULL},
+    {SQL("ALTER TABLE payments ADD msatoshi_sent BIGINT;"), NULL},
     {SQL("UPDATE payments SET msatoshi_sent = msatoshi;"), NULL},
     /* Delete dangling utxoset entries due to Issue #1280  */
     {SQL("DELETE FROM utxoset WHERE blockheight IN ("
 	 "  SELECT DISTINCT(blockheight)"
-	 "  FROM utxoset LEFT OUTER JOIN blocks on (blockheight == "
+	 "  FROM utxoset LEFT OUTER JOIN blocks on (blockheight = "
 	 "blocks.height) "
 	 "  WHERE blocks.hash IS NULL"
 	 ");"),
@@ -346,8 +344,8 @@ static struct migration dbmigrations[] = {
 	 "max_possible_feerate=250000;"),
      NULL},
     /* -- Min and max msatoshi_to_us -- */
-    {SQL("ALTER TABLE channels ADD msatoshi_to_us_min INTEGER;"), NULL},
-    {SQL("ALTER TABLE channels ADD msatoshi_to_us_max INTEGER;"), NULL},
+    {SQL("ALTER TABLE channels ADD msatoshi_to_us_min BIGINT;"), NULL},
+    {SQL("ALTER TABLE channels ADD msatoshi_to_us_max BIGINT;"), NULL},
     {SQL("UPDATE channels"
 	 "   SET msatoshi_to_us_min = msatoshi_local"
 	 "     , msatoshi_to_us_max = msatoshi_local"
@@ -374,8 +372,8 @@ static struct migration dbmigrations[] = {
     /* -- Detailed payment faiure ends -- */
     {SQL("CREATE TABLE channeltxs ("
 	 /* The id serves as insertion order and short ID */
-	 "  id INTEGER"
-	 ", channel_id INTEGER REFERENCES channels(id) ON DELETE CASCADE"
+	 "  id BIGSERIAL"
+	 ", channel_id BIGINT REFERENCES channels(id) ON DELETE CASCADE"
 	 ", type INTEGER"
 	 ", transaction_id BLOB REFERENCES transactions(id) ON DELETE CASCADE"
 	 /* The input_num is only used by the txo_watch, 0 if txwatch */
@@ -394,8 +392,9 @@ static struct migration dbmigrations[] = {
     /* Now make sure we have the lower bound block with the first_blocknum
      * height. This may introduce a block with NULL height if we didn't have any
      * blocks, remove that in the next. */
-    {SQL("INSERT OR IGNORE INTO blocks (height) VALUES ((SELECT "
-	 "MIN(first_blocknum) FROM channels));"),
+    {SQL("INSERT INTO blocks (height) VALUES ((SELECT "
+	 "MIN(first_blocknum) FROM channels)) "
+	 "ON CONFLICT(height) DO NOTHING;"),
      NULL},
     {SQL("DELETE FROM blocks WHERE height IS NULL;"), NULL},
     /* -- End of  PR #1398 -- */
@@ -411,12 +410,12 @@ static struct migration dbmigrations[] = {
      * deleted when the HTLC entries or the channel entries are
      * deleted to avoid unexpected drops in statistics. */
     {SQL("CREATE TABLE forwarded_payments ("
-	 "  in_htlc_id INTEGER REFERENCES channel_htlcs(id) ON DELETE SET NULL"
-	 ", out_htlc_id INTEGER REFERENCES channel_htlcs(id) ON DELETE SET NULL"
-	 ", in_channel_scid INTEGER"
-	 ", out_channel_scid INTEGER"
-	 ", in_msatoshi INTEGER"
-	 ", out_msatoshi INTEGER"
+	 "  in_htlc_id BIGINT REFERENCES channel_htlcs(id) ON DELETE SET NULL"
+	 ", out_htlc_id BIGINT REFERENCES channel_htlcs(id) ON DELETE SET NULL"
+	 ", in_channel_scid BIGINT"
+	 ", out_channel_scid BIGINT"
+	 ", in_msatoshi BIGINT"
+	 ", out_msatoshi BIGINT"
 	 ", state INTEGER"
 	 ", UNIQUE(in_htlc_id, out_htlc_id)"
 	 ");"),
@@ -434,9 +433,9 @@ static struct migration dbmigrations[] = {
     {SQL("ALTER TABLE channels ADD feerate_base INTEGER;"), NULL},
     {SQL("ALTER TABLE channels ADD feerate_ppm INTEGER;"), NULL},
     {NULL, migrate_pr2342_feerate_per_channel},
-    {SQL("ALTER TABLE channel_htlcs ADD received_time INTEGER"), NULL},
-    {SQL("ALTER TABLE forwarded_payments ADD received_time INTEGER"), NULL},
-    {SQL("ALTER TABLE forwarded_payments ADD resolved_time INTEGER"), NULL},
+    {SQL("ALTER TABLE channel_htlcs ADD received_time BIGINT"), NULL},
+    {SQL("ALTER TABLE forwarded_payments ADD received_time BIGINT"), NULL},
+    {SQL("ALTER TABLE forwarded_payments ADD resolved_time BIGINT"), NULL},
     {SQL("ALTER TABLE channels ADD remote_upfront_shutdown_script BLOB;"),
      NULL},
     /* PR #2524: Add failcode into forward_payment */
@@ -445,12 +444,12 @@ static struct migration dbmigrations[] = {
     {SQL("ALTER TABLE channels ADD remote_ann_node_sig BLOB;"), NULL},
     {SQL("ALTER TABLE channels ADD remote_ann_bitcoin_sig BLOB;"), NULL},
     /* Additional information for transaction tracking and listing */
-    {SQL("ALTER TABLE transactions ADD type INTEGER;"), NULL},
+    {SQL("ALTER TABLE transactions ADD type BIGINT;"), NULL},
     /* Not a foreign key on purpose since we still delete channels from
      * the DB which would remove this. It is mainly used to group payments
      * in the list view anyway, e.g., show all close and htlc transactions
      * as a single bundle. */
-    {SQL("ALTER TABLE transactions ADD channel_id INTEGER;"), NULL},
+    {SQL("ALTER TABLE transactions ADD channel_id BIGINT;"), NULL},
     /* Convert pre-Adelaide short_channel_ids */
     {SQL("UPDATE channels"
 	 " SET short_channel_id = REPLACE(short_channel_id, ':', 'x')"
@@ -458,8 +457,12 @@ static struct migration dbmigrations[] = {
     {SQL("UPDATE payments SET failchannel = REPLACE(failchannel, ':', 'x')"
 	 " WHERE failchannel IS NOT NULL;"), NULL },
     /* option_static_remotekey is nailed at creation time. */
-    {SQL("ALTER TABLE channels ADD COLUMN option_static_remotekey"
-	 " DEFAULT FALSE;"), NULL },
+    {SQL("ALTER TABLE channels ADD COLUMN option_static_remotekey INTEGER"
+	 " DEFAULT 0;"), NULL },
+    {SQL("ALTER TABLE vars ADD COLUMN intval INTEGER"), NULL},
+    {SQL("ALTER TABLE vars ADD COLUMN blobval BLOB"), NULL},
+    {SQL("UPDATE vars SET intval = CAST(val AS INTEGER) WHERE name IN ('bip32_max_index', 'last_processed_block', 'next_pay_index')"), NULL},
+    {SQL("UPDATE vars SET blobval = CAST(val AS BLOB) WHERE name = 'genesis_hash'"), NULL},
 };
 
 /* Leak tracking. */
@@ -480,6 +483,9 @@ static void db_assert_no_outstanding_statements(struct db *db)
 
 static void db_stmt_free(struct db_stmt *stmt)
 {
+	if (!stmt->executed)
+		fatal("Freeing an un-executed statement from %s: %s",
+		      stmt->location, stmt->query->query);
 	if (stmt->inner_stmt)
 		stmt->db->config->stmt_free_fn(stmt);
 	assert(stmt->inner_stmt == NULL);
@@ -503,7 +509,7 @@ struct db_stmt *db_prepare_v2_(const char *location, struct db *db,
 
 	/* Look up the query by its ID */
 	for (size_t i = 0; i < db->config->num_queries; i++) {
-		if (streq(query_id, db->config->queries[i].query)) {
+		if (streq(query_id, db->config->queries[i].name)) {
 			stmt->query = &db->config->queries[i];
 			break;
 		}
@@ -567,17 +573,19 @@ const void *db_column_blob(struct db_stmt *stmt, int col)
 
 const unsigned char *db_column_text(struct db_stmt *stmt, int col)
 {
-	return stmt->db->config->column_blob_fn(stmt, col);
+	return stmt->db->config->column_text_fn(stmt, col);
 }
 
 size_t db_count_changes(struct db_stmt *stmt)
 {
+	assert(stmt->executed);
 	return stmt->db->config->count_changes_fn(stmt);
 }
 
 u64 db_last_insert_id_v2(struct db_stmt *stmt TAKES)
 {
 	u64 id;
+	assert(stmt->executed);
 	id = stmt->db->config->last_insert_id_fn(stmt);
 
 	if (taken(stmt))
@@ -645,24 +653,26 @@ void db_commit_transaction(struct db *db)
 	db->in_transaction = NULL;
 }
 
-static void setup_open_db(struct db *db)
-{
-	/* This must be outside a transaction, so catch it */
-	assert(!db->in_transaction);
-
-	db_prepare_for_changes(db);
-	if (db->config->setup_fn)
-		db->config->setup_fn(db);
-	db_report_changes(db, NULL, 0);
-}
-
-static struct db_config *db_config_find(const char *driver_name)
+static struct db_config *db_config_find(const char *dsn)
 {
 	size_t num_configs;
 	struct db_config **configs = autodata_get(db_backends, &num_configs);
-	for (size_t i=0; i<num_configs; i++)
-		if (streq(driver_name, configs[i]->name))
+	const char *sep, *driver_name;
+	sep = strstr(dsn, "://");
+
+	if (!sep)
+		db_fatal("%s doesn't look like a valid data-source name (missing \"://\" separator.", dsn);
+
+	driver_name = tal_strndup(tmpctx, dsn, sep - dsn);
+
+	for (size_t i=0; i<num_configs; i++) {
+		if (streq(driver_name, configs[i]->name)) {
+			tal_free(driver_name);
 			return configs[i];
+		}
+	}
+
+	tal_free(driver_name);
 	return NULL;
 }
 
@@ -671,38 +681,29 @@ static struct db_config *db_config_find(const char *driver_name)
  */
 static struct db *db_open(const tal_t *ctx, char *filename)
 {
-	int err;
 	struct db *db;
-	sqlite3 *sql;
-	const char *driver_name = "sqlite3";
-
-	int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
-	err = sqlite3_open_v2(filename, &sql, flags, NULL);
-
-	if (err != SQLITE_OK) {
-		db_fatal("failed to open database %s: %s", filename,
-			 sqlite3_errstr(err));
-	}
 
 	db = tal(ctx, struct db);
 	db->filename = tal_strdup(db, filename);
-	db->sql = sql;
-	db->config = NULL;
 	list_head_init(&db->pending_statements);
+	if (!strstr(db->filename, "://"))
+		db_fatal("Could not extract driver name from \"%s\"", db->filename);
 
-	db->config = db_config_find(driver_name);
+	db->config = db_config_find(db->filename);
 	if (!db->config)
-		db_fatal("Unable to find DB driver for %s", driver_name);
-
-	// FIXME(cdecker) Once we parse DB connection strings this needs to be
-	// instantiated correctly.
-	db->conn = sql;
+		db_fatal("Unable to find DB driver for %s", db->filename);
 
 	tal_add_destructor(db, destroy_db);
 	db->in_transaction = NULL;
 	db->changes = NULL;
 
-	setup_open_db(db);
+	/* This must be outside a transaction, so catch it */
+	assert(!db->in_transaction);
+
+	db_prepare_for_changes(db);
+	if (db->config->setup_fn && !db->config->setup_fn(db))
+		fatal("Error calling DB setup: %s", db->error);
+	db_report_changes(db, NULL, 0);
 
 	return db;
 }
@@ -719,13 +720,23 @@ static int db_get_version(struct db *db)
 {
 	int res = -1;
 	struct db_stmt *stmt = db_prepare_v2(db, SQL("SELECT version FROM version LIMIT 1"));
+
+	/*
+	 * Tentatively execute a query, but allow failures. Some databases
+	 * like postgres will terminate the DB transaction if there is an
+	 * error during the execution of a query, e.g., trying to access a
+	 * table that doesn't exist yet, so we need to terminate and restart
+	 * the DB transaction.
+	 */
 	if (!db_query_prepared(stmt)) {
+		db_commit_transaction(stmt->db);
+		db_begin_transaction(stmt->db);
 		tal_free(stmt);
 		return res;
 	}
 
 	if (db_step(stmt))
-		res = db_column_u64(stmt, 0);
+		res = db_column_int(stmt, 0);
 
 	tal_free(stmt);
 	return res;
@@ -768,7 +779,7 @@ static void db_migrate(struct lightningd *ld, struct db *db, struct log *log)
 
 	/* Finally update the version number in the version table */
 	stmt = db_prepare_v2(db, SQL("UPDATE version SET version=?;"));
-	db_bind_u64(stmt, 0, available);
+	db_bind_int(stmt, 0, available);
 	db_exec_prepared_v2(stmt);
 	tal_free(stmt);
 
@@ -776,7 +787,7 @@ static void db_migrate(struct lightningd *ld, struct db *db, struct log *log)
 	if (current != orig) {
 		stmt = db_prepare_v2(
 		    db, SQL("INSERT INTO db_upgrades VALUES (?, ?);"));
-		db_bind_u64(stmt, 0, orig);
+		db_bind_int(stmt, 0, orig);
 		db_bind_text(stmt, 1, version());
 		db_exec_prepared_v2(stmt);
 		tal_free(stmt);
@@ -787,8 +798,7 @@ static void db_migrate(struct lightningd *ld, struct db *db, struct log *log)
 
 struct db *db_setup(const tal_t *ctx, struct lightningd *ld, struct log *log)
 {
-	struct db *db = db_open(ctx, DB_FILE);
-
+	struct db *db = db_open(ctx, ld->wallet_dsn);
 	db_migrate(ld, db, log);
 	return db;
 }
@@ -797,13 +807,13 @@ s64 db_get_intvar(struct db *db, char *varname, s64 defval)
 {
 	s64 res = defval;
 	struct db_stmt *stmt = db_prepare_v2(
-	    db, SQL("SELECT val FROM vars WHERE name= ? LIMIT 1"));
+	    db, SQL("SELECT intval FROM vars WHERE name= ? LIMIT 1"));
 	db_bind_text(stmt, 0, varname);
 	if (!db_query_prepared(stmt))
 		goto done;
 
 	if (db_step(stmt))
-		res = atol((const char*)db_column_text(stmt, 0));
+		res = db_column_int(stmt, 0);
 
 done:
 	tal_free(stmt);
@@ -812,10 +822,9 @@ done:
 
 void db_set_intvar(struct db *db, char *varname, s64 val)
 {
-	char *v = tal_fmt(NULL, "%"PRIi64, val);
 	size_t changes;
-	struct db_stmt *stmt = db_prepare_v2(db, SQL("UPDATE vars SET val=? WHERE name=?;"));
-	db_bind_text(stmt, 0, v);
+	struct db_stmt *stmt = db_prepare_v2(db, SQL("UPDATE vars SET intval=? WHERE name=?;"));
+	db_bind_int(stmt, 0, val);
 	db_bind_text(stmt, 1, varname);
 	if (!db_exec_prepared_v2(stmt))
 		db_fatal("Error executing update: %s", stmt->error);
@@ -823,14 +832,13 @@ void db_set_intvar(struct db *db, char *varname, s64 val)
 	tal_free(stmt);
 
 	if (changes == 0) {
-		stmt = db_prepare_v2(db, SQL("INSERT INTO vars (name, val) VALUES (?, ?);"));
+		stmt = db_prepare_v2(db, SQL("INSERT INTO vars (name, intval) VALUES (?, ?);"));
 		db_bind_text(stmt, 0, varname);
-		db_bind_text(stmt, 1, v);
+		db_bind_int(stmt, 1, val);
 		if (!db_exec_prepared_v2(stmt))
 			db_fatal("Error executing insert: %s", stmt->error);
 		tal_free(stmt);
 	}
-	tal_free(v);
 }
 
 /* Will apply the current config fee settings to all channels */

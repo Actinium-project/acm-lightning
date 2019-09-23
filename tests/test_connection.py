@@ -1382,7 +1382,7 @@ def test_forget_channel(node_factory):
 
 def test_peerinfo(node_factory, bitcoind):
     l1, l2 = node_factory.line_graph(2, fundchannel=False, opts={'may_reconnect': True})
-    lfeatures = 'aa'
+    lfeatures = '08aa'
     if EXPERIMENTAL_FEATURES:
         lfeatures = '28aa'
     # Gossiping but no node announcement yet
@@ -1583,8 +1583,9 @@ def test_no_fee_estimate(node_factory, bitcoind, executor):
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     l1.rpc.fundchannel(l2.info['id'], 10**6, 'slow')
 
-    # Can withdraw (use urgent feerate).
-    l1.rpc.withdraw(l2.rpc.newaddr()['bech32'], 'all', 'urgent')
+    # Can withdraw (use urgent feerate). `minconf` may be needed depending on
+    # the previous `fundchannel` selecting all confirmed outputs.
+    l1.rpc.withdraw(l2.rpc.newaddr()['bech32'], 'all', 'urgent', minconf=0)
 
 
 @unittest.skipIf(not DEVELOPER, "needs --dev-disconnect")
@@ -1627,6 +1628,7 @@ def test_funder_simple_reconnect(node_factory, bitcoind):
     l1.pay(l2, 200000000)
 
 
+@unittest.skipIf(os.getenv('TEST_DB_PROVIDER', 'sqlite3') != 'sqlite3', "sqlite3-specific DB rollback")
 @unittest.skipIf(not DEVELOPER, "needs LIGHTNINGD_DEV_LOG_IO")
 def test_dataloss_protection(node_factory, bitcoind):
     l1 = node_factory.get_node(may_reconnect=True, log_all_io=True,
@@ -1638,8 +1640,8 @@ def test_dataloss_protection(node_factory, bitcoind):
         # features 1, 3, 5, 7, 11 and 13 (0x28aa).
         lf = "28aa"
     else:
-        # features 1, 3, 5 and 7 (0xaa).
-        lf = "aa"
+        # features 1, 3, 5, 7 and 11 (0x08aa).
+        lf = "08aa"
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     # l1 should send out WIRE_INIT (0010)
     l1.daemon.wait_for_log(r"\[OUT\] 0010"

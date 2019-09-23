@@ -15,7 +15,7 @@ CCANDIR := ccan
 
 # Where we keep the BOLT RFCs
 BOLTDIR := ../lightning-rfc/
-BOLTVERSION := 8555709811e6b2326f80dc479021b161e850bf03
+BOLTVERSION := c8e53fe5bf131db142d231e88f2adb3a84876836
 
 -include config.vars
 
@@ -199,6 +199,11 @@ ifeq ($(STATIC),1)
 LDLIBS = -L/usr/local/lib -Wl,-lgmp -lsqlite3 -lz -Wl,-lm -lpthread -ldl $(COVFLAGS)
 else
 LDLIBS = -L/usr/local/lib -lm -lgmp -lsqlite3 -lz $(COVFLAGS)
+endif
+
+# If we have the postgres client library we need to link against it as well
+ifeq ($(HAVE_POSTGRES),1)
+LDLIBS += -lpq
 endif
 
 default: all-programs all-test-programs

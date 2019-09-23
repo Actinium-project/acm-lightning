@@ -77,34 +77,6 @@ static u32 max_encoding_bytes = -1U;
 static bool suppress_gossip = false;
 #endif
 
-#if EXPERIMENTAL_FEATURES == 0
-/* We want these definitions for convenience, even if we never encode/decode
- * them when not EXPERIMENTAL_FEATURES */
-struct tlv_reply_channel_range_tlvs_timestamps_tlv {
-        u8 encoding_type;
-        u8 *encoded_timestamps;
-};
-
-struct tlv_reply_channel_range_tlvs_checksums_tlv {
-        struct channel_update_checksums *checksums;
-};
-
-struct channel_update_timestamps {
-        u32 timestamp_node_id_1;
-        u32 timestamp_node_id_2;
-};
-struct channel_update_checksums {
-        u32 checksum_node_id_1;
-        u32 checksum_node_id_2;
-};
-
-static void towire_channel_update_timestamps(u8 **p,
-					     const struct channel_update_timestamps *channel_update_timestamps)
-{
-	abort();
-}
-#endif
-
 /*~ How gossipy do we ask a peer to be? */
 enum gossip_level {
 	/* Give us everything since epoch */
@@ -518,13 +490,8 @@ static bool query_short_channel_ids(struct daemon *daemon,
 		return false;
 	}
 
-#if EXPERIMENTAL_FEATURES
 	msg = towire_query_short_channel_ids(NULL, &daemon->chain_hash,
 					     encoded, NULL);
-#else
-	msg = towire_query_short_channel_ids(NULL, &daemon->chain_hash,
-					     encoded);
-#endif
 	queue_peer_msg(peer, take(msg));
 	peer->scid_query_outstanding = true;
 	peer->scid_query_was_internal = internal;
@@ -623,7 +590,6 @@ static const u8 *handle_query_short_channel_ids(struct peer *peer, const u8 *msg
 	struct short_channel_id *scids;
 	bigsize_t *flags;
 
-#if EXPERIMENTAL_FEATURES
 	struct tlv_query_short_channel_ids_tlvs *tlvs
 		= tlv_query_short_channel_ids_tlvs_new(tmpctx);
 
@@ -634,6 +600,15 @@ static const u8 *handle_query_short_channel_ids(struct peer *peer, const u8 *msg
 				       tal_hex(tmpctx, msg));
 	}
 	if (tlvs->query_flags) {
+		/* BOLT #7:
+		 *
+		 * The receiver:
+		 *...
+		 *  - if the incoming message includes
+		 *    `query_short_channel_ids_tlvs`:
+		 *    - if `encoding_type` is not a known encoding type:
+		 *      - MAY fail the connection
+		 */
 		flags = decode_scid_query_flags(tmpctx, tlvs->query_flags);
 		if (!flags) {
 			return towire_errorfmt(peer, NULL,
@@ -642,14 +617,6 @@ static const u8 *handle_query_short_channel_ids(struct peer *peer, const u8 *msg
 		}
 	} else
 		flags = NULL;
-#else
-	if (!fromwire_query_short_channel_ids(tmpctx, msg, &chain, &encoded)) {
-		return towire_errorfmt(peer, NULL,
-				       "Bad query_short_channel_ids %s",
-				       tal_hex(tmpctx, msg));
-	}
-	flags = NULL;
-#endif
 
 	if (!bitcoin_blkid_eq(&peer->daemon->chain_hash, &chain)) {
 		status_debug("%s sent query_short_channel_ids chainhash %s",
@@ -677,11 +644,10 @@ static const u8 *handle_query_short_channel_ids(struct peer *peer, const u8 *msg
 				       tal_hex(tmpctx, encoded));
 	}
 
-	/* BOLT-61a1365a45cc8b463ddbbe3429d350f8eac787dd #7:
+	/* BOLT #7:
 	 *
 	 * The receiver:
 	 *...
-	 *  - if the incoming message includes `query_short_channel_ids_tlvs`:
 	 *    - if `encoded_query_flags` does not decode to exactly one flag per
 	 *      `short_channel_id`:
 	 *      - MAY fail the connection.
@@ -700,8 +666,8 @@ static const u8 *handle_query_short_channel_ids(struct peer *peer, const u8 *msg
 
 	/* BOLT #7:
 	 *
-	 * - MUST respond to each known `short_channel_id` with a `channel_announcement`
-	 *   and the latest `channel_update` for each end
+	 * - MUST respond to each known `short_channel_id`:
+	 *...
 	 *    - SHOULD NOT wait for the next outgoing gossip flush to send
 	 *      these.
 	 */
@@ -764,7 +730,6 @@ static void reply_channel_range(struct peer *peer,
 	 *   - otherwise:
 	 *     - SHOULD set `complete` to 1.
 	 */
-#if EXPERIMENTAL_FEATURES
  	struct tlv_reply_channel_range_tlvs *tlvs
  		= tlv_reply_channel_range_tlvs_new(tmpctx);
 	tlvs->timestamps_tlv = timestamps;
@@ -775,17 +740,10 @@ static void reply_channel_range(struct peer *peer,
 					     first_blocknum,
 					     number_of_blocks,
 					     1, encoded_scids, tlvs);
-#else
-	u8 *msg = towire_reply_channel_range(NULL,
-					     &peer->daemon->chain_hash,
-					     first_blocknum,
-					     number_of_blocks,
-					     1, encoded_scids);
-#endif
 	queue_peer_msg(peer, take(msg));
 }
 
-/* BOLT-61a1365a45cc8b463ddbbe3429d350f8eac787dd #7:
+/* BOLT #7:
  *
  * `query_option_flags` is a bitfield represented as a minimally-encoded varint.
  * Bits have the following meaning:
@@ -800,7 +758,7 @@ enum query_option_flags {
 	QUERY_ADD_CHECKSUMS = 0x2,
 };
 
-/* BOLT-61a1365a45cc8b463ddbbe3429d350f8eac787dd #7:
+/* BOLT #7:
  *
  * The checksum of a `channel_update` is the CRC32C checksum as specified in
  * [RFC3720](https://tools.ietf.org/html/rfc3720#appendix-B.4) of this
@@ -993,8 +951,6 @@ static u8 *handle_query_channel_range(struct peer *peer, const u8 *msg)
 	u32 first_blocknum, number_of_blocks, tail_blocks;
 	struct short_channel_id last_scid;
 	enum query_option_flags query_option_flags;
-
-#if EXPERIMENTAL_FEATURES
 	struct tlv_query_channel_range_tlvs *tlvs
 		= tlv_query_channel_range_tlvs_new(msg);
 
@@ -1009,15 +965,6 @@ static u8 *handle_query_channel_range(struct peer *peer, const u8 *msg)
 		query_option_flags = tlvs->query_option->query_option_flags;
 	else
 		query_option_flags = 0;
-#else
-	if (!fromwire_query_channel_range(msg, &chain_hash,
-					  &first_blocknum, &number_of_blocks)) {
-		return towire_errorfmt(peer, NULL,
-				       "Bad query_channel_range %s",
-				       tal_hex(tmpctx, msg));
-	}
-	query_option_flags = 0;
-#endif
 
 	/* If they ask for the wrong chain, we give an empty response
 	 * with the `complete` flag unset */
@@ -1026,13 +973,8 @@ static u8 *handle_query_channel_range(struct peer *peer, const u8 *msg)
 			     type_to_string(tmpctx, struct node_id, &peer->id),
 			     type_to_string(tmpctx, struct bitcoin_blkid,
 					    &chain_hash));
-#if EXPERIMENTAL_FEATURES
 		u8 *end = towire_reply_channel_range(NULL, &chain_hash, first_blocknum,
 		                                     number_of_blocks, false, NULL, NULL);
-#else
-		u8 *end = towire_reply_channel_range(NULL, &chain_hash, first_blocknum,
-		                                     number_of_blocks, false, NULL);
-#endif
 		queue_peer_msg(peer, take(end));
 		return NULL;
 	}
@@ -1074,10 +1016,9 @@ static const u8 *handle_reply_channel_range(struct peer *peer, const u8 *msg)
 	struct short_channel_id *scids;
 	size_t n;
 	unsigned long b;
-
-#if EXPERIMENTAL_FEATURES
 	struct tlv_reply_channel_range_tlvs *tlvs
 		= tlv_reply_channel_range_tlvs_new(tmpctx);
+
 	if (!fromwire_reply_channel_range(tmpctx, msg, &chain, &first_blocknum,
 					  &number_of_blocks, &complete,
 					  &encoded, tlvs)) {
@@ -1085,15 +1026,6 @@ static const u8 *handle_reply_channel_range(struct peer *peer, const u8 *msg)
 				       "Bad reply_channel_range w/tlvs %s",
 				       tal_hex(tmpctx, msg));
 	}
-#else
-	if (!fromwire_reply_channel_range(tmpctx, msg, &chain, &first_blocknum,
-					  &number_of_blocks, &complete,
-					  &encoded)) {
-		return towire_errorfmt(peer, NULL,
-				       "Bad reply_channel_range %s",
-				       tal_hex(tmpctx, msg));
-	}
-#endif
 
 	if (!bitcoin_blkid_eq(&peer->daemon->chain_hash, &chain)) {
 		return towire_errorfmt(peer, NULL,
@@ -1286,10 +1218,6 @@ static void uniquify_node_ids(struct node_id **ids)
 	size_t dst, src;
 
 	/* BOLT #7:
-	 *
-	 * - MUST follow with any `node_announcement`s for each
-	 *   `channel_announcement`
-	 *
 	 *   - SHOULD avoid sending duplicate `node_announcements` in
 	 *     response to a single `query_short_channel_ids`.
 	 */
@@ -1320,10 +1248,7 @@ static void maybe_create_next_scid_reply(struct peer *peer)
 
 	/* BOLT #7:
 	 *
-	 *   - MUST respond to each known `short_channel_id` with a
-	 *     `channel_announcement` and the latest `channel_update` for each end
-	 *     - SHOULD NOT wait for the next outgoing gossip flush
-	 *       to send these.
+	 *   - MUST respond to each known `short_channel_id`:
 	 */
 	/* Search for next short_channel_id we know about. */
 	num = tal_count(peer->scid_queries);
@@ -1334,7 +1259,7 @@ static void maybe_create_next_scid_reply(struct peer *peer)
 		if (!chan || !is_chan_public(chan))
 			continue;
 
-		/* BOLT-61a1365a45cc8b463ddbbe3429d350f8eac787dd #7:
+		/* BOLT #7:
 		 * - if bit 0 of `query_flag` is set:
 		 *   - MUST reply with a `channel_announcement`
 		 */
@@ -1343,7 +1268,7 @@ static void maybe_create_next_scid_reply(struct peer *peer)
 			sent = true;
 		}
 
-		/* BOLT-61a1365a45cc8b463ddbbe3429d350f8eac787dd #7:
+		/* BOLT #7:
 		 * - if bit 1 of `query_flag` is set and it has received a
 		 *   `channel_update` from `node_id_1`:
 		 *   - MUST reply with the latest `channel_update` for
@@ -1363,7 +1288,7 @@ static void maybe_create_next_scid_reply(struct peer *peer)
 			sent = true;
 		}
 
-		/* BOLT-61a1365a45cc8b463ddbbe3429d350f8eac787dd #7:
+		/* BOLT #7:
 		 * - if bit 3 of `query_flag` is set and it has received
 		 *   a `node_announcement` from `node_id_1`:
 		 *   - MUST reply with the latest `node_announcement` for
@@ -1390,10 +1315,20 @@ static void maybe_create_next_scid_reply(struct peer *peer)
 
 	/* BOLT #7:
 	 *
-	 *  - MUST follow with any `node_announcement`s for each
-	 *   `channel_announcement`
-	 *    - SHOULD avoid sending duplicate `node_announcements` in response
-	 *     to a single `query_short_channel_ids`.
+	 *    - if the incoming message does not include `encoded_query_flags`:
+	 *      ...
+	 *      - MUST follow with any `node_announcement`s for each
+	 *      `channel_announcement`
+	 *    - otherwise:
+	 *      ...
+	 *      - if bit 3 of `query_flag` is set and it has received a
+	 *        `node_announcement` from `node_id_1`:
+	 *        - MUST reply with the latest `node_announcement` for
+	 *          `node_id_1`
+	 *      - if bit 4 of `query_flag` is set and it has received a
+	 *        `node_announcement` from `node_id_2`:
+	 *        - MUST reply with the latest `node_announcement` for
+	 *          `node_id_2`
 	 */
 	/* If we haven't sent anything above, we look for the next
 	 * node_announcement to send. */
@@ -2520,14 +2455,9 @@ static struct io_plan *query_channel_range(struct io_conn *conn,
 	status_debug("sending query_channel_range for blocks %u+%u",
 		     first_blocknum, number_of_blocks);
 
-#if EXPERIMENTAL_FEATURES
 	msg = towire_query_channel_range(NULL, &daemon->chain_hash,
 					 first_blocknum, number_of_blocks,
 					 NULL);
-#else
-	msg = towire_query_channel_range(NULL, &daemon->chain_hash,
-					 first_blocknum, number_of_blocks);
-#endif
 	queue_peer_msg(peer, take(msg));
 	peer->range_first_blocknum = first_blocknum;
 	peer->range_end_blocknum = first_blocknum + number_of_blocks;

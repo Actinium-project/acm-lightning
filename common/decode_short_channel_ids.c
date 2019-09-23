@@ -63,7 +63,6 @@ struct short_channel_id *decode_short_ids(const tal_t *ctx, const u8 *encoded)
 	return NULL;
 }
 
-#if EXPERIMENTAL_FEATURES
 bigsize_t *decode_scid_query_flags(const tal_t *ctx,
 				   const struct tlv_query_short_channel_ids_tlvs_query_flags *qf)
 {
@@ -71,7 +70,7 @@ bigsize_t *decode_scid_query_flags(const tal_t *ctx,
 	size_t max = tal_count(encoded);
 	bigsize_t *flags;
 
-	/* BOLT-61a1365a45cc8b463ddbbe3429d350f8eac787dd #7:
+	/* BOLT #7:
 	 *
 	 * The receiver:
 	 *...
@@ -104,4 +103,3 @@ bigsize_t *decode_scid_query_flags(const tal_t *ctx,
 	}
 	return NULL;
 }
-#endif /* EXPERIMENTAL_FEATURES */

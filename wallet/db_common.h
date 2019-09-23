@@ -15,7 +15,6 @@
 struct db {
 	char *filename;
 	const char *in_transaction;
-	sqlite3 *sql;
 
 	/* DB-specific context */
 	void *conn;
@@ -56,7 +55,7 @@ enum db_binding_type {
 struct db_binding {
 	enum db_binding_type type;
 	union {
-		int i;
+		s32 i;
 		u64 u64;
 		const char* text;
 		const u8 *blob;
@@ -86,6 +85,8 @@ struct db_stmt {
 	void *inner_stmt;
 
 	bool executed;
+
+	int row;
 };
 
 struct db_config {
