@@ -1122,7 +1122,7 @@ find_shorter_route(const tal_t *ctx, struct routing_state *rstate,
 		   struct node *src, struct node *dst,
 		   const struct node *me,
 		   struct amount_msat msat,
-		   size_t max_hops,
+		   u32 max_hops,
 		   double fuzz, const struct siphash_seed *base_seed,
 		   struct chan **long_route,
 		   struct amount_msat *fee)
@@ -1245,7 +1245,7 @@ find_route(const tal_t *ctx, struct routing_state *rstate,
 	   struct amount_msat msat,
 	   double riskfactor,
 	   double fuzz, const struct siphash_seed *base_seed,
-	   size_t max_hops,
+	   u32 max_hops,
 	   struct amount_msat *fee)
 {
 	struct node *src, *dst;
@@ -1602,6 +1602,7 @@ bool routing_add_channel_announcement(struct routing_state *rstate,
 
 u8 *handle_channel_announcement(struct routing_state *rstate,
 				const u8 *announce TAKES,
+				u32 current_blockheight,
 				const struct short_channel_id **scid)
 {
 	struct pending_cannouncement *pending;
@@ -1634,6 +1635,19 @@ u8 *handle_channel_announcement(struct routing_state *rstate,
 				      "Malformed channel_announcement %s",
 				      tal_hex(pending, pending->announce));
 		goto malformed;
+	}
+
+	/* If we know the blockheight, and it's in the future, reject
+	 * out-of-hand.  Remember, it should be 6 deep before they tell us
+	 * anyway. */
+	if (current_blockheight != 0
+	    && short_channel_id_blocknum(&pending->short_channel_id) > current_blockheight) {
+		status_debug("Ignoring future channel_announcment for %s"
+			     " (current block %u)",
+			     type_to_string(tmpctx, struct short_channel_id,
+					    &pending->short_channel_id),
+			     current_blockheight);
+		goto ignored;
 	}
 
 	/* If a prior txout lookup failed there is little point it trying
@@ -1730,6 +1744,20 @@ u8 *handle_channel_announcement(struct routing_state *rstate,
 		 *    - SHOULD fail the connection.
 		 */
 		goto malformed;
+	}
+
+	/* Don't add an infinite number of pending announcements.  If we're
+	 * catching up with the bitcoin chain, though, they can definitely
+	 * pile up. */
+	if (pending_cannouncement_map_count(&rstate->pending_cannouncements)
+	    > 100000) {
+		static bool warned = false;
+		if (!warned) {
+			status_unusual("Flooded by channel_announcements:"
+				       " ignoring some");
+			warned = true;
+		}
+		goto ignored;
 	}
 
 	status_debug("Received channel_announcement for channel %s",
@@ -2494,7 +2522,7 @@ struct route_hop *get_route(const tal_t *ctx, struct routing_state *rstate,
 			    u32 final_cltv,
 			    double fuzz, u64 seed,
 			    struct exclude_entry **excluded,
-			    size_t max_hops)
+			    u32 max_hops)
 {
 	struct chan **route;
 	struct amount_msat total_amount;

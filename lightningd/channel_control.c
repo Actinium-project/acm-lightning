@@ -3,6 +3,7 @@
 #include <ccan/cast/cast.h>
 #include <channeld/gen_channel_wire.h>
 #include <common/features.h>
+#include <common/gossip_constants.h>
 #include <common/json_command.h>
 #include <common/jsonrpc_errors.h>
 #include <common/memleak.h>
@@ -12,7 +13,6 @@
 #include <common/wallet_tx.h>
 #include <common/wire_error.h>
 #include <errno.h>
-#include <gossipd/gossip_constants.h>
 #include <hsmd/gen_hsm_wire.h>
 #include <inttypes.h>
 #include <lightningd/channel_control.h>
@@ -376,9 +376,9 @@ void peer_start_channeld(struct channel *channel,
 
 	if (channel->scid) {
 		scid = *channel->scid;
-		/* Subtle: depth=1 at funding height. */
-		reached_announce_depth = get_block_height(ld->topology) + 1 >=
-				       short_channel_id_blocknum(&scid) + ANNOUNCE_MIN_DEPTH;
+		reached_announce_depth
+			= is_scid_depth_announceable(&scid,
+						     get_block_height(ld->topology));
 		log_debug(channel->log, "Already have funding locked in%s",
 			  reached_announce_depth
 			  ? " (and ready to announce)" : "");

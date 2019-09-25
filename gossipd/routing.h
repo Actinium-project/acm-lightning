@@ -7,9 +7,9 @@
 #include <ccan/intmap/intmap.h>
 #include <ccan/time/time.h>
 #include <common/amount.h>
+#include <common/gossip_constants.h>
 #include <common/node_id.h>
 #include <gossipd/broadcast.h>
-#include <gossipd/gossip_constants.h>
 #include <gossipd/gossip_store.h>
 #include <wire/gen_onion_wire.h>
 #include <wire/wire.h>
@@ -346,6 +346,7 @@ struct chan *new_chan(struct routing_state *rstate,
  */
 u8 *handle_channel_announcement(struct routing_state *rstate,
 				const u8 *announce TAKES,
+				u32 current_blockheight,
 				const struct short_channel_id **scid);
 
 /**
@@ -385,7 +386,7 @@ struct route_hop *get_route(const tal_t *ctx, struct routing_state *rstate,
 			    double fuzz,
 			    u64 seed,
 			    struct exclude_entry **excluded,
-			    size_t max_hops);
+			    u32 max_hops);
 /* Disable channel(s) based on the given routing failure. */
 void routing_failure(struct routing_state *rstate,
 		     const struct node_id *erring_node,
