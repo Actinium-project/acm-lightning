@@ -248,6 +248,9 @@ struct routing_state {
 	/* Which chain we're on */
 	const struct chainparams *chainparams;
 
+	/* TImers base from struct gossipd. */
+	struct timers *timers;
+
 	/* All known nodes. */
 	struct node_map *nodes;
 
@@ -275,7 +278,9 @@ struct routing_state {
 
 	/* Cache for txout queries that failed. Allows us to skip failed
 	 * checks if we get another announcement for the same scid. */
-	UINTMAP(bool) txout_failures;
+	size_t num_txout_failures;
+	UINTMAP(bool) txout_failures, txout_failures_old;
+	struct oneshot *txout_failure_timer;
 
         /* A map of local channels by short_channel_ids */
 	struct local_chan_map local_chan_map;
@@ -286,6 +291,9 @@ struct routing_state {
 
 	/* Speed up gossip. */
 	bool dev_fast_gossip;
+
+	/* Speed up pruning. */
+	bool dev_fast_gossip_prune;
 #endif
 };
 
@@ -321,8 +329,10 @@ struct routing_state *new_routing_state(const tal_t *ctx,
 					const struct chainparams *chainparams,
 					const struct node_id *local_id,
 					struct list_head *peers,
+					struct timers *timers,
 					const u32 *dev_gossip_time TAKES,
-					bool dev_fast_gossip);
+					bool dev_fast_gossip,
+					bool dev_fast_gossip_prune);
 
 /**
  * Add a new bidirectional channel from id1 to id2 with the given

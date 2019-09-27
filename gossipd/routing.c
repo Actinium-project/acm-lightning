@@ -10,6 +10,7 @@
 #include <common/memleak.h>
 #include <common/pseudorand.h>
 #include <common/status.h>
+#include <common/timeout.h>
 #include <common/type_to_string.h>
 #include <common/wire_error.h>
 #include <common/wireaddr.h>
@@ -207,7 +208,7 @@ static bool timestamp_reasonable(struct routing_state *rstate, u32 timestamp)
 	if (timestamp > now + 24*60*60)
 		return false;
 	/* More than 2 weeks behind? */
-	if (timestamp < now - GOSSIP_PRUNE_INTERVAL(rstate->dev_fast_gossip))
+	if (timestamp < now - GOSSIP_PRUNE_INTERVAL(rstate->dev_fast_gossip_prune))
 		return false;
 	return true;
 }
@@ -223,6 +224,7 @@ static void memleak_help_routing_tables(struct htable *memtable,
 	memleak_remove_htable(memtable, &rstate->pending_node_map->raw);
 	memleak_remove_htable(memtable, &rstate->pending_cannouncements.raw);
 	memleak_remove_htable(memtable, &rstate->local_chan_map.raw);
+	memleak_remove_uintmap(memtable, &rstate->unupdated_chanmap);
 
 	for (n = node_map_first(rstate->nodes, &nit);
 	     n;
@@ -233,16 +235,56 @@ static void memleak_help_routing_tables(struct htable *memtable,
 }
 #endif /* DEVELOPER */
 
+/* Once an hour, or at 10000 entries, we expire old ones */
+static void txout_failure_age(struct routing_state *rstate)
+{
+	uintmap_clear(&rstate->txout_failures_old);
+	rstate->txout_failures_old = rstate->txout_failures;
+	uintmap_init(&rstate->txout_failures);
+	rstate->num_txout_failures = 0;
+
+	rstate->txout_failure_timer = new_reltimer(rstate->timers,
+						   rstate, time_from_sec(3600),
+						   txout_failure_age, rstate);
+}
+
+static void add_to_txout_failures(struct routing_state *rstate,
+				  const struct short_channel_id *scid)
+{
+	if (uintmap_add(&rstate->txout_failures, scid->u64, true)
+	    && ++rstate->num_txout_failures == 10000) {
+		tal_free(rstate->txout_failure_timer);
+		txout_failure_age(rstate);
+	}
+}
+
+static bool in_txout_failures(struct routing_state *rstate,
+			      const struct short_channel_id *scid)
+{
+	if (uintmap_get(&rstate->txout_failures, scid->u64))
+		return true;
+
+	/* If we were going to expire it, we no longer are. */
+	if (uintmap_get(&rstate->txout_failures_old, scid->u64)) {
+		add_to_txout_failures(rstate, scid);
+		return true;
+	}
+	return false;
+}
+
 struct routing_state *new_routing_state(const tal_t *ctx,
 					const struct chainparams *chainparams,
 					const struct node_id *local_id,
 					struct list_head *peers,
+					struct timers *timers,
 					const u32 *dev_gossip_time TAKES,
-					bool dev_fast_gossip)
+					bool dev_fast_gossip,
+					bool dev_fast_gossip_prune)
 {
 	struct routing_state *rstate = tal(ctx, struct routing_state);
 	rstate->nodes = new_node_map(rstate);
 	rstate->gs = gossip_store_new(rstate, peers);
+	rstate->timers = timers;
 	rstate->chainparams = chainparams;
 	rstate->local_id = *local_id;
 	rstate->local_channel_announced = false;
@@ -252,8 +294,10 @@ struct routing_state *new_routing_state(const tal_t *ctx,
 	uintmap_init(&rstate->chanmap);
 	uintmap_init(&rstate->unupdated_chanmap);
 	local_chan_map_init(&rstate->local_chan_map);
+	rstate->num_txout_failures = 0;
 	uintmap_init(&rstate->txout_failures);
-
+	uintmap_init(&rstate->txout_failures_old);
+	txout_failure_age(rstate);
 	rstate->pending_node_map = tal(ctx, struct pending_node_map);
 	pending_node_map_init(rstate->pending_node_map);
 
@@ -265,6 +309,7 @@ struct routing_state *new_routing_state(const tal_t *ctx,
 	} else
 		rstate->gossip_time = NULL;
 	rstate->dev_fast_gossip = dev_fast_gossip;
+	rstate->dev_fast_gossip_prune = dev_fast_gossip_prune;
 #endif
 	tal_add_destructor(rstate, destroy_routing_state);
 	memleak_add_helper(rstate, memleak_help_routing_tables);
@@ -1832,7 +1877,7 @@ bool handle_pending_cannouncement(struct routing_state *rstate,
 			     type_to_string(pending, struct short_channel_id,
 					    scid));
 		tal_free(pending);
-		uintmap_add(&rstate->txout_failures, scid->u64, true);
+		add_to_txout_failures(rstate, scid);
 		return false;
 	}
 
@@ -2030,7 +2075,7 @@ bool routing_add_channel_update(struct routing_state *rstate,
 		}
 
 		/* Allow redundant updates once every 7 days */
-		if (timestamp < hc->bcast.timestamp + GOSSIP_PRUNE_INTERVAL(rstate->dev_fast_gossip) / 2
+		if (timestamp < hc->bcast.timestamp + GOSSIP_PRUNE_INTERVAL(rstate->dev_fast_gossip_prune) / 2
 		    && !cupdate_different(rstate->gs, hc, update)) {
 			status_debug("Ignoring redundant update for %s/%u"
 				     " (last %u, now %u)",
@@ -2210,7 +2255,7 @@ u8 *handle_channel_update(struct routing_state *rstate, const u8 *update TAKES,
 	/* If we dropped the matching announcement for this channel due to the
 	 * txout query failing, don't report failure, it's just too noisy on
 	 * mainnet */
-	if (uintmap_get(&rstate->txout_failures, short_channel_id.u64))
+	if (in_txout_failures(rstate, &short_channel_id))
 		return NULL;
 
 	/* If we have an unvalidated channel, just queue on that */
@@ -2382,7 +2427,7 @@ bool routing_add_node_announcement(struct routing_state *rstate,
 		}
 
 		/* Allow redundant updates once every 7 days */
-		if (timestamp < node->bcast.timestamp + GOSSIP_PRUNE_INTERVAL(rstate->dev_fast_gossip) / 2
+		if (timestamp < node->bcast.timestamp + GOSSIP_PRUNE_INTERVAL(rstate->dev_fast_gossip_prune) / 2
 		    && !nannounce_different(rstate->gs, node, msg)) {
 			status_debug("Ignoring redundant nannounce for %s"
 				     " (last %u, now %u)",
@@ -2730,7 +2775,7 @@ void route_prune(struct routing_state *rstate)
 {
 	u64 now = gossip_time_now(rstate).ts.tv_sec;
 	/* Anything below this highwater mark ought to be pruned */
-	const s64 highwater = now - GOSSIP_PRUNE_INTERVAL(rstate->dev_fast_gossip);
+	const s64 highwater = now - GOSSIP_PRUNE_INTERVAL(rstate->dev_fast_gossip_prune);
 	struct chan **pruned = tal_arr(tmpctx, struct chan *, 0);
 	u64 idx;
 
