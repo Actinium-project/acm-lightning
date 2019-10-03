@@ -2014,7 +2014,7 @@ static void resend_commitment(struct peer *peer, const struct changed_htlc *last
 			       peer->revocations_received);
 }
 
-/* BOLT-531c8d7d9b01ab610b8a73a0deba1b9e9c83e1ed #2:
+/* BOLT #2:
  *
  * A receiving node:
  *  - if `option_static_remotekey` applies to the commitment transaction:
@@ -2077,7 +2077,7 @@ static void check_future_dataloss_fields(struct peer *peer,
 	peer_failed(peer->pps, &peer->channel_id, "Awaiting unilateral close");
 }
 
-/* BOLT-531c8d7d9b01ab610b8a73a0deba1b9e9c83e1ed #2:
+/* BOLT #2:
  *
  * A receiving node:
  *  - if `option_static_remotekey` applies to the commitment transaction:
@@ -2239,7 +2239,7 @@ static void peer_reconnect(struct peer *peer,
 	get_per_commitment_point(peer->next_index[LOCAL] - 1,
 				 &my_current_per_commitment_point, NULL);
 
-	/* BOLT-531c8d7d9b01ab610b8a73a0deba1b9e9c83e1ed #2:
+	/* BOLT #2:
 	 *
 	 *   - upon reconnection:
 	 *     - if a channel is in an error state:
@@ -2272,7 +2272,6 @@ static void peer_reconnect(struct peer *peer,
 	 *       - MUST set `your_last_per_commitment_secret` to the last
 	 *         `per_commitment_secret` it received
 	 */
-#if EXPERIMENTAL_FEATURES
 	if (peer->channel->option_static_remotekey) {
 		msg = towire_channel_reestablish_option_static_remotekey
 			(NULL, &peer->channel_id,
@@ -2281,9 +2280,7 @@ static void peer_reconnect(struct peer *peer,
 			 last_remote_per_commit_secret,
 			 /* Can send any (valid) point here */
 			 &peer->remote_per_commit);
-	} else
-#endif /* EXPERIMENTAL_FEATURES */
-	if (dataloss_protect) {
+	} else if (dataloss_protect) {
 		msg = towire_channel_reestablish_option_data_loss_protect
 			(NULL, &peer->channel_id,
 			 peer->next_index[LOCAL],
@@ -2310,7 +2307,6 @@ static void peer_reconnect(struct peer *peer,
 	} while (handle_peer_gossip_or_error(peer->pps, &peer->channel_id, msg)
 		 || capture_premature_msg(&premature_msgs, msg));
 
-#if EXPERIMENTAL_FEATURES
 	if (peer->channel->option_static_remotekey) {
 		struct pubkey ignore;
 		if (!fromwire_channel_reestablish_option_static_remotekey(msg,
@@ -2325,9 +2321,7 @@ static void peer_reconnect(struct peer *peer,
 				    wire_type_name(fromwire_peektype(msg)),
 				    tal_hex(msg, msg));
 		}
-	} else
-#endif /* EXPERIMENTAL_FEATURES */
-	if (dataloss_protect) {
+	} else if (dataloss_protect) {
 		if (!fromwire_channel_reestablish_option_data_loss_protect(msg,
 					&channel_id,
 					&next_commitment_number,
@@ -2950,7 +2944,7 @@ static void init_channel(struct peer *peer)
 
 	msg = wire_sync_read(tmpctx, MASTER_FD);
 	if (!fromwire_channel_init(peer, msg,
-				   &peer->chain_hash,
+				   &chainparams,
 				   &funding_txid, &funding_txout,
 				   &funding,
 				   &minimum_depth,
@@ -3007,6 +3001,7 @@ static void init_channel(struct peer *peer)
 	}
 	/* stdin == requests, 3 == peer, 4 = gossip, 5 = gossip_store, 6 = HSM */
 	per_peer_state_set_fds(peer->pps, 3, 4, 5);
+	peer->chain_hash = chainparams->genesis_blockhash;
 
 	status_debug("init %s: remote_per_commit = %s, old_remote_per_commit = %s"
 		     " next_idx_local = %"PRIu64
@@ -3023,9 +3018,7 @@ static void init_channel(struct peer *peer)
 		     feerate_per_kw[LOCAL], feerate_per_kw[REMOTE],
 		     peer->feerate_min, peer->feerate_max);
 
-#if EXPERIMENTAL_FEATURES
 	status_debug("option_static_remotekey = %u", option_static_remotekey);
-#endif
 
 	if(remote_ann_node_sig && remote_ann_bitcoin_sig) {
 		peer->announcement_node_sigs[REMOTE] = *remote_ann_node_sig;

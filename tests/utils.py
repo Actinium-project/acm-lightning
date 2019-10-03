@@ -8,12 +8,14 @@ from lightning import LightningRpc
 import json
 import logging
 import lzma
+import math
 import os
 import random
 import re
 import shutil
 import sqlite3
 import string
+import struct
 import subprocess
 import threading
 import time
@@ -64,12 +66,12 @@ def wait_for(success, timeout=TIMEOUT):
         raise ValueError("Error waiting for {}", success)
 
 
-def write_config(filename, opts, regtest_opts=None):
+def write_config(filename, opts, regtest_opts=None, section_name='regtest'):
     with open(filename, 'w') as f:
         for k, v in opts.items():
             f.write("{}={}\n".format(k, v))
         if regtest_opts:
-            f.write("[regtest]\n")
+            f.write("[{}]\n".format(section_name))
             for k, v in regtest_opts.items():
                 f.write("{}={}\n".format(k, v))
 
@@ -303,9 +305,9 @@ class BitcoinD(TailableProc):
         # For after 0.16.1 (eg. 3f398d7a17f136cd4a67998406ca41a124ae2966), this
         # needs its own [regtest] section.
         BITCOIND_REGTEST = {'rpcport': rpcport}
-        btc_conf_file = os.path.join(bitcoin_dir, 'bitcoin.conf')
-        write_config(btc_conf_file, BITCOIND_CONFIG, BITCOIND_REGTEST)
-        self.rpc = SimpleBitcoinProxy(btc_conf_file=btc_conf_file)
+        self.conf_file = os.path.join(bitcoin_dir, 'bitcoin.conf')
+        write_config(self.conf_file, BITCOIND_CONFIG, BITCOIND_REGTEST)
+        self.rpc = SimpleBitcoinProxy(btc_conf_file=self.conf_file)
         self.proxies = []
 
     def start(self):
@@ -385,6 +387,55 @@ class BitcoinD(TailableProc):
         self.wait_for_log(r'UpdateTip: new best=.* height={}'.format(final_len))
         return hashes
 
+    def getnewaddress(self):
+        return self.rpc.getnewaddress()
+
+
+class ElementsD(BitcoinD):
+    def __init__(self, bitcoin_dir="/tmp/bitcoind-test", rpcport=None):
+        config = BITCOIND_CONFIG.copy()
+        if 'regtest' in config:
+            del config['regtest']
+
+        config['chain'] = 'liquid-regtest'
+        BitcoinD.__init__(self, bitcoin_dir, rpcport)
+
+        self.cmd_line = [
+            'elementsd',
+            '-datadir={}'.format(bitcoin_dir),
+            '-printtoconsole',
+            '-server',
+            '-logtimestamps',
+            '-nolisten',
+            '-validatepegin=0',
+            '-con_blocksubsidy=5000000000',
+        ]
+        conf_file = os.path.join(bitcoin_dir, 'elements.conf')
+        config['rpcport'] = self.rpcport
+        BITCOIND_REGTEST = {'rpcport': self.rpcport}
+        write_config(conf_file, config, BITCOIND_REGTEST, section_name='liquid-regtest')
+        self.conf_file = conf_file
+        self.rpc = SimpleBitcoinProxy(btc_conf_file=self.conf_file)
+        self.prefix = 'elementsd'
+
+    def generate_block(self, numblocks=1, wait_for_mempool=0):
+        if wait_for_mempool:
+            if isinstance(wait_for_mempool, str):
+                wait_for_mempool = [wait_for_mempool]
+            if isinstance(wait_for_mempool, list):
+                wait_for(lambda: all(txid in self.rpc.getrawmempool() for txid in wait_for_mempool))
+            else:
+                wait_for(lambda: len(self.rpc.getrawmempool()) >= wait_for_mempool)
+        # As of 0.16, generate() is removed; use generatetoaddress.
+        return self.rpc.generate(numblocks)
+
+    def getnewaddress(self):
+        """Need to get an address and then make it unconfidential
+        """
+        addr = self.rpc.getnewaddress()
+        info = self.rpc.getaddressinfo(addr)
+        return info['unconfidential']
+
 
 class LightningD(TailableProc):
     def __init__(self, lightning_dir, bitcoindproxy, port=9735, random_hsm=False, node_id=0):
@@ -402,7 +453,7 @@ class LightningD(TailableProc):
             'lightning-dir': lightning_dir,
             'addr': '127.0.0.1:{}'.format(port),
             'allow-deprecated-apis': 'false',
-            'network': 'regtest',
+            'network': config.get('TEST_NETWORK', 'regtest'),
             'ignore-fee-limits': 'false',
             'bitcoin-rpcuser': BITCOIND_CONFIG['rpcuser'],
             'bitcoin-rpcpassword': BITCOIND_CONFIG['rpcpassword'],
@@ -750,6 +801,29 @@ class LightningNode(object):
 
         wait_for(lambda: txid in self.bitcoin.rpc.getrawmempool())
 
+    def query_gossip(self, querytype, *args):
+        """Generate a gossip query, feed it into this node and get responses
+        in hex"""
+        query = subprocess.run(['devtools/mkquery',
+                                querytype] + [str(a) for a in args],
+                               check=True,
+                               timeout=TIMEOUT,
+                               stdout=subprocess.PIPE).stdout.strip()
+        out = subprocess.run(['devtools/gossipwith',
+                              '--timeout-after={}'.format(int(math.sqrt(TIMEOUT) * 1000)),
+                              '{}@localhost:{}'.format(self.info['id'],
+                                                       self.port),
+                              query],
+                             check=True,
+                             timeout=TIMEOUT, stdout=subprocess.PIPE).stdout
+
+        msgs = []
+        while len(out):
+            length = struct.unpack('>H', out[0:2])[0]
+            msgs.append(out[2:2 + length].hex())
+            out = out[2 + length:]
+        return msgs
+
 
 class NodeFactory(object):
     """A factory to setup and start `lightningd` daemons.
@@ -885,7 +959,7 @@ class NodeFactory(object):
                 'valgrind',
                 '-q',
                 '--trace-children=yes',
-                '--trace-children-skip=*python*,*bitcoin-cli*',
+                '--trace-children-skip=*python*,*bitcoin-cli*,*elements-cli*',
                 '--error-exitcode=7',
                 '--log-file={}/valgrind-errors.%p'.format(node.daemon.lightning_dir)
             ]

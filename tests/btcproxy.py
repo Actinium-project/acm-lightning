@@ -10,7 +10,6 @@ import decimal
 import flask
 import json
 import logging
-import os
 import threading
 
 
@@ -34,8 +33,7 @@ class BitcoinRpcProxy(object):
         self.request_count = 0
 
     def _handle_request(self, r):
-        conf_file = os.path.join(self.bitcoind.bitcoin_dir, 'bitcoin.conf')
-        brpc = BitcoinProxy(btc_conf_file=conf_file)
+        brpc = BitcoinProxy(btc_conf_file=self.bitcoind.conf_file)
         method = r['method']
 
         # If we have set a mock for this method reply with that instead of

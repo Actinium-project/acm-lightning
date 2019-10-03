@@ -1,6 +1,6 @@
 from concurrent import futures
 from db import SqliteDbProvider, PostgresDbProvider
-from utils import NodeFactory, BitcoinD
+from utils import NodeFactory, BitcoinD, ElementsD
 
 import logging
 import os
@@ -15,6 +15,7 @@ with open('config.vars') as configfile:
     config = dict([(line.rstrip().split('=', 1)) for line in configfile])
 
 VALGRIND = os.getenv("VALGRIND", config['VALGRIND']) == "1"
+TEST_NETWORK = os.getenv("TEST_NETWORK", config['TEST_NETWORK'])
 DEVELOPER = os.getenv("DEVELOPER", config['DEVELOPER']) == "1"
 TEST_DEBUG = os.getenv("TEST_DEBUG", "0") == "1"
 
@@ -74,9 +75,17 @@ def test_name(request):
     yield request.function.__name__
 
 
+network_daemons = {
+    'regtest': BitcoinD,
+    'liquid-regtest': ElementsD,
+}
+
+
 @pytest.fixture
 def bitcoind(directory, teardown_checks):
-    bitcoind = BitcoinD(bitcoin_dir=directory)
+    chaind = network_daemons[config.get('TEST_NETWORK', 'regtest')]
+    bitcoind = chaind(bitcoin_dir=directory)
+
     try:
         bitcoind.start()
     except Exception:
@@ -297,3 +306,29 @@ def executor(teardown_checks):
     ex = futures.ThreadPoolExecutor(max_workers=20)
     yield ex
     ex.shutdown(wait=False)
+
+
+@pytest.fixture
+def chainparams():
+    chainparams = {
+        'regtest': {
+            "bip173_prefix": "bcrt",
+            "elements": False,
+            "name": "regtest",
+            "p2sh_prefix": '2',
+            "elements": False,
+            "example_addr": "bcrt1qeyyk6sl5pr49ycpqyckvmttus5ttj25pd0zpvg",
+            "feeoutput": False,
+        },
+        'liquid-regtest': {
+            "bip173_prefix": "ert",
+            "elements": True,
+            "name": "liquid-regtest",
+            "p2sh_prefix": 'X',
+            "elements": True,
+            "example_addr": "ert1qq8adjz4u6enf0cjey9j8yt0y490tact9fahkwf",
+            "feeoutput": True,
+        }
+    }
+
+    return chainparams[config['TEST_NETWORK']]

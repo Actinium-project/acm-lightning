@@ -26,7 +26,28 @@ bitcoin_block_from_hex(const tal_t *ctx, const struct chainparams *chainparams,
 	if (!hex_decode(hex, hexlen, linear_tx, len))
 		return tal_free(b);
 
-	pull(&p, &len, &b->hdr, sizeof(b->hdr));
+	b->hdr.version = pull_le32(&p, &len);
+	pull(&p, &len, &b->hdr.prev_hash, sizeof(b->hdr.prev_hash));
+	pull(&p, &len, &b->hdr.merkle_hash, sizeof(b->hdr.merkle_hash));
+	b->hdr.timestamp = pull_le32(&p, &len);
+
+	if (is_elements(chainparams)) {
+		b->elements_hdr = tal(b, struct elements_block_hdr);
+		b->elements_hdr->block_height = pull_le32(&p, &len);
+
+		size_t challenge_len = pull_varint(&p, &len);
+		b->elements_hdr->proof.challenge = tal_arr(b->elements_hdr, u8, challenge_len);
+		pull(&p, &len, b->elements_hdr->proof.challenge, challenge_len);
+
+		size_t solution_len = pull_varint(&p, &len);
+		b->elements_hdr->proof.solution = tal_arr(b->elements_hdr, u8, solution_len);
+		pull(&p, &len, b->elements_hdr->proof.solution, solution_len);
+
+	} else {
+		b->hdr.target = pull_le32(&p, &len);
+		b->hdr.nonce = pull_le32(&p, &len);
+	}
+
 	num = pull_varint(&p, &len);
 	b->tx = tal_arr(b, struct bitcoin_tx *, num);
 	for (i = 0; i < num; i++) {
@@ -40,6 +61,35 @@ bitcoin_block_from_hex(const tal_t *ctx, const struct chainparams *chainparams,
 
 	tal_free(linear_tx);
 	return b;
+}
+
+void bitcoin_block_blkid(const struct bitcoin_block *b,
+			 struct bitcoin_blkid *out)
+{
+	struct sha256_ctx shactx;
+	u8 vt[VARINT_MAX_LEN];
+	size_t vtlen;
+
+	sha256_init(&shactx);
+	sha256_le32(&shactx, b->hdr.version);
+	sha256_update(&shactx, &b->hdr.prev_hash, sizeof(b->hdr.prev_hash));
+	sha256_update(&shactx, &b->hdr.merkle_hash, sizeof(b->hdr.merkle_hash));
+	sha256_le32(&shactx, b->hdr.timestamp);
+
+        if (is_elements(chainparams)) {
+		size_t clen = tal_bytelen(b->elements_hdr->proof.challenge);
+		sha256_le32(&shactx, b->elements_hdr->block_height);
+
+		vtlen = varint_put(vt, clen);
+		sha256_update(&shactx, vt, vtlen);
+		sha256_update(&shactx, b->elements_hdr->proof.challenge, clen);
+		/* The solution is skipped, since that'd create a circular
+		 * dependency apparently */
+	} else {
+		sha256_le32(&shactx, b->hdr.target);
+		sha256_le32(&shactx, b->hdr.nonce);
+	}
+	sha256_double_done(&shactx, &out->shad);
 }
 
 /* We do the same hex-reversing crud as txids. */

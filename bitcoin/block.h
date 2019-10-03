@@ -25,8 +25,19 @@ struct bitcoin_block_hdr {
 	le32 nonce;
 };
 
+struct elements_block_proof {
+	u8 *challenge;
+	u8 *solution;
+};
+
+struct elements_block_hdr {
+	u32 block_height;
+	struct elements_block_proof proof;
+};
+
 struct bitcoin_block {
 	struct bitcoin_block_hdr hdr;
+	struct elements_block_hdr *elements_hdr;
 	/* tal_count shows now many */
 	struct bitcoin_tx **tx;
 };
@@ -34,6 +45,10 @@ struct bitcoin_block {
 struct bitcoin_block *
 bitcoin_block_from_hex(const tal_t *ctx, const struct chainparams *chainparams,
 		       const char *hex, size_t hexlen);
+
+/* Compute the double SHA block ID from the block header. */
+void bitcoin_block_blkid(const struct bitcoin_block *block,
+			 struct bitcoin_blkid *out);
 
 /* Parse hex string to get blockid (reversed, a-la bitcoind). */
 bool bitcoin_blkid_from_hex(const char *hexstr, size_t hexstr_len,

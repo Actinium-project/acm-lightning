@@ -354,6 +354,7 @@ static const struct utxo **wallet_select(const tal_t *ctx, struct wallet *w,
 	size_t i = 0;
 	struct utxo **available;
 	u64 weight;
+	size_t num_outputs = may_have_change ? 2 : 1;
 	const struct utxo **utxos = tal_arr(ctx, const struct utxo *, 0);
 	tal_add_destructor2(utxos, destroy_utxos, w);
 
@@ -369,6 +370,22 @@ static const struct utxo **wallet_select(const tal_t *ctx, struct wallet *w,
 	/* Change output will be P2WPKH */
 	if (may_have_change)
 		weight += (8 + 1 + BITCOIN_SCRIPTPUBKEY_P2WPKH_LEN) * 4;
+
+	/* A couple of things need to change for elements: */
+	if (chainparams->is_elements) {
+                /* Each transaction has surjection and rangeproof (both empty
+		 * for us as long as we use unblinded L-BTC transactions). */
+		weight += 2 * 4;
+
+		/* Each output additionally has an asset_tag (1 + 32), value
+		 * is prefixed by a version (1 byte), an empty nonce (1
+		 * byte), two empty proofs (2 bytes). */
+		weight += (32 + 1 + 1 + 1) * 4 * num_outputs;
+
+		/* An elements transaction has 1 additional output for fees */
+		weight += (8 + 1) * 4; /* Bitcoin style output */
+		weight += (32 + 1 + 1 + 1) * 4; /* Elements added fields */
+	}
 
 	*fee_estimate = AMOUNT_SAT(0);
 	*satoshi_in = AMOUNT_SAT(0);
@@ -406,6 +423,10 @@ static const struct utxo **wallet_select(const tal_t *ctx, struct wallet *w,
 
 		/* Account for witness (1 byte count + sig + key) */
 		input_weight += 1 + (1 + 73 + 1 + 33);
+
+		/* Elements inputs have 6 bytes of blank proofs attached. */
+		if (chainparams->is_elements)
+			input_weight += 6;
 
 		weight += input_weight;
 
@@ -1498,17 +1519,23 @@ int wallet_extract_owned_outputs(struct wallet *w, const struct bitcoin_tx *tx,
 		struct utxo *utxo;
 		u32 index;
 		bool is_p2sh;
-		const u8 *script = bitcoin_tx_output_get_script(tmpctx, tx, output);
+		const u8 *script;
+		struct amount_asset asset = bitcoin_tx_output_get_amount(tx, output);
 
+		if (!amount_asset_is_main(&asset))
+			continue;
 
-		if (!wallet_can_spend(w, script, &index,
-				      &is_p2sh))
+		script = bitcoin_tx_output_get_script(tmpctx, tx, output);
+		if (!script)
+			continue;
+
+		if (!wallet_can_spend(w, script, &index, &is_p2sh))
 			continue;
 
 		utxo = tal(w, struct utxo);
 		utxo->keyindex = index;
 		utxo->is_p2sh = is_p2sh;
-		utxo->amount = bitcoin_tx_output_get_amount(tx, output);
+		utxo->amount = amount_asset_to_sat(&asset);
 		utxo->status = output_state_available;
 		bitcoin_txid(tx, &utxo->txid);
 		utxo->outnum = output;

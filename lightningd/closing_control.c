@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <gossipd/gen_gossip_wire.h>
 #include <inttypes.h>
+#include <lightningd/bitcoind.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/channel.h>
 #include <lightningd/closing_control.h>
@@ -21,10 +22,25 @@
 static struct amount_sat calc_tx_fee(struct amount_sat sat_in,
 				     const struct bitcoin_tx *tx)
 {
-	struct amount_sat amt, fee = sat_in;
+	struct amount_asset amt;
+	struct amount_sat fee = sat_in;
+	const u8 *oscript;
+	size_t scriptlen;
 	for (size_t i = 0; i < tx->wtx->num_outputs; i++) {
 		amt = bitcoin_tx_output_get_amount(tx, i);
-		if (!amount_sat_sub(&fee, fee, amt))
+		oscript = bitcoin_tx_output_get_script(NULL, tx, i);
+		scriptlen = tal_bytelen(oscript);
+		tal_free(oscript);
+
+		if (chainparams->is_elements && scriptlen == 0)
+			continue;
+
+		/* Ignore outputs that are not denominated in our main
+		 * currency. */
+		if (!amount_asset_is_main(&amt))
+			continue;
+
+		if (!amount_sat_sub(&fee, fee, amount_asset_to_sat(&amt)))
 			fatal("Tx spends more than input %s? %s",
 			      type_to_string(tmpctx, struct amount_sat, &sat_in),
 			      type_to_string(tmpctx, struct bitcoin_tx, tx));
@@ -54,7 +70,7 @@ static bool better_closing_fee(struct lightningd *ld,
 		  type_to_string(tmpctx, struct amount_sat, &last_fee));
 
 	/* Weight once we add in sigs. */
-	weight = measure_tx_weight(tx) + 74 * 2;
+	weight = bitcoin_tx_weight(tx) + 74 * 2;
 
 	/* If we don't have a feerate estimate, this gives feerate_floor */
 	min_feerate = feerate_min(ld, &feerate_unknown);
@@ -245,9 +261,6 @@ void peer_start_closingd(struct channel *channel,
 	}
 
 	/* BOLT #2:
-	 *
-	 *   - if it supports `option_data_loss_protect`:
-	 *...
 	 *     - if `next_revocation_number` equals 0:
 	 *       - MUST set `your_last_per_commitment_secret` to all zeroes
 	 *     - otherwise:
@@ -266,7 +279,7 @@ void peer_start_closingd(struct channel *channel,
 		return;
 	}
 	initmsg = towire_closing_init(tmpctx,
-				      &get_chainparams(ld)->genesis_blockhash,
+				      chainparams,
 				      pps,
 				      &channel->funding_txid,
 				      channel->funding_outnum,

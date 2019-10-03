@@ -12,7 +12,9 @@
 
 const char *placeholder_script = "0020b95810f824f843934fa042acd0becba52087813e260edaeebc42b5cb9abe1464";
 const char *placeholder_funding_addr;
-const struct amount_sat *max_funding;
+
+/* Populated by libplugin */
+extern const struct chainparams *chainparams;
 
 struct funding_req {
 	struct node_id *id;
@@ -333,11 +335,12 @@ static struct command_result *tx_prepare_dryrun(struct command *cmd,
 						const jsmntok_t *result,
 						struct funding_req *fr)
 {
-	const struct bitcoin_tx *tx;
+	struct bitcoin_tx *tx;
 	const char *hex;
 	struct amount_sat funding;
 	bool funding_found;
 	u8 *placeholder = tal_hexdata(tmpctx, placeholder_script, strlen(placeholder_script));
+	struct amount_asset asset;
 
 	/* Stash the 'reserved' txid to unreserve later */
 	hex = json_strdup(tmpctx, buf, json_get_member(buf, result, "txid"));
@@ -347,13 +350,21 @@ static struct command_result *tx_prepare_dryrun(struct command *cmd,
 
 	hex = json_strdup(tmpctx, buf, json_get_member(buf, result, "unsigned_tx"));
 	tx = bitcoin_tx_from_hex(fr, hex, strlen(hex));
+	tx->chainparams = chainparams;
 
 	/* Find the funding amount */
 	funding_found = false;
 	for (size_t i = 0; i < tx->wtx->num_outputs; i++) {
 		const u8 *output_script = bitcoin_tx_output_get_script(tmpctx, tx, i);
+		asset = bitcoin_tx_output_get_amount(tx, i);
+
+		/* We do not support funding a channel with anything but the
+		 * main asset, for now. */
+		if (!amount_asset_is_main(&asset))
+			continue;
+
 		if (scripteq(output_script, placeholder)) {
-			funding = bitcoin_tx_output_get_amount(tx, i);
+			funding = amount_asset_to_sat(&asset);
 			funding_found = true;
 			break;
 		}
@@ -363,8 +374,8 @@ static struct command_result *tx_prepare_dryrun(struct command *cmd,
 		plugin_err("Error creating placebo funding tx, funding_out not found. %s", hex);
 
 	/* Update funding to actual amount */
-	if (fr->funding_all && amount_sat_greater(funding, *max_funding))
-		funding = *max_funding;
+	if (fr->funding_all && amount_sat_greater(funding, chainparams->max_funding))
+		funding = chainparams->max_funding;
 
 	fr->funding_str = type_to_string(fr, struct amount_sat, &funding);
 	return fundchannel_start(cmd, fr);
@@ -404,7 +415,6 @@ static void init(struct plugin_conn *rpc,
 {
 	/* Figure out what the 'placeholder' addr is */
 	const char *network_name;
-	const struct chainparams *chainparams;
 	u8 *placeholder = tal_hexdata(tmpctx, placeholder_script, strlen(placeholder_script));
 
 	network_name = rpc_delve(tmpctx, "listconfigs",
@@ -415,7 +425,6 @@ static void init(struct plugin_conn *rpc,
 	placeholder_funding_addr = encode_scriptpubkey_to_addr(NULL,
 							       chainparams->bip173_name,
 							       placeholder);
-	max_funding = &chainparams->max_funding;
 }
 
 

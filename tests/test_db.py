@@ -1,10 +1,12 @@
 from fixtures import *  # noqa: F401,F403
 from utils import wait_for, sync_blockheight, COMPAT
+from fixtures import TEST_NETWORK
 
 import os
 import unittest
 
 
+@unittest.skipIf(TEST_NETWORK != 'regtest', "The DB migration is network specific due to the chain var.")
 def test_db_dangling_peer_fix(node_factory):
     # This was taken from test_fail_unconfirmed() node.
     l1 = node_factory.get_node(dbfile='dangling-peer.sqlite3.xz')
@@ -21,7 +23,8 @@ def test_db_dangling_peer_fix(node_factory):
     l2.fund_channel(l1, 200000, wait_for_active=True)
 
 
-def test_block_backfill(node_factory, bitcoind):
+@unittest.skipIf(TEST_NETWORK != 'regtest', "Address is network specific")
+def test_block_backfill(node_factory, bitcoind, chainparams):
     """Test whether we backfill data from the blockchain correctly.
 
     For normal operation we will process any block after the initial start
@@ -118,6 +121,7 @@ def test_max_channel_id(node_factory, bitcoind):
 
 @unittest.skipIf(not COMPAT, "needs COMPAT to convert obsolete db")
 @unittest.skipIf(os.getenv('TEST_DB_PROVIDER', 'sqlite3') != 'sqlite3', "This test is based on a sqlite3 snapshot")
+@unittest.skipIf(TEST_NETWORK != 'regtest', "The network must match the DB snapshot")
 def test_scid_upgrade(node_factory):
 
     # Created through the power of sed "s/X'\([0-9]*\)78\([0-9]*\)78\([0-9]*\)'/X'\13A\23A\3'/"

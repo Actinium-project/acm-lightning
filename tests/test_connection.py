@@ -1,9 +1,10 @@
 from collections import namedtuple
 from decimal import Decimal
 from fixtures import *  # noqa: F401,F403
+from fixtures import TEST_NETWORK
 from flaky import flaky  # noqa: F401
 from lightning import RpcError
-from utils import DEVELOPER, only_one, wait_for, sync_blockheight, VALGRIND, TIMEOUT, SLOW_MACHINE, EXPERIMENTAL_FEATURES
+from utils import DEVELOPER, only_one, wait_for, sync_blockheight, VALGRIND, TIMEOUT, SLOW_MACHINE
 from bitcoin.core import CMutableTransaction, CMutableTxOut
 
 import binascii
@@ -133,6 +134,7 @@ def test_bad_opening(node_factory):
 
 
 @unittest.skipIf(not DEVELOPER, "gossip without DEVELOPER=1 is slow")
+@unittest.skipIf(TEST_NETWORK != 'regtest', "Fee computation and limits are network specific")
 def test_opening_tiny_channel(node_factory):
     # Test custom min-capacity-sat parameters
     #
@@ -979,6 +981,7 @@ def test_funding_cancel_race(node_factory, bitcoind, executor):
         assert num_complete > 0
 
 
+@unittest.skipIf(TEST_NETWORK != 'regtest', "External wallet support doesn't work with elements yet.")
 def test_funding_external_wallet(node_factory, bitcoind):
     l1 = node_factory.get_node()
     l2 = node_factory.get_node()
@@ -1382,9 +1385,7 @@ def test_forget_channel(node_factory):
 
 def test_peerinfo(node_factory, bitcoind):
     l1, l2 = node_factory.line_graph(2, fundchannel=False, opts={'may_reconnect': True})
-    lfeatures = '08a2'
-    if EXPERIMENTAL_FEATURES:
-        lfeatures = '28a2'
+    lfeatures = '28a2'
     # Gossiping but no node announcement yet
     assert l1.rpc.getpeer(l2.info['id'])['connected']
     assert len(l1.rpc.getpeer(l2.info['id'])['channels']) == 0
@@ -1636,12 +1637,8 @@ def test_dataloss_protection(node_factory, bitcoind):
     l2 = node_factory.get_node(may_reconnect=True, log_all_io=True,
                                feerates=(7500, 7500, 7500), allow_broken_log=True)
 
-    if EXPERIMENTAL_FEATURES:
-        # features 1, 3, 7, 11 and 13 (0x28a2).
-        lf = "28a2"
-    else:
-        # features 1, 3, 7 and 11 (0x08a2).
-        lf = "08a2"
+    # features 1, 3, 7, 11 and 13 (0x28a2).
+    lf = "28a2"
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     # l1 should send out WIRE_INIT (0010)
     l1.daemon.wait_for_log(r"\[OUT\] 0010"
@@ -1963,11 +1960,12 @@ def test_change_chaining(node_factory, bitcoind):
     l1.rpc.fundchannel(l3.info['id'], 10**7, minconf=0)
 
 
-def test_feerate_spam(node_factory):
+def test_feerate_spam(node_factory, chainparams):
     l1, l2 = node_factory.line_graph(2)
 
+    slack = 25000000 if not chainparams['elements'] else 35000000
     # Pay almost everything to l2.
-    l1.pay(l2, 10**9 - 25000000)
+    l1.pay(l2, 10**9 - slack)
 
     # It will send this once (may have happened before line_graph's wait)
     wait_for(lambda: l1.daemon.is_in_log('Setting REMOTE feerate to 15000'))

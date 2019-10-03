@@ -3,14 +3,26 @@
 #include "config.h"
 #include <ccan/intmap/intmap.h>
 #include <ccan/io/io.h>
+#include <ccan/pipecmd/pipecmd.h>
 #include <ccan/take/take.h>
+#include <ccan/tal/path/path.h>
 #include <ccan/tal/tal.h>
+#include <common/json_command.h>
+#include <common/jsonrpc_errors.h>
+#include <common/memleak.h>
+#include <common/param.h>
+#include <common/timeout.h>
+#include <dirent.h>
+#include <errno.h>
+#include <lightningd/io_loop_with_timers.h>
 #include <lightningd/jsonrpc.h>
+#include <lightningd/lightningd.h>
 #include <lightningd/log.h>
+#include <unistd.h>
+
 
 enum plugin_state {
 	UNCONFIGURED,
-	CONFIGURING,
 	CONFIGURED
 };
 
@@ -31,7 +43,6 @@ struct plugin {
 
 	/* If this plugin can be restarted without restarting lightningd */
 	bool dynamic;
-	bool signal_startup;
 
 	/* Stuff we read */
 	char *buffer;
@@ -73,6 +84,7 @@ struct plugins {
 	struct log_book *log_book;
 
 	struct lightningd *ld;
+	const char *default_dir;
 };
 
 /* The value of a plugin option, which can have different types.
@@ -104,12 +116,9 @@ struct plugins *plugins_new(const tal_t *ctx, struct log_book *log_book,
 			    struct lightningd *ld);
 
 /**
- * Search for `default_dir`, and if it exists add every directory it
- * contains as a plugin dir.
+ * Recursively add all plugins from the default plugins directory.
  */
-void plugins_add_default_dir(struct plugins *plugins, const char *default_dir);
-
-void plugins_start(struct plugins *plugins, const char *dev_plugin_debug);
+void plugins_add_default_dir(struct plugins *plugins);
 
 /**
  * Initialize the registered plugins.
@@ -130,7 +139,7 @@ void plugins_init(struct plugins *plugins, const char *dev_plugin_debug);
  * @param plugins: Plugin context
  * @param path: The path of the executable for this plugin
  */
-void plugin_register(struct plugins *plugins, const char* path TAKES);
+struct plugin *plugin_register(struct plugins *plugins, const char* path TAKES);
 
 /**
  * Returns true if the provided name matches a plugin command
@@ -159,6 +168,20 @@ void PRINTF_FMT(2,3) plugin_kill(struct plugin *plugin, char *fmt, ...);
  * incoming JSON-RPC calls and messages.
  */
 void plugins_config(struct plugins *plugins);
+
+/**
+ * Read and treat (populate options, methods, ...) the `getmanifest` response.
+ */
+bool plugin_parse_getmanifest_response(const char *buffer,
+                                       const jsmntok_t *toks,
+                                       const jsmntok_t *idtok,
+                                       struct plugin *plugin);
+
+/**
+ * This populates the jsonrpc request with the plugin/lightningd specifications
+ */
+void plugin_populate_init_request(struct plugin *p, struct jsonrpc_request *req);
+
 /**
  * Add the plugin option and their respective options to listconfigs.
  *
@@ -181,7 +204,7 @@ void *plugin_exclusive_loop(struct plugin *plugin);
  * Add a directory to the plugin path to automatically load plugins.
  */
 char *add_plugin_dir(struct plugins *plugins, const char *dir,
-		     bool nonexist_ok);
+		     bool error_ok);
 
 /**
  * Clear all plugins registered so far.
@@ -203,6 +226,14 @@ void plugin_request_send(struct plugin *plugin,
  */
 char *plugin_opt_set(const char *arg, struct plugin_opt *popt);
 
+/**
+ * Helpers to initialize a connection to a plugin; we read from their
+ * stdout, and write to their stdin.
+ */
+struct io_plan *plugin_stdin_conn_init(struct io_conn *conn,
+                                       struct plugin *plugin);
+struct io_plan *plugin_stdout_conn_init(struct io_conn *conn,
+                                        struct plugin *plugin);
 
 /**
  * Needed for I/O logging for plugin messages.

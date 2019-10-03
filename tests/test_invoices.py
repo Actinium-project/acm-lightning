@@ -1,4 +1,5 @@
 from fixtures import *  # noqa: F401,F403
+from fixtures import TEST_NETWORK
 from lightning import RpcError
 from utils import only_one, DEVELOPER, wait_for, wait_channel_quiescent
 
@@ -8,7 +9,7 @@ import time
 import unittest
 
 
-def test_invoice(node_factory):
+def test_invoice(node_factory, chainparams):
     l1, l2 = node_factory.line_graph(2, fundchannel=False)
 
     addr1 = l2.rpc.newaddr('bech32')['bech32']
@@ -17,7 +18,7 @@ def test_invoice(node_factory):
     inv = l1.rpc.invoice(123000, 'label', 'description', '3700', [addr1, addr2])
     after = int(time.time())
     b11 = l1.rpc.decodepay(inv['bolt11'])
-    assert b11['currency'] == 'bcrt'
+    assert b11['currency'] == chainparams['bip173_prefix']
     assert b11['created_at'] >= before
     assert b11['created_at'] <= after
     assert b11['payment_hash'] == inv['payment_hash']
@@ -42,7 +43,7 @@ def test_invoice(node_factory):
     b11 = inv['bolt11']
     # Amount usually comes after currency (bcrt in our case),
     # but an any-amount invoices will have no amount
-    assert b11.startswith("lnbcrt1")
+    assert b11.startswith("ln" + chainparams['bip173_prefix'])
     # By bech32 rules, the last '1' digit is the separator
     # between the human-readable and data parts. We want
     # to match the "lnbcrt1" above with the '1' digit as the
@@ -123,6 +124,7 @@ def test_invoice_preimage(node_factory):
 
 
 @unittest.skipIf(not DEVELOPER, "gossip without DEVELOPER=1 is slow")
+@unittest.skipIf(TEST_NETWORK != 'regtest', "Amounts too low, dominated by fees in elements")
 def test_invoice_routeboost(node_factory, bitcoind):
     """Test routeboost 'r' hint in bolt11 invoice.
     """

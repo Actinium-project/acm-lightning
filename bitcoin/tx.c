@@ -19,13 +19,35 @@ int bitcoin_tx_add_output(struct bitcoin_tx *tx, const u8 *script,
 {
 	size_t i = tx->wtx->num_outputs;
 	struct wally_tx_output *output;
+	int ret;
+	u64 satoshis = amount.satoshis; /* Raw: low-level helper */
+	const struct chainparams *chainparams = tx->chainparams;
 	assert(i < tx->wtx->outputs_allocation_len);
 
 	assert(tx->wtx != NULL);
-	wally_tx_output_init_alloc(amount.satoshis /* Raw: low-level helper */,
-				   script, tal_bytelen(script), &output);
-	wally_tx_add_output(tx->wtx, output);
+	assert(chainparams);
+
+	if (chainparams->is_elements) {
+		u8 value[9];
+		ret = wally_tx_confidential_value_from_satoshi(satoshis, value,
+							       sizeof(value));
+		assert(ret == WALLY_OK);
+		ret = wally_tx_elements_output_init_alloc(
+		    script, tal_bytelen(script), chainparams->fee_asset_tag, 33,
+		    value, sizeof(value), NULL, 0, NULL, 0, NULL, 0, &output);
+		assert(ret == WALLY_OK);
+		/* Cheat a bit by also setting the numeric satoshi value,
+		 * otherwise we end up converting a number of times */
+		output->satoshi = satoshis;
+	} else {
+		ret = wally_tx_output_init_alloc(satoshis, script,
+						 tal_bytelen(script), &output);
+	}
+	ret = wally_tx_add_output(tx->wtx, output);
+	assert(ret == WALLY_OK);
+
 	wally_tx_output_free(output);
+	bitcoin_tx_output_set_amount(tx, i, amount);
 
 	return i;
 }
@@ -38,6 +60,66 @@ int bitcoin_tx_add_multi_outputs(struct bitcoin_tx *tx,
 				      outputs[j]->amount);
 
 	return tx->wtx->num_outputs;
+}
+
+static bool elements_tx_output_is_fee(const struct bitcoin_tx *tx, int outnum)
+{
+	assert(outnum < tx->wtx->num_outputs);
+	return chainparams->is_elements &&
+	       tx->wtx->outputs[outnum].script_len == 0;
+}
+
+/**
+ * Compute how much fee we are actually sending with this transaction.
+ */
+static struct amount_sat bitcoin_tx_compute_fee(const struct bitcoin_tx *tx)
+{
+	struct amount_sat fee = AMOUNT_SAT(0), value;
+	struct amount_asset asset;
+	bool ok;
+
+	for (size_t i = 0; i < tal_count(tx->input_amounts); i++) {
+		value.satoshis = tx->input_amounts[i]->satoshis; /* Raw: fee computation */
+		ok = amount_sat_add(&fee, fee, value);
+		assert(ok);
+	}
+
+	for (size_t i = 0; i < tx->wtx->num_outputs; i++) {
+		asset = bitcoin_tx_output_get_amount(tx, i);
+		if (elements_tx_output_is_fee(tx, i) ||
+		    !amount_asset_is_main(&asset))
+			continue;
+
+		value = amount_asset_to_sat(&asset);
+		ok = amount_sat_sub(&fee, fee, value);
+		assert(ok);
+	}
+	return fee;
+}
+
+int elements_tx_add_fee_output(struct bitcoin_tx *tx)
+{
+	struct amount_sat fee = bitcoin_tx_compute_fee(tx);
+	int pos = -1;
+
+	/* If we aren't using elements, we don't add explicit fee outputs */
+	if (!chainparams->is_elements || amount_sat_eq(fee, AMOUNT_SAT(0)))
+		return -1;
+
+	/* Try to find any existing fee output */
+	for (int i=0; i<tx->wtx->num_outputs; i++) {
+		if (elements_tx_output_is_fee(tx, i)) {
+			assert(pos == -1);
+			pos = i;
+		}
+	}
+
+	if (pos == -1) {
+		return bitcoin_tx_add_output(tx, NULL, fee);
+	} else {
+		bitcoin_tx_output_set_amount(tx, pos, fee);
+		return pos;
+	}
 }
 
 int bitcoin_tx_add_input(struct bitcoin_tx *tx, const struct bitcoin_txid *txid,
@@ -53,6 +135,7 @@ int bitcoin_tx_add_input(struct bitcoin_tx *tx, const struct bitcoin_txid *txid,
 				  sizeof(struct bitcoin_txid), outnum, sequence,
 				  script, tal_bytelen(script),
 				  NULL /* Empty witness stack */, &input);
+	input->features = chainparams->is_elements ? WALLY_TX_IS_ELEMENTS : 0;
 	wally_tx_add_input(tx->wtx, input);
 	wally_tx_input_free(input);
 
@@ -67,14 +150,18 @@ bool bitcoin_tx_check(const struct bitcoin_tx *tx)
 {
 	u8 *newtx;
 	size_t written;
+	int flags = WALLY_TX_FLAG_USE_WITNESS;
 
-	if (wally_tx_get_length(tx->wtx, WALLY_TX_FLAG_USE_WITNESS, &written) !=
-	    WALLY_OK)
+	if (wally_tx_get_length(tx->wtx, flags, &written) != WALLY_OK)
 		return false;
 
+	if (chainparams->is_elements) {
+		flags |= WALLY_TX_FLAG_USE_ELEMENTS;
+	}
+
 	newtx = tal_arr(tmpctx, u8, written);
-	if (wally_tx_to_bytes(tx->wtx, WALLY_TX_FLAG_USE_WITNESS, newtx,
-			      written, &written) != WALLY_OK)
+	if (wally_tx_to_bytes(tx->wtx, flags, newtx, written, &written) !=
+	    WALLY_OK)
 		return false;
 
 	if (written != tal_bytelen(newtx))
@@ -86,8 +173,16 @@ bool bitcoin_tx_check(const struct bitcoin_tx *tx)
 void bitcoin_tx_output_set_amount(struct bitcoin_tx *tx, int outnum,
 				  struct amount_sat amount)
 {
+	u64 satoshis = amount.satoshis; /* Raw: low-level helper */
+	struct wally_tx_output *output = &tx->wtx->outputs[outnum];
 	assert(outnum < tx->wtx->num_outputs);
-	tx->wtx->outputs[outnum].satoshi = amount.satoshis; /* Raw: low-level helper */
+	if (chainparams->is_elements) {
+		int ret = wally_tx_confidential_value_from_satoshi(
+		    satoshis, output->value, output->value_len);
+		assert(ret == WALLY_OK);
+	} else {
+		output->satoshi = satoshis;
+	}
 }
 
 const u8 *bitcoin_tx_output_get_script(const tal_t *ctx,
@@ -97,17 +192,43 @@ const u8 *bitcoin_tx_output_get_script(const tal_t *ctx,
 	u8 *res;
 	assert(outnum < tx->wtx->num_outputs);
 	output = &tx->wtx->outputs[outnum];
+
+	if (output->script == NULL) {
+		/* This can happen for coinbase transactions and pegin
+		 * transactions */
+		return NULL;
+	}
+
 	res = tal_arr(ctx, u8, output->script_len);
 	memcpy(res, output->script, output->script_len);
 	return res;
 }
 
-struct amount_sat bitcoin_tx_output_get_amount(const struct bitcoin_tx *tx,
-					       int outnum)
+struct amount_asset bitcoin_tx_output_get_amount(const struct bitcoin_tx *tx,
+						 int outnum)
 {
-	struct amount_sat amount;
+	struct amount_asset amount;
+	struct wally_tx_output *output;
+	be64 raw;
+
+	assert(tx->chainparams);
 	assert(outnum < tx->wtx->num_outputs);
-	amount.satoshis = tx->wtx->outputs[outnum].satoshi; /* Raw: helper */
+	output = &tx->wtx->outputs[outnum];
+
+	if (chainparams->is_elements) {
+		/* We currently only support v1 asset tags */
+		assert(output->asset_len == sizeof(amount.asset) &&
+		       output->asset[0] == 0x01);
+		memcpy(&amount.asset, output->asset, sizeof(amount.asset));
+		memcpy(&raw, output->value + 1, sizeof(raw));
+		amount.value = be64_to_cpu(raw);
+
+	} else {
+		/* Do not assign amount.asset, we should never touch it in
+		 * non-elements scenarios. */
+		amount.value = tx->wtx->outputs[outnum].satoshi;
+	}
+
 	return amount;
 }
 
@@ -172,32 +293,6 @@ static bool uses_witness(const struct bitcoin_tx *tx)
 	return false;
 }
 
-/* BIP 141: The witness is a serialization of all witness data of the
- * transaction. Each txin is associated with a witness field. A
- * witness field starts with a var_int to indicate the number of stack
- * items for the txin.  */
-static void push_witnesses(const struct bitcoin_tx *tx,
-			  void (*push)(const void *, size_t, void *), void *pushp)
-{
-	for (size_t i = 0; i < tx->wtx->num_inputs; i++) {
-		struct wally_tx_witness_stack *witness = tx->wtx->inputs[i].witness;
-
-		/* Not every input needs a witness. */
-		if (!witness) {
-			push_varint(0, push, pushp);
-			continue;
-		}
-
-		push_varint(witness->num_items, push, pushp);
-		for (size_t j = 0; j < witness->num_items; j++) {
-			size_t witlen = witness->items[j].witness_len;
-			const u8 *wit = witness->items[j].witness;
-			push_varint(witlen, push, pushp);
-			push(wit, witlen, pushp);
-		}
-	}
-}
-
 /* For signing, we ignore input scripts on other inputs, and pretend
  * the current input has a certain script: this is indicated by a
  * non-NULL override_script.
@@ -220,7 +315,10 @@ static void push_tx(const struct bitcoin_tx *tx,
         if (bip144 && uses_witness(tx))
 		flag |= WALLY_TX_FLAG_USE_WITNESS;
 
-	res = wally_tx_get_length(tx->wtx, flag, &len);
+	if (chainparams->is_elements)
+		flag |= WALLY_TX_FLAG_USE_ELEMENTS;
+
+	res = wally_tx_get_length(tx->wtx, flag & WALLY_TX_FLAG_USE_WITNESS, &len);
 	assert(res == WALLY_OK);
 	serialized = tal_arr(tmpctx, u8, len);
 
@@ -253,23 +351,12 @@ u8 *linearize_tx(const tal_t *ctx, const struct bitcoin_tx *tx)
 	return arr;
 }
 
-static void push_measure(const void *data UNUSED, size_t len, void *lenp)
+size_t bitcoin_tx_weight(const struct bitcoin_tx *tx)
 {
-	*(size_t *)lenp += len;
-}
-
-size_t measure_tx_weight(const struct bitcoin_tx *tx)
-{
-	size_t non_witness_len = 0, witness_len = 0;
-	push_tx(tx, NULL, 0, push_measure, &non_witness_len, false);
-	if (uses_witness(tx)) {
-		push_witnesses(tx, push_measure, &witness_len);
-		/* Include BIP 144 marker and flag bytes in witness length */
-		witness_len += 2;
-	}
-
-	/* Normal bytes weigh 4 times more than Witness bytes */
-	return non_witness_len * 4 + witness_len;
+	size_t weight;
+	int ret = wally_tx_get_weight(tx->wtx, &weight);
+	assert(ret == WALLY_OK);
+	return weight;
 }
 
 void bitcoin_txid(const struct bitcoin_tx *tx, struct bitcoin_txid *txid)
@@ -294,6 +381,12 @@ struct bitcoin_tx *bitcoin_tx(const tal_t *ctx,
 	struct bitcoin_tx *tx = tal(ctx, struct bitcoin_tx);
 	assert(chainparams);
 
+	/* If we are constructing an elements transaction we need to
+	 * explicitly add the fee as an extra output. So allocate one more
+	 * than the outputs we need internally. */
+	if (chainparams->is_elements)
+		output_count += 1;
+
 	wally_tx_init_alloc(WALLY_TX_VERSION_2, 0, input_count, output_count,
 			    &tx->wtx);
 	tal_add_destructor(tx, bitcoin_tx_destroy);
@@ -309,13 +402,27 @@ struct bitcoin_tx *pull_bitcoin_tx(const tal_t *ctx, const u8 **cursor,
 				   size_t *max)
 {
 	size_t wsize;
+	int flags = WALLY_TX_FLAG_USE_WITNESS;
 	struct bitcoin_tx *tx = tal(ctx, struct bitcoin_tx);
-	if (wally_tx_from_bytes(*cursor, *max, 0, &tx->wtx) != WALLY_OK) {
+
+	if (chainparams->is_elements)
+		flags |= WALLY_TX_FLAG_USE_ELEMENTS;
+
+	if (wally_tx_from_bytes(*cursor, *max, flags, &tx->wtx) != WALLY_OK) {
 		fromwire_fail(cursor, max);
 		return tal_free(tx);
 	}
+
 	tal_add_destructor(tx, bitcoin_tx_destroy);
-	wally_tx_get_length(tx->wtx, WALLY_TX_FLAG_USE_WITNESS, &wsize);
+
+	/* For whatever reason the length computation gets upset if we tell it
+	 * that we are using elements. It wants to discover it on its own, NO
+	 * CLUES! (Ms. Doyle)
+	 *
+	 * https://github.com/ElementsProject/libwally-core/issues/139
+	 */
+	wally_tx_get_length(tx->wtx, flags & ~WALLY_TX_FLAG_USE_ELEMENTS,
+			    &wsize);
 
 	/* We don't know the input amounts yet, so set them all to NULL */
 	tx->input_amounts =

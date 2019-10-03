@@ -101,9 +101,9 @@ struct peer {
 	struct node_id *scid_query_nodes;
 	size_t scid_query_nodes_idx;
 
-	/* Do we have an scid_query outstanding?  Was it internal? */
+	/* Do we have an scid_query outstanding?  What to call when it's done? */
 	bool scid_query_outstanding;
-	bool scid_query_was_internal;
+	void (*scid_query_cb)(struct peer *peer, bool complete);
 
 	/* How many pongs are we expecting? */
 	size_t num_pings_outstanding;
@@ -114,6 +114,10 @@ struct peer {
 	u32 range_first_blocknum, range_end_blocknum;
 	u32 range_blocks_remaining;
 	struct short_channel_id *query_channel_scids;
+	void (*query_channel_range_cb)(struct peer *peer,
+				       u32 first_blocknum, u32 number_of_blocks,
+				       const struct short_channel_id *scids,
+				       bool complete);
 
 	/* Are we asking this peer to give us lot of gossip? */
 	enum gossip_level gossip_level;

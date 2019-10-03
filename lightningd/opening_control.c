@@ -198,7 +198,7 @@ wallet_commit_channel(struct lightningd *ld,
 	/* old_remote_per_commit not valid yet, copy valid one. */
 	channel_info->old_remote_per_commit = channel_info->remote_per_commit;
 
-	/* BOLT-531c8d7d9b01ab610b8a73a0deba1b9e9c83e1ed #2:
+	/* BOLT #2:
 	 * 1. type: 35 (`funding_signed`)
 	 * 2. data:
 	 *     * [`channel_id`:`channel_id`]
@@ -937,7 +937,7 @@ void peer_start_openingd(struct peer *peer,
 	uc->minimum_depth = peer->ld->config.anchor_confirms;
 
 	msg = towire_opening_init(NULL,
-				  &get_chainparams(peer->ld)->genesis_blockhash,
+				  chainparams,
 				  &uc->our_config,
 				  max_to_self_delay,
 				  min_effective_htlc_capacity,

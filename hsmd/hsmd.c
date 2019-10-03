@@ -580,7 +580,6 @@ static struct io_plan *init_hsm(struct io_conn *conn,
 	struct secret *seed;
 	struct secrets *secrets;
 	struct sha256 *shaseed;
-	struct bitcoin_blkid chain_hash;
 
 	/* This must be lightningd. */
 	assert(is_lightningd(c));
@@ -589,7 +588,7 @@ static struct io_plan *init_hsm(struct io_conn *conn,
 	 * definitions in hsm_client_wire.csv.  The format of those files is
 	 * an extension of the simple comma-separated format output by the
 	 * BOLT tools/extract-formats.py tool. */
-	if (!fromwire_hsm_init(NULL, msg_in, &bip32_key_version, &chain_hash,
+	if (!fromwire_hsm_init(NULL, msg_in, &bip32_key_version, &chainparams,
 			       &privkey, &seed, &secrets, &shaseed))
 		return bad_req(conn, c, msg_in);
 
@@ -602,7 +601,7 @@ static struct io_plan *init_hsm(struct io_conn *conn,
 
 	/* Once we have read the init message we know which params the master
 	 * will use */
-	c->chainparams = chainparams_by_chainhash(&chain_hash);
+	c->chainparams = chainparams;
 	maybe_create_new_hsm();
 	load_hsm();
 
@@ -1385,7 +1384,7 @@ static void hsm_unilateral_close_privkey(struct privkey *dst,
 	get_channel_seed(&info->peer_id, info->channel_id, &channel_seed);
 	derive_basepoints(&channel_seed, NULL, &basepoints, &secrets, NULL);
 
-	/* BOLT-531c8d7d9b01ab610b8a73a0deba1b9e9c83e1ed #3:
+	/* BOLT #3:
 	 *
 	 * If `option_static_remotekey` is negotiated the `remotepubkey`
 	 * is simply the remote node's `payment_basepoint`, otherwise it is

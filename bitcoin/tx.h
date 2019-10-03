@@ -51,7 +51,7 @@ void bitcoin_txid(const struct bitcoin_tx *tx, struct bitcoin_txid *txid);
 u8 *linearize_tx(const tal_t *ctx, const struct bitcoin_tx *tx);
 
 /* Get weight of tx in Sipa. */
-size_t measure_tx_weight(const struct bitcoin_tx *tx);
+size_t bitcoin_tx_weight(const struct bitcoin_tx *tx);
 
 /* Allocate a tx: you just need to fill in inputs and outputs (they're
  * zeroed with inputs' sequence_number set to FFFFFFFF) */
@@ -110,8 +110,8 @@ const u8 *bitcoin_tx_output_get_script(const tal_t *ctx, const struct bitcoin_tx
 /**
  * Helper to just get an amount_sat for the output amount.
  */
-struct amount_sat bitcoin_tx_output_get_amount(const struct bitcoin_tx *tx,
-					       int outnum);
+struct amount_asset bitcoin_tx_output_get_amount(const struct bitcoin_tx *tx,
+						 int outnum);
 
 /**
  * Set the input witness.
@@ -147,5 +147,17 @@ void bitcoin_tx_input_get_txid(const struct bitcoin_tx *tx, int innum,
  * both transactions serialize to two identical representations.
  */
 bool bitcoin_tx_check(const struct bitcoin_tx *tx);
+
+/**
+ * Add an explicit fee output if necessary.
+ *
+ * An explicit fee output is only necessary if we are using an elements
+ * transaction, and we have a non-zero fee. This method may be called multiple
+ * times.
+ *
+ * Returns the position of the fee output, or -1 in the case of non-elements
+ * transactions.
+ */
+int elements_tx_add_fee_output(struct bitcoin_tx *tx);
 
 #endif /* LIGHTNING_BITCOIN_TX_H */
