@@ -222,7 +222,9 @@ const struct chainparams networks[] = {
      .p2pkh_version = 53,
      .p2sh_version = 55,
      .testnet = false,
-     .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_MAIN_PUBLIC, .bip32_privkey_version = BIP32_VER_MAIN_PRIVATE}},
+     .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_MAIN_PUBLIC, .bip32_privkey_version = BIP32_VER_MAIN_PRIVATE},
+     .fee_asset_tag = NULL,
+     .is_elements = false},
     {.network_name = "actinium-testnet",
      .bip173_name = "tacm",
      .bip70_name = "test",
@@ -237,11 +239,9 @@ const struct chainparams networks[] = {
      .p2pkh_version = 43,
      .p2sh_version = 58,
      .testnet = true,
-     .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_TEST_PUBLIC, .bip32_privkey_version = BIP32_VER_TEST_PRIVATE}},
+     .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_TEST_PUBLIC, .bip32_privkey_version = BIP32_VER_TEST_PRIVATE},
      .fee_asset_tag = NULL,
-     .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_TEST_PUBLIC,
-			   .bip32_privkey_version = BIP32_VER_TEST_PRIVATE},
-     .is_elements = false}
+     .is_elements = false},
 };
 
 const struct chainparams *chainparams_for_network(const char *network_name)
