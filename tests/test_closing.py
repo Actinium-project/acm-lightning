@@ -1,7 +1,7 @@
 from fixtures import *  # noqa: F401,F403
 from flaky import flaky
 from lightning import RpcError
-from utils import only_one, sync_blockheight, wait_for, DEVELOPER, TIMEOUT, VALGRIND, SLOW_MACHINE
+from utils import only_one, sync_blockheight, wait_for, DEVELOPER, TIMEOUT, VALGRIND, SLOW_MACHINE, COMPAT
 
 import os
 import queue
@@ -295,6 +295,103 @@ def test_closing_negotiation_reconnect(node_factory, bitcoind):
     l1.daemon.wait_for_logs(['sendrawtx exit 0', ' to CLOSINGD_COMPLETE'])
     l2.daemon.wait_for_logs(['sendrawtx exit 0', ' to CLOSINGD_COMPLETE'])
     assert bitcoind.rpc.getmempoolinfo()['size'] == 1
+
+
+@unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1")
+def test_closing_specified_destination(node_factory, bitcoind):
+    l1, l2, l3, l4 = node_factory.get_nodes(4)
+
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    l1.rpc.connect(l3.info['id'], 'localhost', l3.port)
+    l1.rpc.connect(l4.info['id'], 'localhost', l4.port)
+
+    chan12 = l1.fund_channel(l2, 10**6)
+    chan13 = l1.fund_channel(l3, 10**6)
+    chan14 = l1.fund_channel(l4, 10**6)
+
+    l1.pay(l2, 100000000)
+    l1.pay(l3, 100000000)
+    l1.pay(l4, 100000000)
+
+    bitcoind.generate_block(5)
+    addr = 'bcrt1qeyyk6sl5pr49ycpqyckvmttus5ttj25pd0zpvg'
+    l1.rpc.close(chan12, None, addr)
+    l1.rpc.call('close', {'id': chan13, 'destination': addr})
+    l1.rpc.call('close', [chan14, None, addr])
+
+    l1.daemon.wait_for_logs([' to CLOSINGD_SIGEXCHANGE'] * 3)
+
+    # Both nodes should have disabled the channel in their view
+    wait_for(lambda: len(l1.getactivechannels()) == 0)
+
+    assert bitcoind.rpc.getmempoolinfo()['size'] == 3
+
+    # Now grab the close transaction
+    closetxid = bitcoind.rpc.getrawmempool(False)
+    assert len(closetxid) == 3
+
+    idindex = {}
+    for n in [l2, l3, l4]:
+        billboard = only_one(l1.rpc.listpeers(n.info['id'])['peers'][0]['channels'])['status']
+        idindex[n] = [i for i in range(3) if billboard == [
+            'CLOSINGD_SIGEXCHANGE:We agreed on a closing fee of 5430 satoshi for tx:{}'.format(closetxid[i]),
+        ]][0]
+        assert idindex[n] in range(3)
+
+    bitcoind.generate_block(1)
+    sync_blockheight(bitcoind, [l1, l2, l3, l4])
+
+    # l1 can't spent the output to addr.
+    assert not l1.daemon.is_in_log(r'Owning output.* \(SEGWIT\).* txid %s.* CONFIRMED' % closetxid[0])
+    assert not l1.daemon.is_in_log(r'Owning output.* \(SEGWIT\).* txid %s.* CONFIRMED' % closetxid[1])
+    assert not l1.daemon.is_in_log(r'Owning output.* \(SEGWIT\).* txid %s.* CONFIRMED' % closetxid[2])
+    # Check the txid has at least 1 confirmation
+    l2.daemon.wait_for_log(r'Owning output.* \(SEGWIT\).* txid %s.* CONFIRMED' % closetxid[idindex[l2]])
+    l3.daemon.wait_for_log(r'Owning output.* \(SEGWIT\).* txid %s.* CONFIRMED' % closetxid[idindex[l3]])
+    l4.daemon.wait_for_log(r'Owning output.* \(SEGWIT\).* txid %s.* CONFIRMED' % closetxid[idindex[l4]])
+
+    for n in [l2, l3, l4]:
+        # Make sure both nodes have grabbed their close tx funds
+        outputs = n.rpc.listfunds()['outputs']
+        assert closetxid[idindex[n]] in set([o['txid'] for o in outputs])
+        output_num2 = [o for o in outputs if o['txid'] == closetxid[idindex[n]]][0]['output']
+        output_num1 = 0 if output_num2 == 1 else 1
+        # Check the another address is addr
+        assert addr == bitcoind.rpc.gettxout(closetxid[idindex[n]], output_num1)['scriptPubKey']['addresses'][0]
+        assert 1 == bitcoind.rpc.gettxout(closetxid[idindex[n]], output_num1)['confirmations']
+
+
+@unittest.skipIf(not COMPAT, "needs COMPAT=1")
+def test_deprecated_closing_compat(node_factory, bitcoind):
+    """ The old-style close command is:
+        close {id} {force} {timeout}
+    """
+    l1, l2 = node_factory.get_nodes(2, opts=[{'allow-deprecated-apis': True}, {}])
+    addr = 'bcrt1qeyyk6sl5pr49ycpqyckvmttus5ttj25pd0zpvg'
+    nodeid = l2.info['id']
+
+    l1.rpc.check(command_to_check='close', id=nodeid)
+    # New-style
+    l1.rpc.check(command_to_check='close', id=nodeid, unilateraltimeout=10, destination=addr)
+    l1.rpc.check(command_to_check='close', id=nodeid, unilateraltimeout=0)
+    l1.rpc.check(command_to_check='close', id=nodeid, destination=addr)
+    # Old-style
+    l1.rpc.check(command_to_check='close', id=nodeid, force=False)
+    l1.rpc.check(command_to_check='close', id=nodeid, force=False, timeout=10)
+    l1.rpc.check(command_to_check='close', id=nodeid, timeout=10)
+
+    l1.rpc.call('check', ['close', nodeid])
+    # Array(new-style)
+    l1.rpc.call('check', ['close', nodeid, 10])
+    l1.rpc.call('check', ['close', nodeid, 0, addr])
+    l1.rpc.call('check', ['close', nodeid, None, addr])
+    # Array(old-style)
+    l1.rpc.call('check', ['close', nodeid, True, 10])
+    l1.rpc.call('check', ['close', nodeid, False])
+    l1.rpc.call('check', ['close', nodeid, None, 10])
+    # Not new-style nor old-style
+    with pytest.raises(RpcError, match=r'Expected unilerataltimeout to be a number'):
+        l1.rpc.call('check', ['close', nodeid, "Given enough eyeballs, all bugs are shallow."])
 
 
 @unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1")

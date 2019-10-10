@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and has `connected` and `state` fields for channels, like `listpeers`.
 - JSON API: `fundchannel_start` now includes field `scriptpubkey`
 - JSON API: `txprepare` and `withdraw` now accept an optional parameter `utxos`, a list of utxos to include in the prepared transaction
+- JSON_API: `close` now accepts an optional parameter `destination`, to which the to-local output will be sent.
 
 - bolt11: support for parsing feature bits (field `9`).
 
@@ -19,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Protocol: we now offer `option_gossip_queries_ex` for finegrained gossip control.
 - Protocol: no longer ask for `initial_routing_sync` (only affects ancient peers).
 - Protocol: nodes now announce features in `node_announcement` broadcasts.
+
+- Wallet: we now support the encryption of the BIP32 master seed (a.k.a. `hsm_secret`).
 
 ### Changed
 
@@ -35,6 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Note: You should always set `allow-deprecated-apis=false` to test for
 changes.
+- JSON-API: `fundchannel` now uses `amount` as the parameter name to replace `satoshi`
+- JSON-API: `fundchannel_start` now uses `amount` as the parameter name to replace `satoshi`
 
 ### Removed
 

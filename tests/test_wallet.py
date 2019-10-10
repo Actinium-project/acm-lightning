@@ -3,9 +3,11 @@ from fixtures import *  # noqa: F401,F403
 from fixtures import TEST_NETWORK
 from flaky import flaky  # noqa: F401
 from lightning import RpcError, Millisatoshi
-from utils import only_one, wait_for, sync_blockheight, EXPERIMENTAL_FEATURES
+from utils import only_one, wait_for, sync_blockheight, EXPERIMENTAL_FEATURES, COMPAT, VALGRIND, SLOW_MACHINE
 
+import os
 import pytest
+import subprocess
 import time
 import unittest
 
@@ -214,6 +216,50 @@ def test_addfunds_from_block(node_factory, bitcoind):
     # The address we detect must match what was paid to.
     output = only_one(l1.rpc.listfunds()['outputs'])
     assert output['address'] == addr
+
+
+@unittest.skipIf(not COMPAT, "needs COMPAT=1")
+def test_deprecated_txprepare(node_factory, bitcoind):
+    """Test the deprecated old-style:
+       txprepare {destination} {satoshi} {feerate} {minconf}
+    """
+    amount = 10**4
+    l1 = node_factory.get_node(options={'allow-deprecated-apis': True})
+    addr = l1.rpc.newaddr()['bech32']
+
+    for i in range(7):
+        l1.fundwallet(10**8)
+
+    bitcoind.generate_block(1)
+    sync_blockheight(bitcoind, [l1])
+
+    wait_for(lambda: len(l1.rpc.listfunds()['outputs']) == 7)
+
+    # Array type
+    with pytest.raises(RpcError, match=r'.* should be an amount in satoshis or all, not .*'):
+        l1.rpc.call('txprepare', [addr, 'slow'])
+
+    with pytest.raises(RpcError, match=r'Need set \'satoshi\' field.'):
+        l1.rpc.call('txprepare', [addr])
+
+    with pytest.raises(RpcError, match=r'Could not parse destination address.*'):
+        l1.rpc.call('txprepare', [Millisatoshi(amount * 100), 'slow', 1])
+
+    l1.rpc.call('txprepare', [addr, Millisatoshi(amount * 100), 'slow', 1])
+    l1.rpc.call('txprepare', [addr, Millisatoshi(amount * 100), 'normal'])
+    l1.rpc.call('txprepare', [addr, Millisatoshi(amount * 100), None, 1])
+    l1.rpc.call('txprepare', [addr, Millisatoshi(amount * 100)])
+
+    # Object type
+    with pytest.raises(RpcError, match=r'Need set \'outputs\' field.'):
+        l1.rpc.call('txprepare', {'destination': addr, 'feerate': 'slow'})
+
+    with pytest.raises(RpcError, match=r'Need set \'outputs\' field.'):
+        l1.rpc.call('txprepare', {'satoshi': Millisatoshi(amount * 100), 'feerate': '10perkw', 'minconf': 2})
+
+    l1.rpc.call('txprepare', {'destination': addr, 'satoshi': Millisatoshi(amount * 100), 'feerate': '2000perkw', 'minconf': 1})
+    l1.rpc.call('txprepare', {'destination': addr, 'satoshi': Millisatoshi(amount * 100), 'feerate': '2000perkw'})
+    l1.rpc.call('txprepare', {'destination': addr, 'satoshi': Millisatoshi(amount * 100)})
 
 
 def test_txprepare(node_factory, bitcoind, chainparams):
@@ -518,3 +564,45 @@ def test_transaction_annotations(node_factory, bitcoind):
     assert(len(peers) == 1 and len(peers[0]['channels']) == 1)
     scid = peers[0]['channels'][0]['short_channel_id']
     assert(txs[1]['outputs'][fundidx]['channel'] == scid)
+
+
+@unittest.skipIf(VALGRIND, "It does not play well with prompt and key derivation.")
+def test_hsm_secret_encryption(node_factory, executor):
+    l1 = node_factory.get_node()
+    password = "reckful\n"
+    # We need to simulate a terminal to use termios in `lightningd`.
+    master_fd, slave_fd = os.openpty()
+
+    # Test we can encrypt an already-existing and not encrypted hsm_secret
+    l1.rpc.stop()
+    l1.daemon.opts.update({"encrypted-hsm": None})
+    l1.daemon.start(stdin=slave_fd, wait_for_initialized=False)
+    time.sleep(3 if SLOW_MACHINE else 1)
+    os.write(master_fd, password.encode("utf-8"))
+    l1.daemon.wait_for_log("Server started with public key")
+    id = l1.rpc.getinfo()["id"]
+
+    # Test we cannot start the same wallet without specifying --encrypted-hsm
+    l1.stop()
+    l1.daemon.opts.pop("encrypted-hsm")
+    l1.daemon.start(stdin=slave_fd, stderr=subprocess.STDOUT,
+                    wait_for_initialized=False)
+    time.sleep(3 if SLOW_MACHINE else 1)
+    os.write(master_fd, password[2:].encode("utf-8"))
+    err = "hsm_secret is encrypted, you need to pass the --encrypted-hsm startup option."
+    assert l1.daemon.is_in_log(err)
+
+    # Test we cannot restore the same wallet with another password
+    l1.daemon.opts.update({"encrypted-hsm": None})
+    l1.daemon.start(stdin=slave_fd, stderr=subprocess.STDOUT,
+                    wait_for_initialized=False)
+    time.sleep(3 if SLOW_MACHINE else 1)
+    os.write(master_fd, password[2:].encode("utf-8"))
+    l1.daemon.wait_for_log("Wrong password for encrypted hsm_secret.")
+
+    # Test we can restore the same wallet with the same password
+    l1.daemon.start(stdin=slave_fd, wait_for_initialized=False)
+    time.sleep(3 if SLOW_MACHINE else 1)
+    os.write(master_fd, password.encode("utf-8"))
+    l1.daemon.wait_for_log("Server started with public key")
+    assert id == l1.rpc.getinfo()["id"]

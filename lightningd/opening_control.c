@@ -26,6 +26,7 @@
 #include <lightningd/log.h>
 #include <lightningd/notification.h>
 #include <lightningd/opening_control.h>
+#include <lightningd/options.h>
 #include <lightningd/peer_control.h>
 #include <lightningd/plugin_hook.h>
 #include <lightningd/subd.h>
@@ -246,7 +247,8 @@ wallet_commit_channel(struct lightningd *ld,
 			      remote_commit_sig,
 			      NULL, /* No HTLC sigs yet */
 			      channel_info,
-			      NULL, /* No remote_shutdown_scriptpubkey yet */
+			      NULL, /* No shutdown_scriptpubkey[REMOTE] yet */
+			      NULL, /* No shutdown_scriptpubkey[LOCAL] yet. Generate the default one. */
 			      final_key_idx, false,
 			      NULL, /* No commit sent yet */
 			      /* If we're fundee, could be a little before this
@@ -502,14 +504,14 @@ static void opening_fundee_finished(struct subd *openingd,
 	}
 
 	log_debug(channel->log, "Watching funding tx %s",
-		     type_to_string(reply, struct bitcoin_txid,
-				    &channel->funding_txid));
+		  type_to_string(reply, struct bitcoin_txid,
+				 &channel->funding_txid));
 
 	channel_watch_funding(ld, channel);
 
 	/* Tell plugins about the success */
 	notify_channel_opened(ld, &channel->peer->id, &channel->funding,
-			   &channel->funding_txid, &channel->remote_funding_locked);
+			      &channel->funding_txid, &channel->remote_funding_locked);
 
 	/* On to normal operation! */
 	peer_start_channeld(channel, pps, funding_signed, false);
@@ -1069,16 +1071,41 @@ static struct command_result *json_fund_channel_start(struct command *cmd,
 	fc->cancels = tal_arr(fc, struct command *, 0);
 	fc->uc = NULL;
 	fc->inflight = false;
-	if (!param(fc->cmd, buffer, params,
-		   p_req("id", param_node_id, &id),
-		   p_req("satoshi", param_sat, &amount),
-		   p_opt("feerate", param_feerate, &feerate_per_kw),
-		   p_opt_def("announce", param_bool, &announce_channel, true),
-		   NULL))
-		return command_param_failed();
+
+	/* For generating help, give new-style. */
+	if (!params || !deprecated_apis || params->type == JSMN_ARRAY) {
+		if (!param(fc->cmd, buffer, params,
+			   p_req("id", param_node_id, &id),
+			   p_req("amount", param_sat, &amount),
+			   p_opt("feerate", param_feerate, &feerate_per_kw),
+			   p_opt_def("announce", param_bool, &announce_channel, true),
+			   NULL))
+			return command_param_failed();
+	} else {
+		/* For json object type when allow deprecated api, 'check' command
+		 * can't find the error if we don't set 'amount' nor 'satoshi'.
+		 */
+		struct amount_sat *satoshi;
+		if (!param(fc->cmd, buffer, params,
+			   p_req("id", param_node_id, &id),
+			   p_opt("amount", param_sat, &amount),
+			   p_opt("satoshi", param_sat, &satoshi),
+			   p_opt("feerate", param_feerate, &feerate_per_kw),
+			   p_opt_def("announce", param_bool, &announce_channel, true),
+			   NULL))
+			return command_param_failed();
+
+		if (!amount) {
+			if (satoshi)
+				amount = satoshi;
+			else
+				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+						    "Need set 'amount' field");
+		}
+	}
 
 	if (amount_sat_greater(*amount, max_funding_satoshi))
-                return command_fail(cmd, FUND_MAX_EXCEEDED,
+		return command_fail(cmd, FUND_MAX_EXCEEDED,
 				    "Amount exceeded %s",
 				    type_to_string(tmpctx, struct amount_sat,
 						   &max_funding_satoshi));

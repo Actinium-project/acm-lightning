@@ -255,18 +255,25 @@ const u8 *handle_query_short_channel_ids(struct peer *peer, const u8 *msg)
 	} else
 		flags = NULL;
 
+	/* BOLT #7
+	 *
+	 * The receiver:
+	 * ...
+	 *   - if does not maintain up-to-date channel information for `chain_hash`:
+	 *     - MUST set `complete` to 0.
+	 */
 	if (!bitcoin_blkid_eq(&peer->daemon->chain_hash, &chain)) {
 		status_debug("%s sent query_short_channel_ids chainhash %s",
 			     type_to_string(tmpctx, struct node_id, &peer->id),
 			     type_to_string(tmpctx, struct bitcoin_blkid, &chain));
-		return NULL;
+		return towire_reply_short_channel_ids_end(peer, &chain, 0);
 	}
 
 	/* BOLT #7:
 	 *
 	 * - if it has not sent `reply_short_channel_ids_end` to a
 	 *   previously received `query_short_channel_ids` from this
-         *   sender:
+	 *   sender:
 	 *    - MAY fail the connection.
 	 */
 	if (peer->scid_queries || peer->scid_query_nodes) {
@@ -334,7 +341,7 @@ static void reply_channel_range(struct peer *peer,
 	 *     knows in blocks `first_blocknum` to `first_blocknum` plus
 	 *     `number_of_blocks` minus one.
 	 *   - MUST limit `number_of_blocks` to the maximum number of blocks
-         *     whose results could fit in `encoded_short_ids`
+	 *     whose results could fit in `encoded_short_ids`
 	 *   - if does not maintain up-to-date channel information for
 	 *     `chain_hash`:
 	 *     - MUST set `complete` to 0.
@@ -556,7 +563,7 @@ wont_fit:
 					tail_blocks, query_option_flags);
 }
 
-/*~ The peer can ask for all channels is a series of blocks.  We reply with one
+/*~ The peer can ask for all channels in a series of blocks.  We reply with one
  * or more messages containing the short_channel_ids. */
 const u8 *handle_query_channel_range(struct peer *peer, const u8 *msg)
 {
@@ -580,8 +587,13 @@ const u8 *handle_query_channel_range(struct peer *peer, const u8 *msg)
 	else
 		query_option_flags = 0;
 
-	/* If they ask for the wrong chain, we give an empty response
-	 * with the `complete` flag unset */
+	/* BOLT #7
+	 *
+	 * The receiver of `query_channel_range`:
+	 * ...
+	 *   - if does not maintain up-to-date channel information for `chain_hash`:
+	 *     - MUST set `complete` to 0.
+	 */
 	if (!bitcoin_blkid_eq(&peer->daemon->chain_hash, &chain_hash)) {
 		status_debug("%s sent query_channel_range chainhash %s",
 			     type_to_string(tmpctx, struct node_id, &peer->id),
@@ -666,6 +678,10 @@ const u8 *handle_reply_channel_range(struct peer *peer, const u8 *msg)
 
 	scids = decode_short_ids(tmpctx, encoded);
 	if (!scids) {
+		if (complete == 0)
+			return towire_errorfmt(peer, NULL,
+			                       "No up to date infos about this network: %s",
+			                       tal_hex(tmpctx, msg));
 		return towire_errorfmt(peer, NULL,
 				       "Bad reply_channel_range encoding %s",
 				       tal_hex(tmpctx, encoded));
@@ -771,6 +787,11 @@ const u8 *handle_reply_short_channel_ids_end(struct peer *peer, const u8 *msg)
 				       "unexpected reply_short_channel_ids_end: %s",
 				       tal_hex(tmpctx, msg));
 	}
+
+	if (complete == 0)
+		return towire_errorfmt(peer, NULL,
+		                       "No up to date infos about this network: %s",
+		                       tal_hex(tmpctx, msg));
 
 	peer->scid_query_outstanding = false;
 	if (peer->scid_query_cb)

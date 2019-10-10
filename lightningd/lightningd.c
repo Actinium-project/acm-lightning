@@ -76,6 +76,7 @@
 #include <lightningd/options.h>
 #include <onchaind/onchain_wire.h>
 #include <signal.h>
+#include <sodium.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -233,6 +234,11 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 
 	/*~ This is set when a JSON RPC command comes in to shut us down. */
 	ld->stop_conn = NULL;
+
+	/*~ This is used to signal that `hsm_secret` is encrypted, and will
+	 * be set to `true` if the `--encrypted` option is passed at startup.
+	 */
+	ld->encrypted_hsm = false;
 
 	return ld;
 }
@@ -714,6 +720,11 @@ int main(int argc, char *argv[])
 	 * doesn't really make sense, but we can't call it the Badly-named
 	 * Daemon Software Module. */
 	hsm_init(ld);
+
+	/*~ If hsm_secret is encrypted, we don't need its encryption key
+	 * anymore. Note that sodium_munlock() also zeroes the memory.*/
+	if (ld->config.keypass)
+		sodium_munlock(ld->config.keypass->data, sizeof(ld->config.keypass->data));
 
 	/*~ Our default color and alias are derived from our node id, so we
 	 * can only set those now (if not set by config options). */
