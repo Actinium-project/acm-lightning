@@ -13,6 +13,10 @@ struct io_plan *daemon_conn_read_next(struct io_conn *conn UNNEEDED,
 /* Generated stub for daemon_conn_wake */
 void daemon_conn_wake(struct daemon_conn *dc UNNEEDED)
 { fprintf(stderr, "daemon_conn_wake called!\n"); abort(); }
+/* Generated stub for decode_channel_update_timestamps */
+struct channel_update_timestamps *decode_channel_update_timestamps(const tal_t *ctx UNNEEDED,
+				 const struct tlv_reply_channel_range_tlvs_timestamps_tlv *timestamps_tlv UNNEEDED)
+{ fprintf(stderr, "decode_channel_update_timestamps called!\n"); abort(); }
 /* Generated stub for decode_scid_query_flags */
 bigsize_t *decode_scid_query_flags(const tal_t *ctx UNNEEDED,
 				   const struct tlv_query_short_channel_ids_tlvs_query_flags *qf UNNEEDED)
@@ -49,11 +53,12 @@ struct timeabs gossip_time_now(const struct routing_state *rstate UNNEEDED)
 { fprintf(stderr, "gossip_time_now called!\n"); abort(); }
 /* Generated stub for handle_channel_update */
 u8 *handle_channel_update(struct routing_state *rstate UNNEEDED, const u8 *update TAKES UNNEEDED,
-			  const char *source UNNEEDED,
+			  struct peer *peer UNNEEDED,
 			  struct short_channel_id *unknown_scid UNNEEDED)
 { fprintf(stderr, "handle_channel_update called!\n"); abort(); }
 /* Generated stub for handle_node_announcement */
-u8 *handle_node_announcement(struct routing_state *rstate UNNEEDED, const u8 *node UNNEEDED)
+u8 *handle_node_announcement(struct routing_state *rstate UNNEEDED, const u8 *node UNNEEDED,
+			     struct peer *peer UNNEEDED, bool *was_unknown UNNEEDED)
 { fprintf(stderr, "handle_node_announcement called!\n"); abort(); }
 /* Generated stub for master_badmsg */
 void master_badmsg(u32 type_expected UNNEEDED, const u8 *msg)
@@ -67,6 +72,9 @@ struct oneshot *new_reltimer_(struct timers *timers UNNEEDED,
 /* Generated stub for notleak_ */
 void *notleak_(const void *ptr UNNEEDED, bool plus_children UNNEEDED)
 { fprintf(stderr, "notleak_ called!\n"); abort(); }
+/* Generated stub for peer_supplied_good_gossip */
+void peer_supplied_good_gossip(struct peer *peer UNNEEDED, size_t amount UNNEEDED)
+{ fprintf(stderr, "peer_supplied_good_gossip called!\n"); abort(); }
 /* Generated stub for queue_peer_from_store */
 void queue_peer_from_store(struct peer *peer UNNEEDED,
 			   const struct broadcastable *bcast UNNEEDED)

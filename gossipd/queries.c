@@ -13,6 +13,7 @@
 #include <gossipd/gossipd.h>
 #include <gossipd/queries.h>
 #include <gossipd/routing.h>
+#include <gossipd/seeker.h>
 #include <wire/gen_peer_wire.h>
 #include <wire/wire.h>
 #include <zlib.h>
@@ -48,7 +49,7 @@ static void encoding_add_timestamps(u8 **encoded,
 }
 
 /* Marshal a single query flag (we don't query, so not currently used) */
-static UNNEEDED void encoding_add_query_flag(u8 **encoded, bigsize_t flag)
+static void encoding_add_query_flag(u8 **encoded, bigsize_t flag)
 {
 	towire_bigsize(encoded, flag);
 }
@@ -73,13 +74,9 @@ static u8 *zencode(const tal_t *ctx, const u8 *scids, size_t len)
 	z = tal_arr(ctx, u8, compressed_len);
 	err = compress2(z, &compressed_len, scids, len, Z_DEFAULT_COMPRESSION);
 	if (err == Z_OK) {
-		status_debug("compressed %zu into %lu",
-			     len, compressed_len);
 		tal_resize(&z, compressed_len);
 		return z;
 	}
-	status_debug("compress %zu returned %i:"
-		     " not compresssing", len, err);
 	return NULL;
 }
 
@@ -130,7 +127,7 @@ static bool encoding_end_prepend_type(u8 **encoded, size_t max_bytes)
 }
 
 /* Try compressing, leaving type external */
-static UNNEEDED bool encoding_end_external_type(u8 **encoded, u8 *type, size_t max_bytes)
+static bool encoding_end_external_type(u8 **encoded, u8 *type, size_t max_bytes)
 {
 	if (encoding_end_zlib(encoded, 0))
 		*type = ARR_ZLIB;
@@ -143,13 +140,14 @@ static UNNEEDED bool encoding_end_external_type(u8 **encoded, u8 *type, size_t m
 }
 
 /* Query this peer for these short-channel-ids. */
-static bool query_short_channel_ids(struct daemon *daemon,
-				    struct peer *peer,
-				    const struct short_channel_id *scids,
-				    void (*cb)(struct peer *peer, bool complete))
+bool query_short_channel_ids(struct daemon *daemon,
+			     struct peer *peer,
+			     const struct short_channel_id *scids,
+			     const u8 *query_flags,
+			     void (*cb)(struct peer *peer, bool complete))
 {
 	u8 *encoded, *msg;
-
+	struct tlv_query_short_channel_ids_tlvs *tlvs;
 	/* BOLT #7:
 	 *
 	 * 1. type: 261 (`query_short_channel_ids`) (`gossip_queries`)
@@ -159,11 +157,20 @@ static bool query_short_channel_ids(struct daemon *daemon,
 	 *     * [`len*byte`:`encoded_short_ids`]
 	 */
 	const size_t reply_overhead = 32 + 2;
-	const size_t max_encoded_bytes = 65535 - 2 - reply_overhead;
+	size_t max_encoded_bytes = 65535 - 2 - reply_overhead;
 
 	/* Can't query if they don't have gossip_queries_feature */
 	if (!peer->gossip_queries_feature)
 		return false;
+
+	/* BOLT #7:
+	 *   - MAY include an optional `query_flags`. If so:
+	 *    - MUST set `encoding_type`, as for `encoded_short_ids`.
+	 *    - Each query flag is a minimally-encoded varint.
+	 *    - MUST encode one query flag per `short_channel_id`.
+	 */
+	if (query_flags)
+		assert(tal_count(query_flags) == tal_count(scids));
 
 	/* BOLT #7:
 	 *
@@ -176,8 +183,17 @@ static bool query_short_channel_ids(struct daemon *daemon,
 		return false;
 
 	encoded = encoding_start(tmpctx);
-	for (size_t i = 0; i < tal_count(scids); i++)
+	for (size_t i = 0; i < tal_count(scids); i++) {
+		/* BOLT #7:
+		 *
+		 * Encoding types:
+		 * * `0`: uncompressed array of `short_channel_id` types, in
+		 *   ascending order.
+		 * * `1`: array of `short_channel_id` types, in ascending order
+		 */
+		assert(i == 0 || scids[i].u64 > scids[i-1].u64);
 		encoding_add_short_channel_id(&encoded, &scids[i]);
+	}
 
 	if (!encoding_end_prepend_type(&encoded, max_encoded_bytes)) {
 		status_broken("query_short_channel_ids: %zu is too many",
@@ -185,8 +201,30 @@ static bool query_short_channel_ids(struct daemon *daemon,
 		return false;
 	}
 
+	if (query_flags) {
+		struct tlv_query_short_channel_ids_tlvs_query_flags *tlvq;
+		tlvs = tlv_query_short_channel_ids_tlvs_new(tmpctx);
+		tlvq = tlvs->query_flags = tal(tlvs,
+			   struct tlv_query_short_channel_ids_tlvs_query_flags);
+ 		tlvq->encoded_query_flags = encoding_start(tlvq);
+		for (size_t i = 0; i < tal_count(query_flags); i++)
+			encoding_add_query_flag(&tlvq->encoded_query_flags,
+						query_flags[i]);
+
+		max_encoded_bytes -= tal_bytelen(encoded);
+		if (!encoding_end_external_type(&tlvq->encoded_query_flags,
+						&tlvq->encoding_type,
+						max_encoded_bytes)) {
+			status_broken("query_short_channel_ids:"
+				      " %zu query_flags is too many",
+				      tal_count(query_flags));
+			return false;
+		}
+	} else
+		tlvs = NULL;
+
 	msg = towire_query_short_channel_ids(NULL, &daemon->chain_hash,
-					     encoded, NULL);
+					     encoded, tlvs);
 	queue_peer_msg(peer, take(msg));
 	peer->scid_query_outstanding = true;
 	peer->scid_query_cb = cb;
@@ -195,27 +233,6 @@ static bool query_short_channel_ids(struct daemon *daemon,
 		     type_to_string(tmpctx, struct node_id, &peer->id),
 		     tal_count(scids));
 	return true;
-}
-
-/* This peer told us about an update to an unknown channel.  Ask it for a
- * channel_announcement. */
-void query_unknown_channel(struct daemon *daemon,
-			   struct peer *peer,
-			   const struct short_channel_id *id)
-{
-	/* Don't go overboard if we're already asking for a lot. */
-	if (tal_count(daemon->unknown_scids) > 1000)
-		return;
-
-	/* Check we're not already getting this one. */
-	for (size_t i = 0; i < tal_count(daemon->unknown_scids); i++)
-		if (short_channel_id_eq(&daemon->unknown_scids[i], id))
-			return;
-
-	tal_arr_expand(&daemon->unknown_scids, *id);
-
-	/* This is best effort: if peer is busy, we'll try next time. */
-	query_short_channel_ids(daemon, peer, daemon->unknown_scids, NULL);
 }
 
 /* The peer can ask about an array of short channel ids: we don't assemble the
@@ -360,21 +377,6 @@ static void reply_channel_range(struct peer *peer,
 					     1, encoded_scids, tlvs);
 	queue_peer_msg(peer, take(msg));
 }
-
-/* BOLT #7:
- *
- * `query_option_flags` is a bitfield represented as a minimally-encoded varint.
- * Bits have the following meaning:
- *
- * | Bit Position  | Meaning                 |
- * | ------------- | ----------------------- |
- * | 0             | Sender wants timestamps |
- * | 1             | Sender wants checksums  |
- */
-enum query_option_flags {
-	QUERY_ADD_TIMESTAMPS = 0x1,
-	QUERY_ADD_CHECKSUMS = 0x2,
-};
 
 /* BOLT #7:
  *
@@ -640,11 +642,13 @@ const u8 *handle_reply_channel_range(struct peer *peer, const u8 *msg)
 	u32 first_blocknum, number_of_blocks, start, end;
 	u8 *encoded;
 	struct short_channel_id *scids;
+	struct channel_update_timestamps *ts;
 	size_t n;
 	unsigned long b;
 	void (*cb)(struct peer *peer,
 		   u32 first_blocknum, u32 number_of_blocks,
 		   const struct short_channel_id *scids,
+		   const struct channel_update_timestamps *ts,
 		   bool complete);
 	struct tlv_reply_channel_range_tlvs *tlvs
 		= tlv_reply_channel_range_tlvs_new(tmpctx);
@@ -744,20 +748,44 @@ const u8 *handle_reply_channel_range(struct peer *peer, const u8 *msg)
 	tal_resize(&peer->query_channel_scids, n + tal_count(scids));
 	memcpy(peer->query_channel_scids + n, scids, tal_bytelen(scids));
 
+	/* Credit peer for answering gossip, so seeker doesn't get upset:
+	 * since scids are only 8 bytes, use a discount over normal gossip. */
+	peer_supplied_good_gossip(peer, tal_count(scids) / 20);
+
+	/* Add timestamps (if any), or zeroes */
+	if (tlvs->timestamps_tlv) {
+		ts = decode_channel_update_timestamps(tlvs,
+						      tlvs->timestamps_tlv);
+		if (!ts || tal_count(ts) != tal_count(scids)) {
+			return towire_errorfmt(peer, NULL,
+					       "reply_channel_range %zu timestamps when %zu scids?",
+					       tal_count(ts),
+					       tal_count(scids));
+		}
+	} else {
+		ts = tal_arrz(tlvs, struct channel_update_timestamps,
+			      tal_count(scids));
+	}
+	n = tal_count(peer->query_channel_timestamps);
+	tal_resize(&peer->query_channel_timestamps, n + tal_count(ts));
+	memcpy(peer->query_channel_timestamps + n, ts, tal_bytelen(ts));
+
 	/* Still more to go? */
 	if (peer->range_blocks_remaining)
 		return NULL;
 
 	/* Clear these immediately in case cb want to queue more */
 	scids = tal_steal(tmpctx, peer->query_channel_scids);
+	ts = tal_steal(tmpctx, peer->query_channel_timestamps);
 	cb = peer->query_channel_range_cb;
 	tal_steal(tmpctx, peer->query_channel_blocks);
 
 	peer->query_channel_scids = NULL;
+	peer->query_channel_timestamps = NULL;
 	peer->query_channel_blocks = NULL;
 	peer->query_channel_range_cb = NULL;
 
-	cb(peer, first_blocknum, number_of_blocks, scids, complete);
+	cb(peer, first_blocknum, number_of_blocks, scids, ts, complete);
 	return NULL;
 }
 
@@ -982,13 +1010,17 @@ void maybe_send_query_responses(struct peer *peer)
 bool query_channel_range(struct daemon *daemon,
 			 struct peer *peer,
 			 u32 first_blocknum, u32 number_of_blocks,
+			 enum query_option_flags qflags,
 			 void (*cb)(struct peer *peer,
 				    u32 first_blocknum, u32 number_of_blocks,
 				    const struct short_channel_id *scids,
+				    const struct channel_update_timestamps *,
 				    bool complete))
 {
 	u8 *msg;
+	struct tlv_query_channel_range_tlvs *tlvs;
 
+	assert((qflags & ~(QUERY_ADD_TIMESTAMPS|QUERY_ADD_CHECKSUMS)) == 0);
 	assert(peer->gossip_queries_feature);
 	assert(!peer->query_channel_blocks);
 	assert(!peer->query_channel_range_cb);
@@ -1000,12 +1032,19 @@ bool query_channel_range(struct daemon *daemon,
 		return false;
 	}
 
+	if (qflags) {
+		tlvs = tlv_query_channel_range_tlvs_new(tmpctx);
+		tlvs->query_option
+			= tal(tlvs, struct tlv_query_channel_range_tlvs_query_option);
+		tlvs->query_option->query_option_flags = qflags;
+	} else
+		tlvs = NULL;
 	status_debug("sending query_channel_range for blocks %u+%u",
 		     first_blocknum, number_of_blocks);
 
 	msg = towire_query_channel_range(NULL, &daemon->chain_hash,
 					 first_blocknum, number_of_blocks,
-					 NULL);
+					 tlvs);
 	queue_peer_msg(peer, take(msg));
 	peer->range_first_blocknum = first_blocknum;
 	peer->range_end_blocknum = first_blocknum + number_of_blocks;
@@ -1013,6 +1052,8 @@ bool query_channel_range(struct daemon *daemon,
 	peer->query_channel_blocks = tal_arrz(peer, bitmap,
 					      BITMAP_NWORDS(number_of_blocks));
 	peer->query_channel_scids = tal_arr(peer, struct short_channel_id, 0);
+	peer->query_channel_timestamps
+		= tal_arr(peer, struct channel_update_timestamps, 0);
 	peer->query_channel_range_cb = cb;
 
 	return true;

@@ -1478,7 +1478,7 @@ def test_peerinfo(node_factory, bitcoind):
     # Gossiping but no node announcement yet
     assert l1.rpc.getpeer(l2.info['id'])['connected']
     assert len(l1.rpc.getpeer(l2.info['id'])['channels']) == 0
-    assert l1.rpc.getpeer(l2.info['id'])['localfeatures'] == lfeatures
+    assert l1.rpc.getpeer(l2.info['id'])['features'] == lfeatures
 
     # Fund a channel to force a node announcement
     chan = l1.fund_channel(l2, 10**6)
@@ -1487,23 +1487,23 @@ def test_peerinfo(node_factory, bitcoind):
     l1.daemon.wait_for_logs(['Received node_announcement for node ' + l2.info['id']])
     l2.daemon.wait_for_logs(['Received node_announcement for node ' + l1.info['id']])
 
-    # Should have announced the same global features as told to peer.
+    # Should have announced the same features as told to peer.
     nodes1 = l1.rpc.listnodes(l2.info['id'])['nodes']
     nodes2 = l2.rpc.listnodes(l2.info['id'])['nodes']
     peer1 = l1.rpc.getpeer(l2.info['id'])
     peer2 = l2.rpc.getpeer(l1.info['id'])
-    assert only_one(nodes1)['globalfeatures'] == peer1['localfeatures']
-    assert only_one(nodes2)['globalfeatures'] == peer2['localfeatures']
+    assert only_one(nodes1)['features'] == peer1['features']
+    assert only_one(nodes2)['features'] == peer2['features']
 
-    assert l1.rpc.getpeer(l2.info['id'])['localfeatures'] == lfeatures
-    assert l2.rpc.getpeer(l1.info['id'])['localfeatures'] == lfeatures
+    assert l1.rpc.getpeer(l2.info['id'])['features'] == lfeatures
+    assert l2.rpc.getpeer(l1.info['id'])['features'] == lfeatures
 
     # If it reconnects after db load, it should know features.
     l1.restart()
     wait_for(lambda: l1.rpc.getpeer(l2.info['id'])['connected'])
     wait_for(lambda: l2.rpc.getpeer(l1.info['id'])['connected'])
-    assert l1.rpc.getpeer(l2.info['id'])['localfeatures'] == lfeatures
-    assert l2.rpc.getpeer(l1.info['id'])['localfeatures'] == lfeatures
+    assert l1.rpc.getpeer(l2.info['id'])['features'] == lfeatures
+    assert l2.rpc.getpeer(l1.info['id'])['features'] == lfeatures
 
     # Close the channel to forget the peer
     l1.rpc.close(chan)
@@ -1731,8 +1731,9 @@ def test_dataloss_protection(node_factory, bitcoind):
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     # l1 should send out WIRE_INIT (0010)
     l1.daemon.wait_for_log(r"\[OUT\] 0010"
-                           # gflen == 0
-                           "0000"
+                           # gflen
+                           + format(len(lf) // 2, '04x')
+                           + lf
                            # lflen
                            + format(len(lf) // 2, '04x')
                            + lf)
@@ -1888,7 +1889,7 @@ def test_fulfill_incoming_first(node_factory, bitcoind):
 
 
 @unittest.skipIf(not DEVELOPER, "gossip without DEVELOPER=1 is slow")
-def test_restart_many_payments(node_factory):
+def test_restart_many_payments(node_factory, bitcoind):
     l1 = node_factory.get_node(may_reconnect=True)
 
     # On my laptop, these take 74 seconds and 44 seconds (with restart commented out)
@@ -1911,31 +1912,20 @@ def test_restart_many_payments(node_factory):
         n.rpc.connect(l1.info['id'], 'localhost', l1.port)
         outchans.append(l1.fund_channel(n, 10**6, False))
 
+    # Make sure they're all announced.
+    bitcoind.generate_block(5)
+
+    # We wait for each node to see each dir active, and its own
+    # channel CHANNELD_NORMAL
+    logs = ([r'update for channel {}/0 now ACTIVE'.format(scid)
+             for scid in inchans + outchans]
+            + [r'update for channel {}/1 now ACTIVE'.format(scid)
+               for scid in inchans + outchans]
+            + ['to CHANNELD_NORMAL'])
+
     # Now do all the waiting at once: if !DEVELOPER, this can be *very* slow!
-    l1_logs = []
-    for i in range(len(innodes)):
-        scid = inchans[i]
-        l1_logs += [r'update for channel {}/0 now ACTIVE'.format(scid),
-                    r'update for channel {}/1 now ACTIVE'.format(scid),
-                    'to CHANNELD_NORMAL']
-        innodes[i].daemon.wait_for_logs([r'update for channel {}/0 now ACTIVE'
-                                         .format(scid),
-                                         r'update for channel {}/1 now ACTIVE'
-                                         .format(scid),
-                                         'to CHANNELD_NORMAL'])
-
-    for i in range(len(outnodes)):
-        scid = outchans[i]
-        l1_logs += [r'update for channel {}/0 now ACTIVE'.format(scid),
-                    r'update for channel {}/1 now ACTIVE'.format(scid),
-                    'to CHANNELD_NORMAL']
-        outnodes[i].daemon.wait_for_logs([r'update for channel {}/0 now ACTIVE'
-                                          .format(scid),
-                                          r'update for channel {}/1 now ACTIVE'
-                                          .format(scid),
-                                          'to CHANNELD_NORMAL'])
-
-    l1.daemon.wait_for_logs(l1_logs)
+    for n in innodes + outnodes:
+        n.daemon.wait_for_logs(logs)
 
     # Manually create routes, get invoices
     Payment = namedtuple('Payment', ['innode', 'route', 'payment_hash'])

@@ -34,9 +34,13 @@ static struct command_result *plugin_dynamic_list_plugins(struct command *cmd)
 static struct command_result *
 plugin_dynamic_error(struct dynamic_plugin *dp, const char *error)
 {
-	plugin_kill(dp->plugin, "%s: %s", dp->plugin->cmd, error);
+	if (dp->plugin)
+		plugin_kill(dp->plugin, "%s", error);
+	else
+		log_info(dp->cmd->ld->log, "%s", error);
 	return command_fail(dp->cmd, JSONRPC2_INVALID_PARAMS,
-	                    "%s: %s", dp->plugin->cmd, error);
+	                    "%s: %s", dp->plugin ? dp->plugin->cmd : "unknown plugin",
+	                    error);
 }
 
 static void plugin_dynamic_timeout(struct dynamic_plugin *dp)
@@ -121,7 +125,7 @@ static struct command_result *plugin_start(struct dynamic_plugin *dp)
 	/* Give the plugin 20 seconds to respond to `getmanifest`, so we don't hang
 	 * too long on the RPC caller. */
 	p->timeout_timer = new_reltimer(dp->cmd->ld->timers, dp,
-	                                time_from_sec(20),
+	                                time_from_sec((10)),
 	                                plugin_dynamic_timeout, dp);
 
 	/* Create two connections, one read-only on top of the plugin's stdin, and one

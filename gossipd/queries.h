@@ -3,6 +3,7 @@
 #include "config.h"
 #include <ccan/short_types/short_types.h>
 
+struct channel_update_timestamps;
 struct daemon;
 struct io_conn;
 struct peer;
@@ -15,22 +16,42 @@ const u8 *handle_reply_short_channel_ids_end(struct peer *peer, const u8 *msg);
 const u8 *handle_query_channel_range(struct peer *peer, const u8 *msg);
 const u8 *handle_reply_channel_range(struct peer *peer, const u8 *msg);
 
-void query_unknown_channel(struct daemon *daemon,
-			   struct peer *peer,
-			   const struct short_channel_id *id);
-
 /* This called when the peer is idle. */
 void maybe_send_query_responses(struct peer *peer);
+
+/* BOLT #7:
+ *
+ * `query_option_flags` is a bitfield represented as a minimally-encoded varint.
+ * Bits have the following meaning:
+ *
+ * | Bit Position  | Meaning                 |
+ * | ------------- | ----------------------- |
+ * | 0             | Sender wants timestamps |
+ * | 1             | Sender wants checksums  |
+ */
+enum query_option_flags {
+	QUERY_ADD_TIMESTAMPS = 0x1,
+	QUERY_ADD_CHECKSUMS = 0x2,
+};
 
 /* Ask this peer for a range of scids.  Must support it, and not already
  * have a query pending. */
 bool query_channel_range(struct daemon *daemon,
 			 struct peer *peer,
 			 u32 first_blocknum, u32 number_of_blocks,
+			 enum query_option_flags qflags,
 			 void (*cb)(struct peer *peer,
 				    u32 first_blocknum, u32 number_of_blocks,
 				    const struct short_channel_id *scids,
+				    const struct channel_update_timestamps *,
 				    bool complete));
+
+/* Ask this peer for info about an array of scids, with optional query_flags */
+bool query_short_channel_ids(struct daemon *daemon,
+			     struct peer *peer,
+			     const struct short_channel_id *scids,
+			     const u8 *query_flags,
+			     void (*cb)(struct peer *peer, bool complete));
 
 #if DEVELOPER
 struct io_plan *query_scids_req(struct io_conn *conn,

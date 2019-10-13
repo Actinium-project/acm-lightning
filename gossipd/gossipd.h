@@ -15,7 +15,9 @@
 #define CONNECTD_FD 4
 
 struct chan;
+struct channel_update_timestamps;
 struct broadcastable;
+struct seeker;
 
 /*~ The core daemon structure: */
 struct daemon {
@@ -53,29 +55,14 @@ struct daemon {
 	/* What addresses we can actually announce. */
 	struct wireaddr *announcable;
 
-	/* Do we think we're missing gossip?  Contains timer to re-check */
-	struct oneshot *gossip_missing;
-
-	/* Channels we've heard about, but don't know. */
-	struct short_channel_id *unknown_scids;
-
 	/* Timer until we can send a new node_announcement */
 	struct oneshot *node_announce_timer;
 
 	/* Channels we have an announce for, but aren't deep enough. */
 	struct short_channel_id *deferred_txouts;
-};
 
-/*~ How gossipy do we ask a peer to be? */
-enum gossip_level {
-	/* Give us everything since epoch */
-	GOSSIP_HIGH,
-	/* Give us everything from 24 hours ago. */
-	GOSSIP_MEDIUM,
-	/* Give us everything from now. */
-	GOSSIP_LOW,
-	/* Give us nothing. */
-	GOSSIP_NONE,
+	/* What, if any, gossip we're seeker from peers. */
+	struct seeker *seeker;
 };
 
 /* This represents each peer we're gossiping with */
@@ -88,6 +75,9 @@ struct peer {
 
 	/* The ID of the peer (always unique) */
 	struct node_id id;
+
+	/* How much contribution have we made to gossip? */
+	size_t gossip_counter;
 
 	/* The two features gossip cares about (so far) */
 	bool gossip_queries_feature, initial_routing_sync_feature;
@@ -114,13 +104,12 @@ struct peer {
 	u32 range_first_blocknum, range_end_blocknum;
 	u32 range_blocks_remaining;
 	struct short_channel_id *query_channel_scids;
+	struct channel_update_timestamps *query_channel_timestamps;
 	void (*query_channel_range_cb)(struct peer *peer,
 				       u32 first_blocknum, u32 number_of_blocks,
 				       const struct short_channel_id *scids,
+				       const struct channel_update_timestamps *,
 				       bool complete);
-
-	/* Are we asking this peer to give us lot of gossip? */
-	enum gossip_level gossip_level;
 
 	/* The daemon_conn used to queue messages to/from the peer. */
 	struct daemon_conn *dc;
@@ -128,6 +117,13 @@ struct peer {
 
 /* Search for a peer. */
 struct peer *find_peer(struct daemon *daemon, const struct node_id *id);
+
+/* This peer (may be NULL) gave is valid gossip. */
+void peer_supplied_good_gossip(struct peer *peer, size_t amount);
+
+/* Pick a random peer which passes check_peer */
+struct peer *random_peer(struct daemon *daemon,
+			 bool (*check_peer)(const struct peer *peer));
 
 /* Queue a gossip message for the peer: the subdaemon on the other end simply
  * forwards it to the peer. */
@@ -137,5 +133,11 @@ void queue_peer_msg(struct peer *peer, const u8 *msg TAKES);
  * other end simply forwards it to the peer. */
 void queue_peer_from_store(struct peer *peer,
 			   const struct broadcastable *bcast);
+
+/* Reset gossip range for this peer. */
+void setup_gossip_range(struct peer *peer);
+
+/* A peer has given us these short channel ids: see if we need to catch up */
+void process_scids(struct daemon *daemon, const struct short_channel_id *scids);
 
 #endif /* LIGHTNING_GOSSIPD_GOSSIPD_H */
