@@ -1200,7 +1200,7 @@ def test_htlc_send_timeout(node_factory, bitcoind):
     timedout = False
     while not timedout:
         try:
-            l2.daemon.wait_for_log(r'channeld-{} chan #[0-9]*:\[IN\] 0101'.format(l3.info['id']), timeout=30)
+            l2.daemon.wait_for_log(r'channeld-{} chan #[0-9]*:\[IN\] '.format(l3.info['id']), timeout=30)
         except TimeoutError:
             timedout = True
 
@@ -1646,3 +1646,55 @@ def test_relative_config_dir(node_factory):
     assert os.path.isabs(l1.rpc.listconfigs()["lightning-dir"])
     l1.stop()
     os.chdir(initial_dir)
+
+
+def test_signmessage(node_factory):
+    l1, l2 = node_factory.line_graph(2, wait_for_announce=True)
+
+    corpus = [[None,
+               "this is a test!",
+               l1.rpc.call('signmessage', ["this is a test!"])['zbase'],
+               l1.info['id']]]
+
+    # Other contributions from LND users!
+    corpus += [
+        ['@bitconner',
+         "is this compatible?",
+         'rbgfioj114mh48d8egqx8o9qxqw4fmhe8jbeeabdioxnjk8z3t1ma1hu1fiswpakgucwwzwo6ofycffbsqusqdimugbh41n1g698hr9t',
+         '02b80cabdf82638aac86948e4c06e82064f547768dcef977677b9ea931ea75bab5'],
+        ['@duck1123',
+         'hi',
+         'rnrphcjswusbacjnmmmrynh9pqip7sy5cx695h6mfu64iac6qmcmsd8xnsyczwmpqp9shqkth3h4jmkgyqu5z47jfn1q7gpxtaqpx4xg',
+         '02de60d194e1ca5947b59fe8e2efd6aadeabfb67f2e89e13ae1a799c1e08e4a43b'],
+        ['@jochemin',
+         'hi',
+         'ry8bbsopmduhxy3dr5d9ekfeabdpimfx95kagdem7914wtca79jwamtbw4rxh69hg7n6x9ty8cqk33knbxaqftgxsfsaeprxkn1k48p3',
+         '022b8ece90ee891cbcdac0c1cc6af46b73c47212d8defbce80265ac81a6b794931'],
+    ]
+
+    for c in corpus:
+        print("Shout out to {}".format(c[0]))
+        assert subprocess.check_output(['devtools/lightning-checkmessage',
+                                        c[1], c[2]]).decode('utf-8') == "Signature claims to be from key {}\n".format(c[3])
+
+        subprocess.run(['devtools/lightning-checkmessage', c[1], c[2], c[3]], check=True)
+
+        with pytest.raises(subprocess.CalledProcessError):
+            subprocess.run(['devtools/lightning-checkmessage',
+                            c[1] + "modified", c[2], c[3]], check=True)
+
+        assert l1.rpc.call('checkmessage', [c[1], c[2], c[3]])['verified']
+        assert not l1.rpc.call('checkmessage', [c[1] + "modified", c[2], c[3]])['verified']
+        checknokey = l1.rpc.call('checkmessage', [c[1], c[2]])
+        # Of course, we know our own pubkey
+        if c[3] == l1.info['id']:
+            assert checknokey['verified']
+        else:
+            assert not checknokey['verified']
+        assert checknokey['pubkey'] == c[3]
+
+    # l2 knows about l1, so it can validate it.
+    zm = l1.rpc.call('signmessage', ["message for you"])['zbase']
+    checknokey = l2.rpc.call('checkmessage', ["message for you", zm])
+    assert checknokey['pubkey'] == l1.info['id']
+    assert checknokey['verified']
