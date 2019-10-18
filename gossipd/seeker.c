@@ -717,13 +717,23 @@ static void peer_gossip_probe_scids(struct seeker *seeker)
 
 static void probe_random_scids(struct seeker *seeker, size_t num_blocks)
 {
-	if (seeker->daemon->current_blockheight < num_blocks) {
+	u32 avail_blocks;
+
+	/* Ignore early blocks (unless we're before, which would be weird) */
+	if (seeker->daemon->current_blockheight
+	    < chainparams->when_lightning_became_cool)
+		avail_blocks = seeker->daemon->current_blockheight;
+	else
+		avail_blocks = seeker->daemon->current_blockheight
+			- chainparams->when_lightning_became_cool;
+
+	if (avail_blocks < num_blocks) {
 		seeker->scid_probe_start = 0;
 		seeker->scid_probe_end = seeker->daemon->current_blockheight;
 	} else {
 		seeker->scid_probe_start
-			= pseudorand(seeker->daemon->current_blockheight
-				     - num_blocks);
+			= chainparams->when_lightning_became_cool
+			+ pseudorand(avail_blocks - num_blocks);
 		seeker->scid_probe_end
 			= seeker->scid_probe_start + num_blocks - 1;
 	}
@@ -735,18 +745,16 @@ static void probe_random_scids(struct seeker *seeker, size_t num_blocks)
 /* We usually get a channel per block, so these cover a fair bit of ground */
 static void probe_some_random_scids(struct seeker *seeker)
 {
-	return probe_random_scids(seeker, 64);
+	return probe_random_scids(seeker, 1024);
 }
 
 static void probe_many_random_scids(struct seeker *seeker)
 {
-	return probe_random_scids(seeker, 1008);
+	return probe_random_scids(seeker, 10000);
 }
 
 static void check_firstpeer(struct seeker *seeker)
 {
-	struct chan *c;
-	u64 index;
 	struct peer *peer = seeker->random_peer_softref, *p;
 
 	/* It might have died, pick another. */
@@ -777,14 +785,11 @@ static void check_firstpeer(struct seeker *seeker)
 		normal_gossip_start(seeker, p);
 	}
 
-	/* We always look up 6 prior to last we have */
-	c = uintmap_last(&seeker->daemon->rstate->chanmap, &index);
-	if (c && short_channel_id_blocknum(&c->scid) > 6) {
-		seeker->scid_probe_start = short_channel_id_blocknum(&c->scid) - 6;
-	} else {
-		seeker->scid_probe_start = 0;
-	}
+	/* Ask a random peer for all channels, in case we're missing */
+	seeker->scid_probe_start = chainparams->when_lightning_became_cool;
 	seeker->scid_probe_end = seeker->daemon->current_blockheight;
+	if (seeker->scid_probe_start > seeker->scid_probe_end)
+		seeker->scid_probe_start = 0;
 	peer_gossip_probe_scids(seeker);
 }
 

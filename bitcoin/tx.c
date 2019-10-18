@@ -159,10 +159,6 @@ bool bitcoin_tx_check(const struct bitcoin_tx *tx)
 	if (wally_tx_get_length(tx->wtx, flags, &written) != WALLY_OK)
 		return false;
 
-	if (chainparams->is_elements) {
-		flags |= WALLY_TX_FLAG_USE_ELEMENTS;
-	}
-
 	newtx = tal_arr(tmpctx, u8, written);
 	if (wally_tx_to_bytes(tx->wtx, flags, newtx, written, &written) !=
 	    WALLY_OK)
@@ -208,6 +204,8 @@ const u8 *bitcoin_tx_output_get_script(const tal_t *ctx,
 	return res;
 }
 
+/* FIXME(cdecker) Make the caller pass in a reference to amount_asset, and
+ * return false if unintelligible/encrypted. (WARN UNUSED). */
 struct amount_asset bitcoin_tx_output_get_amount(const struct bitcoin_tx *tx,
 						 int outnum)
 {
@@ -220,13 +218,18 @@ struct amount_asset bitcoin_tx_output_get_amount(const struct bitcoin_tx *tx,
 	output = &tx->wtx->outputs[outnum];
 
 	if (chainparams->is_elements) {
-		/* We currently only support v1 asset tags */
-		assert(output->asset_len == sizeof(amount.asset) &&
-		       output->asset[0] == 0x01);
+		assert(output->asset_len == sizeof(amount.asset));
 		memcpy(&amount.asset, output->asset, sizeof(amount.asset));
-		memcpy(&raw, output->value + 1, sizeof(raw));
-		amount.value = be64_to_cpu(raw);
 
+		/* We currently only support explicit value asset tags, others
+		 * are confidential, so don't even try to assign a value to
+		 * it. */
+		if (output->asset[0] == 0x01) {
+			memcpy(&raw, output->value + 1, sizeof(raw));
+			amount.value = be64_to_cpu(raw);
+		} else {
+			amount.value = 0;
+		}
 	} else {
 		/* Do not assign amount.asset, we should never touch it in
 		 * non-elements scenarios. */
@@ -319,10 +322,7 @@ static void push_tx(const struct bitcoin_tx *tx,
         if (bip144 && uses_witness(tx))
 		flag |= WALLY_TX_FLAG_USE_WITNESS;
 
-	if (chainparams->is_elements)
-		flag |= WALLY_TX_FLAG_USE_ELEMENTS;
-
-	res = wally_tx_get_length(tx->wtx, flag & WALLY_TX_FLAG_USE_WITNESS, &len);
+	res = wally_tx_get_length(tx->wtx, flag, &len);
 	assert(res == WALLY_OK);
 	serialized = tal_arr(tmpctx, u8, len);
 
