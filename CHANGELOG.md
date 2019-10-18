@@ -4,7 +4,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.7.3rc1] T.B.D.
+## [0.7.3] - 2019-10-17: "Bitcoin's Proof of Stake"
+
+This release named by @trueptolemy.
 
 ### Added
 
@@ -16,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - JSON API: `fundchannel_start` now includes field `scriptpubkey`
 - JSON API: New method `listtransactions`
 - JSON API: `signmessage` will now create a signature from your node on a message; `checkmessage` will verify it.
+- JSON API: `fundchannel_start` now accepts an optional parameter `close_to`, the address to which these channel funds should be sent to on close. Returns `using_close_to` if will use.
 - Plugin: new notifications `sendpay_success` and `sendpay_failure`.
 - Protocol: nodes now announce features in `node_announcement` broadcasts.
 - Protocol: we now offer `option_gossip_queries_ex` for finegrained gossip control.
@@ -492,7 +495,8 @@ There predate the BOLT specifications, and are only of vague historic interest:
 6. [0.5.1] - 2016-10-21
 7. [0.5.2] - 2016-11-21: "Bitcoin Savings & Trust Daily Interest II"
 
-[Unreleased]: https://github.com/ElementsProject/lightning/compare/v0.7.2.1...HEAD
+[Unreleased]: https://github.com/ElementsProject/lightning/compare/v0.7.3...HEAD
+[0.7.3]: https://github.com/ElementsProject/lightning/releases/tag/v0.7.3
 [0.7.2.1]: https://github.com/ElementsProject/lightning/releases/tag/v0.7.2.1
 [0.7.1]: https://github.com/ElementsProject/lightning/releases/tag/v0.7.1
 [0.7.0]: https://github.com/ElementsProject/lightning/releases/tag/v0.7.0

@@ -379,7 +379,7 @@ static char *opt_set_hsm_password(struct lightningd *ld)
 	struct termios current_term, temp_term;
 	char *passwd = NULL;
 	size_t passwd_size = 0;
-	u8 salt[11] = "c-lightning";
+	u8 salt[16] = "c-lightning\0\0\0\0\0";
 	ld->encrypted_hsm = true;
 
 	ld->config.keypass = tal(NULL, struct secret);
@@ -398,6 +398,8 @@ static char *opt_set_hsm_password(struct lightningd *ld)
 	printf("Enter hsm_secret password : ");
 	if (getline(&passwd, &passwd_size, stdin) < 0)
 		return "Could not read password from stdin.";
+	if(passwd[strlen(passwd) - 1] == '\n')
+		passwd[strlen(passwd) - 1] = '\0';
 	if (tcsetattr(fileno(stdin), TCSAFLUSH, &current_term) != 0)
 		return "Could not restore terminal options.";
 	printf("\n");
@@ -416,7 +418,6 @@ static char *opt_set_hsm_password(struct lightningd *ld)
 	                  crypto_pwhash_ALG_ARGON2ID13) != 0)
 		return "Could not derive a key from the password.";
 	free(passwd);
-
 	return NULL;
 }
 

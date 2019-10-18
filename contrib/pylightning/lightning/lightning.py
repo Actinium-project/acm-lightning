@@ -5,7 +5,7 @@ from math import floor, log10
 import socket
 import warnings
 
-__version__ = "0.0.7.3"
+__version__ = "0.0.7.4"
 
 
 class RpcError(ValueError):
@@ -568,12 +568,13 @@ class LightningRpc(UnixDomainSocketRpc):
         if 'satoshi' in kwargs:
             return self._deprecated_fundchannel_start(node_id, *args, **kwargs)
 
-        def _fundchannel_start(node_id, amount, feerate=None, announce=True):
+        def _fundchannel_start(node_id, amount, feerate=None, announce=True, close_to=None):
             payload = {
                 "id": node_id,
                 "amount": amount,
                 "feerate": feerate,
-                "announce": announce
+                "announce": announce,
+                "close_to": close_to,
             }
             return self.call("fundchannel_start", payload)
 
@@ -991,3 +992,24 @@ class LightningRpc(UnixDomainSocketRpc):
             "txid": txid
         }
         return self.call("txsend", payload)
+
+    def signmessage(self, message):
+        """
+        Sign a message with this node's secret key.
+        """
+        payload = {
+            "message": message
+        }
+        return self.call("signmessage", payload)
+
+    def checkmessage(self, message, zbase, pubkey=None):
+        """
+        Check if a message was signed (with a specific key).
+        Use returned field ['verified'] to get result.
+        """
+        payload = {
+            "message": message,
+            "zbase": zbase,
+            "pubkey": pubkey,
+        }
+        return self.call("checkmessage", payload)
