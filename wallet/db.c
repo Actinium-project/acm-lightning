@@ -477,6 +477,9 @@ static struct migration dbmigrations[] = {
 	 ");"), NULL},
     {SQL("ALTER TABLE channels ADD shutdown_scriptpubkey_local BLOB;"),
 	 NULL},
+    /* See https://github.com/ElementsProject/lightning/issues/3189 */
+    {SQL("UPDATE forwarded_payments SET received_time=0 WHERE received_time IS NULL;"),
+	 NULL},
 };
 
 /* Leak tracking. */
@@ -562,7 +565,10 @@ bool db_step(struct db_stmt *stmt)
 
 u64 db_column_u64(struct db_stmt *stmt, int col)
 {
-	assert(!db_column_is_null(stmt, col));
+	if (db_column_is_null(stmt, col)) {
+		log_broken(stmt->db->log, "Accessing a null column %d in query %s", col, stmt->query->query);
+		return 0;
+	}
 	return stmt->db->config->column_u64_fn(stmt, col);
 }
 
@@ -576,13 +582,19 @@ int db_column_int_or_default(struct db_stmt *stmt, int col, int def)
 
 int db_column_int(struct db_stmt *stmt, int col)
 {
-	assert(!db_column_is_null(stmt, col));
+	if (db_column_is_null(stmt, col)) {
+		log_broken(stmt->db->log, "Accessing a null column %d in query %s", col, stmt->query->query);
+		return 0;
+	}
 	return stmt->db->config->column_int_fn(stmt, col);
 }
 
 size_t db_column_bytes(struct db_stmt *stmt, int col)
 {
-	assert(!db_column_is_null(stmt, col));
+	if (db_column_is_null(stmt, col)) {
+		log_broken(stmt->db->log, "Accessing a null column %d in query %s", col, stmt->query->query);
+		return 0;
+	}
 	return stmt->db->config->column_bytes_fn(stmt, col);
 }
 
@@ -593,13 +605,19 @@ int db_column_is_null(struct db_stmt *stmt, int col)
 
 const void *db_column_blob(struct db_stmt *stmt, int col)
 {
-	assert(!db_column_is_null(stmt, col));
+	if (db_column_is_null(stmt, col)) {
+		log_broken(stmt->db->log, "Accessing a null column %d in query %s", col, stmt->query->query);
+		return NULL;
+	}
 	return stmt->db->config->column_blob_fn(stmt, col);
 }
 
 const unsigned char *db_column_text(struct db_stmt *stmt, int col)
 {
-	assert(!db_column_is_null(stmt, col));
+	if (db_column_is_null(stmt, col)) {
+		log_broken(stmt->db->log, "Accessing a null column %d in query %s", col, stmt->query->query);
+		return NULL;
+	}
 	return stmt->db->config->column_text_fn(stmt, col);
 }
 
@@ -772,7 +790,7 @@ static int db_get_version(struct db *db)
 /**
  * db_migrate - Apply all remaining migrations from the current version
  */
-static void db_migrate(struct lightningd *ld, struct db *db, struct log *log)
+static void db_migrate(struct lightningd *ld, struct db *db)
 {
 	/* Attempt to read the version from the database */
 	int current, orig, available;
@@ -784,12 +802,12 @@ static void db_migrate(struct lightningd *ld, struct db *db, struct log *log)
 	available = ARRAY_SIZE(dbmigrations) - 1;
 
 	if (current == -1)
-		log_info(log, "Creating database");
+		log_info(db->log, "Creating database");
 	else if (available < current)
 		db_fatal("Refusing to migrate down from version %u to %u",
 			 current, available);
 	else if (current != available)
-		log_info(log, "Updating database from version %u to %u",
+		log_info(db->log, "Updating database from version %u to %u",
 			 current, available);
 
 	while (current < available) {
@@ -826,7 +844,8 @@ static void db_migrate(struct lightningd *ld, struct db *db, struct log *log)
 struct db *db_setup(const tal_t *ctx, struct lightningd *ld, struct log *log)
 {
 	struct db *db = db_open(ctx, ld->wallet_dsn);
-	db_migrate(ld, db, log);
+	db->log = log;
+	db_migrate(ld, db);
 	return db;
 }
 
