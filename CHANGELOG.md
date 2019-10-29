@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.7.3rc3] - 2019-10-18: "Bitcoin's Proof of Stake"
+## [0.7.3] - 2019-10-18: "Bitcoin's Proof of Stake"
 
 This release named by @trueptolemy.
 
@@ -38,7 +38,7 @@ This release named by @trueptolemy.
 - JSON API: The `plugin` command now returns on error. A timeout of 20 seconds is added to `start` and `startdir` subcommands at the end of which the plugin is errored if it did not complete the handshake with `lightningd`.
 - JSON API: The `plugin` command does not allow to start static plugins after `lightningd` startup anymore.
 - Protocol: We now push our own gossip to all peers, independent of their filter.
-- Protocol: Now follows spec in responses to short channel id queries on unknown chainhashes; correspondingly, disconnects from peers that signal they do not maintain up-to-date information for the requested chain.
+- Protocol: Now follows spec in responses to short channel id queries on unknown chainhashes
 - Tor: We default now with autotor to generate if possible temporary ED25519-V3 onions.  You can use new option `enable-autotor-v2-mode` to fallback to V2 RSA1024 mode.
 
 ### Deprecated
@@ -59,6 +59,7 @@ Note: You should always set `allow-deprecated-apis=false` to test for changes.
 
 ### Fixed
 
+- Fixed bogus "Bad commit_sig signature" which caused channel closures when reconnecting after updating fees under simultaneous bidirectional traffic.
 - Relative `--lightning_dir` is now working again.
 - Build: MacOS now builds again (missing pwritev).
 
