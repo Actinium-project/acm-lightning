@@ -6,24 +6,34 @@ Here's a checklist for the release process.
 
 1. Talk to team about whether there are any changes which MUST go in
    this release which may cause delay.
-2. Create a milestone for the *next* release, and go though issues and PR
-   and mark accordingly.
-3. Ask the most significant contributor who has not already named a
-   release to name the release (use devtools/credit).  CC previous namers
-   and team.
+2. Look through outstanding issues, to identify any problems that might
+   be necessary to fixup before the release. Good candidates are reports
+   of the project not building on different architectures or crashes.
+3. Identify a good lead for each outstanding issue, and ask them about
+   a fix timeline.
+4. Create a milestone for the *next* release on Github, and go though
+   open issues and PRs and mark accordingly.
+5. Ask (via email) the most significant contributor who has not
+   already named a release to name the release (use devtools/credit to
+   find this contributor). CC previous namers and team.
 
-### Prepering for -rc1
+### Preparing for -rc1
 
 1. Check that CHANGELOG.md is well formatted, ordered in areas,
    covers all signficant changes, and sub-ordered approximately by user impact
    & coolness.
-2. Update the CHANGELOG.md with [Unreleased] changed to -rc1.
+2. Update the CHANGELOG.md with [Unreleased] changed to v<VERSION>-rc1. Note that
+   you should exactly copy the date and name format from a previous
+   release, as the `build-release.sh` script relies on this.
 3. Create a PR with the above.
 
 ### Releasing -rc1
 
-1. Merge the PR above.
-2. Tag it `git pull && git tag -s v<VERSION>rc1 && git push --tags`
+1. Merge the above PR.
+2. Tag it `git pull && git tag -s v<VERSION>rc1`. Note that you
+   should get a prompt to give this tag a 'message'. Make sure you fill this in.
+3. Confirm that the tag will show up for builds with `git describe`
+4. Push the tag to remote `git push --tags`.
 3. Update the /topic on #c-lightning on Freenode.
 4. Prepare draft release notes (see devtools/credit), and share with team for editing.
 5. Upgrade your personal nodes to the rc1, to help testing.
@@ -41,8 +51,8 @@ Here's a checklist for the release process.
 
 ### Tagging the Release
 
-1. Update the CHANGELOG.md; remove -rcN in both places, and add an
-   [Unreleased] footnote URL from this new version to HEAD.
+1. Update the CHANGELOG.md; remove -rcN in both places, update the date, and
+   add an [Unreleased] footnote URL from this new version to HEAD.
 2. Add a PR with that release.
 3. Merge the PR, then `git pull && git tag -s v<VERSION> && git push --tags`.
 4. Run `tools/build-release.sh` to build the non-reprodicible images
@@ -69,5 +79,7 @@ Here's a checklist for the release process.
 
 ### Post-release
 
-1. Add a new '[Unreleased]' section the CHANGELOG.md with empty headers.
+1. Add a new '[Unreleased]' section to the CHANGELOG.md with empty headers.
 2. Look through PRs which were delayed for release and merge them.
+3. Close out the Milestone for the now-shipped release.
+4. Update this file with any missing or changed instructions.
