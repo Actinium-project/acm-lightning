@@ -1164,6 +1164,40 @@ static bool adjust_balance(struct channel *channel, struct htlc *htlc)
 	return true;
 }
 
+static bool offset_balances(struct channel *channel)
+{
+	for (enum side view = LOCAL; view < NUM_SIDES; view++) {
+		for (enum side side = LOCAL; side < NUM_SIDES; side++) {
+			struct amount_msat *a = &channel->view[view].owed[side];
+			if (amount_msat_add(a, *a, AMOUNT_MSAT((u64)1 << 63)))
+				continue;
+
+			status_broken("Can't offset %s",
+				      type_to_string(tmpctx, struct amount_msat,
+						     a));
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool unoffset_balances(struct channel *channel)
+{
+	for (enum side view = LOCAL; view < NUM_SIDES; view++) {
+		for (enum side side = LOCAL; side < NUM_SIDES; side++) {
+			struct amount_msat *a = &channel->view[view].owed[side];
+			if (amount_msat_sub(a, *a, AMOUNT_MSAT((u64)1 << 63)))
+				continue;
+
+			status_broken("Can't unoffset %s",
+				      type_to_string(tmpctx, struct amount_msat,
+						     a));
+			return false;
+		}
+	}
+	return true;
+}
+
 bool channel_force_htlcs(struct channel *channel,
 			 const struct added_htlc *htlcs,
 			 const enum htlc_state *hstates,
@@ -1178,22 +1212,23 @@ bool channel_force_htlcs(struct channel *channel,
 	struct htlc_map_iter it;
 
 	if (tal_count(hstates) != tal_count(htlcs)) {
-		status_debug("#hstates %zu != #htlcs %zu",
+		status_broken("#hstates %zu != #htlcs %zu",
 			     tal_count(hstates), tal_count(htlcs));
 		return false;
 	}
 
 	if (tal_count(fulfilled) != tal_count(fulfilled_sides)) {
-		status_debug("#fulfilled sides %zu != #fulfilled %zu",
+		status_broken("#fulfilled sides %zu != #fulfilled %zu",
 			     tal_count(fulfilled_sides), tal_count(fulfilled));
 		return false;
 	}
 
 	if (tal_count(failed) != tal_count(failed_sides)) {
-		status_debug("#failed sides %zu != #failed %zu",
+		status_broken("#failed sides %zu != #failed %zu",
 			     tal_count(failed_sides), tal_count(failed));
 		return false;
 	}
+
 	for (i = 0; i < tal_count(htlcs); i++) {
 		enum channel_add_err e;
 		struct htlc *htlc;
@@ -1215,7 +1250,7 @@ bool channel_force_htlcs(struct channel *channel,
 			     &htlcs[i].payment_hash,
 			     htlcs[i].onion_routing_packet, &htlc, false, NULL);
 		if (e != CHANNEL_ERR_ADD_OK) {
-			status_debug("%s HTLC %"PRIu64" failed error %u",
+			status_broken("%s HTLC %"PRIu64" failed error %u",
 				     htlc_state_owner(hstates[i]) == LOCAL
 				     ? "out" : "in", htlcs[i].id, e);
 			return false;
@@ -1227,31 +1262,31 @@ bool channel_force_htlcs(struct channel *channel,
 						     fulfilled_sides[i],
 						     fulfilled[i].id);
 		if (!htlc) {
-			status_debug("Fulfill %s HTLC %"PRIu64" not found",
+			status_broken("Fulfill %s HTLC %"PRIu64" not found",
 				     fulfilled_sides[i] == LOCAL ? "out" : "in",
 				     fulfilled[i].id);
 			return false;
 		}
 		if (htlc->r) {
-			status_debug("Fulfill %s HTLC %"PRIu64" already fulfilled",
+			status_broken("Fulfill %s HTLC %"PRIu64" already fulfilled",
 				     fulfilled_sides[i] == LOCAL ? "out" : "in",
 				     fulfilled[i].id);
 			return false;
 		}
 		if (htlc->fail) {
-			status_debug("Fulfill %s HTLC %"PRIu64" already failed",
+			status_broken("Fulfill %s HTLC %"PRIu64" already failed",
 				     fulfilled_sides[i] == LOCAL ? "out" : "in",
 				     fulfilled[i].id);
 			return false;
 		}
 		if (htlc->failcode) {
-			status_debug("Fulfill %s HTLC %"PRIu64" already fail %u",
+			status_broken("Fulfill %s HTLC %"PRIu64" already fail %u",
 				     fulfilled_sides[i] == LOCAL ? "out" : "in",
 				     fulfilled[i].id, htlc->failcode);
 			return false;
 		}
 		if (!htlc_has(htlc, HTLC_REMOVING)) {
-			status_debug("Fulfill %s HTLC %"PRIu64" state %s",
+			status_broken("Fulfill %s HTLC %"PRIu64" state %s",
 				     fulfilled_sides[i] == LOCAL ? "out" : "in",
 				     fulfilled[i].id,
 				     htlc_state_name(htlc->state));
@@ -1266,31 +1301,31 @@ bool channel_force_htlcs(struct channel *channel,
 		htlc = channel_get_htlc(channel, failed_sides[i],
 					failed[i]->id);
 		if (!htlc) {
-			status_debug("Fail %s HTLC %"PRIu64" not found",
+			status_broken("Fail %s HTLC %"PRIu64" not found",
 				     failed_sides[i] == LOCAL ? "out" : "in",
 				     failed[i]->id);
 			return false;
 		}
 		if (htlc->r) {
-			status_debug("Fail %s HTLC %"PRIu64" already fulfilled",
+			status_broken("Fail %s HTLC %"PRIu64" already fulfilled",
 				     failed_sides[i] == LOCAL ? "out" : "in",
 				     failed[i]->id);
 			return false;
 		}
 		if (htlc->fail) {
-			status_debug("Fail %s HTLC %"PRIu64" already failed",
+			status_broken("Fail %s HTLC %"PRIu64" already failed",
 				     failed_sides[i] == LOCAL ? "out" : "in",
 				     failed[i]->id);
 			return false;
 		}
 		if (htlc->failcode) {
-			status_debug("Fail %s HTLC %"PRIu64" already fail %u",
+			status_broken("Fail %s HTLC %"PRIu64" already fail %u",
 				     failed_sides[i] == LOCAL ? "out" : "in",
 				     failed[i]->id, htlc->failcode);
 			return false;
 		}
 		if (!htlc_has(htlc, HTLC_REMOVING)) {
-			status_debug("Fail %s HTLC %"PRIu64" state %s",
+			status_broken("Fail %s HTLC %"PRIu64" state %s",
 				     failed_sides[i] == LOCAL ? "out" : "in",
 				     fulfilled[i].id,
 				     htlc_state_name(htlc->state));
@@ -1316,8 +1351,13 @@ bool channel_force_htlcs(struct channel *channel,
 			htlc->failed_scid = NULL;
 	}
 
-	/* Now adjust balances.  The balance never goes negative, because
-	 * we do them in id order. */
+	/* Add giant offset so we never go negative here. */
+	if (!offset_balances(channel))
+		return false;
+
+	/* You'd think, since we traverse HTLCs in ID order, this would never
+	 * go negative.  But this ignores the fact that HTLCs ids from each
+	 * side have no correlation with each other. */
 	for (htlc = htlc_map_first(channel->htlcs, &it);
 	     htlc;
 	     htlc = htlc_map_next(channel->htlcs, &it)) {
@@ -1325,7 +1365,7 @@ bool channel_force_htlcs(struct channel *channel,
 			return false;
 	}
 
-	return true;
+	return unoffset_balances(channel);
 }
 
 const char *channel_add_err_name(enum channel_add_err e)
