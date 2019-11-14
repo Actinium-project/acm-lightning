@@ -61,7 +61,7 @@ struct sphinx_path;
  *    * [`u32`:`outgoing_cltv_value`]
  *    * [`12*byte`:`padding`]
  */
-struct hop_data {
+struct hop_data_legacy {
 	u8 realm;
 	struct short_channel_id channel_id;
 	struct amount_msat amt_forward;
@@ -80,7 +80,8 @@ struct route_step {
 	struct onionpacket *next;
 	enum sphinx_payload_type type;
 	union {
-		struct hop_data v0;
+		struct hop_data_legacy v0;
+		struct tlv_tlv_payload *tlv;
 	} payload;
 	u8 *raw_payload;
 };
@@ -219,15 +220,42 @@ struct sphinx_path *sphinx_path_new_with_key(const tal_t *ctx,
 					     const struct secret *session_key);
 
 /**
- * Add a V0 (Realm 0) single frame hop to the path.
- */
-void sphinx_add_v0_hop(struct sphinx_path *path, const struct pubkey *pubkey,
-		       const struct short_channel_id *scid, struct amount_msat forward,
-		       u32 outgoing_cltv);
-/**
  * Add a raw payload hop to the path.
  */
 void sphinx_add_raw_hop(struct sphinx_path *path, const struct pubkey *pubkey,
 			enum sphinx_payload_type type, const u8 *payload);
 
+/**
+ * Add a non-final hop to the path.
+ */
+void sphinx_add_nonfinal_hop(struct sphinx_path *path,
+			     const struct pubkey *pubkey,
+			     bool use_tlv,
+			     const struct short_channel_id *scid,
+			     struct amount_msat forward,
+			     u32 outgoing_cltv);
+
+/**
+ * Add a final hop to the path.
+ */
+void sphinx_add_final_hop(struct sphinx_path *path,
+			  const struct pubkey *pubkey,
+			  bool use_tlv,
+			  struct amount_msat forward,
+			  u32 outgoing_cltv);
+
+/**
+ * Helper to extract fields from ONION_END.
+ */
+bool route_step_decode_end(const struct route_step *rs,
+			   struct amount_msat *amt_forward,
+			   u32 *outgoing_cltv);
+
+/**
+ * Helper to extract fields from ONION_FORWARD.
+ */
+bool route_step_decode_forward(const struct route_step *rs,
+			       struct amount_msat *amt_forward,
+			       u32 *outgoing_cltv,
+			       struct short_channel_id *scid);
 #endif /* LIGHTNING_COMMON_SPHINX_H */

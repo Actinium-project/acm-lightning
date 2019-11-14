@@ -615,6 +615,20 @@ static struct command_result *wait_payment(struct lightningd *ld,
 	abort();
 }
 
+static bool should_use_tlv(enum route_hop_style style)
+{
+	switch (style) {
+	case ROUTE_HOP_TLV:
+#if EXPERIMENTAL_FEATURES
+		return true;
+#endif
+		/* Otherwise fall thru */
+	case ROUTE_HOP_LEGACY:
+		return false;
+	}
+	abort();
+}
+
 /* Returns command_result if cmd was resolved, NULL if not yet called. */
 static struct command_result *
 send_payment(struct lightningd *ld,
@@ -632,7 +646,6 @@ send_payment(struct lightningd *ld,
 	struct secret *path_secrets;
 	enum onion_type failcode;
 	size_t i, n_hops = tal_count(route);
-	struct hop_data *hop_data = tal_arr(tmpctx, struct hop_data, n_hops);
 	struct node_id *ids = tal_arr(tmpctx, struct node_id, n_hops);
 	struct wallet_payment *payment = NULL;
 	struct htlc_out *hout;
@@ -640,40 +653,38 @@ send_payment(struct lightningd *ld,
 	struct routing_failure *fail;
 	struct channel *channel;
 	struct sphinx_path *path;
-	struct short_channel_id finalscid;
 	struct pubkey pubkey;
 	bool ret;
 
 	/* Expiry for HTLCs is absolute.  And add one to give some margin. */
 	base_expiry = get_block_height(ld->topology) + 1;
-	memset(&finalscid, 0, sizeof(struct short_channel_id));
 
 	path = sphinx_path_new(tmpctx, rhash->u.u8);
 	/* Extract IDs for each hop: create_onionpacket wants array. */
 	for (i = 0; i < n_hops; i++)
 		ids[i] = route[i].nodeid;
 
-	/* Copy hop_data[n] from route[n+1] (ie. where it goes next) */
+	/* Create sphinx path */
 	for (i = 0; i < n_hops - 1; i++) {
 		ret = pubkey_from_node_id(&pubkey, &ids[i]);
 		assert(ret);
-		hop_data[i].realm = 0;
-		hop_data[i].channel_id = route[i+1].channel_id;
-		hop_data[i].amt_forward = route[i+1].amount;
-		hop_data[i].outgoing_cltv = base_expiry + route[i+1].delay;
-		sphinx_add_v0_hop(path, &pubkey, &route[i + 1].channel_id,
-				  route[i + 1].amount,
-				  base_expiry + route[i + 1].delay);
+
+		sphinx_add_nonfinal_hop(path, &pubkey,
+					should_use_tlv(route[i].style),
+					&route[i + 1].channel_id,
+					route[i + 1].amount,
+					base_expiry + route[i + 1].delay);
 	}
 
 	/* And finally set the final hop to the special values in
 	 * BOLT04 */
-	memset(&finalscid, 0, sizeof(struct short_channel_id));
 	ret = pubkey_from_node_id(&pubkey, &ids[i]);
 	assert(ret);
-	sphinx_add_v0_hop(path, &pubkey, &finalscid,
-			  route[i].amount,
-			  base_expiry + route[i].delay);
+
+	sphinx_add_final_hop(path, &pubkey,
+			     should_use_tlv(route[i].style),
+			     route[i].amount,
+			     base_expiry + route[i].delay);
 
 	/* Now, do we already have a payment? */
 	payment = wallet_payment_by_hash(tmpctx, ld->wallet, rhash);
@@ -793,6 +804,27 @@ send_payment(struct lightningd *ld,
 JSON-RPC sendpay interface
 -----------------------------------------------------------------------------*/
 
+static struct command_result *param_route_hop_style(struct command *cmd,
+						    const char *name,
+						    const char *buffer,
+						    const jsmntok_t *tok,
+						    enum route_hop_style **style)
+{
+	*style = tal(cmd, enum route_hop_style);
+	if (json_tok_streq(buffer, tok, "legacy")) {
+		**style = ROUTE_HOP_LEGACY;
+		return NULL;
+	} else if (json_tok_streq(buffer, tok, "tlv")) {
+		**style = ROUTE_HOP_TLV;
+		return NULL;
+	}
+
+	return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			    "'%s' should be a legacy or tlv, not '%.*s'",
+			    name, json_tok_full_len(tok),
+			    json_tok_full(buffer, tok));
+}
+
 static struct command_result *json_sendpay(struct command *cmd,
 					   const char *buffer,
 					   const jsmntok_t *obj UNNEEDED,
@@ -851,6 +883,7 @@ static struct command_result *json_sendpay(struct command *cmd,
 		struct node_id *id;
 		struct short_channel_id *channel;
 		unsigned *delay, *direction;
+		enum route_hop_style *style;
 
 		if (!param(cmd, buffer, t,
 			   /* Only *one* of these is required */
@@ -861,6 +894,8 @@ static struct command_result *json_sendpay(struct command *cmd,
 			   p_opt("delay", param_number, &delay),
 			   p_opt("channel", param_short_channel_id, &channel),
 			   p_opt("direction", param_number, &direction),
+			   p_opt_def("style", param_route_hop_style, &style,
+				     ROUTE_HOP_LEGACY),
 			   NULL))
 			return command_param_failed();
 
@@ -889,6 +924,7 @@ static struct command_result *json_sendpay(struct command *cmd,
 		route[i].nodeid = *id;
 		route[i].delay = *delay;
 		route[i].channel_id = *channel;
+		route[i].style = *style;
 		/* FIXME: Actually ignored by sending code! */
 		route[i].direction = direction ? *direction : 0;
 	}

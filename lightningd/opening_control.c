@@ -301,7 +301,7 @@ static void funding_started_success(struct funding_channel *fc,
 
 	response = json_stream_success(cmd);
 	out = encode_scriptpubkey_to_addr(cmd,
-				          get_chainparams(cmd->ld)->bip173_name,
+				          get_chainparams(cmd->ld),
 					  scriptPubkey);
 	if (out) {
 		json_add_string(response, "funding_address", out);
@@ -965,6 +965,7 @@ void peer_start_openingd(struct peer *peer,
 				  feature_negotiated(peer->features,
 						     OPT_STATIC_REMOTEKEY),
 				  send_msg,
+				  IFDEV(peer->ld->dev_force_tmp_channel_id, NULL),
 				  IFDEV(peer->ld->dev_fast_gossip, false));
 	subd_send_msg(uc->openingd, take(msg));
 }

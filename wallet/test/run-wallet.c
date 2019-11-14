@@ -90,6 +90,11 @@ void connect_succeeded(struct lightningd *ld UNNEEDED, const struct node_id *id 
 void delay_then_reconnect(struct channel *channel UNNEEDED, u32 seconds_delay UNNEEDED,
 			  const struct wireaddr_internal *addrhint TAKES UNNEEDED)
 { fprintf(stderr, "delay_then_reconnect called!\n"); abort(); }
+/* Generated stub for encode_scriptpubkey_to_addr */
+char *encode_scriptpubkey_to_addr(const tal_t *ctx UNNEEDED,
+				  const struct chainparams *chainparams UNNEEDED,
+                                  const u8 *scriptPubkey UNNEEDED)
+{ fprintf(stderr, "encode_scriptpubkey_to_addr called!\n"); abort(); }
 /* Generated stub for fatal */
 void   fatal(const char *fmt UNNEEDED, ...)
 { fprintf(stderr, "fatal called!\n"); abort(); }
@@ -530,6 +535,17 @@ struct route_step *process_onionpacket(
 	const size_t assocdatalen
 	)
 { fprintf(stderr, "process_onionpacket called!\n"); abort(); }
+/* Generated stub for route_step_decode_end */
+bool route_step_decode_end(const struct route_step *rs UNNEEDED,
+			   struct amount_msat *amt_forward UNNEEDED,
+			   u32 *outgoing_cltv UNNEEDED)
+{ fprintf(stderr, "route_step_decode_end called!\n"); abort(); }
+/* Generated stub for route_step_decode_forward */
+bool route_step_decode_forward(const struct route_step *rs UNNEEDED,
+			       struct amount_msat *amt_forward UNNEEDED,
+			       u32 *outgoing_cltv UNNEEDED,
+			       struct short_channel_id *scid UNNEEDED)
+{ fprintf(stderr, "route_step_decode_forward called!\n"); abort(); }
 /* Generated stub for serialize_onionpacket */
 u8 *serialize_onionpacket(
 	const tal_t *ctx UNNEEDED,
