@@ -8,8 +8,8 @@
 #include <common/status.h>
 
 #include <stdio.h>
-#define status_fmt(level, fmt, ...)					\
-	do { printf((fmt) ,##__VA_ARGS__); printf("\n"); } while(0)
+#define status_fmt(level, node_id, fmt, ...)				\
+	do { (void)node_id; printf((fmt) ,##__VA_ARGS__); printf("\n"); } while(0)
 
 #include "../routing.c"
 #include "../gossip_store.c"

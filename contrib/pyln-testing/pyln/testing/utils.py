@@ -542,7 +542,7 @@ class LightningD(TailableProc):
 class LightningNode(object):
     def __init__(self, node_id, lightning_dir, bitcoind, executor, may_fail=False,
                  may_reconnect=False, allow_broken_log=False,
-                 allow_bad_gossip=False, db=None, port=None, disconnect=None, random_hsm=None, log_all_io=None, options=None, **kwargs):
+                 allow_bad_gossip=False, db=None, port=None, disconnect=None, random_hsm=None, options=None, **kwargs):
         self.bitcoin = bitcoind
         self.executor = executor
         self.may_fail = may_fail
@@ -564,10 +564,6 @@ class LightningNode(object):
             with open(self.daemon.disconnect_file, "w") as f:
                 f.write("\n".join(disconnect))
             self.daemon.opts["dev-disconnect"] = "dev_disconnect"
-        if log_all_io:
-            assert DEVELOPER
-            self.daemon.env["LIGHTNINGD_DEV_LOG_IO"] = "1"
-            self.daemon.opts["log-level"] = "io"
         if DEVELOPER:
             self.daemon.opts["dev-fail-on-subdaemon-fail"] = None
             self.daemon.env["LIGHTNINGD_DEV_MEMLEAK"] = "1"
@@ -732,9 +728,13 @@ class LightningNode(object):
                                      'to CHANNELD_NORMAL'])
         return scid
 
-    def subd_pid(self, subd):
+    def subd_pid(self, subd, peerid=None):
         """Get the process id of the given subdaemon, eg channeld or gossipd"""
-        ex = re.compile(r'lightning_{}.*: pid ([0-9]*),'.format(subd))
+        if peerid:
+            ex = re.compile(r'{}-.*{}.*: pid ([0-9]*),'
+                            .format(peerid, subd))
+        else:
+            ex = re.compile('{}-.*: pid ([0-9]*),'.format(subd))
         # Make sure we get latest one if it's restarted!
         for l in reversed(self.daemon.logs):
             group = ex.search(l)
@@ -877,7 +877,7 @@ class LightningNode(object):
                                timeout=TIMEOUT,
                                stdout=subprocess.PIPE).stdout.strip()
         out = subprocess.run(['devtools/gossipwith',
-                              '--timeout-after={}'.format(int(math.sqrt(TIMEOUT) * 1000)),
+                              '--timeout-after={}'.format(int(math.sqrt(TIMEOUT) + 1)),
                               '{}@localhost:{}'.format(self.info['id'],
                                                        self.port),
                               query],
@@ -927,7 +927,6 @@ class NodeFactory(object):
             'allow_broken_log',
             'may_reconnect',
             'random_hsm',
-            'log_all_io',
             'feerates',
             'wait_for_bitcoind_sync',
             'allow_bad_gossip'
@@ -1024,7 +1023,7 @@ class NodeFactory(object):
         # getpeers.
         if not fundchannel:
             for src, dst in connections:
-                dst.daemon.wait_for_log('openingd-{} chan #[0-9]*: Handed peer, entering loop'.format(src.info['id']))
+                dst.daemon.wait_for_log(r'{}-.*openingd-chan#[0-9]*: Handed peer, entering loop'.format(src.info['id']))
             return nodes
 
         # If we got here, we want to fund channels

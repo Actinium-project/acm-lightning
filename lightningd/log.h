@@ -13,119 +13,43 @@
 struct command;
 struct json_stream;
 struct lightningd;
+struct node_id;
 struct timerel;
-
-struct log_entry {
-	struct list_node list;
-	struct timeabs time;
-	enum log_level level;
-	unsigned int skipped;
-	const char *prefix;
-	char *log;
-	/* Iff LOG_IO */
-	const u8 *io;
-};
-
-struct log_book {
-	size_t mem_used;
-	size_t max_mem;
-	void (*print)(const char *prefix,
-		      enum log_level level,
-		      bool continued,
-		      const struct timeabs *time,
-		      const char *str,
-		      const u8 *io, size_t io_len,
-		      void *arg);
-	void *print_arg;
-	enum log_level print_level;
-	struct timeabs init_time;
-
-	struct list_head log;
-	/* Although log_book will copy log entries to parent log_book
-	 * (the log_book belongs to lightningd), a pointer to lightningd
-	 *  is more directly because the notification needs ld->plugins.
-	 */
-	struct lightningd *ld;
-};
-
-struct log {
-	struct log_book *lr;
-	const char *prefix;
-};
 
 /* We can have a single log book, with multiple logs in it: it's freed
  * by the last struct log itself. */
-struct log_book *new_log_book(struct lightningd *ld, size_t max_mem,
-			      enum log_level printlevel);
+struct log_book *new_log_book(struct lightningd *ld, size_t max_mem);
 
 /* With different entry points */
-struct log *new_log(const tal_t *ctx, struct log_book *record, const char *fmt, ...) PRINTF_FMT(3,4);
+struct log *new_log(const tal_t *ctx, struct log_book *record,
+		    const struct node_id *default_node_id,
+		    const char *fmt, ...) PRINTF_FMT(4,5);
 
-#define log_debug(log, ...) log_((log), LOG_DBG, false, __VA_ARGS__)
-#define log_info(log, ...) log_((log), LOG_INFORM, false, __VA_ARGS__)
-#define log_unusual(log, ...) log_((log), LOG_UNUSUAL, true, __VA_ARGS__)
-#define log_broken(log, ...) log_((log), LOG_BROKEN, true, __VA_ARGS__)
+#define log_debug(log, ...) log_((log), LOG_DBG, NULL, false, __VA_ARGS__)
+#define log_info(log, ...) log_((log), LOG_INFORM, NULL, false, __VA_ARGS__)
+#define log_unusual(log, ...) log_((log), LOG_UNUSUAL, NULL, true, __VA_ARGS__)
+#define log_broken(log, ...) log_((log), LOG_BROKEN, NULL, true, __VA_ARGS__)
 
-void log_io(struct log *log, enum log_level dir, const char *comment,
+#define log_peer_debug(log, nodeid, ...) log_((log), LOG_DBG, nodeid, false, __VA_ARGS__)
+#define log_peer_info(log, nodeid, ...) log_((log), LOG_INFORM, nodeid, false, __VA_ARGS__)
+#define log_peer_unusual(log, nodeid, ...) log_((log), LOG_UNUSUAL, nodeid, true, __VA_ARGS__)
+#define log_peer_broken(log, nodeid, ...) log_((log), LOG_BROKEN, nodeid, true, __VA_ARGS__)
+
+void log_io(struct log *log, enum log_level dir,
+	    const struct node_id *node_id,
+	    const char *comment,
 	    const void *data, size_t len);
 
-void log_(struct log *log, enum log_level level, bool call_notifier, const char *fmt, ...)
-	PRINTF_FMT(4,5);
-void log_add(struct log *log, const char *fmt, ...) PRINTF_FMT(2,3);
-void logv(struct log *log, enum log_level level, bool call_notifier, const char *fmt, va_list ap);
-void logv_add(struct log *log, const char *fmt, va_list ap);
+void log_(struct log *log, enum log_level level,
+	  const struct node_id *node_id,
+	  bool call_notifier,
+	  const char *fmt, ...)
+	PRINTF_FMT(5,6);
+void logv(struct log *log, enum log_level level, const struct node_id *node_id,
+	  bool call_notifier, const char *fmt, va_list ap);
 
-enum log_level get_log_level(struct log_book *lr);
-void set_log_level(struct log_book *lr, enum log_level level);
-void set_log_prefix(struct log *log, const char *prefix);
 const char *log_prefix(const struct log *log);
-struct log_book *get_log_book(const struct log *log);
-
-#define set_log_outfn(lr, print, arg)					\
-	set_log_outfn_((lr),						\
-		       typesafe_cb_preargs(void, void *, (print), (arg),\
-					   const char *,		\
-					   enum log_level,		\
-					   bool,			\
-					   const struct timeabs *,	\
-					   const char *,		\
-					   const u8 *, size_t), (arg))
-
-/* If level == LOG_IO_IN/LOG_IO_OUT, then io contains data */
-void set_log_outfn_(struct log_book *lr,
-		    void (*print)(const char *prefix,
-				  enum log_level level,
-				  bool continued,
-				  const struct timeabs *time,
-				  const char *str,
-				  const u8 *io, size_t io_len,
-				  void *arg),
-		    void *arg);
-
-size_t log_max_mem(const struct log_book *lr);
-size_t log_used(const struct log_book *lr);
-const struct timeabs *log_init_time(const struct log_book *lr);
-
-#define log_each_line(lr, func, arg)					\
-	log_each_line_((lr),						\
-		       typesafe_cb_preargs(void, void *, (func), (arg),	\
-					   unsigned int,		\
-					   struct timerel,		\
-					   enum log_level,		\
-					   const char *,		\
-					   const char *,		\
-					   const u8 *), (arg))
-
-void log_each_line_(const struct log_book *lr,
-		    void (*func)(unsigned int skipped,
-				 struct timerel time,
-				 enum log_level level,
-				 const char *prefix,
-				 const char *log,
-				 const u8 *io,
-				 void *arg),
-		    void *arg);
-
+enum log_level log_print_level(struct log *log);
 
 void opt_register_logging(struct lightningd *ld);
 
@@ -140,7 +64,9 @@ void log_backtrace_exit(void);
 
 /* Adds an array showing log entries */
 void json_add_log(struct json_stream *result,
-		  const struct log_book *lr, enum log_level minlevel);
+		  const struct log_book *lr,
+		  const struct node_id *node_id,
+		  enum log_level minlevel);
 
 struct command_result *param_loglevel(struct command *cmd,
 				      const char *name,
@@ -148,4 +74,19 @@ struct command_result *param_loglevel(struct command *cmd,
 				      const jsmntok_t *tok,
 				      enum log_level **level);
 
+struct log_entry {
+	struct timeabs time;
+	enum log_level level;
+	unsigned int skipped;
+	struct node_id_cache *nc;
+	const char *prefix;
+	char *log;
+	/* Iff LOG_IO */
+	const u8 *io;
+};
+
+/* For options.c's listconfig */
+char *opt_log_level(const char *arg, struct log *log);
+void json_add_opt_log_levels(struct json_stream *response, struct log *log);
+void logging_options_parsed(struct log_book *lr);
 #endif /* LIGHTNING_LIGHTNINGD_LOG_H */

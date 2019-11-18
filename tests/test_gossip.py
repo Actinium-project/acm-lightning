@@ -123,9 +123,6 @@ def test_announce_address(node_factory, bitcoind):
     scid = l1.fund_channel(l2, 10**6)
     bitcoind.generate_block(5)
 
-    # Activate IO logging for l1.
-    subprocess.run(['kill', '-USR1', l1.subd_pid('channeld')])
-
     l1.wait_channel_active(scid)
     l2.wait_channel_active(scid)
 
@@ -357,7 +354,7 @@ def test_gossip_weirdalias(node_factory, bitcoind):
                                .format(normal_name))
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
-    l2.daemon.wait_for_log('openingd-{} chan #1: Handed peer, entering loop'.format(l1.info['id']))
+    l2.daemon.wait_for_log('openingd-chan#1: Handed peer, entering loop')
     l2.fund_channel(l1, 10**6)
     bitcoind.generate_block(6)
 
@@ -482,12 +479,6 @@ def test_gossip_no_empty_announcements(node_factory, bitcoind):
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     l2.rpc.connect(l3.info['id'], 'localhost', l3.port)
     l3.rpc.connect(l4.info['id'], 'localhost', l4.port)
-
-    # Turn on IO logging for openingd (make sure it's ready!)
-    l1.daemon.wait_for_log('openingd-.*: Handed peer, entering loop')
-    subprocess.run(['kill', '-USR1', l1.subd_pid('openingd')])
-    l2.daemon.wait_for_log('openingd-{}.*: Handed peer, entering loop'.format(l3.info['id']))
-    subprocess.run(['kill', '-USR1', l2.subd_pid('openingd-{}'.format(l3.info['id']))])
 
     # Make an announced-but-not-updated channel.
     l3.fund_channel(l4, 10**5)
@@ -1021,7 +1012,7 @@ def test_gossip_store_load_amount_truncated(node_factory):
 def test_node_reannounce(node_factory, bitcoind):
     "Test that we reannounce a node when parameters change"
     l1, l2 = node_factory.line_graph(2, opts={'may_reconnect': True,
-                                              'log_all_io': True})
+                                              'log-level': 'io'})
     bitcoind.generate_block(5)
 
     # Wait for node_announcement for l1.
@@ -1075,7 +1066,7 @@ def test_gossipwith(node_factory):
 
     out = subprocess.run(['devtools/gossipwith',
                           '--initial-sync',
-                          '--timeout-after={}'.format(int(math.sqrt(TIMEOUT) * 1000)),
+                          '--timeout-after={}'.format(int(math.sqrt(TIMEOUT) + 1)),
                           '{}@localhost:{}'.format(l1.info['id'], l1.port)],
                          check=True,
                          timeout=TIMEOUT, stdout=subprocess.PIPE).stdout
@@ -1100,9 +1091,6 @@ def test_gossip_notices_close(node_factory, bitcoind):
                                allow_bad_gossip=True)
     l2, l3 = node_factory.line_graph(2)
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
-    # FIXME: sending SIGUSR1 immediately may kill it before handler installed.
-    l1.daemon.wait_for_log('Handed peer, entering loop')
-    subprocess.run(['kill', '-USR1', l1.subd_pid('openingd')])
 
     bitcoind.generate_block(5)
 
@@ -1527,7 +1515,7 @@ def test_gossip_no_backtalk(node_factory):
     l1, l2 = node_factory.line_graph(2, wait_for_announce=True)
 
     # This connects, gets gossip, but should *not* play it back.
-    l3 = node_factory.get_node(log_all_io=True)
+    l3 = node_factory.get_node(options={'log-level': 'io'})
 
     l3.rpc.connect(l2.info['id'], 'localhost', l2.port)
     # Will get channel_announce, then two channel_update and two node_announcement

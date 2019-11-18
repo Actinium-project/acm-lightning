@@ -18,7 +18,7 @@
 static int status_fd = -1;
 static struct daemon_conn *status_conn;
 volatile bool logging_io = false;
-static bool was_logging_io = false;
+static bool was_logging_io;
 
 /* If we're more than this many msgs deep, don't add debug messages. */
 #define TRACE_QUEUE_LIMIT 20
@@ -32,6 +32,9 @@ static void got_sigusr1(int signal UNUSED)
 static void setup_logging_sighandler(void)
 {
 	struct sigaction act;
+
+	/* Could have been set to true by --log-io arg. */
+	was_logging_io = logging_io;
 
 	memset(&act, 0, sizeof(act));
 	act.sa_handler = got_sigusr1;
@@ -55,10 +58,6 @@ void status_setup_sync(int fd)
 	assert(!status_conn);
 	status_fd = fd;
 	setup_logging_sighandler();
-#if DEVELOPER
-	logging_io = (getenv("LIGHTNINGD_DEV_LOG_IO") != NULL);
-	report_logging_io("LIGHTNINGD_DEV_LOG_IO");
-#endif
 }
 
 static void destroy_daemon_conn(struct daemon_conn *dc UNUSED)
@@ -75,10 +74,6 @@ void status_setup_async(struct daemon_conn *master)
 	tal_add_destructor(master, destroy_daemon_conn);
 
 	setup_logging_sighandler();
-#if DEVELOPER
-	logging_io = (getenv("LIGHTNINGD_DEV_LOG_IO") != NULL);
-	report_logging_io("LIGHTNINGD_DEV_LOG_IO");
-#endif
 }
 
 void status_send(const u8 *msg TAKES)
@@ -93,39 +88,49 @@ void status_send(const u8 *msg TAKES)
 	}
 }
 
-static void status_io_full(enum log_level iodir, const char *who, const u8 *p)
+static void status_io_full(enum log_level iodir,
+			   const struct node_id *peer,
+			   const char *who, const u8 *p)
 {
-	status_send(take(towire_status_io(NULL, iodir, who, p)));
+	status_send(take(towire_status_io(NULL, iodir, peer, who, p)));
 }
 
-static void status_peer_io_short(enum log_level iodir, const u8 *p)
+static void status_peer_io_short(enum log_level iodir,
+				 const struct node_id *peer,
+				 const u8 *p)
 {
-	status_debug("%s %s",
-		     iodir == LOG_IO_OUT ? "peer_out" : "peer_in",
-		     wire_type_name(fromwire_peektype(p)));
+	status_peer_debug(peer, "%s %s",
+			  iodir == LOG_IO_OUT ? "peer_out" : "peer_in",
+			  wire_type_name(fromwire_peektype(p)));
 }
 
-void status_peer_io(enum log_level iodir, const u8 *p)
+void status_peer_io(enum log_level iodir,
+		    const struct node_id *peer,
+		    const u8 *p)
 {
 	report_logging_io("SIGUSR1");
 	if (logging_io)
-		status_io_full(iodir, "", p);
+		status_io_full(iodir, NULL, "", p);
 	/* We get a huge amount of gossip; don't log it */
 	else if (!is_msg_for_gossipd(p))
-		status_peer_io_short(iodir, p);
+		status_peer_io_short(iodir, peer, p);
 }
 
-void status_io(enum log_level iodir, const char *who,
+void status_io(enum log_level iodir,
+	       const struct node_id *peer,
+	       const char *who,
 	       const void *data, size_t len)
 {
 	report_logging_io("SIGUSR1");
 	if (!logging_io)
 		return;
 	/* Horribly inefficient, but so is logging IO generally. */
-	status_io_full(iodir, who, tal_dup_arr(tmpctx, u8, data, len, 0));
+	status_io_full(iodir, peer, who, tal_dup_arr(tmpctx, u8, data, len, 0));
 }
 
-void status_vfmt(enum log_level level, const char *fmt, va_list ap)
+void status_vfmt(enum log_level level,
+		 const struct node_id *peer,
+		 const char *fmt, va_list ap)
 {
 	char *str;
 
@@ -146,16 +151,18 @@ void status_vfmt(enum log_level level, const char *fmt, va_list ap)
 		}
 	}
 	str = tal_vfmt(NULL, fmt, ap);
-	status_send(take(towire_status_log(NULL, level, str)));
+	status_send(take(towire_status_log(NULL, level, peer, str)));
 	tal_free(str);
 }
 
-void status_fmt(enum log_level level, const char *fmt, ...)
+void status_fmt(enum log_level level,
+		const struct node_id *peer,
+		const char *fmt, ...)
 {
 	va_list ap;
 
 	va_start(ap, fmt);
-	status_vfmt(level, fmt, ap);
+	status_vfmt(level, peer, fmt, ap);
 	va_end(ap);
 }
 

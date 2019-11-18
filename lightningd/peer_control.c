@@ -72,23 +72,6 @@ static void destroy_peer(struct peer *peer)
 	list_del_from(&peer->ld->peers, &peer->list);
 }
 
-/* We copy per-peer entries above --log-level into the main log. */
-static void copy_to_parent_log(const char *prefix,
-			       enum log_level level,
-			       bool continued,
-			       const struct timeabs *time UNUSED,
-			       const char *str,
-			       const u8 *io, size_t io_len,
-			       struct log *parent_log)
-{
-	if (level == LOG_IO_IN || level == LOG_IO_OUT)
-		log_io(parent_log, level, prefix, io, io_len);
-	else if (continued)
-		log_add(parent_log, "%s ... %s", prefix, str);
-	else
-		log_(parent_log, level, false, "%s %s", prefix, str);
-}
-
 static void peer_update_features(struct peer *peer, const u8 *features TAKES)
 {
 	tal_free(peer->features);
@@ -115,9 +98,6 @@ struct peer *new_peer(struct lightningd *ld, u64 dbid,
 	peer->ignore_htlcs = false;
 #endif
 
-	/* Max 128k per peer. */
-	peer->log_book = new_log_book(peer->ld, 128*1024, get_log_level(ld->log_book));
-	set_log_outfn(peer->log_book, copy_to_parent_log, ld->log);
 	list_add_tail(&ld->peers, &peer->list);
 	tal_add_destructor(peer, destroy_peer);
 	return peer;
@@ -1144,7 +1124,7 @@ static void json_add_peer(struct lightningd *ld,
 	json_array_end(response);
 
 	if (ll)
-		json_add_log(response, p->log_book, *ll);
+		json_add_log(response, ld->log_book, &p->id, *ll);
 	json_object_end(response);
 }
 
@@ -1823,7 +1803,7 @@ static void set_channel_fees(struct command *cmd, struct channel *channel,
 	channel->feerate_ppm = ppm;
 
 	/* tell channeld to make a send_channel_update */
-	if (channel->owner && streq(channel->owner->name, "lightning_channeld"))
+	if (channel->owner && streq(channel->owner->name, "channeld"))
 		subd_send_msg(channel->owner,
 				take(towire_channel_specific_feerates(NULL, base, ppm)));
 
@@ -2030,7 +2010,7 @@ static struct command_result *json_dev_reenable_commit(struct command *cmd,
 				    "Peer has no owner");
 	}
 
-	if (!streq(channel->owner->name, "lightning_channeld")) {
+	if (!streq(channel->owner->name, "channeld")) {
 		return command_fail(cmd, LIGHTNINGD,
 				    "Peer owned by %s", channel->owner->name);
 	}
@@ -2237,7 +2217,7 @@ static void peer_memleak_req_next(struct command *cmd, struct channel *prev)
 				continue;
 
 			/* Note: closingd does its own checking automatically */
-			if (streq(c->owner->name, "lightning_channeld")) {
+			if (streq(c->owner->name, "channeld")) {
 				subd_req(c, c->owner,
 					 take(towire_channel_dev_memleak(NULL)),
 					 -1, 0, channeld_memleak_req_done, cmd);
@@ -2246,7 +2226,7 @@ static void peer_memleak_req_next(struct command *cmd, struct channel *prev)
 						    cmd);
 				return;
 			}
-			if (streq(c->owner->name, "lightning_onchaind")) {
+			if (streq(c->owner->name, "onchaind")) {
 				subd_req(c, c->owner,
 					 take(towire_onchain_dev_memleak(NULL)),
 					 -1, 0, onchaind_memleak_req_done, cmd);

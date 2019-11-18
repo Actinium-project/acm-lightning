@@ -658,15 +658,12 @@ def test_io_logging(node_factory, executor):
     pid2 = l2.subd_pid('channeld')
     l2.daemon.wait_for_log(' to CHANNELD_NORMAL')
 
-    # Send it sigusr1: should turn on logging.
-    subprocess.run(['kill', '-USR1', pid1])
-
     fut = executor.submit(l1.pay, l2, 200000000)
 
     # WIRE_UPDATE_ADD_HTLC = 128 = 0x0080
-    l1.daemon.wait_for_log(r'channeld.*:\[OUT\] 0080')
+    l1.daemon.wait_for_log(r'channeld.*: \[OUT\] 0080')
     # WIRE_UPDATE_FULFILL_HTLC = 130 = 0x0082
-    l1.daemon.wait_for_log(r'channeld.*:\[IN\] 0082')
+    l1.daemon.wait_for_log(r'channeld.*: \[IN\] 0082')
     fut.result(10)
 
     # Send it sigusr1: should turn off logging.
@@ -674,9 +671,9 @@ def test_io_logging(node_factory, executor):
 
     l1.pay(l2, 200000000)
 
-    assert not l1.daemon.is_in_log(r'channeld.*:\[OUT\] 0080',
+    assert not l1.daemon.is_in_log(r'channeld.*: \[OUT\] 0080',
                                    start=l1.daemon.logsearch_start)
-    assert not l1.daemon.is_in_log(r'channeld.*:\[IN\] 0082',
+    assert not l1.daemon.is_in_log(r'channeld.*: \[IN\] 0082',
                                    start=l1.daemon.logsearch_start)
 
     # IO logs should not appear in peer logs.
@@ -1171,7 +1168,7 @@ def test_reserve_enforcement(node_factory, executor):
     # kill us for trying to violate reserve.
     executor.submit(l2.pay, l1, 1000000)
     l1.daemon.wait_for_log(
-        'Peer permanent failure in CHANNELD_NORMAL: lightning_channeld: sent '
+        'Peer permanent failure in CHANNELD_NORMAL: channeld: sent '
         'ERROR Bad peer_add_htlc: CHANNEL_ERR_CHANNEL_CAPACITY_EXCEEDED'
     )
 
@@ -1194,9 +1191,6 @@ def test_htlc_send_timeout(node_factory, bitcoind):
     l1.fund_channel(l2, 10**6)
     chanid2 = l2.fund_channel(l3, 10**6)
 
-    subprocess.run(['kill', '-USR1', l1.subd_pid('channeld')])
-    subprocess.run(['kill', '-USR1', l2.subd_pid('channeld')])
-
     # Make sure channels get announced.
     bitcoind.generate_block(5)
 
@@ -1205,7 +1199,7 @@ def test_htlc_send_timeout(node_factory, bitcoind):
     timedout = False
     while not timedout:
         try:
-            l2.daemon.wait_for_log(r'channeld-{} chan #[0-9]*:\[IN\] '.format(l3.info['id']), timeout=30)
+            l2.daemon.wait_for_log(r'channeld-chan#[0-9]*: \[IN\] ', timeout=30)
         except TimeoutError:
             timedout = True
 
@@ -1227,11 +1221,11 @@ def test_htlc_send_timeout(node_factory, bitcoind):
     assert status['attempts'][0]['failure']['data']['erring_channel'] == chanid2
 
     # L2 should send ping, but never receive pong so never send commitment.
-    l2.daemon.wait_for_log(r'channeld.*:\[OUT\] 0012')
-    assert not l2.daemon.is_in_log(r'channeld.*:\[IN\] 0013')
-    assert not l2.daemon.is_in_log(r'channeld.*:\[OUT\] 0084')
+    l2.daemon.wait_for_log(r'{}-.*channeld.*: \[OUT\] 0012'.format(l3.info['id']))
+    assert not l2.daemon.is_in_log(r'{}-.*channeld.*: \[IN\] 0013'.format(l3.info['id']))
+    assert not l2.daemon.is_in_log(r'{}-.*channeld.*: \[OUT\] 0084'.format(l3.info['id']))
     # L2 killed the channel with l3 because it was too slow.
-    l2.daemon.wait_for_log('channeld-{}.*Adding HTLC too slow: killing connection'.format(l3.info['id']))
+    l2.daemon.wait_for_log('{}-.*channeld-.*Adding HTLC too slow: killing connection'.format(l3.info['id']))
 
 
 def test_ipv4_and_ipv6(node_factory):
@@ -1453,11 +1447,11 @@ def test_check_command(node_factory):
     sock.close()
 
 
-@unittest.skipIf(not DEVELOPER, "need log_all_io")
+@unittest.skipIf(not DEVELOPER, "FIXME: without DEVELOPER=1 we timeout")
 def test_bad_onion(node_factory, bitcoind):
     """Test that we get a reasonable error from sendpay when an onion is bad"""
     l1, l2, l3, l4 = node_factory.line_graph(4, wait_for_announce=True,
-                                             opts={'log_all_io': True})
+                                             opts={'log-level': 'io'})
 
     h = l4.rpc.invoice(123000, 'test_bad_onion', 'description')['payment_hash']
     route = l1.rpc.getroute(l4.info['id'], 123000, 1)['route']

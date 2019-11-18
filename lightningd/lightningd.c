@@ -161,15 +161,15 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	htlc_in_map_init(&ld->htlcs_in);
 	htlc_out_map_init(&ld->htlcs_out);
 
-	/*~ We have a two-level log-book infrastructure: we define a 20MB log
+	/*~ We have a multi-entry log-book infrastructure: we define a 100MB log
 	 * book to hold all the entries (and trims as necessary), and multiple
 	 * log objects which each can write into it, each with a unique
 	 * prefix. */
-	ld->log_book = new_log_book(ld, 20*1024*1024, LOG_INFORM);
+	ld->log_book = new_log_book(ld, 100*1024*1024);
 	/*~ Note the tal context arg (by convention, the first argument to any
 	 * allocation function): ld->log will be implicitly freed when ld
 	 * is. */
-	ld->log = new_log(ld, ld->log_book, "lightningd(%u):", (int)getpid());
+	ld->log = new_log(ld, ld->log_book, NULL, "lightningd");
 	ld->logfile = NULL;
 
 	/*~ We explicitly set these to NULL: if they're still NULL after option
@@ -212,6 +212,10 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->pure_tor_setup = false;
 	ld->tor_service_password = NULL;
 	ld->max_funding_unconfirmed = 2016;
+
+	/*~ This is initialized later, but the plugin loop examines this,
+	 * so set it to NULL explicitly now. */
+	ld->wallet = NULL;
 
 	/*~ In the next step we will initialize the plugins. This will
 	 *  also populate the JSON-RPC with passthrough methods, hence
@@ -695,7 +699,7 @@ int main(int argc, char *argv[])
 	/*~ Our "wallet" code really wraps the db, which is more than a simple
 	 * bitcoin wallet (though it's that too).  It also stores channel
 	 * states, invoices, payments, blocks and bitcoin transactions. */
-	ld->wallet = wallet_new(ld, ld->log, ld->timers);
+	ld->wallet = wallet_new(ld, ld->timers);
 
 	/*~ We keep a filter of scriptpubkeys we're interested in. */
 	ld->owned_txfilter = txfilter_new(ld);

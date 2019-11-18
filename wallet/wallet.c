@@ -50,19 +50,18 @@ static void outpointfilters_init(struct wallet *w)
 	tal_free(stmt);
 }
 
-struct wallet *wallet_new(struct lightningd *ld,
-			  struct log *log, struct timers *timers)
+struct wallet *wallet_new(struct lightningd *ld, struct timers *timers)
 {
 	struct wallet *wallet = tal(ld, struct wallet);
 	wallet->ld = ld;
-	wallet->db = db_setup(wallet, ld, log);
-	wallet->log = log;
+	wallet->db = db_setup(wallet, ld);
+	wallet->log = new_log(wallet, ld->log_book, NULL, "wallet");
 	wallet->bip32_base = NULL;
 	list_head_init(&wallet->unstored_payments);
 	list_head_init(&wallet->unreleased_txs);
 
 	db_begin_transaction(wallet->db);
-	wallet->invoices = invoices_new(wallet, wallet->db, log, timers);
+	wallet->invoices = invoices_new(wallet, wallet->db, timers);
 	outpointfilters_init(wallet);
 	db_commit_transaction(wallet->db);
 	return wallet;
@@ -3462,16 +3461,18 @@ struct wallet_transaction *wallet_transactions_get(struct wallet *w, const tal_t
 			cur->tx = db_column_tx(txs, stmt, 1);
 			cur->rawtx = tal_dup_arr(txs, u8, db_column_blob(stmt, 1),
 						 db_column_bytes(stmt, 1), 0);
-            /* TX may be unconfirmed. */
-            if (!db_column_is_null(stmt, 2) || !db_column_is_null(stmt, 3)) {
-                /* assert incomplete information */
-                assert(!db_column_is_null(stmt, 2) && !db_column_is_null(stmt, 3));
-                cur->blockheight = db_column_int(stmt, 2);
-                cur->txindex = db_column_int(stmt, 3);
-            } else {
-                cur->blockheight = 0;
-                cur->txindex = 0;
-            }
+			/* TX may be unconfirmed. */
+			if (!db_column_is_null(stmt, 2)) {
+				cur->blockheight = db_column_int(stmt, 2);
+				if (!db_column_is_null(stmt, 3)) {
+					cur->txindex = db_column_int(stmt, 3);
+				} else {
+					cur->txindex = 0;
+				}
+			} else {
+				cur->blockheight = 0;
+				cur->txindex = 0;
+			}
 			if (!db_column_is_null(stmt, 4))
 				cur->annotation.type = db_column_u64(stmt, 4);
 			else
