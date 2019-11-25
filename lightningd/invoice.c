@@ -9,6 +9,7 @@
 #include <common/amount.h>
 #include <common/bech32.h>
 #include <common/bolt11.h>
+#include <common/features.h>
 #include <common/json_command.h>
 #include <common/json_helpers.h>
 #include <common/jsonrpc_errors.h>
@@ -99,6 +100,23 @@ static void wait_on_invoice(const struct invoice *invoice, void *cmd)
 		tell_waiter((struct command *) cmd, invoice);
 	else
 		tell_waiter_deleted((struct command *) cmd);
+}
+
+/* We derive invoice secret using 1-way function from payment_preimage
+ * (just a different one from the payment_hash!) */
+static void invoice_secret(const struct preimage *payment_preimage,
+			   struct secret *payment_secret)
+{
+	struct preimage modified;
+	struct sha256 secret;
+
+	modified = *payment_preimage;
+	modified.r[0] ^= 1;
+
+	sha256(&secret, modified.r,
+	       ARRAY_SIZE(modified.r) * sizeof(*modified.r));
+	BUILD_ASSERT(sizeof(secret.u.u8) == sizeof(payment_secret->data));
+	memcpy(payment_secret->data, secret.u.u8, sizeof(secret.u.u8));
 }
 
 struct invoice_payment_hook_payload {
@@ -218,7 +236,8 @@ REGISTER_PLUGIN_HOOK(invoice_payment,
 void invoice_try_pay(struct lightningd *ld,
 		     struct htlc_in *hin,
 		     const struct sha256 *payment_hash,
-		     const struct amount_msat msat)
+		     const struct amount_msat msat,
+		     const struct secret *payment_secret)
 {
 	struct invoice invoice;
 	const struct invoice_details *details;
@@ -229,6 +248,42 @@ void invoice_try_pay(struct lightningd *ld,
 		return;
 	}
 	details = wallet_invoice_details(tmpctx, ld->wallet, invoice);
+
+	log_debug(ld->log, "payment_secret is %s",
+		  payment_secret ? "set": "NULL");
+
+	/* BOLT-e36f7b6517e1173dcbd49da3b516cfe1f48ae556 #4:
+	 *
+	 * - if the `payment_secret` doesn't match the expected value for that
+	 *   `payment_hash`, or the `payment_secret` is required and is not
+	 *   present:
+	 *   - MUST fail the HTLC.
+	 *   - MUST return an `incorrect_or_unknown_payment_details` error.
+	 */
+	/* BOLT-e36f7b6517e1173dcbd49da3b516cfe1f48ae556 #1:
+	 *
+	 * - if `payment_secret` is required in the onion:
+	 *    - MUST set the even feature `var_onion_optin`.
+	 */
+	if (feature_is_set(details->features, COMPULSORY_FEATURE(OPT_VAR_ONION))
+	    && !payment_secret) {
+		fail_htlc(hin, WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS);
+		return;
+	}
+
+	if (payment_secret) {
+		struct secret expected;
+
+		invoice_secret(&details->r, &expected);
+		log_debug(ld->log, "payment_secret %s vs %s",
+			  type_to_string(tmpctx, struct secret, payment_secret),
+			  type_to_string(tmpctx, struct secret, &expected));
+		if (!secret_eq_consttime(payment_secret, &expected)) {
+			fail_htlc(hin,
+				  WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS);
+			return;
+		}
+	}
 
 	/* BOLT #4:
 	 *
@@ -502,6 +557,7 @@ static void gossipd_incoming_channels_reply(struct subd *gossipd,
 				   info->b11->expiry,
 				   b11enc,
 				   info->b11->description,
+				   info->b11->features,
 				   &info->payment_preimage,
 				   &info->b11->payment_hash)) {
 		was_pending(command_fail(info->cmd, INVOICE_LABEL_ALREADY_EXISTS,
@@ -683,6 +739,7 @@ static struct command_result *json_invoice(struct command *cmd,
 	u64 *expiry;
 	struct sha256 rhash;
 	bool *exposeprivate;
+	struct secret payment_secret;
 #if DEVELOPER
 	const jsmntok_t *routes;
 #endif
@@ -756,6 +813,8 @@ static struct command_result *json_invoice(struct command *cmd,
 				sizeof(info->payment_preimage));
 	/* Generate preimage hash. */
 	sha256(&rhash, &info->payment_preimage, sizeof(info->payment_preimage));
+	/* Generate payment secret. */
+	invoice_secret(&info->payment_preimage, &payment_secret);
 
 	info->b11 = new_bolt11(info, msatoshi_val);
 	info->b11->chain = chainparams;
@@ -766,6 +825,10 @@ static struct command_result *json_invoice(struct command *cmd,
 	info->b11->expiry = *expiry;
 	info->b11->description = tal_steal(info->b11, desc_val);
 	info->b11->description_hash = NULL;
+	info->b11->payment_secret = tal_dup(info->b11, struct secret,
+					    &payment_secret);
+	info->b11->features = get_offered_bolt11features(info->b11);
+
 
 #if DEVELOPER
 	info->b11->routes = unpack_routes(info->b11, buffer, routes);
@@ -1083,6 +1146,9 @@ static struct command_result *json_decodepay(struct command *cmd,
                                 b11->description_hash);
 	json_add_num(response, "min_final_cltv_expiry",
 		     b11->min_final_cltv_expiry);
+        if (b11->payment_secret)
+                json_add_secret(response, "payment_secret",
+                                b11->payment_secret);
 	if (b11->features)
 		json_add_hex_talarr(response, "features", b11->features);
         if (tal_count(b11->fallbacks)) {

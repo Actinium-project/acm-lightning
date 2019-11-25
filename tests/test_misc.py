@@ -5,7 +5,7 @@ from fixtures import TEST_NETWORK
 from flaky import flaky  # noqa: F401
 from lightning import RpcError
 from threading import Event
-from utils import DEVELOPER, TIMEOUT, VALGRIND, sync_blockheight, only_one, wait_for, TailableProc, EXPERIMENTAL_FEATURES
+from utils import DEVELOPER, TIMEOUT, VALGRIND, sync_blockheight, only_one, wait_for, TailableProc, EXPERIMENTAL_FEATURES, env
 from ephemeral_port_reserve import reserve
 
 import json
@@ -77,7 +77,7 @@ def test_db_upgrade(node_factory):
     assert(upgrades[0]['lightning_version'] == version)
 
     # Try resetting to earlier db state.
-    os.unlink(os.path.join(l1.daemon.lightning_dir, "lightningd.sqlite3"))
+    os.unlink(os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, "lightningd.sqlite3"))
     l1.db_manip("CREATE TABLE version (version INTEGER);")
     l1.db_manip("INSERT INTO version VALUES (1);")
 
@@ -714,7 +714,7 @@ def test_address(node_factory):
 
     # Now test UNIX domain binding.
     l1.stop()
-    l1.daemon.opts['bind-addr'] = os.path.join(l1.daemon.lightning_dir, "sock")
+    l1.daemon.opts['bind-addr'] = os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, "sock")
     l1.start()
 
     l2 = node_factory.get_node()
@@ -723,7 +723,7 @@ def test_address(node_factory):
     # 'addr' with local socket works too.
     l1.stop()
     del l1.daemon.opts['bind-addr']
-    l1.daemon.opts['addr'] = os.path.join(l1.daemon.lightning_dir, "sock")
+    l1.daemon.opts['addr'] = os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, "sock")
     # start expects a port, so we open-code here.
     l1.daemon.start()
 
@@ -732,13 +732,16 @@ def test_address(node_factory):
 
 
 def test_listconfigs(node_factory, bitcoind, chainparams):
-    l1 = node_factory.get_node()
+    # Make extremely long entry, check it works
+    l1 = node_factory.get_node(options={'log-prefix': 'lightning1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'})
 
     configs = l1.rpc.listconfigs()
     # See utils.py
     assert configs['allow-deprecated-apis'] is False
     assert configs['network'] == chainparams['name']
     assert configs['ignore-fee-limits'] is False
+    assert configs['ignore-fee-limits'] is False
+    assert configs['log-prefix'] == 'lightning1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...'
 
     # Test one at a time.
     for c in configs.keys():
@@ -851,6 +854,7 @@ def test_cli(node_factory):
     l1 = node_factory.get_node()
 
     out = subprocess.check_output(['cli/lightning-cli',
+                                   '--network={}'.format(TEST_NETWORK),
                                    '--lightning-dir={}'
                                    .format(l1.daemon.lightning_dir),
                                    'help']).decode('utf-8')
@@ -859,6 +863,7 @@ def test_cli(node_factory):
 
     # Test JSON output.
     out = subprocess.check_output(['cli/lightning-cli',
+                                   '--network={}'.format(TEST_NETWORK),
                                    '--lightning-dir={}'
                                    .format(l1.daemon.lightning_dir),
                                    '-J',
@@ -869,6 +874,7 @@ def test_cli(node_factory):
 
     # Test keyword input (autodetect)
     out = subprocess.check_output(['cli/lightning-cli',
+                                   '--network={}'.format(TEST_NETWORK),
                                    '--lightning-dir={}'
                                    .format(l1.daemon.lightning_dir),
                                    '-J',
@@ -878,6 +884,7 @@ def test_cli(node_factory):
 
     # Test keyword input (forced)
     out = subprocess.check_output(['cli/lightning-cli',
+                                   '--network={}'.format(TEST_NETWORK),
                                    '--lightning-dir={}'
                                    .format(l1.daemon.lightning_dir),
                                    '-J', '-k',
@@ -887,6 +894,7 @@ def test_cli(node_factory):
 
     # Test ordered input (autodetect)
     out = subprocess.check_output(['cli/lightning-cli',
+                                   '--network={}'.format(TEST_NETWORK),
                                    '--lightning-dir={}'
                                    .format(l1.daemon.lightning_dir),
                                    '-J',
@@ -896,6 +904,7 @@ def test_cli(node_factory):
 
     # Test ordered input (forced)
     out = subprocess.check_output(['cli/lightning-cli',
+                                   '--network={}'.format(TEST_NETWORK),
                                    '--lightning-dir={}'
                                    .format(l1.daemon.lightning_dir),
                                    '-J', '-o',
@@ -908,6 +917,7 @@ def test_cli(node_factory):
         # This will error due to missing parameters.
         # We want to check if lightningd will crash.
         out = subprocess.check_output(['cli/lightning-cli',
+                                       '--network={}'.format(TEST_NETWORK),
                                        '--lightning-dir={}'
                                        .format(l1.daemon.lightning_dir),
                                        '-J', '-o',
@@ -918,6 +928,7 @@ def test_cli(node_factory):
     # Test it escapes JSON completely in both method and params.
     # cli turns " into \", reply turns that into \\\".
     out = subprocess.run(['cli/lightning-cli',
+                          '--network={}'.format(TEST_NETWORK),
                           '--lightning-dir={}'
                           .format(l1.daemon.lightning_dir),
                           'x"[]{}'],
@@ -925,11 +936,13 @@ def test_cli(node_factory):
     assert 'Unknown command \'x\\\\\\"[]{}\'' in out.stdout.decode('utf-8')
 
     subprocess.check_output(['cli/lightning-cli',
+                             '--network={}'.format(TEST_NETWORK),
                              '--lightning-dir={}'
                              .format(l1.daemon.lightning_dir),
                              'invoice', '123000', 'l"[]{}', 'd"[]{}']).decode('utf-8')
     # Check label is correct, and also that cli's keyword parsing works.
     out = subprocess.check_output(['cli/lightning-cli',
+                                   '--network={}'.format(TEST_NETWORK),
                                    '--lightning-dir={}'
                                    .format(l1.daemon.lightning_dir),
                                    '-k',
@@ -961,23 +974,26 @@ def test_daemon_option(node_factory):
     l1.stop()
 
     os.unlink(l1.rpc.socket_path)
-    subprocess.run(l1.daemon.cmd_line + ['--daemon', '--log-file={}/log-daemon'.format(l1.daemon.lightning_dir)], env=l1.daemon.env,
+    logfname = os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, "log-daemon")
+    subprocess.run(l1.daemon.cmd_line + ['--daemon', '--log-file={}'.format(logfname)], env=l1.daemon.env,
                    check=True)
 
     # Test some known output (wait for rpc to be ready)
     wait_for(lambda: os.path.exists(l1.rpc.socket_path))
     out = subprocess.check_output(['cli/lightning-cli',
+                                   '--network={}'.format(TEST_NETWORK),
                                    '--lightning-dir={}'
                                    .format(l1.daemon.lightning_dir),
                                    'help']).decode('utf-8')
     assert 'help [command]\n    List available commands, or give verbose help on one {command}' in out
 
     subprocess.run(['cli/lightning-cli',
+                    '--network={}'.format(TEST_NETWORK),
                     '--lightning-dir={}'.format(l1.daemon.lightning_dir),
                     'stop'], check=True)
 
     # It should not complain that subdaemons aren't children.
-    with open('{}/log-daemon'.format(l1.daemon.lightning_dir), 'r') as f:
+    with open(logfname, 'r') as f:
         assert 'No child process' not in f.read()
 
 
@@ -1135,14 +1151,76 @@ def test_rescan(node_factory, bitcoind):
     assert l1.daemon.is_in_log(r'Adding block 31')
     assert not l1.daemon.is_in_log(r'Adding block 30')
 
-    # Restarting with a future absolute blockheight should just start with
-    # the current height
+    # Restarting with a future absolute blockheight should *fail* if we
+    # can't find that height
     l1.daemon.opts['rescan'] = -500000
     l1.stop()
     bitcoind.generate_block(4)
+    with pytest.raises(ValueError):
+        l1.start()
+
+    # Restarting with future absolute blockheight is fine if we can find it.
+    l1.daemon.opts['rescan'] = -105
+    oldneedle = l1.daemon.logsearch_start
     l1.start()
+    # This could occur before pubkey msg, so move search needle back.
+    l1.daemon.logsearch_start = oldneedle
     l1.daemon.wait_for_log(r'Adding block 105')
     assert not l1.daemon.is_in_log(r'Adding block 102')
+
+
+def test_bitcoind_goes_backwards(node_factory, bitcoind):
+    """Check that we refuse to acknowledge bitcoind giving a shorter chain without explicit rescan"""
+    l1 = node_factory.get_node(may_fail=True, allow_broken_log=True)
+
+    bitcoind.generate_block(10)
+    sync_blockheight(bitcoind, [l1])
+    l1.stop()
+
+    # Now shrink chain (invalidateblock leaves 'headers' field until restart)
+    bitcoind.rpc.invalidateblock(bitcoind.rpc.getblockhash(105))
+    # Restart without killing proxies
+    bitcoind.rpc.stop()
+    TailableProc.stop(bitcoind)
+    bitcoind.start()
+
+    # Will simply refuse to start.
+    with pytest.raises(ValueError):
+        l1.start()
+
+    # Nor will it start with if we ask for a reindex of fewer blocks.
+    l1.daemon.opts['rescan'] = 3
+
+    with pytest.raises(ValueError):
+        l1.start()
+
+    # This will force it, however.
+    l1.daemon.opts['rescan'] = -100
+    l1.start()
+
+    # Now mess with bitcoind at runtime.
+    bitcoind.generate_block(6)
+    sync_blockheight(bitcoind, [l1])
+
+    l1.daemon.wait_for_log('Adding block 110')
+
+    bitcoind.rpc.invalidateblock(bitcoind.rpc.getblockhash(105))
+    bitcoind.rpc.stop()
+    TailableProc.stop(bitcoind)
+    bitcoind.start()
+    bitcoind.generate_block(5)
+
+    # It will ignore bitcoind and keep asking for block 110.
+    time.sleep(5)
+    assert l1.rpc.getinfo()['blockheight'] == 110
+    assert not l1.daemon.is_in_log('Adding block 109',
+                                   start=l1.daemon.logsearch_start)
+
+    # Get past that, and it will suddenly read new blocks
+    bitcoind.generate_block(2)
+    l1.daemon.wait_for_log('Adding block 109')
+    l1.daemon.wait_for_log('Adding block 110')
+    l1.daemon.wait_for_log('Adding block 111')
 
 
 @flaky
@@ -1312,8 +1390,8 @@ def test_feerates(node_factory):
 def test_logging(node_factory):
     # Since we redirect, node.start() will fail: do manually.
     l1 = node_factory.get_node(options={'log-file': 'logfile'}, may_fail=True, start=False)
-    logpath = os.path.join(l1.daemon.lightning_dir, 'logfile')
-    logpath_moved = os.path.join(l1.daemon.lightning_dir, 'logfile_moved')
+    logpath = os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, 'logfile')
+    logpath_moved = os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, 'logfile_moved')
 
     l1.daemon.rpcproxy.start()
     l1.daemon.opts['bitcoin-rpcport'] = l1.daemon.rpcproxy.rpcport
@@ -1340,7 +1418,7 @@ def test_crashlog(node_factory):
     l1 = node_factory.get_node(may_fail=True, allow_broken_log=True)
 
     def has_crash_log(n):
-        files = os.listdir(n.daemon.lightning_dir)
+        files = os.listdir(os.path.join(n.daemon.lightning_dir, TEST_NETWORK))
         crashfiles = [f for f in files if 'crash.log' in f]
         return len(crashfiles) > 0
 
@@ -1357,7 +1435,7 @@ def test_configfile_before_chdir(node_factory):
     olddir = os.getcwd()
     # as lightning_dir ends in /, basename and dirname don't work as expected.
     os.chdir(os.path.dirname(l1.daemon.lightning_dir[:-1]))
-    config = os.path.join(os.path.basename(l1.daemon.lightning_dir[:-1]), "test_configfile")
+    config = os.path.join(os.path.basename(l1.daemon.lightning_dir[:-1]), TEST_NETWORK, "test_configfile")
     # Test both an early arg and a normal arg.
     with open(config, 'wb') as f:
         f.write(b'always-use-proxy=true\n')
@@ -1631,8 +1709,10 @@ def test_list_features_only(node_factory):
                     'option_upfront_shutdown_script/odd',
                     'option_gossip_queries/odd',
                     'option_var_onion_optin/odd',
+                    'option_payment_secret/odd',
                     'option_gossip_queries_ex/odd',
-                    'option_static_remotekey/odd']
+                    'option_static_remotekey/odd',
+                    ]
     else:
         expected = ['option_data_loss_protect/odd',
                     'option_upfront_shutdown_script/odd',
@@ -1705,3 +1785,203 @@ def test_signmessage(node_factory):
     checknokey = l2.rpc.checkmessage(message="message for you", zbase=zm)
     assert checknokey['pubkey'] == l1.info['id']
     assert checknokey['verified']
+
+
+def test_include(node_factory):
+    l1 = node_factory.get_node(start=False)
+
+    subdir = os.path.join(l1.daemon.opts.get("lightning-dir"), "subdir")
+    os.makedirs(subdir)
+    with open(os.path.join(subdir, "conf1"), 'w') as f:
+        f.write('include conf2')
+    with open(os.path.join(subdir, "conf2"), 'w') as f:
+        f.write('alias=conf2')
+    l1.daemon.opts['conf'] = os.path.join(subdir, "conf1")
+    l1.start()
+
+    assert l1.rpc.listconfigs('alias')['alias'] == 'conf2'
+
+
+def test_config_in_subdir(node_factory):
+    l1 = node_factory.get_node(start=False)
+
+    subdir = os.path.join(l1.daemon.opts.get("lightning-dir"), "regtest")
+    with open(os.path.join(subdir, "config"), 'w') as f:
+        f.write('alias=test_config_in_subdir')
+    l1.start()
+
+    assert l1.rpc.listconfigs('alias')['alias'] == 'test_config_in_subdir'
+
+    l1.stop()
+
+    # conf is not allowed in any config file.
+    with open(os.path.join(l1.daemon.opts.get("lightning-dir"), "config"), 'w') as f:
+        f.write('conf=regtest/conf')
+
+    out = subprocess.run(['lightningd/lightningd',
+                          '--lightning-dir={}'.format(l1.daemon.opts.get("lightning-dir"))],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert out.returncode == 1
+    assert "conf: not permitted in configuration files" in out.stderr.decode('utf-8')
+
+    # network is allowed in root config file.
+    with open(os.path.join(l1.daemon.opts.get("lightning-dir"), "config"), 'w') as f:
+        f.write('network=regtest')
+
+    l1.start()
+    l1.stop()
+
+    # but not in network config file.
+    with open(os.path.join(subdir, "config"), 'w') as f:
+        f.write('network=regtest')
+
+    out = subprocess.run(['lightningd/lightningd',
+                          '--lightning-dir={}'.format(l1.daemon.opts.get("lightning-dir"))],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert out.returncode == 1
+    assert "network: not permitted in network-specific configuration files" in out.stderr.decode('utf-8')
+
+    # lightning-dir only allowed if we explicitly use --conf
+    os.unlink(os.path.join(subdir, "config"))
+    with open(os.path.join(l1.daemon.opts.get("lightning-dir"), "config"), 'w') as f:
+        f.write('lightning-dir={}/test'.format(l1.daemon.opts.get("lightning-dir")))
+
+    out = subprocess.run(['lightningd/lightningd',
+                          '--lightning-dir={}'.format(l1.daemon.opts.get("lightning-dir"))],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert out.returncode == 1
+    assert "lightning-dir: not permitted in implicit configuration files" in out.stderr.decode('utf-8')
+
+    l1.daemon.opts['conf'] = os.path.join(l1.daemon.opts.get("lightning-dir"), "config")
+    l1.start()
+
+
+def restore_valgrind(node, subdir):
+    """Move valgrind files back to where fixtures expect them"""
+    for f in os.listdir(subdir):
+        if f.startswith('valgrind-errors.'):
+            shutil.move(os.path.join(subdir, f),
+                        node.daemon.opts.get("lightning-dir"))
+
+
+@unittest.skipIf(env('COMPAT') != 1, "Upgrade code requires COMPAT_V073")
+def test_testnet_upgrade(node_factory):
+    """Test that we move files correctly on old testnet upgrade (even without specifying the network)"""
+    l1 = node_factory.get_node(start=False, may_fail=True)
+
+    basedir = l1.daemon.opts.get("lightning-dir")
+    # Make it old-style
+    os.rename(os.path.join(basedir, TEST_NETWORK, 'hsm_secret'),
+              os.path.join(basedir, 'hsm_secret'))
+    shutil.rmtree(os.path.join(basedir, TEST_NETWORK))
+    # Add (empty!) config file; it should be left in place.
+    with open(os.path.join(basedir, 'config'), 'wb') as f:
+        f.write(b"# Test config file")
+    with open(os.path.join(basedir, 'another_file'), 'wb') as f:
+        pass
+
+    # We need to allow this, otherwise no upgrade!
+    del l1.daemon.opts['allow-deprecated-apis']
+    # We want to test default network
+    del l1.daemon.opts['network']
+
+    # Wrong chain, will fail to start, but that's OK.
+    with pytest.raises(ValueError):
+        l1.start()
+
+    netdir = os.path.join(basedir, "testnet")
+    assert l1.daemon.is_in_log("Moving hsm_secret into {}/".format(netdir))
+    assert l1.daemon.is_in_log("Moving another_file into {}/".format(netdir))
+    assert not l1.daemon.is_in_log("Moving config into {}/".format(netdir))
+    assert not l1.daemon.is_in_log("Moving lightningd-testnet.pid into {}/"
+                                   .format(netdir))
+
+    # Should move these
+    assert os.path.isfile(os.path.join(netdir, "hsm_secret"))
+    assert not os.path.isfile(os.path.join(basedir, "hsm_secret"))
+    assert os.path.isfile(os.path.join(netdir, "another_file"))
+    assert not os.path.isfile(os.path.join(basedir, "another_file"))
+
+    # Should NOT move these
+    assert not os.path.isfile(os.path.join(netdir, "lightningd-testnet.pid"))
+    assert os.path.isfile(os.path.join(basedir, "lightningd-testnet.pid"))
+    assert not os.path.isfile(os.path.join(netdir, "config"))
+    assert os.path.isfile(os.path.join(basedir, "config"))
+
+    restore_valgrind(l1, netdir)
+
+
+@unittest.skipIf(env('COMPAT') != 1, "Upgrade code requires COMPAT_V073")
+def test_regtest_upgrade(node_factory):
+    """Test that we move files correctly on regtest upgrade"""
+    l1 = node_factory.get_node(start=False)
+
+    basedir = l1.daemon.opts.get("lightning-dir")
+    netdir = os.path.join(basedir, TEST_NETWORK)
+
+    # Make it old-style
+    os.rename(os.path.join(basedir, TEST_NETWORK, 'hsm_secret'),
+              os.path.join(basedir, 'hsm_secret'))
+    shutil.rmtree(os.path.join(basedir, TEST_NETWORK))
+    # Add config file which tells us it's regtest; it should be left in place.
+    with open(os.path.join(basedir, 'config'), 'wb') as f:
+        f.write(bytes("network={}".format(TEST_NETWORK), "utf-8"))
+    with open(os.path.join(basedir, 'another_file'), 'wb') as f:
+        pass
+
+    # We need to allow this, otherwise no upgrade!
+    del l1.daemon.opts['allow-deprecated-apis']
+    # It should get this from the config file.
+    del l1.daemon.opts['network']
+
+    l1.start()
+
+    assert l1.daemon.is_in_log("Moving hsm_secret into {}/".format(netdir))
+    assert l1.daemon.is_in_log("Moving another_file into {}/".format(netdir))
+    assert not l1.daemon.is_in_log("Moving config into {}/".format(netdir))
+    assert not l1.daemon.is_in_log("Moving lightningd-testnet.pid into {}/"
+                                   .format(netdir))
+
+    # Should move these
+    assert os.path.isfile(os.path.join(netdir, "hsm_secret"))
+    assert not os.path.isfile(os.path.join(basedir, "hsm_secret"))
+    assert os.path.isfile(os.path.join(netdir, "another_file"))
+    assert not os.path.isfile(os.path.join(basedir, "another_file"))
+
+    # Should NOT move these
+    assert not os.path.isfile(os.path.join(netdir, "lightningd-{}.pid".format(TEST_NETWORK)))
+    assert os.path.isfile(os.path.join(basedir, "lightningd-{}.pid".format(TEST_NETWORK)))
+    assert not os.path.isfile(os.path.join(netdir, "config"))
+    assert os.path.isfile(os.path.join(basedir, "config"))
+
+    # Should restart fine
+    l1.restart()
+
+    restore_valgrind(l1, netdir)
+
+
+@unittest.skipIf(VALGRIND, "valgrind files can't be written since we rmdir")
+@unittest.skipIf(TEST_NETWORK != "regtest", "needs bitcoin mainnet")
+def test_new_node_is_mainnet(node_factory):
+    """Test that an empty directory causes us to be on mainnet"""
+    l1 = node_factory.get_node(start=False, may_fail=True)
+
+    basedir = l1.daemon.opts.get("lightning-dir")
+    netdir = os.path.join(basedir, "bitcoin")
+
+    shutil.rmtree(basedir)
+
+    # Don't suppress upgrade (though it shouldn't happen!)
+    del l1.daemon.opts['allow-deprecated-apis']
+    # We want to test default network
+    del l1.daemon.opts['network']
+
+    # Wrong chain, will fail to start, but that's OK.
+    with pytest.raises(ValueError):
+        l1.start()
+
+    # Should create these
+    assert os.path.isfile(os.path.join(netdir, "hsm_secret"))
+    assert not os.path.isfile(os.path.join(basedir, "hsm_secret"))
+    assert not os.path.isfile(os.path.join(netdir, "lightningd-bitcoin.pid"))
+    assert os.path.isfile(os.path.join(basedir, "lightningd-bitcoin.pid"))

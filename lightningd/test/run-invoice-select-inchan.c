@@ -93,6 +93,9 @@ void fail_htlc(struct htlc_in *hin UNNEEDED, enum onion_type failcode UNNEEDED)
 /* Generated stub for fatal */
 void   fatal(const char *fmt UNNEEDED, ...)
 { fprintf(stderr, "fatal called!\n"); abort(); }
+/* Generated stub for feature_is_set */
+bool feature_is_set(const u8 *features UNNEEDED, size_t bit UNNEEDED)
+{ fprintf(stderr, "feature_is_set called!\n"); abort(); }
 /* Generated stub for fromwire_channel_dev_memleak_reply */
 bool fromwire_channel_dev_memleak_reply(const void *p UNNEEDED, bool *leak UNNEEDED)
 { fprintf(stderr, "fromwire_channel_dev_memleak_reply called!\n"); abort(); }
@@ -120,6 +123,9 @@ void fulfill_htlc(struct htlc_in *hin UNNEEDED, const struct preimage *preimage 
 /* Generated stub for get_block_height */
 u32 get_block_height(const struct chain_topology *topo UNNEEDED)
 { fprintf(stderr, "get_block_height called!\n"); abort(); }
+/* Generated stub for get_offered_bolt11features */
+u8 *get_offered_bolt11features(const tal_t *ctx UNNEEDED)
+{ fprintf(stderr, "get_offered_bolt11features called!\n"); abort(); }
 /* Generated stub for htlc_is_trimmed */
 bool htlc_is_trimmed(enum side htlc_owner UNNEEDED,
 		     struct amount_msat htlc_amount UNNEEDED,
@@ -188,6 +194,11 @@ void json_add_node_id(struct json_stream *response UNNEEDED,
 void json_add_num(struct json_stream *result UNNEEDED, const char *fieldname UNNEEDED,
 		  unsigned int value UNNEEDED)
 { fprintf(stderr, "json_add_num called!\n"); abort(); }
+/* Generated stub for json_add_secret */
+void json_add_secret(struct json_stream *response UNNEEDED,
+		     const char *fieldname UNNEEDED,
+		     const struct secret *secret UNNEEDED)
+{ fprintf(stderr, "json_add_secret called!\n"); abort(); }
 /* Generated stub for json_add_sha256 */
 void json_add_sha256(struct json_stream *result UNNEEDED, const char *fieldname UNNEEDED,
 		     const struct sha256 *hash UNNEEDED)
@@ -510,6 +521,7 @@ bool wallet_invoice_create(struct wallet *wallet UNNEEDED,
 			   u64 expiry UNNEEDED,
 			   const char *b11enc UNNEEDED,
 			   const char *description UNNEEDED,
+			   const u8 *features UNNEEDED,
 			   const struct preimage *r UNNEEDED,
 			   const struct sha256 *rhash UNNEEDED)
 { fprintf(stderr, "wallet_invoice_create called!\n"); abort(); }

@@ -204,7 +204,7 @@ static void disable_gossip_stream(struct seeker *seeker, struct peer *peer)
 
 	/* This is allowed even if they don't understand it (odd) */
 	msg = towire_gossip_timestamp_filter(NULL,
-					     &seeker->daemon->chain_hash,
+					     &chainparams->genesis_blockhash,
 					     UINT32_MAX,
 					     UINT32_MAX);
 	queue_peer_msg(peer, take(msg));
@@ -231,7 +231,7 @@ static void enable_gossip_stream(struct seeker *seeker, struct peer *peer)
 
 	/* This is allowed even if they don't understand it (odd) */
 	msg = towire_gossip_timestamp_filter(NULL,
-					     &seeker->daemon->chain_hash,
+					     &chainparams->genesis_blockhash,
 					     start,
 					     UINT32_MAX);
 	queue_peer_msg(peer, take(msg));
@@ -358,6 +358,8 @@ static struct short_channel_id *stale_scids_remove(const tal_t *ctx,
 		uintmap_del(&seeker->stale_scids, scid);
 		tal_free(qf);
 		i++;
+		if (i == max)
+			break;
 	}
 	tal_resize(&scids, i);
 	tal_resize(query_flags, i);

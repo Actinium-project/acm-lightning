@@ -611,7 +611,7 @@ def test_hsm_secret_encryption(node_factory):
 def test_hsmtool_secret_decryption(node_factory):
     l1 = node_factory.get_node()
     password = "reckless\n"
-    hsm_path = os.path.join(l1.daemon.lightning_dir, "hsm_secret")
+    hsm_path = os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, "hsm_secret")
     # We need to simulate a terminal to use termios in `lightningd`.
     master_fd, slave_fd = os.openpty()
 
@@ -676,5 +676,6 @@ def test_fundchannel_listtransaction(node_factory, bitcoind):
     # next call warned about SQL Accessing a null column
     # and crashed the daemon for accessing random memory or null
     txs = l1.rpc.listtransactions()['transactions']
-    assert txs[0]['hash'] == txid
-    assert txs[0]['blockheight'] == 0
+
+    tx = [t for t in txs if t['hash'] == txid][0]
+    assert tx['blockheight'] == 0

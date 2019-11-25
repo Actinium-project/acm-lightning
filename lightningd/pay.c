@@ -637,7 +637,8 @@ send_payment(struct lightningd *ld,
 	     const struct route_hop *route,
 	     struct amount_msat msat,
 	     const char *label TAKES,
-	     const char *b11str TAKES)
+	     const char *b11str TAKES,
+	     const struct secret *payment_secret)
 {
 	const u8 *onion;
 	u8 sessionkey[32];
@@ -654,7 +655,7 @@ send_payment(struct lightningd *ld,
 	struct channel *channel;
 	struct sphinx_path *path;
 	struct pubkey pubkey;
-	bool ret;
+	bool final_tlv, ret;
 
 	/* Expiry for HTLCs is absolute.  And add one to give some margin. */
 	base_expiry = get_block_height(ld->topology) + 1;
@@ -681,10 +682,27 @@ send_payment(struct lightningd *ld,
 	ret = pubkey_from_node_id(&pubkey, &ids[i]);
 	assert(ret);
 
-	sphinx_add_final_hop(path, &pubkey,
-			     should_use_tlv(route[i].style),
-			     route[i].amount,
-			     base_expiry + route[i].delay);
+	final_tlv = should_use_tlv(route[i].style);
+	/* BOLT-3a09bc54f8443c4757b47541a5310aff6377ee21 #4:
+	 * - Unless `node_announcement`, `init` message or the
+	 *   [BOLT #11](11-payment-encoding.md#tagged-fields) offers feature
+	 *   `var_onion_optin`:
+	 *    - MUST use the legacy payload format instead.
+	 */
+	/* In our case, we don't use it unless we also have a payment_secret;
+	 * everyone should support this eventually */
+	if (!final_tlv && payment_secret)
+		final_tlv = true;
+
+	if (!sphinx_add_final_hop(path, &pubkey,
+				  final_tlv,
+				  route[i].amount,
+				  base_expiry + route[i].delay,
+				  route[i].amount, payment_secret)) {
+		return command_fail(cmd, PAY_DESTINATION_PERM_FAIL,
+				    "Destination does not support"
+				    " payment_secret");
+	}
 
 	/* Now, do we already have a payment? */
 	payment = wallet_payment_by_hash(tmpctx, ld->wallet, rhash);
@@ -824,6 +842,23 @@ static struct command_result *param_route_hop_style(struct command *cmd,
 			    json_tok_full(buffer, tok));
 }
 
+static struct command_result *param_secret(struct command *cmd,
+					   const char *name,
+					   const char *buffer,
+					   const jsmntok_t *tok,
+					   struct secret **secret)
+{
+	*secret = tal(cmd, struct secret);
+	if (hex_decode(buffer + tok->start,
+		       tok->end - tok->start,
+		       *secret, sizeof(**secret)))
+		return NULL;
+
+	return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+			    "'%s' should be a 32 byte hex value, not '%.*s'",
+			    name, tok->end - tok->start, buffer + tok->start);
+}
+
 static struct command_result *json_sendpay(struct command *cmd,
 					   const char *buffer,
 					   const jsmntok_t *obj UNNEEDED,
@@ -837,6 +872,7 @@ static struct command_result *json_sendpay(struct command *cmd,
 	struct amount_msat *msat;
 	const char *b11str, *label = NULL;
 	struct command_result *res;
+	struct secret *payment_secret;
 
 	/* For generating help, give new-style. */
 	if (!params || !deprecated_apis) {
@@ -846,6 +882,8 @@ static struct command_result *json_sendpay(struct command *cmd,
 			   p_opt("label", param_escaped_string, &label),
 			   p_opt("msatoshi", param_msat, &msat),
 			   p_opt("bolt11", param_string, &b11str),
+			   p_opt("payment_secret", param_secret,
+				 &payment_secret),
 			   NULL))
 			return command_param_failed();
 	} else if (params->type == JSMN_ARRAY) {
@@ -855,6 +893,8 @@ static struct command_result *json_sendpay(struct command *cmd,
 			   p_opt("label_or_description", param_escaped_string, &label),
 			   p_opt("msatoshi", param_msat, &msat),
 			   p_opt("bolt11", param_string, &b11str),
+			   p_opt("payment_secret", param_secret,
+				 &payment_secret),
 			   NULL))
 			return command_param_failed();
 	} else {
@@ -866,6 +906,8 @@ static struct command_result *json_sendpay(struct command *cmd,
 			   p_opt("description", param_escaped_string, &desc),
 			   p_opt("msatoshi", param_msat, &msat),
 			   p_opt("bolt11", param_string, &b11str),
+			   p_opt("payment_secret", param_secret,
+				 &payment_secret),
 			   NULL))
 			return command_param_failed();
 
@@ -957,9 +999,18 @@ static struct command_result *json_sendpay(struct command *cmd,
 							   &route[routetok->size-1].amount));
 	}
 
+	/* It's easier to leave this in the API, then ignore it here. */
+#if !EXPERIMENTAL_FEATURES
+	if (payment_secret) {
+		log_unusual(cmd->ld->log,
+			    "sendpay: we don't support payment_secret yet, ignoring");
+		payment_secret = NULL;
+	}
+#endif
+
 	res = send_payment(cmd->ld, cmd, rhash, route,
 			   msat ? *msat : route[routetok->size-1].amount,
-			   label, b11str);
+			   label, b11str, payment_secret);
 	if (res)
 		return res;
 	return command_still_pending(cmd);

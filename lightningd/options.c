@@ -7,10 +7,8 @@
 #include <ccan/read_write_all/read_write_all.h>
 #include <ccan/short_types/short_types.h>
 #include <ccan/str/hex/hex.h>
-#include <ccan/tal/grab_file/grab_file.h>
 #include <ccan/tal/path/path.h>
 #include <ccan/tal/str/str.h>
-#include <common/configdir.h>
 #include <common/derive_basepoints.h>
 #include <common/features.h>
 #include <common/json_command.h>
@@ -43,38 +41,10 @@
 #include <unistd.h>
 #include <wire/wire.h>
 
-bool deprecated_apis = true;
-static bool opt_table_alloced = false;
-
 /* Declare opt_add_addr here, because we we call opt_add_addr
  * and opt_announce_addr vice versa
 */
 static char *opt_add_addr(const char *arg, struct lightningd *ld);
-
-/* Tal wrappers for opt. */
-static void *opt_allocfn(size_t size)
-{
-	return tal_arr_label(NULL, char, size, TAL_LABEL("opt_allocfn", ""));
-}
-
-static void *tal_reallocfn(void *ptr, size_t size)
-{
-	if (!ptr) {
-		/* realloc(NULL) call is to allocate opt_table */
-		if (!opt_table_alloced) {
-			opt_table_alloced = true;
-			return notleak(opt_allocfn(size));
-		}
-		return opt_allocfn(size);
-	}
-	tal_resize_(&ptr, 1, size, false);
-	return ptr;
-}
-
-static void tal_freefn(void *ptr)
-{
-	tal_free(ptr);
-}
 
 /* FIXME: Put into ccan/time. */
 #define TIME_FROM_SEC(sec) { { .tv_nsec = 0, .tv_sec = sec } }
@@ -248,38 +218,6 @@ static void opt_show_u32(char buf[OPT_SHOW_LEN], const u32 *u)
 static void opt_show_s32(char buf[OPT_SHOW_LEN], const s32 *u)
 {
 	snprintf(buf, OPT_SHOW_LEN, "%"PRIi32, *u);
-}
-
-static char *opt_set_network(const char *arg, struct lightningd *ld)
-{
-	assert(arg != NULL);
-
-	/* Set the global chainparams instance */
-	chainparams = chainparams_for_network(arg);
-	if (!chainparams)
-		return tal_fmt(NULL, "Unknown network name '%s'", arg);
-	return NULL;
-}
-
-static char *opt_set_testnet(struct lightningd *ld)
-{
-	return opt_set_network("testnet", ld);
-}
-
-static char *opt_set_signet(struct lightningd *ld)
-{
-	return opt_set_network("signet", ld);
-}
-
-static char *opt_set_mainnet(struct lightningd *ld)
-{
-	return opt_set_network("bitcoin", ld);
-}
-
-static void opt_show_network(char buf[OPT_SHOW_LEN],
-			     const struct lightningd *ld)
-{
-	snprintf(buf, OPT_SHOW_LEN, "%s", chainparams->network_name);
 }
 
 static char *opt_set_rgb(const char *arg, struct lightningd *ld)
@@ -688,125 +626,6 @@ static void check_config(struct lightningd *ld)
 		fatal("--always-use-proxy needs --proxy");
 }
 
-static void setup_default_config(struct lightningd *ld)
-{
-	if (chainparams->testnet)
-		ld->config = testnet_config;
-	else
-		ld->config = mainnet_config;
-
-	/* Set default PID file name to be per-network */
-	tal_free(ld->pidfile);
-	ld->pidfile = tal_fmt(ld, "lightningd-%s.pid", chainparams->network_name);
-}
-
-
-/* FIXME: make this nicer! */
-static int config_parse_line_number = 0;
-
-static void config_log_stderr_exit(const char *fmt, ...)
-{
-	char *msg;
-	va_list ap;
-
-	va_start(ap, fmt);
-
-	/* This is the format we expect:*/
-	if (streq(fmt, "%s: %.*s: %s")) {
-		const char *argv0 = va_arg(ap, const char *);
-		unsigned int len = va_arg(ap, unsigned int);
-		const char *arg = va_arg(ap, const char *);
-		const char *problem = va_arg(ap, const char *);
-
-		assert(argv0 != NULL);
-		assert(arg != NULL);
-		assert(problem != NULL);
-		/*mangle it to remove '--' and add the line number.*/
-		msg = tal_fmt(NULL, "%s line %d: %.*s: %s",
-			      argv0, config_parse_line_number, len-2, arg+2, problem);
-	} else {
-		msg = tal_vfmt(NULL, fmt, ap);
-	}
-	va_end(ap);
-
-	fatal("%s", msg);
-}
-
-/**
- * We turn the config file into cmdline arguments. @early tells us
- * whether to parse early options only (and ignore any unknown ones),
- * or the non-early options.
- */
-static void opt_parse_from_config(struct lightningd *ld, bool early)
-{
-	char *contents, **lines;
-	char **all_args; /*For each line: either argument string or NULL*/
-	char *argv[3];
-	int i, argc;
-	char *filename;
-
-	if (ld->config_filename != NULL)
-		filename = ld->config_filename;
-	else
-		filename = path_join(tmpctx, ld->config_dir, "config");
-
-	contents = grab_file(ld, filename);
-
-	/* The default config doesn't have to exist, but if the config was
-	 * specified on the command line it has to exist. */
-	if (!contents) {
-		if ((errno != ENOENT) || (ld->config_filename != NULL))
-			fatal("Opening and reading %s: %s",
-			      filename, strerror(errno));
-		return;
-	}
-
-	lines = tal_strsplit(contents, contents, "\r\n", STR_EMPTY_OK);
-
-	/* We have to keep all_args around, since opt will point into it */
-	all_args = notleak(tal_arr(ld, char *, tal_count(lines) - 1));
-
-	for (i = 0; i < tal_count(lines) - 1; i++) {
-		if (strstarts(lines[i], "#")) {
-			all_args[i] = NULL;
-		}
-		else {
-			/* Only valid forms are "foo" and "foo=bar" */
-			all_args[i] = tal_fmt(all_args, "--%s", lines[i]);
-		}
-	}
-
-	/*
-	For each line we construct a fake argc,argv commandline.
-	argv[1] is the only element that changes between iterations.
-	*/
-	argc = 2;
-	argv[0] = "lightning config file";
-	argv[argc] = NULL;
-
-	if (early) {
-		for (i = 0; i < tal_count(all_args); i++) {
-			if (all_args[i] != NULL) {
-				config_parse_line_number = i + 1;
-				argv[1] = all_args[i];
-				opt_early_parse_incomplete(argc, argv,
-						config_log_stderr_exit);
-			}
-		}
-	} else {
-		for (i = 0; i < tal_count(all_args); i++) {
-			if (all_args[i] != NULL) {
-				config_parse_line_number = i + 1;
-				argv[1] = all_args[i];
-				opt_parse(&argc, argv, config_log_stderr_exit);
-				argc = 2; /* opt_parse might have changed it  */
-			}
-		}
-	}
-
-	tal_free(contents);
-}
-
 static char *test_subdaemons_and_exit(struct lightningd *ld)
 {
 	test_subdaemons(ld);
@@ -824,9 +643,6 @@ static char *list_features_and_exit(struct lightningd *ld)
 
 static char *opt_lightningd_usage(struct lightningd *ld)
 {
-	/* Reload config so that --help has the correct network defaults
-	 * to display before it exits */
-	setup_default_config(ld);
 	char *extra = tal_fmt(NULL, "\nA bitcoin lightning daemon (default "
 			"values shown for network: %s).", chainparams->network_name);
 	opt_usage_and_exit(extra);
@@ -869,73 +685,6 @@ static char *opt_start_daemon(struct lightningd *ld)
 	errx(1, "Died with signal %u", WTERMSIG(exitcode));
 }
 
-static char *opt_ignore_talstr(const char *arg, char **p)
-{
-	return NULL;
-}
-
-static char *opt_set_conf(const char *arg, struct lightningd *ld)
-{
-	/* This is a pass-through if arg is absolute */
-	tal_free(ld->config_filename);
-	ld->config_filename = path_join(ld, path_cwd(tmpctx), arg);
-	return NULL;
-}
-
-/* Just enough parsing to find config file, and other maintenance options
- * which don't want us to create the lightning dir */
-static void handle_minimal_config_opts(struct lightningd *ld,
-				       int argc, char *argv[])
-{
-	/* First, they could specify a config, which specifies a lightning dir */
-	opt_register_early_arg("--conf=<file>", opt_set_conf, NULL,
-			       ld,
-			       "Specify configuration file (default: <lightning-dir>/config)");
-
-	ld->config_dir = NULL;
-	opt_register_early_arg("--lightning-dir=<dir>",
-			       opt_set_talstr, NULL,
-			       &ld->config_dir,
-			       "Set working directory. All other files are relative to this");
-
-	/* List features immediately, before doing anything interesting */
-	opt_register_early_noarg("--list-features-only",
-				 list_features_and_exit,
-				 ld, opt_hidden);
-
-	/* Handle --version (and exit) here too: don't create lightning-dir for this */
-	opt_register_version();
-
-	opt_early_parse_incomplete(argc, argv, opt_log_stderr_exit);
-
-	/* Corner case: if they specified a config filename, and didn't set
-	 * set lightning-dir, read config file to get it! */
-	if (ld->config_filename && !ld->config_dir)
-		opt_parse_from_config(ld, true);
-
-	if (!ld->config_dir)
-		ld->config_dir = default_configdir(ld);
-
-	/* Now, reset and ignore those options from now on. */
-	opt_free_table();
-	opt_table_alloced = false;
-
-	opt_register_early_arg("--conf=<file>", opt_ignore_talstr, NULL,
-			       &ld->config_filename,
-			       "Specify configuration file (default: <lightning-dir>/config)");
-	opt_register_early_arg("--lightning-dir=<dir>",
-			       opt_ignore_talstr, opt_show_charp,
-			       &ld->config_dir,
-			       "Set working directory. All other files are relative to this");
-
-	ld->config_dir = path_join(ld, path_cwd(tmpctx), take(ld->config_dir));
-
-	ld->wallet_dsn = tal_fmt(ld, "sqlite3://%s/lightningd.sqlite3", ld->config_dir);
-	opt_register_early_arg("--wallet", opt_set_talstr, NULL,
-			       &ld->wallet_dsn,
-			       "Location of the wallet database.");
-}
-
 static void register_opts(struct lightningd *ld)
 {
 	/* This happens before plugins started */
@@ -956,25 +705,6 @@ static void register_opts(struct lightningd *ld)
 			       NULL, ld,
 			       "Disable a particular plugin by filename/name");
 
-	/* We need to know network early, so we can set defaults (which normal
-	 * options can change) */
-	opt_register_early_arg("--network", opt_set_network, opt_show_network,
-			       ld,
-			       "Select the network parameters (bitcoin, testnet,"
-			       " regtest, litecoin or litecoin-testnet)");
-	opt_register_early_noarg("--testnet", opt_set_testnet, ld,
-				 "Alias for --network=testnet");
-	opt_register_early_noarg("--signet", opt_set_signet, ld,
-				 "Alias for --network=signet");
-	opt_register_early_noarg("--mainnet", opt_set_mainnet, ld,
-				 "Alias for --network=bitcoin");
-
-	/* This can effect commandline parsing */
-	opt_register_early_arg("--allow-deprecated-apis",
-			       opt_set_bool_arg, opt_show_bool,
-			       &deprecated_apis,
-			       "Enable deprecated options, JSONRPC commands, fields, etc.");
-
 	/* Early, as it suppresses DNS lookups from cmdline too. */
 	opt_register_early_arg("--always-use-proxy",
 			       opt_set_bool_arg, opt_show_bool,
@@ -983,10 +713,10 @@ static void register_opts(struct lightningd *ld)
 	/* This immediately makes is a daemon. */
 	opt_register_early_noarg("--daemon", opt_start_daemon, ld,
 				 "Run in the background, suppress stdout/stderr");
+	opt_register_early_arg("--wallet", opt_set_talstr, NULL,
+			       &ld->wallet_dsn,
+			       "Location of the wallet database.");
 
-	opt_register_arg("--rpc-file", opt_set_talstr, opt_show_charp,
-			 &ld->rpc_filename,
-			 "Set JSON-RPC socket (or /dev/tty)");
 	opt_register_noarg("--help|-h", opt_lightningd_usage, ld,
 				 "Print this message.");
 	opt_register_arg("--bitcoin-datadir", opt_set_talstr, NULL,
@@ -1109,6 +839,62 @@ static void register_opts(struct lightningd *ld)
 #endif
 }
 
+/* We are in ld->config_netdir when this is run! */
+static void promote_missing_files(struct lightningd *ld)
+{
+#ifdef COMPAT_V073
+	DIR *d_from;
+	struct dirent *d;
+	struct stat st;
+
+	/* If hsm_secret already exists, we assume we're ugpraded */
+	if (stat("hsm_secret", &st) == 0)
+		return;
+
+	if (errno != ENOENT)
+		err(1, "Looking for hsm_secret in lightning dir");
+
+	/* If hsm doesn't exist in basedir, we've nothing to upgrade. */
+	if (stat(path_join(tmpctx, ld->config_basedir, "hsm_secret"), &st) != 0)
+		return;
+
+	d_from = opendir(ld->config_basedir);
+	if (!d_from)
+		err(1, "Opening %s", ld->config_basedir);
+
+	while ((d = readdir(d_from)) != NULL) {
+		const char *fullname;
+
+		/* Ignore this directory and upper one, and leave
+		 * config and pid files */
+		if (streq(d->d_name, ".")
+		    || streq(d->d_name, "..")
+		    || streq(d->d_name, "config")
+		    || strends(d->d_name, ".pid"))
+			continue;
+
+		fullname = path_join(tmpctx, ld->config_basedir, d->d_name);
+
+		/* Ignore any directories. */
+		if (lstat(fullname, &st) != 0)
+			errx(1, "Could not stat %s", fullname);
+		if ((st.st_mode & S_IFMT) == S_IFDIR)
+			continue;
+
+		/* Check we don't overwrite something in this dir! */
+		if (lstat(d->d_name, &st) != -1)
+			errx(1, "Refusing to overwrite %s into %s/",
+			     fullname, ld->config_netdir);
+		log_unusual(ld->log, "Moving %s into %s/",
+			    d->d_name, ld->config_netdir);
+		if (rename(fullname, d->d_name) != 0)
+			err(1, "Could not move %s/%s to %s",
+			    ld->config_basedir, d->d_name, ld->config_netdir);
+	}
+	closedir(d_from);
+#endif /* COMPAT_V073 */
+}
+
 /* Names stolen from https://github.com/ternus/nsaproductgenerator/blob/master/nsa.js */
 static const char *codename_adjective[]
 = { "LOUD", "RED", "BLUE", "GREEN", "YELLOW", "IRATE", "ANGRY", "PEEVED",
@@ -1162,38 +948,67 @@ void setup_color_and_alias(struct lightningd *ld)
 
 void handle_early_opts(struct lightningd *ld, int argc, char *argv[])
 {
-	/*~ These functions make ccan/opt use tal for allocations */
-	opt_set_alloc(opt_allocfn, tal_reallocfn, tal_freefn);
+	/* Make ccan/opt use tal for allocations */
+	setup_option_allocators();
 
-	/*~ Handle --conf and --lightning-dir super-early. */
-	handle_minimal_config_opts(ld, argc, argv);
+	/*~ List features immediately, before doing anything interesting */
+	opt_register_early_noarg("--list-features-only",
+				 list_features_and_exit,
+				 ld, opt_hidden);
+
+	/*~ This does enough parsing to get us the base configuration options */
+	initial_config_opts(ld, argc, argv,
+			    &ld->config_filename,
+			    &ld->config_basedir,
+			    &ld->config_netdir,
+			    &ld->rpc_filename);
+
+	/* Copy in default config, to be modified by further options */
+	if (chainparams->testnet)
+		ld->config = testnet_config;
+	else
+		ld->config = mainnet_config;
+
+	/* Now we can initialize wallet_dsn */
+	ld->wallet_dsn = tal_fmt(ld, "sqlite3://%s/lightningd.sqlite3",
+				 ld->config_netdir);
+
+	/* Set default PID file name to be per-network (in base dir) */
+	ld->pidfile = path_join(ld, ld->config_basedir,
+				tal_fmt(tmpctx, "lightningd-%s.pid",
+					chainparams->network_name));
 
 	/*~ Move into config dir: this eases path manipulation and also
 	 * gives plugins a good place to store their stuff. */
-	if (chdir(ld->config_dir) != 0) {
+	if (chdir(ld->config_netdir) != 0) {
 		log_unusual(ld->log, "Creating configuration directory %s",
-			    ld->config_dir);
-		if (mkdir(ld->config_dir, 0700) != 0)
+			    ld->config_netdir);
+		/* We assume home dir exists, so only create two. */
+		if (mkdir(ld->config_basedir, 0700) != 0 && errno != EEXIST)
 			fatal("Could not make directory %s: %s",
-			      ld->config_dir, strerror(errno));
-		if (chdir(ld->config_dir) != 0)
+			      ld->config_basedir,
+			      strerror(errno));
+		if (mkdir(ld->config_netdir, 0700) != 0)
+			fatal("Could not make directory %s: %s",
+			      ld->config_netdir, strerror(errno));
+		if (chdir(ld->config_netdir) != 0)
 			fatal("Could not change directory %s: %s",
-			      ld->config_dir, strerror(errno));
+			      ld->config_netdir, strerror(errno));
 	}
+
+	/*~ We move files from old locations on first upgrade. */
+	promote_missing_files(ld);
 
 	/*~ The ccan/opt code requires registration then parsing; we
 	 *  mimic this API here, even though they're on separate lines.*/
 	register_opts(ld);
 
-	/* Now look inside config file, but only handle the early
+	/* Now look inside config file(s), but only handle the early
 	 * options (testnet, plugins etc), others may be added on-demand */
-	opt_parse_from_config(ld, true);
+	parse_config_files(ld->config_filename, ld->config_basedir, true);
 
 	/* Early cmdline options now override config file options. */
 	opt_early_parse_incomplete(argc, argv, opt_log_stderr_exit);
-
-	/* Now we know what network we're on, initialize defaults. */
-	setup_default_config(ld);
 
 	/* Finalize the logging subsystem now. */
 	logging_options_parsed(ld->log_book);
@@ -1204,7 +1019,7 @@ void handle_opts(struct lightningd *ld, int argc, char *argv[])
 	/* Now look for config file, but only handle non-early
 	 * options, early ones have been parsed in
 	 * handle_early_opts */
-	opt_parse_from_config(ld, false);
+	parse_config_files(ld->config_filename, ld->config_basedir, false);
 
 	/* Now parse cmdline, which overrides config. */
 	opt_parse(&argc, argv, opt_log_stderr_exit);
@@ -1267,10 +1082,7 @@ static void add_config(struct lightningd *ld,
 			/* Ignore hidden options (deprecated) */
 		} else if (opt->cb == (void *)opt_usage_and_exit
 		    || opt->cb == (void *)version_and_exit
-		    /* These two show up as --network= */
-		    || opt->cb == (void *)opt_set_testnet
-		    || opt->cb == (void *)opt_set_signet
-		    || opt->cb == (void *)opt_set_mainnet
+		    || is_restricted_ignored(opt->cb)
 		    || opt->cb == (void *)opt_lightningd_usage
 		    || opt->cb == (void *)test_subdaemons_and_exit
 		    /* FIXME: we can't recover this. */
@@ -1300,7 +1112,8 @@ static void add_config(struct lightningd *ld,
 		if (opt->desc == opt_hidden) {
 			/* Ignore hidden options (deprecated) */
 		} else if (opt->show) {
-			char *buf = tal_arr(name0, char, OPT_SHOW_LEN+1);
+			char buf[OPT_SHOW_LEN + sizeof("...")];
+			strcpy(buf + OPT_SHOW_LEN, "...");
 			opt->show(buf, opt->u.carg);
 
 			if (streq(buf, "true") || streq(buf, "false")
@@ -1314,13 +1127,14 @@ static void add_config(struct lightningd *ld,
 
 			/* opt_show_charp surrounds with "", strip them */
 			if (strstarts(buf, "\"")) {
-				buf[strlen(buf)-1] = '\0';
+				char *end = strrchr(buf, '"');
+				memmove(end, end + 1, strlen(end));
 				answer = buf + 1;
 			} else
 				answer = buf;
 		} else if (opt->cb_arg == (void *)opt_set_talstr
 			   || opt->cb_arg == (void *)opt_set_charp
-			   || opt->cb_arg == (void *)opt_ignore_talstr) {
+			   || is_restricted_print_if_nonnull(opt->cb_arg)) {
 			const char *arg = *(char **)opt->u.carg;
 			if (arg)
 				answer = tal_fmt(name0, "%s", arg);

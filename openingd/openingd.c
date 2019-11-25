@@ -109,8 +109,6 @@ struct state {
 	 * as initial channels never have HTLCs. */
 	struct channel *channel;
 
-	/* Which chain we're on, so we can check/set `chain_hash` fields */
-	const struct chainparams *chainparams;
 	bool option_static_remotekey;
 };
 
@@ -480,11 +478,11 @@ static bool setup_channel_funder(struct state *state)
 	 *...
 	 *   - MUST set `funding_satoshis` to less than 2^24 satoshi.
 	 */
-	if (amount_sat_greater(state->funding, state->chainparams->max_funding)) {
+	if (amount_sat_greater(state->funding, chainparams->max_funding)) {
 		status_failed(STATUS_FAIL_MASTER_IO,
 			      "funding_satoshis must be < %s, not %s",
 			      type_to_string(tmpctx, struct amount_sat,
-					     &state->chainparams->max_funding),
+					     &chainparams->max_funding),
 			      type_to_string(tmpctx, struct amount_sat,
 					     &state->funding));
 		return false;
@@ -520,7 +518,7 @@ static u8 *funder_channel_start(struct state *state,
 		our_upfront_shutdown_script = dev_upfront_shutdown_script(tmpctx);
 
 	msg = towire_open_channel_option_upfront_shutdown_script(NULL,
-				  &state->chainparams->genesis_blockhash,
+				  &chainparams->genesis_blockhash,
 				  &state->channel_id,
 				  state->funding,
 				  state->push_msat,
@@ -666,7 +664,6 @@ static bool funder_finalize_channel_setup(struct state *state,
 	 * enough for us here, and the complete channel support required by
 	 * `channeld` which lives in channeld/full_channel. */
 	state->channel = new_initial_channel(state,
-					     &state->chainparams->genesis_blockhash,
 					     &state->funding_txid,
 					     state->funding_txout,
 					     state->minimum_depth,
@@ -881,7 +878,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	struct bitcoin_signature theirsig, sig;
 	struct bitcoin_tx *local_commit, *remote_commit;
 	struct bitcoin_blkid chain_hash;
-	u8 *msg;
+	u8 *msg, *our_upfront_shutdown_script;
 	const u8 *wscript;
 	u8 channel_flags;
 	char* err_reason;
@@ -951,8 +948,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	 *  - the `chain_hash` value is set to a hash of a chain
 	 *  that is unknown to the receiver.
 	 */
-	if (!bitcoin_blkid_eq(&chain_hash,
-			      &state->chainparams->genesis_blockhash)) {
+	if (!bitcoin_blkid_eq(&chain_hash, &chainparams->genesis_blockhash)) {
 		negotiation_failed(state, false,
 				   "Unknown chain-hash %s",
 				   type_to_string(tmpctx,
@@ -965,7 +961,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	 *
 	 * The receiving node ... MUST fail the channel if `funding-satoshis`
 	 * is greater than or equal to 2^24 */
-	if (amount_sat_greater(state->funding, state->chainparams->max_funding)) {
+	if (amount_sat_greater(state->funding, chainparams->max_funding)) {
 		negotiation_failed(state, false,
 				   "funding_satoshis %s too large",
 				   type_to_string(tmpctx, struct amount_sat,
@@ -1068,7 +1064,8 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	wire_sync_write(REQ_FD, take(msg));
 	msg = wire_sync_read(tmpctx, REQ_FD);
 
-	if (!fromwire_opening_got_offer_reply(tmpctx, msg, &err_reason))
+	if (!fromwire_opening_got_offer_reply(NULL, msg, &err_reason,
+					      &our_upfront_shutdown_script))
 		master_badmsg(WIRE_OPENING_GOT_OFFER_REPLY, msg);
 
 	/* If they give us a reason to reject, do so. */
@@ -1078,6 +1075,9 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 		sync_crypto_write(state->pps, take(errmsg));
 		return NULL;
 	}
+
+	if (!our_upfront_shutdown_script)
+		our_upfront_shutdown_script = dev_upfront_shutdown_script(state);
 
 	/* OK, we accept! */
 	msg = towire_accept_channel_option_upfront_shutdown_script(NULL, &state->channel_id,
@@ -1094,7 +1094,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 				    &state->our_points.delayed_payment,
 				    &state->our_points.htlc,
 				    &state->first_per_commitment_point[LOCAL],
-				    dev_upfront_shutdown_script(tmpctx));
+				    our_upfront_shutdown_script);
 
 	sync_crypto_write(state->pps, take(msg));
 
@@ -1131,7 +1131,6 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 
 	/* Now we can create the channel structure. */
 	state->channel = new_initial_channel(state,
-					     &chain_hash,
 					     &state->funding_txid,
 					     state->funding_txout,
 					     state->minimum_depth,
@@ -1263,6 +1262,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 				     state->feerate_per_kw,
 				     msg,
 				     state->localconf.channel_reserve,
+				     our_upfront_shutdown_script,
 				     state->remote_upfront_shutdown_script);
 }
 
@@ -1472,11 +1472,6 @@ int main(int argc, char *argv[])
 		fail_if_all_error(inner);
 		tal_free(inner);
 	}
-
-	/*~ Even though I only care about bitcoin, there's still testnet and
-	 * regtest modes, so we have a general "parameters for this chain"
-	 * function. */
-	state->chainparams = chainparams;
 
 	/*~ Initially we're not associated with a channel, but
 	 * handle_peer_gossip_or_error compares this. */

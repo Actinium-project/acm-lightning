@@ -35,7 +35,7 @@ plugin dirs, usually `/usr/local/libexec/c-lightning/plugins` and
 lightningd --plugin=/path/to/plugin1 --plugin=path/to/plugin2
 ```
 
-`lightningd` run your plugins from the `--lightning-dir`, then
+`lightningd` run your plugins from the `--lightning-dir`/networkname, then
 will write JSON-RPC requests to the plugin's `stdin` and
 will read replies from its `stdout`. To initialize the plugin two RPC
 methods are required:
@@ -132,7 +132,7 @@ simple JSON object containing the options:
     "greeting": "World"
   },
   "configuration": {
-    "lightning-dir": "/home/user/.lightning",
+    "lightning-dir": "/home/user/.lightning/testnet",
     "rpc-file": "lightning-rpc",
     "startup": true
   }
@@ -577,6 +577,21 @@ the string `reject` or `continue`.  If `reject` and
 there's a member `error_message`, that member is sent to the peer
 before disconnection.
 
+For a 'continue'd result, you can also include a `close_to` address,
+which will be used as the output address for a mutual close transaction.
+
+e.g.
+
+```json
+{
+    "result": "continue",
+    "close_to": "bc1qlq8srqnz64wgklmqvurv7qnr4rvtq2u96hhfg2"
+}
+```
+
+Note that `close_to` must be a valid address for the current chain; an invalid address will cause the node to exit with an error.
+
+
 #### `htlc_accepted`
 
 The `htlc_accepted` hook is called whenever an incoming HTLC is accepted, and
@@ -616,6 +631,8 @@ For detailed information about each field please refer to [BOLT 04 of the specif
      and should match the incoming funds in case we are the recipient.
  - `outgoing_cltv_value` determines what the CLTV value for the HTLC that we
      forward to the next hop should be.
+ - `total_msat` specifies the total amount to pay, if present.
+ - `payment_secret` specifies the payment secret (which the payer should have obtained from the invoice), if present.
  - `next_onion` is the fully processed onion that we should be sending to the
    next hop as part of the outgoing HTLC. Processed in this case means that we
    took the incoming onion, decrypted it, extracted the payload destined for

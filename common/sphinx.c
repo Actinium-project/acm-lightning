@@ -147,7 +147,7 @@ static void sphinx_add_v0_hop(struct sphinx_path *path,
 	towire_u32(&buf, outgoing_cltv);
 	towire(&buf, padding, ARRAY_SIZE(padding));
 	assert(tal_bytelen(buf) == 32);
-	sphinx_add_raw_hop(path, pubkey, 0, buf);
+	sphinx_add_raw_hop(path, pubkey, SPHINX_V0_PAYLOAD, buf);
 }
 
 static void sphinx_add_tlv_hop(struct sphinx_path *path,
@@ -156,7 +156,7 @@ static void sphinx_add_tlv_hop(struct sphinx_path *path,
 {
 	u8 *tlvs = tal_arr(path, u8, 0);
 	towire_tlvs(&tlvs, tlvs_tlv_payload, TLVS_TLV_PAYLOAD_ARRAY_SIZE, tlv);
-	sphinx_add_raw_hop(path, pubkey, tal_bytelen(tlvs), tlvs);
+	sphinx_add_raw_hop(path, pubkey, SPHINX_TLV_PAYLOAD, tlvs);
 }
 
 void sphinx_add_nonfinal_hop(struct sphinx_path *path,
@@ -192,16 +192,25 @@ void sphinx_add_nonfinal_hop(struct sphinx_path *path,
 	}
 }
 
-void sphinx_add_final_hop(struct sphinx_path *path,
+bool sphinx_add_final_hop(struct sphinx_path *path,
 			  const struct pubkey *pubkey,
 			  bool use_tlv,
 			  struct amount_msat forward,
-			  u32 outgoing_cltv)
+			  u32 outgoing_cltv,
+			  struct amount_msat total_msat,
+			  const struct secret *payment_secret)
 {
+	/* These go together! */
+	if (!payment_secret)
+		assert(amount_msat_eq(total_msat, forward));
+
 	if (use_tlv) {
 		struct tlv_tlv_payload *tlv = tlv_tlv_payload_new(tmpctx);
 		struct tlv_tlv_payload_amt_to_forward tlv_amt;
 		struct tlv_tlv_payload_outgoing_cltv_value tlv_cltv;
+#if EXPERIMENTAL_FEATURES
+		struct tlv_tlv_payload_payment_data tlv_pdata;
+#endif
 
 		/* BOLT #4:
 		 *
@@ -216,12 +225,27 @@ void sphinx_add_final_hop(struct sphinx_path *path,
 		tlv->amt_to_forward = &tlv_amt;
 		tlv->outgoing_cltv_value = &tlv_cltv;
 
+#if EXPERIMENTAL_FEATURES
+		if (payment_secret) {
+			tlv_pdata.payment_secret = *payment_secret;
+			tlv_pdata.total_msat = total_msat.millisatoshis; /* Raw: TLV convert */
+			tlv->payment_data = &tlv_pdata;
+		}
+#else
+		/* Wihtout EXPERIMENTAL_FEATURES, we can't send payment_secret */
+		if (payment_secret)
+			return false;
+#endif
 		sphinx_add_tlv_hop(path, pubkey, tlv);
 	} else {
 		static struct short_channel_id all_zero_scid;
+		/* No payment secrets in legacy format. */
+		if (payment_secret)
+			return false;
 		sphinx_add_v0_hop(path, pubkey, &all_zero_scid,
 				  forward, outgoing_cltv);
 	}
+	return true;
 }
 
 /* Small helper to append data to a buffer and update the position
@@ -591,9 +615,13 @@ static void sphinx_parse_payload(struct route_step *step, const u8 *src)
 		const u8 *tlv = step->raw_payload;
 		size_t max = tal_bytelen(tlv);
 		step->payload.tlv = tlv_tlv_payload_new(step);
-		if (!fromwire_tlvs(&tlv, &max, tlvs_tlv_payload,
-				   TLVS_TLV_PAYLOAD_ARRAY_SIZE,
-				   step->payload.tlv)) {
+
+		/* The raw payload includes the length / realm prefix, Consume
+		 * the length off of the payload, so the decoding can strat
+		 * correctly. */
+		fromwire_varint(&tlv, &max);
+
+		if (!fromwire_tlv_payload(&tlv, &max, step->payload.tlv)) {
 			/* FIXME: record offset of violation for error! */
 			step->type = SPHINX_INVALID_PAYLOAD;
 			return;
@@ -679,6 +707,75 @@ struct onionpacket *create_onionpacket(
 	return packet;
 }
 
+/**
+ * Helper to extract fields from the legacy or tlv payload into the top-level
+ * struct.
+ */
+static void route_step_decode(struct route_step *rs)
+{
+	switch (rs->type) {
+	case SPHINX_V0_PAYLOAD:
+		rs->amt_to_forward = &rs->payload.v0.amt_forward;
+		rs->outgoing_cltv = &rs->payload.v0.outgoing_cltv;
+		rs->payment_secret = NULL;
+		/* BOLT-e36f7b6517e1173dcbd49da3b516cfe1f48ae556 #4:
+		 * - if it is the final node:
+		 *   - MUST treat `total_msat` as if it were equal to
+		 *     `amt_to_forward` if it is not present. */
+		rs->total_msat = rs->amt_to_forward;
+		if (rs->nextcase == ONION_FORWARD) {
+			rs->forward_channel = &rs->payload.v0.channel_id;
+		} else {
+			rs->forward_channel = NULL;
+		}
+		break;
+	case SPHINX_TLV_PAYLOAD:
+		if (rs->payload.tlv->amt_to_forward) {
+			rs->amt_to_forward = tal(rs, struct amount_msat);
+			amount_msat_from_u64(
+			    rs->amt_to_forward,
+			    rs->payload.tlv->amt_to_forward->amt_to_forward);
+		} else {
+			rs->amt_to_forward = NULL;
+		}
+
+		if (rs->payload.tlv->outgoing_cltv_value) {
+			rs->outgoing_cltv =
+			    &rs->payload.tlv->outgoing_cltv_value
+				 ->outgoing_cltv_value;
+		} else {
+			rs->outgoing_cltv = NULL;
+		}
+
+		if (rs->payload.tlv->short_channel_id)
+			rs->forward_channel = &rs->payload.tlv->short_channel_id
+						   ->short_channel_id;
+		else
+			rs->forward_channel = NULL;
+
+		rs->payment_secret = NULL;
+		/* BOLT-e36f7b6517e1173dcbd49da3b516cfe1f48ae556 #4:
+		 * - if it is the final node:
+		 *   - MUST treat `total_msat` as if it were equal to
+		 *     `amt_to_forward` if it is not present. */
+		rs->total_msat = rs->amt_to_forward;
+
+#if EXPERIMENTAL_FEATURES
+		if (rs->payload.tlv->payment_data) {
+			rs->payment_secret
+				= &rs->payload.tlv->payment_data->payment_secret;
+			rs->total_msat = tal(rs, struct amount_msat);
+			rs->total_msat->millisatoshis /* Raw: tu64 on wire */
+				= rs->payload.tlv->payment_data->total_msat;
+		}
+#endif
+		break;
+	case SPHINX_INVALID_PAYLOAD:
+	case SPHINX_RAW_PAYLOAD:
+		abort();
+	}
+}
+
 /*
  * Given an onionpacket msg extract the information for the current
  * node and unwrap the remainder so that the node can forward it.
@@ -749,6 +846,8 @@ struct route_step *process_onionpacket(
 	} else {
 		step->nextcase = ONION_FORWARD;
 	}
+
+	route_step_decode(step);
 
 	return step;
 }
@@ -879,75 +978,4 @@ struct onionreply *unwrap_onionreply(const tal_t *ctx,
 	tal_steal(ctx, oreply);
 	return oreply;
 
-}
-
-/**
- * Helper to extract fields from ONION_END.
- */
-bool route_step_decode_end(const struct route_step *rs,
-			   struct amount_msat *amt_forward,
-			   u32 *outgoing_cltv)
-{
-	assert(rs->nextcase == ONION_END);
-
-	switch (rs->type) {
-	case SPHINX_V0_PAYLOAD:
-		*amt_forward = rs->payload.v0.amt_forward;
-		*outgoing_cltv = rs->payload.v0.outgoing_cltv;
-		return true;
-	case SPHINX_TLV_PAYLOAD:
-		if (!rs->payload.tlv->amt_to_forward)
-			return false;
-		if (!rs->payload.tlv->outgoing_cltv_value)
-			return false;
-		amt_forward->millisatoshis /* Raw: tu64 -> millisatoshis */
-			= rs->payload.tlv->amt_to_forward->amt_to_forward;
-		*outgoing_cltv = rs->payload.tlv->outgoing_cltv_value->outgoing_cltv_value;
-		return true;
-	case SPHINX_INVALID_PAYLOAD:
-		return false;
-
-	/* This should probably be removed, as it's just for testing */
-	case SPHINX_RAW_PAYLOAD:
-		abort();
-	}
-	abort();
-}
-
-/**
- * Helper to extract fields from ONION_FORWARD.
- */
-bool route_step_decode_forward(const struct route_step *rs,
-			       struct amount_msat *amt_forward,
-			       u32 *outgoing_cltv,
-			       struct short_channel_id *scid)
-{
-	assert(rs->nextcase == ONION_FORWARD);
-
-	switch (rs->type) {
-	case SPHINX_V0_PAYLOAD:
-		*amt_forward = rs->payload.v0.amt_forward;
-		*outgoing_cltv = rs->payload.v0.outgoing_cltv;
-		*scid = rs->payload.v0.channel_id;
-		return true;
-	case SPHINX_TLV_PAYLOAD:
-		if (!rs->payload.tlv->amt_to_forward)
-			return false;
-		amt_forward->millisatoshis /* Raw: tu64 -> millisatoshis */
-			= rs->payload.tlv->amt_to_forward->amt_to_forward;
-		if (!rs->payload.tlv->outgoing_cltv_value)
-			return false;
-		*outgoing_cltv = rs->payload.tlv->outgoing_cltv_value->outgoing_cltv_value;
-		if (!rs->payload.tlv->short_channel_id)
-			return false;
-		*scid = rs->payload.tlv->short_channel_id->short_channel_id;
-		return true;
-	case SPHINX_INVALID_PAYLOAD:
-		return false;
-
-	/* This should probably be removed, as it's just for testing */
-	case SPHINX_RAW_PAYLOAD:
-		abort();
-	}
-	abort();
 }

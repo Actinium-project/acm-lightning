@@ -18,6 +18,12 @@ bool amount_asset_is_main(struct amount_asset *asset UNNEEDED)
 /* Generated stub for amount_asset_to_sat */
 struct amount_sat amount_asset_to_sat(struct amount_asset *asset UNNEEDED)
 { fprintf(stderr, "amount_asset_to_sat called!\n"); abort(); }
+/* Generated stub for amount_msat_eq */
+bool amount_msat_eq(struct amount_msat a UNNEEDED, struct amount_msat b UNNEEDED)
+{ fprintf(stderr, "amount_msat_eq called!\n"); abort(); }
+/* Generated stub for amount_msat_from_u64 */
+void amount_msat_from_u64(struct amount_msat *msat UNNEEDED, u64 millisatoshis UNNEEDED)
+{ fprintf(stderr, "amount_msat_from_u64 called!\n"); abort(); }
 /* Generated stub for amount_sat_add */
  bool amount_sat_add(struct amount_sat *val UNNEEDED,
 				       struct amount_sat a UNNEEDED,
@@ -49,6 +55,9 @@ bigsize_t fromwire_bigsize(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
 /* Generated stub for fromwire_fail */
 const void *fromwire_fail(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
 { fprintf(stderr, "fromwire_fail called!\n"); abort(); }
+/* Generated stub for fromwire_secret */
+void fromwire_secret(const u8 **cursor UNNEEDED, size_t *max UNNEEDED, struct secret *secret UNNEEDED)
+{ fprintf(stderr, "fromwire_secret called!\n"); abort(); }
 /* Generated stub for fromwire_sha256 */
 void fromwire_sha256(const u8 **cursor UNNEEDED, size_t *max UNNEEDED, struct sha256 *sha256 UNNEEDED)
 { fprintf(stderr, "fromwire_sha256 called!\n"); abort(); }
@@ -56,12 +65,6 @@ void fromwire_sha256(const u8 **cursor UNNEEDED, size_t *max UNNEEDED, struct sh
 void fromwire_short_channel_id(const u8 **cursor UNNEEDED, size_t *max UNNEEDED,
 			       struct short_channel_id *short_channel_id UNNEEDED)
 { fprintf(stderr, "fromwire_short_channel_id called!\n"); abort(); }
-/* Generated stub for fromwire_tlvs */
-bool fromwire_tlvs(const u8 **cursor UNNEEDED, size_t *max UNNEEDED,
-		   const struct tlv_record_type types[] UNNEEDED,
-		   size_t num_types UNNEEDED,
-		   void *record UNNEEDED)
-{ fprintf(stderr, "fromwire_tlvs called!\n"); abort(); }
 /* Generated stub for fromwire_tu32 */
 u32 fromwire_tu32(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
 { fprintf(stderr, "fromwire_tu32 called!\n"); abort(); }
@@ -92,6 +95,9 @@ void towire_bigsize(u8 **pptr UNNEEDED, const bigsize_t val UNNEEDED)
 /* Generated stub for towire_pad */
 void towire_pad(u8 **pptr UNNEEDED, size_t num UNNEEDED)
 { fprintf(stderr, "towire_pad called!\n"); abort(); }
+/* Generated stub for towire_secret */
+void towire_secret(u8 **pptr UNNEEDED, const struct secret *secret UNNEEDED)
+{ fprintf(stderr, "towire_secret called!\n"); abort(); }
 /* Generated stub for towire_sha256 */
 void towire_sha256(u8 **pptr UNNEEDED, const struct sha256 *sha256 UNNEEDED)
 { fprintf(stderr, "towire_sha256 called!\n"); abort(); }

@@ -111,23 +111,25 @@ static void copy_column(void *dst, size_t size,
 
 int main(int argc, char *argv[])
 {
-	char *config_dir, *hsmfile, *dbfile;
+	char *config_dir, *net_dir, *config_filename, *rpc_filename, *hsmfile, *dbfile;
 	sqlite3 *sql;
 	sqlite3_stmt *stmt;
 	int flags = SQLITE_OPEN_READONLY, dberr;
 	struct secret *hsm_secret;
 	bool verbose = false;
 	size_t num, num_ok;
+	const tal_t *top_ctx = tal(NULL, char);
 
 	setup_locale();
 	wally_init(0);
 	secp256k1_ctx = wally_get_secp_context();
 
-	config_dir = default_configdir(NULL);
-	opt_register_arg("--lightning-dir=<dir>",
-			 opt_set_talstr, opt_show_charp,
-			 &config_dir,
-			 "Where to find hsm_secret and lightningd.sqlite3");
+	setup_option_allocators();
+
+	initial_config_opts(top_ctx, argc, argv,
+			    &config_filename, &config_dir, &net_dir,
+			    &rpc_filename);
+
 	opt_register_noarg("-v|--verbose", opt_set_bool, &verbose,
 			 "Print everything");
 
@@ -135,8 +137,8 @@ int main(int argc, char *argv[])
 	if (argc != 1)
 		errx(1, "no arguments accepted");
 
-	hsmfile = path_join(config_dir, config_dir, "hsm_secret");
-	dbfile = path_join(config_dir, config_dir, "lightningd.sqlite3");
+	hsmfile = path_join(top_ctx, net_dir, "hsm_secret");
+	dbfile = path_join(top_ctx, net_dir, "lightningd.sqlite3");
 
 	dberr = sqlite3_open_v2(dbfile, &sql, flags, NULL);
 	if (dberr != SQLITE_OK)
@@ -235,5 +237,5 @@ int main(int argc, char *argv[])
 		printf("\nCheck passed!\n");
 	else
 		errx(1, "%zu channels incorrect.", num - num_ok);
-	tal_free(config_dir);
+	tal_free(top_ctx);
 }

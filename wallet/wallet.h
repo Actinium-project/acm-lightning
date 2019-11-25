@@ -673,6 +673,8 @@ struct invoice_details {
 
 	/* The description of the payment. */
 	char *description;
+	/* The features, if any (tal_arr) */
+	u8 *features;
 };
 
 /* An object that handles iteration over the set of invoices */
@@ -713,6 +715,7 @@ bool wallet_invoice_create(struct wallet *wallet,
 			   u64 expiry,
 			   const char *b11enc,
 			   const char *description,
+			   const u8 *features,
 			   const struct preimage *r,
 			   const struct sha256 *rhash);
 
@@ -1021,8 +1024,7 @@ void wallet_htlc_sigs_save(struct wallet *w, u64 channel_id,
  * genesis_hash with which the DB was initialized. Returns false if
  * the check failed, i.e., if the genesis hashes do not match.
  */
-bool wallet_network_check(struct wallet *w,
-			  const struct chainparams *chainparams);
+bool wallet_network_check(struct wallet *w);
 
 /**
  * wallet_block_add - Add a block to the blockchain tracked by this wallet

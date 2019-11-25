@@ -138,6 +138,7 @@ bool invoices_create(struct invoices *invoices UNNEEDED,
 		     u64 expiry UNNEEDED,
 		     const char *b11enc UNNEEDED,
 		     const char *description UNNEEDED,
+		     const u8 *features UNNEEDED,
 		     const struct preimage *r UNNEEDED,
 		     const struct sha256 *rhash UNNEEDED)
 { fprintf(stderr, "invoices_create called!\n"); abort(); }
@@ -206,7 +207,8 @@ void invoices_waitone(const tal_t *ctx UNNEEDED,
 void invoice_try_pay(struct lightningd *ld UNNEEDED,
 		     struct htlc_in *hin UNNEEDED,
 		     const struct sha256 *payment_hash UNNEEDED,
-		     const struct amount_msat msat UNNEEDED)
+		     const struct amount_msat msat UNNEEDED,
+		     const struct secret *payment_secret UNNEEDED)
 { fprintf(stderr, "invoice_try_pay called!\n"); abort(); }
 /* Generated stub for json_add_address */
 void json_add_address(struct json_stream *response UNNEEDED, const char *fieldname UNNEEDED,
@@ -524,17 +526,6 @@ struct route_step *process_onionpacket(
 	const size_t assocdatalen
 	)
 { fprintf(stderr, "process_onionpacket called!\n"); abort(); }
-/* Generated stub for route_step_decode_end */
-bool route_step_decode_end(const struct route_step *rs UNNEEDED,
-			   struct amount_msat *amt_forward UNNEEDED,
-			   u32 *outgoing_cltv UNNEEDED)
-{ fprintf(stderr, "route_step_decode_end called!\n"); abort(); }
-/* Generated stub for route_step_decode_forward */
-bool route_step_decode_forward(const struct route_step *rs UNNEEDED,
-			       struct amount_msat *amt_forward UNNEEDED,
-			       u32 *outgoing_cltv UNNEEDED,
-			       struct short_channel_id *scid UNNEEDED)
-{ fprintf(stderr, "route_step_decode_forward called!\n"); abort(); }
 /* Generated stub for serialize_onionpacket */
 u8 *serialize_onionpacket(
 	const tal_t *ctx UNNEEDED,
@@ -554,6 +545,9 @@ void subd_req_(const tal_t *ctx UNNEEDED,
 /* Generated stub for subd_send_msg */
 void subd_send_msg(struct subd *sd UNNEEDED, const u8 *msg_out UNNEEDED)
 { fprintf(stderr, "subd_send_msg called!\n"); abort(); }
+/* Generated stub for tlv_payload_is_valid */
+int tlv_payload_is_valid(const struct tlv_tlv_payload *record UNNEEDED)
+{ fprintf(stderr, "tlv_payload_is_valid called!\n"); abort(); }
 /* Generated stub for topology_add_sync_waiter_ */
 void topology_add_sync_waiter_(const tal_t *ctx UNNEEDED,
 			       struct chain_topology *topo UNNEEDED,

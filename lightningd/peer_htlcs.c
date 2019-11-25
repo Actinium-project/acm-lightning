@@ -31,6 +31,10 @@
 #include <wallet/wallet.h>
 #include <wire/gen_onion_wire.h>
 
+#ifndef SUPERVERBOSE
+#define SUPERVERBOSE(...)
+#endif
+
 static bool state_update_ok(struct channel *channel,
 			    enum htlc_state oldstate, enum htlc_state newstate,
 			    u64 htlc_id, const char *dir)
@@ -276,7 +280,9 @@ static void handle_localpay(struct htlc_in *hin,
 			    u32 cltv_expiry,
 			    const struct sha256 *payment_hash,
 			    struct amount_msat amt_to_forward,
-			    u32 outgoing_cltv_value)
+			    u32 outgoing_cltv_value,
+			    struct amount_msat total_msat,
+			    const struct secret *payment_secret)
 {
 	enum onion_type failcode;
 	struct lightningd *ld = hin->key.channel->peer->ld;
@@ -290,6 +296,18 @@ static void handle_localpay(struct htlc_in *hin,
 	 * The amount in the HTLC doesn't match the value in the onion.
 	 */
 	if (!check_amount(hin, amt_to_forward, hin->msat, AMOUNT_MSAT(0))) {
+		failcode = WIRE_FINAL_INCORRECT_HTLC_AMOUNT;
+		goto fail;
+	}
+
+	/* BOLT- #4:
+	 * - if it does not support `basic_mpp`:
+	 *    - MUST fail the HTLC if `total_msat` is not exactly equal to
+	 *    `amt_to_forward`.
+	 */
+	if (!amount_msat_eq(amt_to_forward, total_msat)) {
+		/* FIXME: Ideally, we use WIRE_INVALID_ONION_PAYLOAD and
+		 * point at the total_msat field */
 		failcode = WIRE_FINAL_INCORRECT_HTLC_AMOUNT;
 		goto fail;
 	}
@@ -324,7 +342,7 @@ static void handle_localpay(struct htlc_in *hin,
 		goto fail;
 	}
 
-	invoice_try_pay(ld, hin, payment_hash, amt_to_forward);
+	invoice_try_pay(ld, hin, payment_hash, amt_to_forward, payment_secret);
 	return;
 
 fail:
@@ -594,6 +612,9 @@ fail:
 struct gossip_resolve {
 	struct short_channel_id next_channel;
 	struct amount_msat amt_to_forward;
+	struct amount_msat total_msat;
+	/* Only set if TLV specifies it */
+	const struct secret *payment_secret;
 	u32 outgoing_cltv_value;
 	u8 *next_onion;
 	struct htlc_in *hin;
@@ -637,10 +658,6 @@ struct htlc_accepted_hook_payload {
 	struct htlc_in *hin;
 	struct channel *channel;
 	struct lightningd *ld;
-	struct amount_msat amt_to_forward;
-	u32 outgoing_cltv_value;
-	/* NULL if this is node is final */
-	struct short_channel_id *short_channel_id;
 	u8 *next_onion;
 };
 
@@ -744,11 +761,20 @@ static void htlc_accepted_hook_serialize(struct htlc_accepted_hook_payload *p,
 		json_add_string(s, "type", "tlv");
 	}
 
-	if (p->short_channel_id)
+	if (rs->forward_channel)
 		json_add_short_channel_id(s, "short_channel_id",
-					  p->short_channel_id);
-	json_add_amount_msat_only(s, "forward_amount", p->amt_to_forward);
-	json_add_u32(s, "outgoing_cltv_value", p->outgoing_cltv_value);
+					  rs->forward_channel);
+	if (rs->amt_to_forward)
+		json_add_amount_msat_only(s, "forward_amount",
+					  *rs->amt_to_forward);
+	if (rs->outgoing_cltv)
+		json_add_u32(s, "outgoing_cltv_value", *rs->outgoing_cltv);
+	/* These are specified together in TLV, so only print total_msat if
+	 * payment_secret set (ie. modern, and final hop) */
+	if (rs->payment_secret) {
+		json_add_amount_msat_only(s, "total_msat", *rs->total_msat);
+		json_add_secret(s, "payment_secret", rs->payment_secret);
+	}
 	json_add_hex_talarr(s, "next_onion", p->next_onion);
 	json_add_secret(s, "shared_secret", hin->shared_secret);
 	json_object_end(s);
@@ -759,6 +785,44 @@ static void htlc_accepted_hook_serialize(struct htlc_accepted_hook_payload *p,
 	json_add_s32(s, "cltv_expiry_relative", expiry - blockheight);
 	json_add_sha256(s, "payment_hash", &hin->payment_hash);
 	json_object_end(s);
+}
+
+/* Make sure that we can continue with a default action if the htlc_accepted
+ * hook tells us to. This means enforcing that we have the necessary
+ * information to forward, fail or accept, and that the TVL payload is encoded
+ * correctly. */
+static bool htlc_accepted_can_continue(struct route_step *rs)
+{
+	if (rs->type == SPHINX_TLV_PAYLOAD && !tlv_payload_is_valid(rs->payload.tlv)) {
+		SUPERVERBOSE("Encoding of TLV payload is invalid");
+		return false;
+	}
+
+	/* BOLT #4:
+	 *
+	 * The writer:
+	 *  - MUST include `amt_to_forward` and `outgoing_cltv_value` for every node.
+	 *  - MUST include `short_channel_id` for every non-final node.
+	 *  - MUST NOT include `short_channel_id` for the final node.
+	 *
+	 * The reader:
+	 *  - MUST return an error if `amt_to_forward` or `outgoing_cltv_value` are not present.
+	 */
+	if (rs->amt_to_forward == NULL) {
+		SUPERVERBOSE("Missing amt_to_forward in payload");
+		return false;
+	}
+
+	if (rs->outgoing_cltv == NULL) {
+		SUPERVERBOSE("Missing outgoing_cltv_value in payload");
+		return false;
+	}
+
+	if (rs->nextcase && rs->forward_channel == NULL) {
+		SUPERVERBOSE("Missing short_channel_id in payload");
+		return false;
+	}
+	return true;
 }
 
 /**
@@ -781,13 +845,17 @@ htlc_accepted_hook_callback(struct htlc_accepted_hook_payload *request,
 
 	switch (result) {
 	case htlc_accepted_continue:
-		if (rs->nextcase == ONION_FORWARD) {
+		if (!htlc_accepted_can_continue(rs)) {
+			log_debug(channel->log, "Failing HTLC because of an invalid payload");
+			failure_code = WIRE_INVALID_ONION_PAYLOAD;
+			fail_in_htlc(hin, failure_code, NULL, NULL);
+		}else if (rs->nextcase == ONION_FORWARD) {
 			struct gossip_resolve *gr = tal(ld, struct gossip_resolve);
 
 			gr->next_onion = serialize_onionpacket(gr, rs->next);
-			gr->next_channel = *request->short_channel_id;
-			gr->amt_to_forward = request->amt_to_forward;
-			gr->outgoing_cltv_value = request->outgoing_cltv_value;
+			gr->next_channel = *rs->forward_channel;
+			gr->amt_to_forward = *rs->amt_to_forward;
+			gr->outgoing_cltv_value = *rs->outgoing_cltv;
 			gr->hin = hin;
 
 			req = towire_gossip_get_channel_peer(tmpctx, &gr->next_channel);
@@ -798,8 +866,10 @@ htlc_accepted_hook_callback(struct htlc_accepted_hook_payload *request,
 				 channel_resolve_reply, gr);
 		} else
 			handle_localpay(hin, hin->cltv_expiry, &hin->payment_hash,
-					request->amt_to_forward,
-					request->outgoing_cltv_value);
+					*rs->amt_to_forward,
+					*rs->outgoing_cltv,
+					*rs->total_msat,
+					rs->payment_secret);
 		break;
 	case htlc_accepted_fail:
 		log_debug(channel->log,
@@ -810,7 +880,7 @@ htlc_accepted_hook_callback(struct htlc_accepted_hook_payload *request,
 				   failure_code);
 			failure_code = WIRE_TEMPORARY_NODE_FAILURE;
 		}
-		fail_in_htlc(hin, failure_code, NULL, request->short_channel_id);
+		fail_in_htlc(hin, failure_code, NULL, rs->forward_channel);
 		break;
 	case htlc_accepted_resolve:
 		fulfill_htlc(hin, &payment_preimage);
@@ -922,25 +992,6 @@ static bool peer_accepted_htlc(struct channel *channel, u64 id,
 	}
 
 	hook_payload = tal(hin, struct htlc_accepted_hook_payload);
-
-	if (rs->nextcase == ONION_END) {
-		if (!route_step_decode_end(rs, &hook_payload->amt_to_forward,
-					   &hook_payload->outgoing_cltv_value)) {
-			*failcode = WIRE_INVALID_ONION_PAYLOAD;
-			goto out;
-		}
-		hook_payload->short_channel_id = NULL;
-	} else {
-		hook_payload->short_channel_id
-			= tal(hook_payload, struct short_channel_id);
-		if (!route_step_decode_forward(rs,
-					       &hook_payload->amt_to_forward,
-					       &hook_payload->outgoing_cltv_value,
-					       hook_payload->short_channel_id)) {
-			*failcode = WIRE_INVALID_ONION_PAYLOAD;
-			goto out;
-		}
-	}
 
 	hook_payload->route_step = tal_steal(hook_payload, rs);
 	hook_payload->ld = ld;
