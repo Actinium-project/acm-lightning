@@ -43,92 +43,12 @@ size_t bigsize_get(const u8 *p UNNEEDED, size_t max UNNEEDED, bigsize_t *val UNN
 /* Generated stub for bigsize_put */
 size_t bigsize_put(u8 buf[BIGSIZE_MAX_LEN] UNNEEDED, bigsize_t v UNNEEDED)
 { fprintf(stderr, "bigsize_put called!\n"); abort(); }
-/* Generated stub for fromwire */
-const u8 *fromwire(const u8 **cursor UNNEEDED, size_t *max UNNEEDED, void *copy UNNEEDED, size_t n UNNEEDED)
-{ fprintf(stderr, "fromwire called!\n"); abort(); }
-/* Generated stub for fromwire_amount_msat */
-struct amount_msat fromwire_amount_msat(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
-{ fprintf(stderr, "fromwire_amount_msat called!\n"); abort(); }
-/* Generated stub for fromwire_bigsize */
-bigsize_t fromwire_bigsize(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
-{ fprintf(stderr, "fromwire_bigsize called!\n"); abort(); }
-/* Generated stub for fromwire_fail */
-const void *fromwire_fail(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
-{ fprintf(stderr, "fromwire_fail called!\n"); abort(); }
-/* Generated stub for fromwire_secret */
-void fromwire_secret(const u8 **cursor UNNEEDED, size_t *max UNNEEDED, struct secret *secret UNNEEDED)
-{ fprintf(stderr, "fromwire_secret called!\n"); abort(); }
-/* Generated stub for fromwire_sha256 */
-void fromwire_sha256(const u8 **cursor UNNEEDED, size_t *max UNNEEDED, struct sha256 *sha256 UNNEEDED)
-{ fprintf(stderr, "fromwire_sha256 called!\n"); abort(); }
-/* Generated stub for fromwire_short_channel_id */
-void fromwire_short_channel_id(const u8 **cursor UNNEEDED, size_t *max UNNEEDED,
-			       struct short_channel_id *short_channel_id UNNEEDED)
-{ fprintf(stderr, "fromwire_short_channel_id called!\n"); abort(); }
-/* Generated stub for fromwire_tu32 */
-u32 fromwire_tu32(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
-{ fprintf(stderr, "fromwire_tu32 called!\n"); abort(); }
-/* Generated stub for fromwire_tu64 */
-u64 fromwire_tu64(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
-{ fprintf(stderr, "fromwire_tu64 called!\n"); abort(); }
-/* Generated stub for fromwire_u16 */
-u16 fromwire_u16(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
-{ fprintf(stderr, "fromwire_u16 called!\n"); abort(); }
-/* Generated stub for fromwire_u32 */
-u32 fromwire_u32(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
-{ fprintf(stderr, "fromwire_u32 called!\n"); abort(); }
-/* Generated stub for fromwire_u8 */
-u8 fromwire_u8(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
-{ fprintf(stderr, "fromwire_u8 called!\n"); abort(); }
-/* Generated stub for fromwire_u8_array */
-void fromwire_u8_array(const u8 **cursor UNNEEDED, size_t *max UNNEEDED, u8 *arr UNNEEDED, size_t num UNNEEDED)
-{ fprintf(stderr, "fromwire_u8_array called!\n"); abort(); }
-/* Generated stub for towire */
-void towire(u8 **pptr UNNEEDED, const void *data UNNEEDED, size_t len UNNEEDED)
-{ fprintf(stderr, "towire called!\n"); abort(); }
-/* Generated stub for towire_amount_msat */
-void towire_amount_msat(u8 **pptr UNNEEDED, const struct amount_msat msat UNNEEDED)
-{ fprintf(stderr, "towire_amount_msat called!\n"); abort(); }
-/* Generated stub for towire_bigsize */
-void towire_bigsize(u8 **pptr UNNEEDED, const bigsize_t val UNNEEDED)
-{ fprintf(stderr, "towire_bigsize called!\n"); abort(); }
-/* Generated stub for towire_pad */
-void towire_pad(u8 **pptr UNNEEDED, size_t num UNNEEDED)
-{ fprintf(stderr, "towire_pad called!\n"); abort(); }
-/* Generated stub for towire_secret */
-void towire_secret(u8 **pptr UNNEEDED, const struct secret *secret UNNEEDED)
-{ fprintf(stderr, "towire_secret called!\n"); abort(); }
-/* Generated stub for towire_sha256 */
-void towire_sha256(u8 **pptr UNNEEDED, const struct sha256 *sha256 UNNEEDED)
-{ fprintf(stderr, "towire_sha256 called!\n"); abort(); }
-/* Generated stub for towire_short_channel_id */
-void towire_short_channel_id(u8 **pptr UNNEEDED,
-			     const struct short_channel_id *short_channel_id UNNEEDED)
-{ fprintf(stderr, "towire_short_channel_id called!\n"); abort(); }
 /* Generated stub for towire_tlvs */
 void towire_tlvs(u8 **pptr UNNEEDED,
 		 const struct tlv_record_type types[] UNNEEDED,
 		 size_t num_types UNNEEDED,
 		 const void *record UNNEEDED)
 { fprintf(stderr, "towire_tlvs called!\n"); abort(); }
-/* Generated stub for towire_tu32 */
-void towire_tu32(u8 **pptr UNNEEDED, u32 v UNNEEDED)
-{ fprintf(stderr, "towire_tu32 called!\n"); abort(); }
-/* Generated stub for towire_tu64 */
-void towire_tu64(u8 **pptr UNNEEDED, u64 v UNNEEDED)
-{ fprintf(stderr, "towire_tu64 called!\n"); abort(); }
-/* Generated stub for towire_u16 */
-void towire_u16(u8 **pptr UNNEEDED, u16 v UNNEEDED)
-{ fprintf(stderr, "towire_u16 called!\n"); abort(); }
-/* Generated stub for towire_u32 */
-void towire_u32(u8 **pptr UNNEEDED, u32 v UNNEEDED)
-{ fprintf(stderr, "towire_u32 called!\n"); abort(); }
-/* Generated stub for towire_u64 */
-void towire_u64(u8 **pptr UNNEEDED, u64 v UNNEEDED)
-{ fprintf(stderr, "towire_u64 called!\n"); abort(); }
-/* Generated stub for towire_u8_array */
-void towire_u8_array(u8 **pptr UNNEEDED, const u8 *arr UNNEEDED, size_t num UNNEEDED)
-{ fprintf(stderr, "towire_u8_array called!\n"); abort(); }
 /* AUTOGENERATED MOCKS END */
 
 secp256k1_context *secp256k1_ctx;
@@ -165,54 +85,78 @@ static void run_unit_tests(void)
 		secret_from_hex(secrets[4])
 	};
 
-	int replylen = 164 * 2;
+	int replylen = 292 * 2;
 
 	u8 *intermediates[] = {
-	    tal_hexdata(tmpctx, "500d8596f76d3045bfdbf99914b98519fe76ea130dc223"
-				"38c473ab68d74378b13a06a19f891145610741c83ad40b"
+	    tal_hexdata(tmpctx, "9c5add3963fc7f6ed7f148623c84134b5647e1306419db"
+				"e2174e523fa9e2fbed3a06a19f899145610741c83ad40b"
 				"7712aefaddec8c6baf7325d92ea4ca4d1df8bce517f7e5"
 				"4554608bf2bd8071a4f52a7a2f7ffbb1413edad81eeea5"
 				"785aa9d990f2865dc23b4bc3c301a94eec4eabebca66be"
 				"5cf638f693ec256aec514620cc28ee4a94bd9565bc4d49"
 				"62b9d3641d4278fb319ed2b84de5b665f307a2db0f7fbb"
-				"757366",
+				"757366067d88c50f7e829138fde4f78d39b5b5802f1b92"
+				"a8a820865af5cc79f9f30bc3f461c66af95d13e5e1f038"
+				"1c184572a91dee1c849048a647a1158cf884064deddbf1"
+				"b0b88dfe2f791428d0ba0f6fb2f04e14081f69165ae66d"
+				"9297c118f0907705c9c4954a199bae0bb96fad763d690e"
+				"7daa6cfda59ba7f2c8d11448b604d12d",
 			replylen),
-	    tal_hexdata(tmpctx, "669478a3ddf9ba4049df8fa51f73ac712b9c20380cda43"
-				"1696963a492713ebddb7dfadbb566c8dae8857add94e67"
+	    tal_hexdata(tmpctx, "aac3200c4968f56b21f53e5e374e3a2383ad2b1b6501bb"
+				"cc45abc31e59b26881b7dfadbb56ec8dae8857add94e67"
 				"02fb4c3a4de22e2e669e1ed926b04447fc73034bb730f4"
 				"932acd62727b75348a648a1128744657ca6a4e713b9b64"
 				"6c3ca66cac02cdab44dd3439890ef3aaf61708714f7375"
 				"349b8da541b2548d452d84de7084bb95b3ac2345201d62"
 				"4d31f4d52078aa0fa05a88b4e20202bd2b86ac5b52919e"
-				"a305a8",
+				"a305a8949de95e935eed0319cf3cf19ebea61d76ba9253"
+				"2497fcdc9411d06bcd4275094d0a4a3c5d3a945e43305a"
+				"5a9256e333e1f64dbca5fcd4e03a39b9012d197506e06f"
+				"29339dfee3331995b21615337ae060233d39befea925cc"
+				"262873e0530408e6990f1cbd233a150ef7b004ff6166c7"
+				"0c68d9f8c853c1abca640b8660db2921",
 			replylen),
-	    tal_hexdata(tmpctx, "6984b0ccd86f37995857363df13670acd064bfd1a540e5"
-				"21cad4d71c07b1bc3dff9ac25f41addfb7466e74f81b3e"
+	    tal_hexdata(tmpctx, "a5d3e8634cfe78b2307d87c6d90be6fe7855b4f2cc9b1d"
+				"fb19e92e4b79103f61ff9ac25f412ddfb7466e74f81b3e"
 				"545563cdd8f5524dae873de61d7bdfccd496af2584930d"
 				"2b566b4f8d3881f8c043df92224f38cf094cfc09d92655"
 				"989531524593ec6d6caec1863bdfaa79229b5020acc034"
 				"cd6deeea1021c50586947b9b8e6faa83b81fbfa6133c0a"
 				"f5d6b07c017f7158fa94f0d206baf12dda6b68f785b773"
-				"b360fd",
+				"b360fd0497e16cc402d779c8d48d0fa6315536ef0660f3"
+				"f4e1865f5b38ea49c7da4fd959de4e83ff3ab686f059a4"
+				"5c65ba2af4a6a79166aa0f496bf04d06987b6d2ea205bd"
+				"b0d347718b9aeff5b61dfff344993a275b79717cd815b6"
+				"ad4c0beb568c4ac9c36ff1c315ec1119a1993c4b61e6ea"
+				"a0375e0aaf738ac691abd3263bf937e3",
 			replylen),
-	    tal_hexdata(tmpctx, "08cd44478211b8a4370ab1368b5ffe8c9c92fb830ff4ad"
-				"6e3b0a316df9d24176a081bab161ea0011585323930fa5"
+	    tal_hexdata(tmpctx, "c49a1ce81680f78f5f2000cda36268de34a3f0a0662f55"
+				"b4e837c83a8773c22aa081bab1616a0011585323930fa5"
 				"b9fae0c85770a2279ff59ec427ad1bbff9001c0cd14970"
 				"04bd2a0f68b50704cf6d6a4bf3c8b6a0833399a24b3456"
 				"961ba00736785112594f65b6b2d44d9f5ea4e49b5e1ec2"
 				"af978cbe31c67114440ac51a62081df0ed46d4a3df295d"
 				"a0b0fe25c0115019f03f15ec86fabb4c852f83449e812f"
-				"141a93",
-
+				"141a9395b3f70b766ebbd4ec2fae2b6955bd8f32684c15"
+				"abfe8fd3a6261e52650e8807a92158d9f1463261a925e4"
+				"bfba44bd20b166d532f0017185c3a6ac7957adefe45559"
+				"e3072c8dc35abeba835a8cb01a71a15c736911126f27d4"
+				"6a36168ca5ef7dccd4e2886212602b181463e0dd30185c"
+				"96348f9743a02aca8ec27c0b90dca270",
 			replylen),
-	    tal_hexdata(tmpctx, "69b1e5a3e05a7b5478e6529cd1749fdd8c66da6f6db420"
-				"78ff8497ac4e117e91a8cb9168b58f2fd45edd73c1b0c8"
+	    tal_hexdata(tmpctx, "a5e6bd0c74cb347f10cce367f949098f2457d14c046fd8"
+				"a22cb96efb30b0fdcda8cb9168b50f2fd45edd73c1b0c8"
 				"b33002df376801ff58aaa94000bf8a86f92620f343baef"
 				"38a580102395ae3abf9128d1047a0736ff9b83d456740e"
 				"bbb4aeb3aa9737f18fb4afb4aa074fb26c4d702f429688"
 				"88550a3bded8c05247e045b866baef0499f079fdaeef65"
 				"38f31d44deafffdfd3afa2fb4ca9082b8f1c465371a989"
-				"4dd8c2",
+				"4dd8c243fb4847e004f5256b3e90e2edde4c9fb3082ddf"
+				"e4d1e734cacd96ef0706bf63c9984e22dc98851bcccd1c"
+				"3494351feb458c9c6af41c0044bea3c47552b1d992ae54"
+				"2b17a2d0bba1a096c78d169034ecb55b6e3a7263c26017"
+				"f033031228833c1daefc0dedb8cf7c3e37c9c37ebfe42f"
+				"3225c326e8bcfd338804c145b16e34e4",
 			replylen),
 	};
 
@@ -233,25 +177,12 @@ int main(int argc, char **argv)
 {
 	setup_locale();
 
-	bool unit = false;
-
 	secp256k1_ctx = secp256k1_context_create(
 		SECP256K1_CONTEXT_VERIFY | SECP256K1_CONTEXT_SIGN);
 	setup_tmpctx();
 
-	opt_register_noarg("--help|-h", opt_usage_and_exit,
-			   "--unit\n"
-			   "Run unit tests against test vectors",
-			   "Print this message.");
-	opt_register_noarg("--unit",
-			   opt_set_bool, &unit,
-			   "Run unit tests against test vectors");
+	run_unit_tests();
 
-	opt_parse(&argc, argv, opt_log_stderr_exit);
-
-	if (unit) {
-		run_unit_tests();
-	}
 	secp256k1_context_destroy(secp256k1_ctx);
 	opt_free_table();
 	tal_free(tmpctx);
