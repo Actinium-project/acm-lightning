@@ -3,6 +3,7 @@
 #include <ccan/tal/str/str.h>
 #include <common/bolt11.h>
 #include <common/json_command.h>
+#include <common/json_helpers.h>
 #include <common/jsonrpc_errors.h>
 #include <common/param.h>
 #include <common/timeout.h>
@@ -23,8 +24,8 @@
 struct routing_failure {
 	unsigned int erring_index;
 	enum onion_type failcode;
-	struct node_id erring_node;
-	struct short_channel_id erring_channel;
+	const struct node_id *erring_node;
+	const struct short_channel_id *erring_channel;
 	int channel_dir;
 	/* If remote sent us a message, this is it. */
 	const u8 *msg;
@@ -79,9 +80,18 @@ void json_add_payment_fields(struct json_stream *response,
 {
 	json_add_u64(response, "id", t->id);
 	json_add_sha256(response, "payment_hash", &t->payment_hash);
-	json_add_node_id(response, "destination", &t->destination);
-	json_add_amount_msat_compat(response, t->msatoshi,
-				    "msatoshi", "amount_msat");
+	if (t->destination != NULL)
+		json_add_node_id(response, "destination", t->destination);
+
+	/* If we have a 0 amount delivered at the remote end we simply don't
+	 * know since the onion was generated externally. */
+	if (amount_msat_greater(t->msatoshi, AMOUNT_MSAT(0)))
+		json_add_amount_msat_compat(response, t->msatoshi, "msatoshi",
+					    "amount_msat");
+	else
+		json_add_null(response, "amount_msat");
+
+
 	json_add_amount_msat_compat(response, t->msatoshi_sent,
 				    "msatoshi_sent", "amount_sent_msat");
 	json_add_u64(response, "created_at", t->timestamp);
@@ -98,13 +108,16 @@ void json_add_payment_fields(struct json_stream *response,
 		break;
 	}
 	if (t->payment_preimage)
-		json_add_hex(response, "payment_preimage",
-			     t->payment_preimage,
-			     sizeof(*t->payment_preimage));
+		json_add_preimage(response, "payment_preimage",
+                    t->payment_preimage);
 	if (t->label)
 		json_add_string(response, "label", t->label);
 	if (t->bolt11)
 		json_add_string(response, "bolt11", t->bolt11);
+
+	if (t->failonion)
+		json_add_hex(response, "erroronion", t->failonion,
+			     tal_count(t->failonion));
 }
 
 static struct command_result *sendpay_success(struct command *cmd,
@@ -136,9 +149,15 @@ json_add_routefail_info(struct json_stream *js,
 	/* FIXME: Better way to detect this? */
 	if (!strstarts(failcodename, "INVALID "))
 		json_add_string(js, "failcodename", failcodename);
-	json_add_node_id(js, "erring_node", erring_node);
-	json_add_short_channel_id(js, "erring_channel", erring_channel);
-	json_add_num(js, "erring_direction", channel_dir);
+
+	if (erring_node != NULL)
+		json_add_node_id(js, "erring_node", erring_node);
+
+	if (erring_channel != NULL) {
+		json_add_short_channel_id(js, "erring_channel", erring_channel);
+		json_add_num(js, "erring_direction", channel_dir);
+	}
+
 	if (msg)
 		json_add_hex_talarr(js, "raw_message", msg);
 }
@@ -158,8 +177,8 @@ void json_sendpay_fail_fields(struct json_stream *js,
 		json_add_routefail_info(js,
 					fail->erring_index,
 					fail->failcode,
-					&fail->erring_node,
-					&fail->erring_channel,
+					fail->erring_node,
+					fail->erring_channel,
 					fail->channel_dir,
 					fail->msg);
 }
@@ -283,8 +302,10 @@ immediate_routing_failure(const tal_t *ctx,
 	routing_failure = tal(ctx, struct routing_failure);
 	routing_failure->erring_index = 0;
 	routing_failure->failcode = failcode;
-	routing_failure->erring_node = ld->id;
-	routing_failure->erring_channel = *channel0;
+	routing_failure->erring_node =
+	    tal_dup(routing_failure, struct node_id, &ld->id);
+	routing_failure->erring_channel =
+	    tal_dup(routing_failure, struct short_channel_id, channel0);
 	routing_failure->channel_dir = node_id_idx(&ld->id, dstid);
 	routing_failure->msg = NULL;
 
@@ -306,10 +327,19 @@ local_routing_failure(const tal_t *ctx,
 	routing_failure = tal(ctx, struct routing_failure);
 	routing_failure->erring_index = 0;
 	routing_failure->failcode = hout->failcode;
-	routing_failure->erring_node = ld->id;
-	routing_failure->erring_channel = payment->route_channels[0];
-	routing_failure->channel_dir = node_id_idx(&ld->id,
-						   &payment->route_nodes[0]);
+	routing_failure->erring_node =
+	    tal_dup(routing_failure, struct node_id, &ld->id);
+
+	if (payment->route_nodes != NULL && payment->route_channels != NULL) {
+		routing_failure->erring_channel =
+		    tal_dup(routing_failure, struct short_channel_id,
+			    &payment->route_channels[0]);
+		routing_failure->channel_dir =
+		    node_id_idx(&ld->id, &payment->route_nodes[0]);
+	} else {
+		routing_failure->erring_channel = NULL;
+	}
+
 	routing_failure->msg = NULL;
 
 	log_debug(hout->key.channel->log, "local_routing_failure: %u (%s)",
@@ -340,10 +370,26 @@ remote_routing_failure(const tal_t *ctx,
 	route_channels = payment->route_channels;
 	origin_index = failure->origin_index;
 
-	assert(origin_index < tal_count(route_nodes));
+	assert(route_nodes == NULL || origin_index < tal_count(route_nodes));
 
-	/* Check if at destination. */
-	if (origin_index == tal_count(route_nodes) - 1) {
+	/* Either we have both channels and nodes, or neither */
+	assert((route_nodes == NULL) == (route_channels == NULL));
+
+	if (route_nodes == NULL) {
+		/* This means we have the `shared_secrets`, but cannot infer
+		 * the erring channel and node since we don't have them. This
+		 * can happen if the payment was initialized using `sendonion`
+		 * and the `shared_secrets` where specified. */
+		dir = 0;
+		erring_channel = NULL;
+		erring_node = NULL;
+
+		/* We don't know if there's another route, that'd depend on
+		 * where the failure occured and whether it was a node
+		 * failure. Let's assume it wasn't a terminal one, and have
+		 * the sendonion caller deal with the actual decision. */
+		*pay_errcode = PAY_TRY_OTHER_ROUTE;
+	} else if (origin_index == tal_count(route_nodes) - 1) {
 		/* If any channel is to blame, it's the last one. */
 		erring_channel = &route_channels[origin_index];
 		/* Single hop? */
@@ -399,11 +445,23 @@ remote_routing_failure(const tal_t *ctx,
 
 	routing_failure->erring_index = (unsigned int) (origin_index + 1);
 	routing_failure->failcode = failcode;
-	routing_failure->erring_node = *erring_node;
-	routing_failure->erring_channel = *erring_channel;
-	routing_failure->channel_dir = dir;
 	routing_failure->msg = tal_dup_arr(routing_failure, u8, failure->msg,
 					   tal_count(failure->msg), 0);
+
+	if (erring_node != NULL)
+		routing_failure->erring_node =
+		    tal_dup(routing_failure, struct node_id, erring_node);
+	else
+		routing_failure->erring_node = NULL;
+
+	if (erring_channel != NULL) {
+		routing_failure->erring_channel = tal_dup(
+		    routing_failure, struct short_channel_id, erring_channel);
+		routing_failure->channel_dir = dir;
+	} else {
+		routing_failure->erring_channel = NULL;
+		routing_failure->channel_dir = 0;
+	}
 
 	return routing_failure;
 }
@@ -450,30 +508,25 @@ void payment_failed(struct lightningd *ld, const struct htlc_out *hout,
 					   &hout->payment_hash));
 		return;
 	}
-
-	/* FIXME: Prior to 299b280f7, we didn't put route_nodes and
-	 * route_channels in db.  If this happens, it's an old payment,
-	 * so we can simply mark it failed in db and return. */
-	if (!payment->route_channels) {
-		log_unusual(hout->key.channel->log,
-			    "No route_channels for htlc %s:"
-			    " was this an old database?",
-			    type_to_string(tmpctx, struct sha256,
-					   &hout->payment_hash));
-		wallet_payment_set_status(ld->wallet, &hout->payment_hash,
-					  PAYMENT_FAILED, NULL);
-		return;
-	}
 #else
 	assert(payment);
-	assert(payment->route_channels);
 #endif
+	assert((payment->route_channels == NULL) == (payment->route_nodes == NULL));
 
 	/* This gives more details than a generic failure message */
 	if (localfail) {
 		fail = local_routing_failure(tmpctx, ld, hout, payment);
 		failmsg = localfail;
 		pay_errcode = PAY_TRY_OTHER_ROUTE;
+	} else if (payment->path_secrets == NULL) {
+		/* This was a payment initiated with `sendonion`, we therefore
+		 * don't have the path secrets and cannot decode the error
+		 * onion. Let's store it and hope whatever called `sendonion`
+		 * knows how to deal with these. */
+
+		pay_errcode = PAY_UNPARSEABLE_ONION;
+		fail = NULL;
+		failmsg = NULL;
 	} else {
 		/* Must be remote fail. */
 		assert(!hout->failcode);
@@ -521,8 +574,8 @@ void payment_failed(struct lightningd *ld, const struct htlc_out *hout,
 				    pay_errcode == PAY_DESTINATION_PERM_FAIL,
 				    fail ? fail->erring_index : -1,
 				    fail ? fail->failcode : 0,
-				    fail ? &fail->erring_node : NULL,
-				    fail ? &fail->erring_channel : NULL,
+				    fail ? fail->erring_node : NULL,
+				    fail ? fail->erring_channel : NULL,
 				    NULL,
 				    failmsg,
 				    fail ? fail->channel_dir : 0);
@@ -596,8 +649,10 @@ static struct command_result *wait_payment(struct lightningd *ld,
 			fail = tal(tmpctx, struct routing_failure);
 			fail->erring_index = failindex;
 			fail->failcode = failcode;
-			fail->erring_node = *failnode;
-			fail->erring_channel = *failchannel;
+			fail->erring_node =
+			    tal_dup(fail, struct node_id, failnode);
+			fail->erring_channel =
+			    tal_dup(fail, struct short_channel_id, failchannel);
 			fail->channel_dir = faildirection;
 			/* FIXME: We don't store this! */
 			fail->msg = NULL;
@@ -629,6 +684,22 @@ static bool should_use_tlv(enum route_hop_style style)
 	abort();
 }
 
+static enum onion_type send_onion(struct lightningd *ld,
+				   const struct onionpacket *packet,
+				   const struct route_hop *first_hop,
+				   const struct sha256 *payment_hash,
+				   struct channel *channel,
+				   struct htlc_out **hout)
+{
+	const u8 *onion;
+	unsigned int base_expiry;
+	base_expiry = get_block_height(ld->topology) + 1;
+	onion = serialize_onionpacket(tmpctx, packet);
+	return send_htlc_out(channel, first_hop->amount,
+				  base_expiry + first_hop->delay,
+				  payment_hash, onion, NULL, hout);
+}
+
 /* Returns command_result if cmd was resolved, NULL if not yet called. */
 static struct command_result *
 send_payment(struct lightningd *ld,
@@ -640,8 +711,6 @@ send_payment(struct lightningd *ld,
 	     const char *b11str TAKES,
 	     const struct secret *payment_secret)
 {
-	const u8 *onion;
-	u8 sessionkey[32];
 	unsigned int base_expiry;
 	struct onionpacket *packet;
 	struct secret *path_secrets;
@@ -723,12 +792,14 @@ send_payment(struct lightningd *ld,
 								   struct amount_msat,
 								   &payment->msatoshi));
 			}
-			if (!node_id_eq(&payment->destination, &ids[n_hops-1])) {
+			if (payment->destination &&
+			    !node_id_eq(payment->destination,
+					&ids[n_hops - 1])) {
 				return command_fail(cmd, PAY_RHASH_ALREADY_USED,
 						    "Already succeeded to %s",
 						    type_to_string(tmpctx,
 								   struct node_id,
-								   &payment->destination));
+								   payment->destination));
 			}
 			return sendpay_success(cmd, payment);
 		}
@@ -750,19 +821,12 @@ send_payment(struct lightningd *ld,
 		return command_failed(cmd, data);
 	}
 
-	randombytes_buf(&sessionkey, sizeof(sessionkey));
-
-	/* Onion will carry us from first peer onwards. */
 	packet = create_onionpacket(tmpctx, path, &path_secrets);
-	onion = serialize_onionpacket(tmpctx, packet);
-
+	failcode = send_onion(ld, packet, &route[0], rhash, channel, &hout);
 	log_info(ld->log, "Sending %s over %zu hops to deliver %s",
 		 type_to_string(tmpctx, struct amount_msat, &route[0].amount),
 		 n_hops, type_to_string(tmpctx, struct amount_msat, &msat));
 
-	failcode = send_htlc_out(channel, route[0].amount,
-				 base_expiry + route[0].delay,
-				 rhash, onion, NULL, &hout);
 	if (failcode) {
 		fail = immediate_routing_failure(cmd, ld,
 						 failcode,
@@ -792,7 +856,7 @@ send_payment(struct lightningd *ld,
 	payment = tal(hout, struct wallet_payment);
 	payment->id = 0;
 	payment->payment_hash = *rhash;
-	payment->destination = ids[n_hops - 1];
+	payment->destination = tal_dup(payment, struct node_id, &ids[n_hops - 1]);
 	payment->status = PAYMENT_PENDING;
 	payment->msatoshi = msat;
 	payment->msatoshi_sent = route[0].amount;
@@ -801,6 +865,7 @@ send_payment(struct lightningd *ld,
 	payment->path_secrets = tal_steal(payment, path_secrets);
 	payment->route_nodes = tal_steal(payment, ids);
 	payment->route_channels = tal_steal(payment, channels);
+	payment->failonion = NULL;
 	if (label != NULL)
 		payment->label = tal_strdup(payment, label);
 	else
@@ -816,6 +881,192 @@ send_payment(struct lightningd *ld,
 	add_sendpay_waiter(ld, cmd, rhash);
 	return NULL;
 }
+
+static struct command_result *
+param_route_hop(struct command *cmd, const char *name, const char *buffer,
+		const jsmntok_t *tok, struct route_hop **hop)
+{
+	const jsmntok_t *idtok, *channeltok, *directiontok, *amounttok, *delaytok;
+	struct route_hop *res;
+
+	res = tal(cmd, struct route_hop);
+	idtok = json_get_member(buffer, tok, "id");
+	channeltok = json_get_member(buffer, tok, "channel");
+	directiontok = json_get_member(buffer, tok, "direction");
+	amounttok = json_get_member(buffer, tok, "amount_msat");
+	delaytok = json_get_member(buffer, tok, "delay");
+
+	/* General verification that all fields that we need are present. */
+	if (!idtok && !channeltok)
+		return command_fail(
+		    cmd, JSONRPC2_INVALID_PARAMS,
+		    "Either 'id' or 'channel' is required for a route_hop");
+
+	if (channeltok && !directiontok)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "When specifying a channel you must also "
+				    "specify the direction");
+
+	if (!amounttok)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "'amount_msat' is required");
+
+	if (!delaytok)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "'delay' is required");
+
+	/* Parsing of actual values including sanity check for all parsed
+	 * values. */
+	if (!idtok) {
+		memset(&res->nodeid, 0, sizeof(struct node_id));
+	} else if (!json_to_node_id(buffer, idtok, &res->nodeid)) {
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "'%s' should be a node_id, not '%.*s'",
+				    name, tok->end - tok->start,
+				    buffer + tok->start);
+	}
+
+	if (!channeltok) {
+		memset(&res->channel_id, 0, sizeof(struct node_id));
+	} else if (!json_to_short_channel_id(buffer, channeltok, &res->channel_id)) {
+		return command_fail(
+		    cmd, JSONRPC2_INVALID_PARAMS,
+		    "'%s' should be a short_channel_id, not '%.*s'", name,
+		    tok->end - tok->start, buffer + tok->start);
+	}
+
+	if (directiontok && (!json_to_int(buffer, directiontok, &res->direction) ||
+			     res->direction > 1 || res->direction < 0))
+		return command_fail(
+		    cmd, JSONRPC2_INVALID_PARAMS,
+		    "'%s' should be an integer in [0,1], not '%.*s'", name,
+		    tok->end - tok->start, buffer + tok->start);
+
+	if (!json_to_msat(buffer, amounttok, &res->amount))
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "'%s' should be a valid amount_msat, not '%.*s'",
+				    name, tok->end - tok->start,
+				    buffer + tok->start);
+
+	if (!json_to_number(buffer, delaytok, &res->delay) || res->delay < 1)
+		return command_fail(
+		    cmd, JSONRPC2_INVALID_PARAMS,
+		    "'%s' should be a positive, non-zero, number, not '%.*s'",
+		    name, tok->end - tok->start, buffer + tok->start);
+
+	*hop = res;
+	return NULL;
+}
+
+static struct command_result *json_sendonion(struct command *cmd,
+					     const char *buffer,
+					     const jsmntok_t *obj UNNEEDED,
+					     const jsmntok_t *params)
+{
+	u8 *onion;
+	struct onionpacket *packet;
+	enum onion_type failcode;
+	struct htlc_out *hout;
+	struct route_hop *first_hop;
+	struct sha256 *payment_hash;
+	struct channel *channel;
+	struct lightningd *ld = cmd->ld;
+	struct wallet_payment *payment;
+	const char *label;
+	struct secret *path_secrets;
+
+	if (!param(cmd, buffer, params,
+		   p_req("onion", param_bin_from_hex, &onion),
+		   p_req("first_hop", param_route_hop, &first_hop),
+		   p_req("payment_hash", param_sha256, &payment_hash),
+		   p_opt("label", param_escaped_string, &label),
+		   p_opt("shared_secrets", param_secrets_array, &path_secrets),
+		   NULL))
+		return command_param_failed();
+
+	packet = parse_onionpacket(cmd, onion, tal_bytelen(onion), &failcode);
+
+	if (!packet)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Could not parse the onion. Parsing failed "
+				    "with failcode=%d",
+				    failcode);
+
+	/* Now, do we already have a payment? */
+	payment = wallet_payment_by_hash(tmpctx, ld->wallet, payment_hash);
+	if (payment) {
+		if (payment->status == PAYMENT_PENDING) {
+			log_debug(ld->log, "send_payment: previous still in progress");
+			return json_sendpay_in_progress(cmd, payment);
+		}
+		if (payment->status == PAYMENT_COMPLETE) {
+			log_debug(ld->log, "send_payment: previous succeeded");
+			return sendpay_success(cmd, payment);
+		}
+		log_debug(ld->log, "send_payment: found previous, retrying");
+	}
+
+	channel = active_channel_by_id(ld, &first_hop->nodeid, NULL);
+	if (!channel) {
+		struct json_stream *data
+			= json_stream_fail(cmd, PAY_TRY_OTHER_ROUTE,
+					   "No connection to first "
+					   "peer found");
+
+		json_add_routefail_info(data, 0, WIRE_UNKNOWN_NEXT_PEER,
+					&ld->id, &first_hop->channel_id,
+					node_id_idx(&ld->id, &first_hop->nodeid),
+					NULL);
+		json_object_end(data);
+		return command_failed(cmd, data);
+	}
+
+	/* Cleanup any prior payment. We're about to retry. */
+	if (payment) {
+		wallet_payment_delete(ld->wallet, payment_hash);
+		wallet_local_htlc_out_delete(ld->wallet, channel, payment_hash);
+	}
+
+	failcode = send_onion(cmd->ld, packet, first_hop, payment_hash, channel,
+			  &hout);
+
+	payment = tal(hout, struct wallet_payment);
+	payment->id = 0;
+	payment->payment_hash = *payment_hash;
+	payment->status = PAYMENT_PENDING;
+	payment->msatoshi = AMOUNT_MSAT(0);
+	payment->msatoshi_sent = first_hop->amount;
+	payment->timestamp = time_now().ts.tv_sec;
+
+	/* These are not available for sendonion payments since the onion is
+	 * opaque and we can't extract them. Errors have to be handled
+	 * externally, since we can't decrypt them.*/
+	payment->destination = NULL;
+	payment->payment_preimage = NULL;
+	payment->route_nodes = NULL;
+	payment->route_channels = NULL;
+	payment->bolt11 = NULL;
+	payment->failonion = NULL;
+	payment->path_secrets = tal_steal(payment, path_secrets);
+
+	if (label != NULL)
+		payment->label = tal_strdup(payment, label);
+	else
+		payment->label = NULL;
+
+	/* We write this into db when HTLC is actually sent. */
+	wallet_payment_setup(ld->wallet, payment);
+
+	add_sendpay_waiter(ld, cmd, payment_hash);
+	return command_still_pending(cmd);
+}
+static const struct json_command sendonion_command = {
+	"sendonion",
+	"payment",
+	json_sendonion,
+	"Send a payment with a pre-computed onion."
+};
+AUTODATA(json_command, &sendonion_command);
 
 /*-----------------------------------------------------------------------------
 JSON-RPC sendpay interface
@@ -840,23 +1091,6 @@ static struct command_result *param_route_hop_style(struct command *cmd,
 			    "'%s' should be a legacy or tlv, not '%.*s'",
 			    name, json_tok_full_len(tok),
 			    json_tok_full(buffer, tok));
-}
-
-static struct command_result *param_secret(struct command *cmd,
-					   const char *name,
-					   const char *buffer,
-					   const jsmntok_t *tok,
-					   struct secret **secret)
-{
-	*secret = tal(cmd, struct secret);
-	if (hex_decode(buffer + tok->start,
-		       tok->end - tok->start,
-		       *secret, sizeof(**secret)))
-		return NULL;
-
-	return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-			    "'%s' should be a 32 byte hex value, not '%.*s'",
-			    name, tok->end - tok->start, buffer + tok->start);
 }
 
 static struct command_result *json_sendpay(struct command *cmd,
@@ -1120,3 +1354,57 @@ static const struct json_command listsendpays_command = {
 	"Show sendpay, old and current, optionally limiting to {bolt11} or {payment_hash}."
 };
 AUTODATA(json_command, &listsendpays_command);
+
+static struct command_result *json_createonion(struct command *cmd,
+						const char *buffer,
+						const jsmntok_t *obj UNNEEDED,
+						const jsmntok_t *params)
+{
+	struct json_stream *response;
+	struct secret *session_key, *shared_secrets;
+	struct sphinx_path *sp;
+	u8 *assocdata, *serialized;
+	struct onionpacket *packet;
+	struct sphinx_hop *hops;
+
+	if (!param(cmd, buffer, params,
+		   p_req("hops", param_hops_array, &hops),
+		   p_req("assocdata", param_bin_from_hex, &assocdata),
+		   p_opt("session_key", param_secret, &session_key),
+		   NULL)) {
+		return command_param_failed();
+	}
+
+	if (session_key == NULL)
+		sp = sphinx_path_new(cmd, assocdata);
+	else
+		sp = sphinx_path_new_with_key(cmd, assocdata, session_key);
+
+	for (size_t i=0; i<tal_count(hops); i++)
+		sphinx_add_raw_hop(sp, &hops[i].pubkey, hops[i].type,
+				   hops[i].payload);
+
+	packet = create_onionpacket(cmd, sp, &shared_secrets);
+	if (!packet)
+		return command_fail(cmd, LIGHTNINGD,
+				    "Could not create onion packet");
+
+	serialized = serialize_onionpacket(cmd, packet);
+
+	response = json_stream_success(cmd);
+	json_add_hex(response, "onion", serialized, tal_bytelen(serialized));
+	json_array_start(response, "shared_secrets");
+	for (size_t i=0; i<tal_count(hops); i++) {
+		json_add_secret(response, NULL, &shared_secrets[i]);
+	}
+	json_array_end(response);
+	return command_success(cmd, response);
+}
+
+static const struct json_command createonion_command = {
+	"createonion",
+	"payment",
+	json_createonion,
+	"Create an onion going through the provided nodes, each with its own payload"
+};
+AUTODATA(json_command, &createonion_command);

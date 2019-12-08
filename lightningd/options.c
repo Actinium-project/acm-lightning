@@ -9,6 +9,7 @@
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/path/path.h>
 #include <ccan/tal/str/str.h>
+#include <common/base64.h>
 #include <common/derive_basepoints.h>
 #include <common/features.h>
 #include <common/json_command.h>
@@ -134,6 +135,10 @@ static char *opt_add_announce_addr(const char *arg, struct lightningd *ld)
 
 	/* Check for autotor and reroute the call to --addr  */
 	if (strstarts(arg, "autotor:"))
+		return opt_add_addr(arg, ld);
+
+	/* Check for statictor and reroute the call to --addr  */
+	if (strstarts(arg, "statictor:"))
 		return opt_add_addr(arg, ld);
 
 	err = opt_add_addr_withtype(arg, ld, ADDR_ANNOUNCE, false);
@@ -603,6 +608,7 @@ static const struct config mainnet_config = {
 	/* Sets min_effective_htlc_capacity - at 1000$/BTC this is 10ct */
 	.min_capacity_sat = 10000,
 
+	/* Allow to define the default behavior of tor services calls*/
 	.use_v3_autotor = true,
 };
 
@@ -1081,6 +1087,7 @@ static void add_config(struct lightningd *ld,
 {
 	char *name0 = tal_strndup(response, name, len);
 	const char *answer = NULL;
+	char buf[OPT_SHOW_LEN + sizeof("...")];
 
 	if (opt->type & OPT_NOARG) {
 		if (opt->desc == opt_hidden) {
@@ -1117,7 +1124,6 @@ static void add_config(struct lightningd *ld,
 		if (opt->desc == opt_hidden) {
 			/* Ignore hidden options (deprecated) */
 		} else if (opt->show) {
-			char buf[OPT_SHOW_LEN + sizeof("...")];
 			strcpy(buf + OPT_SHOW_LEN, "...");
 			opt->show(buf, opt->u.carg);
 

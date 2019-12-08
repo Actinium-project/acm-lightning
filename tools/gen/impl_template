@@ -218,6 +218,36 @@ ${static}const struct tlv_record_type tlvs_${tlv.name}[] = {
     % endfor
 };
 
+void towire_${tlv.name}(u8 **pptr,
+			const void *record)
+{
+	size_t num_types = ${len(tlv.messages)};
+	const struct tlv_record_type *types = tlvs_${tlv.name};
+	if (!record)
+		return;
+
+	for (size_t i = 0; i < num_types; i++) {
+		u8 *val;
+		if (i != 0)
+			assert(types[i].type > types[i-1].type);
+		val = types[i].towire(NULL, record);
+		if (!val)
+			continue;
+
+		/* BOLT #1:
+		 *
+		 * The sending node:
+		 ...
+		 *  - MUST minimally encode `type` and `length`.
+		 */
+		towire_bigsize(pptr, types[i].type);
+		towire_bigsize(pptr, tal_bytelen(val));
+		towire(pptr, val, tal_bytelen(val));
+		tal_free(val);
+	}
+}
+
+
 bool fromwire_${tlv.name}(const u8 **cursor, size_t *max, struct ${tlv.struct_name()} *record)
 {
 	size_t num_types = ${len(tlv.messages)};
@@ -306,7 +336,7 @@ fail:
 	return false;
 }
 
-int ${tlv.name}_is_valid(const struct ${tlv.struct_name()} *record)
+bool ${tlv.name}_is_valid(const struct ${tlv.struct_name()} *record, size_t *err_index)
 {
 	size_t numfields = tal_count(record->fields);
 	bool first = true;
@@ -321,8 +351,10 @@ int ${tlv.name}_is_valid(const struct ${tlv.struct_name()} *record)
 			 *   - otherwise, if `type` is odd:
 			 *     - MUST discard the next `length` bytes.
 			 */
-			SUPERVERBOSE("Unknown even type in TLV");
-			return i;
+			SUPERVERBOSE("unknown even");
+			if (err_index != NULL)
+				*err_index = i;
+			return false;
 		} else if (!first && f->numtype <= prev_type) {
 			/* BOLT #1:
 			 *  - if decoded `type`s are not monotonically-increasing:
@@ -332,12 +364,14 @@ int ${tlv.name}_is_valid(const struct ${tlv.struct_name()} *record)
 				SUPERVERBOSE("duplicate tlv type");
 			else
 				SUPERVERBOSE("invalid ordering");
-			return i;
+			if (err_index != NULL)
+				*err_index = i;
+			return false;
 		}
 		first = false;
 		prev_type = f->numtype;
 	}
-	return -1;
+	return true;
 }
 
 % endfor ##  END TLV's
@@ -375,7 +409,7 @@ u8 *towire_${msg.name}(const tal_t *ctx${''.join([f.arg_desc_to() for f in msg.f
 		% endif
 	    % endif
 	% elif f.type_obj.is_tlv():
-	towire_tlvs(&p, tlvs_${f.type_obj.tlv.name}, ARRAY_SIZE(tlvs_${f.type_obj.tlv.name}), ${f.name});
+	towire_${f.type_obj.tlv.name}(&p, ${f.name});
         % elif f.is_optional: ## is optional?
 	if (!${f.name})
 		towire_bool(&p, false);
@@ -421,7 +455,7 @@ bool fromwire_${msg.name}(${'const tal_t *ctx, ' if msg.needs_context() else ''}
 	% if f.len_field_of:
 	${f.name} = fromwire_${type_}(&cursor, &plen);
 	% elif f.type_obj.is_tlv():
-	fromwire_tlvs(&cursor, &plen, tlvs_${f.type_obj.tlv.name}, ARRAY_SIZE(tlvs_${f.type_obj.tlv.name}), ${f.name});
+	fromwire_${f.type_obj.tlv.name}(&cursor, &plen, ${f.name});
 	% elif f.is_array() or f.is_varlen():
 	    % if f.type_obj.has_array_helper():
 	fromwire_${type_}_array(&cursor, &plen, ${'*' if f.is_varlen() else ''}${f.name}, ${f.size('plen')});

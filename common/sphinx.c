@@ -37,17 +37,6 @@ struct keyset {
 	u8 gamma[KEY_LEN];
 };
 
-/*
- * All the necessary information to generate a valid onion for this hop on a
- * sphinx path. The payload is preserialized in order since the onion
- * generation is payload agnostic. */
-struct sphinx_hop {
-	struct pubkey pubkey;
-	enum sphinx_payload_type type;
-	const u8 *payload;
-	u8 hmac[HMAC_SIZE];
-};
-
 /* Encapsulates the information about a given payment path for the the onion
  * routing algorithm.
  */
@@ -155,7 +144,7 @@ static void sphinx_add_tlv_hop(struct sphinx_path *path,
 			       const struct tlv_tlv_payload *tlv)
 {
 	u8 *tlvs = tal_arr(path, u8, 0);
-	towire_tlvs(&tlvs, tlvs_tlv_payload, TLVS_TLV_PAYLOAD_ARRAY_SIZE, tlv);
+	towire_tlv_payload(&tlvs, tlv);
 	sphinx_add_raw_hop(path, pubkey, SPHINX_TLV_PAYLOAD, tlvs);
 }
 
@@ -541,11 +530,6 @@ static bool sphinx_write_frame(u8 *dest, const struct sphinx_hop *hop)
 	size_t hop_size = sphinx_hop_size(hop);
 	size_t padding_size;
 	int pos = 0;
-
-#if !EXPERIMENTAL_FEATURES
-	if (hop->type != SPHINX_V0_PAYLOAD)
-		return false;
-#endif
 
 	/* Backwards compatibility for the legacy hop_data format. */
 	if (hop->type == SPHINX_V0_PAYLOAD)

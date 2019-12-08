@@ -4,7 +4,7 @@ This plugin is used to test the `rpc_command` hook.
 """
 from lightning import Plugin
 
-plugin = Plugin(dynamic=False)
+plugin = Plugin()
 
 
 @plugin.hook("rpc_command")
@@ -21,6 +21,9 @@ def on_rpc_command(plugin, rpc_command, **kwargs):
         # Don't allow this command to be executed
         return {"return": {"error": {"code": -1,
                                      "message": "You cannot do this"}}}
+    elif request["method"] == "help":
+        request["method"] = "autocleaninvoice"
+        return {"replace": request}
     return {"continue": True}
 
 

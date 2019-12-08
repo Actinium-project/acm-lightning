@@ -2129,19 +2129,25 @@ void wallet_payment_store(struct wallet *wallet,
 
 	db_bind_int(stmt, 0, payment->status);
 	db_bind_sha256(stmt, 1, &payment->payment_hash);
-	db_bind_node_id(stmt, 2, &payment->destination);
+
+	if (payment->destination != NULL)
+		db_bind_node_id(stmt, 2, payment->destination);
+	else
+		db_bind_null(stmt, 2);
+
 	db_bind_amount_msat(stmt, 3, &payment->msatoshi);
 	db_bind_int(stmt, 4, payment->timestamp);
 
-	if (payment->route_nodes) {
-		assert(payment->path_secrets);
-		assert(payment->route_nodes);
-		assert(payment->route_channels);
+	if (payment->path_secrets != NULL)
 		db_bind_secret_arr(stmt, 5, payment->path_secrets);
+	else
+		db_bind_null(stmt, 5);
+
+	assert((payment->route_channels == NULL) == (payment->route_nodes == NULL));
+	if (payment->route_nodes) {
 		db_bind_node_id_arr(stmt, 6, payment->route_nodes);
 		db_bind_short_channel_id_arr(stmt, 7, payment->route_channels);
 	} else {
-		db_bind_null(stmt, 5);
 		db_bind_null(stmt, 6);
 		db_bind_null(stmt, 7);
 	}
@@ -2189,7 +2195,13 @@ static struct wallet_payment *wallet_stmt2payment(const tal_t *ctx,
 	payment->id = db_column_u64(stmt, 0);
 	payment->status = db_column_int(stmt, 1);
 
-	db_column_node_id(stmt, 2, &payment->destination);
+	if (!db_column_is_null(stmt, 2)) {
+		payment->destination = tal(payment, struct node_id);
+		db_column_node_id(stmt, 2, payment->destination);
+	} else {
+		payment->destination = NULL;
+	}
+
 	db_column_amount_msat(stmt, 3, &payment->msatoshi);
 	db_column_sha256(stmt, 4, &payment->payment_hash);
 
@@ -2200,15 +2212,22 @@ static struct wallet_payment *wallet_stmt2payment(const tal_t *ctx,
 	} else
 		payment->payment_preimage = NULL;
 
-	/* Can be NULL for old db! */
-	if (!db_column_is_null(stmt, 7)) {
-		assert(!db_column_is_null(stmt, 8));
-		assert(!db_column_is_null(stmt, 9));
+	/* We either used `sendpay` or `sendonion` with the `shared_secrets`
+	 * argument. */
+	if (!db_column_is_null(stmt, 7))
 		payment->path_secrets = db_column_secret_arr(payment, stmt, 7);
+	else
+		payment->path_secrets = NULL;
 
+	/* Either none, or both are set */
+	assert(db_column_is_null(stmt, 8) == db_column_is_null(stmt, 9));
+	if (!db_column_is_null(stmt, 8)) {
 		payment->route_nodes = db_column_node_id_arr(payment, stmt, 8);
 		payment->route_channels =
 		    db_column_short_channel_id_arr(payment, stmt, 9);
+	} else {
+		payment->route_nodes = NULL;
+		payment->route_channels = NULL;
 	}
 
 	db_column_amount_msat(stmt, 10, &payment->msatoshi_sent);
@@ -2224,6 +2243,13 @@ static struct wallet_payment *wallet_stmt2payment(const tal_t *ctx,
 		    payment, (const char *)db_column_text(stmt, 12));
 	else
 		payment->bolt11 = NULL;
+
+	if (!db_column_is_null(stmt, 13))
+		payment->failonion =
+		    tal_dup_arr(payment, u8, db_column_blob(stmt, 13),
+				db_column_bytes(stmt, 13), 0);
+	else
+		payment->failonion = NULL;
 
 	return payment;
 }
@@ -2254,6 +2280,7 @@ wallet_payment_by_hash(const tal_t *ctx, struct wallet *wallet,
 					     ", msatoshi_sent"
 					     ", description"
 					     ", bolt11"
+					     ", failonionreply"
 					     " FROM payments"
 					     " WHERE payment_hash = ?"));
 
@@ -2374,8 +2401,11 @@ void wallet_payment_get_failinfo(const tal_t *ctx,
 		*failupdate = tal_arr(ctx, u8, len);
 		memcpy(*failupdate, db_column_blob(stmt, 6), len);
 	}
-	*faildetail =
-	    tal_strndup(ctx, db_column_blob(stmt, 7), db_column_bytes(stmt, 7));
+	if (!db_column_is_null(stmt, 7))
+		*faildetail = tal_strndup(ctx, db_column_blob(stmt, 7),
+					  db_column_bytes(stmt, 7));
+	else
+		*faildetail = NULL;
 
 	tal_free(stmt);
 }
@@ -2421,11 +2451,7 @@ void wallet_payment_set_failinfo(struct wallet *wallet,
 		db_bind_null(stmt, 4);
 
 	if (failchannel) {
-		/* db_bind_short_channel_id requires the input
-		 * channel to be tal-allocated... */
-		struct short_channel_id *scid = tal(tmpctx, struct short_channel_id);
-		*scid = *failchannel;
-		db_bind_short_channel_id(stmt, 5, scid);
+		db_bind_short_channel_id(stmt, 5, failchannel);
 		db_bind_int(stmt, 8, faildirection);
 	} else {
 		db_bind_null(stmt, 5);
@@ -2437,7 +2463,11 @@ void wallet_payment_set_failinfo(struct wallet *wallet,
 	else
 		db_bind_null(stmt, 6);
 
-	db_bind_text(stmt, 7, faildetail);
+	if (faildetail != NULL)
+		db_bind_text(stmt, 7, faildetail);
+	else
+		db_bind_null(stmt, 7);
+
 	db_bind_sha256(stmt, 9, payment_hash);
 
 	db_exec_prepared_v2(take(stmt));
@@ -2470,6 +2500,7 @@ wallet_payment_list(const tal_t *ctx,
 						  ", msatoshi_sent"
 						  ", description"
 						  ", bolt11"
+						  ", failonionreply"
 						  " FROM payments"
 						  " WHERE payment_hash = ?;"));
 		db_bind_sha256(stmt, 0, payment_hash);
@@ -2488,6 +2519,7 @@ wallet_payment_list(const tal_t *ctx,
 						     ", msatoshi_sent"
 						     ", description"
 						     ", bolt11"
+						     ", failonionreply"
 						     " FROM payments;"));
 	}
 	db_query_prepared(stmt);

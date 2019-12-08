@@ -61,6 +61,7 @@ static void json_add_invoice(struct json_stream *response,
 					    "msatoshi_received",
 					    "amount_received_msat");
 		json_add_u64(response, "paid_at", inv->paid_timestamp);
+		json_add_preimage(response, "payment_preimage", &inv->r);
 	}
 	if (inv->description)
 		json_add_string(response, "description", inv->description);
@@ -138,8 +139,7 @@ invoice_payment_serialize(struct invoice_payment_hook_payload *payload,
 {
 	json_object_start(stream, "payment");
 	json_add_escaped_string(stream, "label", payload->label);
-	json_add_hex(stream, "preimage",
-		     &payload->preimage, sizeof(payload->preimage));
+	json_add_preimage(stream, "preimage", &payload->preimage);
 	json_add_string(stream, "msat",
 			type_to_string(tmpctx, struct amount_msat,
 				       &payload->msat));

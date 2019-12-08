@@ -249,7 +249,13 @@ void json_add_address_internal(struct json_stream *response,
 	case ADDR_INTERNAL_AUTOTOR:
 		json_object_start(response, fieldname);
 		json_add_string(response, "type", "Tor generated address");
-		json_add_address(response, "service", &addr->u.torservice);
+		json_add_address(response, "service", &addr->u.torservice.address);
+		json_object_end(response);
+		return;
+	case ADDR_INTERNAL_STATICTOR:
+		json_object_start(response, fieldname);
+		json_add_string(response, "type", "Tor from blob generated static address");
+		json_add_address(response, "service", &addr->u.torservice.address);
 		json_object_end(response);
 		return;
 	case ADDR_INTERNAL_FORPROXY:
@@ -436,6 +442,12 @@ void json_add_sha256(struct json_stream *result, const char *fieldname,
 		     const struct sha256 *hash)
 {
 	json_add_hex(result, fieldname, hash, sizeof(*hash));
+}
+
+void json_add_preimage(struct json_stream *result, const char *fieldname,
+		     const struct preimage *preimage)
+{
+	json_add_hex(result, fieldname, preimage, sizeof(*preimage));
 }
 
 /**
