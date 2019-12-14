@@ -29,6 +29,7 @@ LIGHTNINGD_COMMON_OBJS :=			\
 	common/daemon.o				\
 	common/derive_basepoints.o		\
 	common/features.o			\
+	common/fee_states.o			\
 	common/funding_tx.o			\
 	common/gen_peer_status_wire.o		\
 	common/gen_status_wire.o		\
@@ -45,6 +46,7 @@ LIGHTNINGD_COMMON_OBJS :=			\
 	common/memleak.o			\
 	common/msg_queue.o			\
 	common/node_id.o			\
+	common/onion.o				\
 	common/param.o				\
 	common/per_peer_state.o			\
 	common/permute_tx.o			\
@@ -74,6 +76,7 @@ LIGHTNINGD_SRC :=				\
 	lightningd/gossip_msg.c			\
 	lightningd/hsm_control.c		\
 	lightningd/htlc_end.c			\
+	lightningd/htlc_set.c			\
 	lightningd/invoice.c			\
 	lightningd/io_loop_with_timers.c	\
 	lightningd/json.c			\

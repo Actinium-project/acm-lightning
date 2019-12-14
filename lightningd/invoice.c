@@ -123,7 +123,7 @@ static void invoice_secret(const struct preimage *payment_preimage,
 struct invoice_payment_hook_payload {
 	struct lightningd *ld;
 	/* Set to NULL if it is deleted while waiting for plugin */
-	struct htlc_in *hin;
+	struct htlc_set *set;
 	/* What invoice it's trying to pay. */
 	const struct json_escape *label;
 	/* Amount it's offering. */
@@ -146,12 +146,13 @@ invoice_payment_serialize(struct invoice_payment_hook_payload *payload,
 	json_object_end(stream); /* .payment */
 }
 
-/* Peer dies?  Remove hin ptr from payload so we know to ignore plugin return */
-static void invoice_payload_remove_hin(struct htlc_in *hin,
+/* Set times out or HTLC deleted?  Remove set ptr from payload so we
+ * know to ignore plugin return */
+static void invoice_payload_remove_set(struct htlc_set *set,
 				       struct invoice_payment_hook_payload *payload)
 {
-	assert(payload->hin == hin);
-	payload->hin = NULL;
+	assert(payload->set == set);
+	payload->set = NULL;
 }
 
 static bool hook_gives_failcode(const char *buffer,
@@ -195,12 +196,12 @@ invoice_payment_hook_cb(struct invoice_payment_hook_payload *payload,
 	 * called even if the hook is not registered. */
 	notify_invoice_payment(ld, payload->msat, payload->preimage, payload->label);
 
-	tal_del_destructor2(payload->hin, invoice_payload_remove_hin, payload);
+	tal_del_destructor2(payload->set, invoice_payload_remove_set, payload);
 	/* We want to free this, whatever happens. */
 	tal_steal(tmpctx, payload);
 
 	/* If peer dies or something, this can happen. */
-	if (!payload->hin) {
+	if (!payload->set) {
 		log_debug(ld->log, "invoice '%s' paying htlc_in has gone!",
 			  payload->label->s);
 		return;
@@ -210,21 +211,22 @@ invoice_payment_hook_cb(struct invoice_payment_hook_payload *payload,
 	 * we can also fail */
 	if (!wallet_invoice_find_by_label(ld->wallet, &invoice, payload->label)) {
 		failcode = WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS;
-		fail_htlc(payload->hin, failcode);
+		htlc_set_fail(payload->set, failcode);
 		return;
 	}
 
 	/* Did we have a hook result? */
 	if (hook_gives_failcode(buffer, toks, &failcode)) {
-		fail_htlc(payload->hin, failcode);
+		htlc_set_fail(payload->set, failcode);
 		return;
 	}
 
-	log_info(ld->log, "Resolved invoice '%s' with amount %s",
-		  payload->label->s,
-		  type_to_string(tmpctx, struct amount_msat, &payload->msat));
+	log_info(ld->log, "Resolved invoice '%s' with amount %s in %zu htlcs",
+		 payload->label->s,
+		 type_to_string(tmpctx, struct amount_msat, &payload->msat),
+		 tal_count(payload->set->htlcs));
 	wallet_invoice_resolve(ld->wallet, invoice, payload->msat);
-	fulfill_htlc(payload->hin, &payload->preimage);
+	htlc_set_fulfill(payload->set, &payload->preimage);
 }
 
 REGISTER_PLUGIN_HOOK(invoice_payment,
@@ -233,56 +235,46 @@ REGISTER_PLUGIN_HOOK(invoice_payment,
 		     invoice_payment_serialize,
 		     struct invoice_payment_hook_payload *);
 
-void invoice_try_pay(struct lightningd *ld,
-		     struct htlc_in *hin,
-		     const struct sha256 *payment_hash,
-		     const struct amount_msat msat,
-		     const struct secret *payment_secret)
+const struct invoice_details *
+invoice_check_payment(const tal_t *ctx,
+		      struct lightningd *ld,
+		      const struct sha256 *payment_hash,
+		      const struct amount_msat msat,
+		      const struct secret *payment_secret)
 {
 	struct invoice invoice;
 	const struct invoice_details *details;
-	struct invoice_payment_hook_payload *payload;
 
-	if (!wallet_invoice_find_unpaid(ld->wallet, &invoice, payment_hash)) {
-		fail_htlc(hin, WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS);
-		return;
-	}
-	details = wallet_invoice_details(tmpctx, ld->wallet, invoice);
-
-	log_debug(ld->log, "payment_secret is %s",
-		  payment_secret ? "set": "NULL");
-
-	/* BOLT-e36f7b6517e1173dcbd49da3b516cfe1f48ae556 #4:
-	 *
-	 * - if the `payment_secret` doesn't match the expected value for that
-	 *   `payment_hash`, or the `payment_secret` is required and is not
-	 *   present:
-	 *   - MUST fail the HTLC.
-	 *   - MUST return an `incorrect_or_unknown_payment_details` error.
+	/* BOLT #4:
+	 *  - if the payment hash has already been paid:
+	 *    - MAY treat the payment hash as unknown.
+	 *    - MAY succeed in accepting the HTLC.
+	 *...
+	 *  - if the payment hash is unknown:
+	 *    - MUST fail the HTLC.
+	 *    - MUST return an `incorrect_or_unknown_payment_details` error.
 	 */
-	/* BOLT-e36f7b6517e1173dcbd49da3b516cfe1f48ae556 #1:
-	 *
-	 * - if `payment_secret` is required in the onion:
-	 *    - MUST set the even feature `var_onion_optin`.
+	if (!wallet_invoice_find_unpaid(ld->wallet, &invoice, payment_hash))
+		return NULL;
+
+	details = wallet_invoice_details(ctx, ld->wallet, invoice);
+
+	/* BOLT-9441a66faad63edc8cd89860b22fbf24a86f0dcd #4:
+	 *  - if the `payment_secret` doesn't match the expected value for that
+	 *     `payment_hash`, or the `payment_secret` is required and is not
+	 *     present:
+	 *    - MUST fail the HTLC.
 	 */
 	if (feature_is_set(details->features, COMPULSORY_FEATURE(OPT_VAR_ONION))
-	    && !payment_secret) {
-		fail_htlc(hin, WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS);
-		return;
-	}
+	    && !payment_secret)
+		return tal_free(details);
 
 	if (payment_secret) {
 		struct secret expected;
 
 		invoice_secret(&details->r, &expected);
-		log_debug(ld->log, "payment_secret %s vs %s",
-			  type_to_string(tmpctx, struct secret, payment_secret),
-			  type_to_string(tmpctx, struct secret, &expected));
-		if (!secret_eq_consttime(payment_secret, &expected)) {
-			fail_htlc(hin,
-				  WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS);
-			return;
-		}
+		if (!secret_eq_consttime(payment_secret, &expected))
+			return tal_free(details);
 	}
 
 	/* BOLT #4:
@@ -295,36 +287,37 @@ void invoice_try_pay(struct lightningd *ld,
 	if (details->msat != NULL) {
 		struct amount_msat twice;
 
-		if (amount_msat_less(msat, *details->msat)) {
-			fail_htlc(hin,
-				  WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS);
-			return;
-		}
+		if (amount_msat_less(msat, *details->msat))
+			return tal_free(details);
 
 		if (amount_msat_add(&twice, *details->msat, *details->msat)
 		    && amount_msat_greater(msat, twice)) {
-			/* FIXME: bolt update fixes this quote! */
 			/* BOLT #4:
 			 *
-			 *   - if the amount paid is more than twice the amount expected:
-			 *     - SHOULD fail the HTLC.
-			 *     - SHOULD return an `incorrect_or_unknown_payment_details` error.
+			 * - if the amount paid is more than twice the amount
+			 *   expected:
+			 *   - SHOULD fail the HTLC.
 			 */
-			fail_htlc(hin,
-				  WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS);
-			return;
+			return tal_free(details);
 		}
 	}
+	return details;
+}
+
+void invoice_try_pay(struct lightningd *ld,
+		     struct htlc_set *set,
+		     const struct invoice_details *details)
+{
+	struct invoice_payment_hook_payload *payload;
 
 	payload = tal(ld, struct invoice_payment_hook_payload);
 	payload->ld = ld;
 	payload->label = tal_steal(payload, details->label);
-	payload->msat = msat;
+	payload->msat = set->so_far;
 	payload->preimage = details->r;
-	payload->hin = hin;
-	tal_add_destructor2(hin, invoice_payload_remove_hin, payload);
+	payload->set = set;
+	tal_add_destructor2(set, invoice_payload_remove_set, payload);
 
-	log_debug(ld->log, "Calling hook for invoice '%s'", details->label->s);
 	plugin_hook_call_invoice_payment(ld, payload, payload);
 }
 

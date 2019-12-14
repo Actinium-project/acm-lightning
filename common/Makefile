@@ -20,6 +20,7 @@ COMMON_SRC_NOGEN :=				\
 	common/derive_basepoints.c		\
 	common/dev_disconnect.c			\
 	common/features.c			\
+	common/fee_states.c			\
 	common/funding_tx.c			\
 	common/gossip_rcvd_filter.c		\
 	common/gossip_store.c			\
@@ -39,6 +40,7 @@ COMMON_SRC_NOGEN :=				\
 	common/memleak.c			\
 	common/msg_queue.c			\
 	common/node_id.c			\
+	common/onion.c				\
 	common/param.c				\
 	common/per_peer_state.c			\
 	common/peer_billboard.c			\

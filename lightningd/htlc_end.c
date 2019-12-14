@@ -28,6 +28,22 @@ struct htlc_in *find_htlc_in(const struct htlc_in_map *map,
 	return htlc_in_map_get(map, &key);
 }
 
+struct htlc_in *remove_htlc_in_by_dbid(struct htlc_in_map *remaining_htlcs_in,
+				       u64 dbid)
+{
+	struct htlc_in *hin;
+	struct htlc_in_map_iter ini;
+
+	for (hin = htlc_in_map_first(remaining_htlcs_in, &ini); hin;
+	     hin = htlc_in_map_next(remaining_htlcs_in, &ini)) {
+		if (hin->dbid == dbid) {
+			htlc_in_map_del(remaining_htlcs_in, hin);
+			return hin;
+		}
+	}
+	return NULL;
+}
+
 static void destroy_htlc_in(struct htlc_in *hend, struct htlc_in_map *map)
 {
 	htlc_in_map_del(map, hend);
@@ -252,6 +268,7 @@ struct htlc_out *new_htlc_out(const tal_t *ctx,
 			      const struct sha256 *payment_hash,
 			      const u8 *onion_routing_packet,
 			      bool am_origin,
+			      u64 partid,
 			      struct htlc_in *in)
 {
 	struct htlc_out *hout = tal(ctx, struct htlc_out);
@@ -273,6 +290,8 @@ struct htlc_out *new_htlc_out(const tal_t *ctx,
 	hout->preimage = NULL;
 
 	hout->am_origin = am_origin;
+	if (am_origin)
+		hout->partid = partid;
 	hout->in = NULL;
 	if (in)
 		htlc_out_connect_htlc_in(hout, in);

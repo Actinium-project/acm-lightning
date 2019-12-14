@@ -1,7 +1,9 @@
 #include <assert.h>
 #include <bitcoin/chainparams.h>
 #include <bitcoin/script.h>
+#include <ccan/array_size/array_size.h>
 #include <ccan/tal/str/str.h>
+#include <common/fee_states.h>
 #include <common/initial_channel.h>
 #include <common/initial_commit_tx.h>
 #include <common/keyset.h>
@@ -14,7 +16,7 @@ struct channel *new_initial_channel(const tal_t *ctx,
 				    u32 minimum_depth,
 				    struct amount_sat funding,
 				    struct amount_msat local_msatoshi,
-				    u32 feerate_per_kw,
+				    const struct fee_states *fee_states TAKES,
 				    const struct channel_config *local,
 				    const struct channel_config *remote,
 				    const struct basepoints *local_basepoints,
@@ -41,12 +43,9 @@ struct channel *new_initial_channel(const tal_t *ctx,
 	channel->funding_pubkey[LOCAL] = *local_funding_pubkey;
 	channel->funding_pubkey[REMOTE] = *remote_funding_pubkey;
 	channel->htlcs = NULL;
-	channel->changes_pending[LOCAL] = channel->changes_pending[REMOTE]
-		= false;
 
-	channel->view[LOCAL].feerate_per_kw
-		= channel->view[REMOTE].feerate_per_kw
-		= feerate_per_kw;
+	/* takes() if necessary */
+	channel->fee_states = dup_fee_states(channel, fee_states);
 
 	channel->view[LOCAL].owed[LOCAL]
 		= channel->view[REMOTE].owed[LOCAL]
@@ -100,7 +99,7 @@ struct bitcoin_tx *initial_channel_tx(const tal_t *ctx,
 				 /* They specify our to_self_delay and v.v. */
 				 channel->config[!side].to_self_delay,
 				 &keyset,
-				 channel->view[side].feerate_per_kw,
+				 channel_feerate(channel, side),
 				 channel->config[side].dust_limit,
 				 channel->view[side].owed[side],
 				 channel->view[side].owed[!side],
@@ -110,19 +109,22 @@ struct bitcoin_tx *initial_channel_tx(const tal_t *ctx,
 				 err_reason);
 }
 
+u32 channel_feerate(const struct channel *channel, enum side side)
+{
+	return get_feerate(channel->fee_states, channel->funder, side);
+}
+
 static char *fmt_channel_view(const tal_t *ctx, const struct channel_view *view)
 {
-	return tal_fmt(ctx, "{ feerate_per_kw=%"PRIu32","
-		       " owed_local=%s,"
+	return tal_fmt(ctx, "{ owed_local=%s,"
 		       " owed_remote=%s }",
-		       view->feerate_per_kw,
 		       type_to_string(tmpctx, struct amount_msat,
 				      &view->owed[LOCAL]),
 		       type_to_string(tmpctx, struct amount_msat,
 				      &view->owed[REMOTE]));
 }
 
-/* FIXME: This should reference HTLCs somehow. */
+/* FIXME: This should reference HTLCs somehow, and feerates! */
 static char *fmt_channel(const tal_t *ctx, const struct channel *channel)
 {
 	return tal_fmt(ctx, "{ funding=%s,"

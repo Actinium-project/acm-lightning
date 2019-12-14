@@ -82,20 +82,24 @@ void connect_succeeded(struct lightningd *ld UNNEEDED, const struct node_id *id 
 void delay_then_reconnect(struct channel *channel UNNEEDED, u32 seconds_delay UNNEEDED,
 			  const struct wireaddr_internal *addrhint TAKES UNNEEDED)
 { fprintf(stderr, "delay_then_reconnect called!\n"); abort(); }
+/* Generated stub for dup_fee_states */
+struct fee_states *dup_fee_states(const tal_t *ctx UNNEEDED,
+				  const struct fee_states *fee_states TAKES UNNEEDED)
+{ fprintf(stderr, "dup_fee_states called!\n"); abort(); }
 /* Generated stub for encode_scriptpubkey_to_addr */
 char *encode_scriptpubkey_to_addr(const tal_t *ctx UNNEEDED,
 				  const struct chainparams *chainparams UNNEEDED,
                                   const u8 *scriptPubkey UNNEEDED)
 { fprintf(stderr, "encode_scriptpubkey_to_addr called!\n"); abort(); }
-/* Generated stub for fail_htlc */
-void fail_htlc(struct htlc_in *hin UNNEEDED, enum onion_type failcode UNNEEDED)
-{ fprintf(stderr, "fail_htlc called!\n"); abort(); }
 /* Generated stub for fatal */
 void   fatal(const char *fmt UNNEEDED, ...)
 { fprintf(stderr, "fatal called!\n"); abort(); }
 /* Generated stub for feature_is_set */
 bool feature_is_set(const u8 *features UNNEEDED, size_t bit UNNEEDED)
 { fprintf(stderr, "feature_is_set called!\n"); abort(); }
+/* Generated stub for fixup_htlcs_out */
+void fixup_htlcs_out(struct lightningd *ld UNNEEDED)
+{ fprintf(stderr, "fixup_htlcs_out called!\n"); abort(); }
 /* Generated stub for fromwire_channel_dev_memleak_reply */
 bool fromwire_channel_dev_memleak_reply(const void *p UNNEEDED, bool *leak UNNEEDED)
 { fprintf(stderr, "fromwire_channel_dev_memleak_reply called!\n"); abort(); }
@@ -117,12 +121,14 @@ bool fromwire_hsm_sign_invoice_reply(const void *p UNNEEDED, secp256k1_ecdsa_rec
 /* Generated stub for fromwire_onchain_dev_memleak_reply */
 bool fromwire_onchain_dev_memleak_reply(const void *p UNNEEDED, bool *leak UNNEEDED)
 { fprintf(stderr, "fromwire_onchain_dev_memleak_reply called!\n"); abort(); }
-/* Generated stub for fulfill_htlc */
-void fulfill_htlc(struct htlc_in *hin UNNEEDED, const struct preimage *preimage UNNEEDED)
-{ fprintf(stderr, "fulfill_htlc called!\n"); abort(); }
 /* Generated stub for get_block_height */
 u32 get_block_height(const struct chain_topology *topo UNNEEDED)
 { fprintf(stderr, "get_block_height called!\n"); abort(); }
+/* Generated stub for get_feerate */
+u32 get_feerate(const struct fee_states *fee_states UNNEEDED,
+		enum side funder UNNEEDED,
+		enum side side UNNEEDED)
+{ fprintf(stderr, "get_feerate called!\n"); abort(); }
 /* Generated stub for get_offered_bolt11features */
 u8 *get_offered_bolt11features(const tal_t *ctx UNNEEDED)
 { fprintf(stderr, "get_offered_bolt11features called!\n"); abort(); }
@@ -133,11 +139,12 @@ bool htlc_is_trimmed(enum side htlc_owner UNNEEDED,
 		     struct amount_sat dust_limit UNNEEDED,
 		     enum side side UNNEEDED)
 { fprintf(stderr, "htlc_is_trimmed called!\n"); abort(); }
-/* Generated stub for htlcs_reconnect */
-struct htlc_in_map *htlcs_reconnect(struct lightningd *ld UNNEEDED,
-				    struct htlc_in_map *htlcs_in UNNEEDED,
-				    struct htlc_out_map *htlcs_out UNNEEDED)
-{ fprintf(stderr, "htlcs_reconnect called!\n"); abort(); }
+/* Generated stub for htlc_set_fail */
+void htlc_set_fail(struct htlc_set *set UNNEEDED, enum onion_type failcode UNNEEDED)
+{ fprintf(stderr, "htlc_set_fail called!\n"); abort(); }
+/* Generated stub for htlc_set_fulfill */
+void htlc_set_fulfill(struct htlc_set *set UNNEEDED, const struct preimage *preimage UNNEEDED)
+{ fprintf(stderr, "htlc_set_fulfill called!\n"); abort(); }
 /* Generated stub for json_add_address */
 void json_add_address(struct json_stream *response UNNEEDED, const char *fieldname UNNEEDED,
 		      const struct wireaddr *addr UNNEEDED)
@@ -504,12 +511,17 @@ void wallet_channeltxs_add(struct wallet *w UNNEEDED, struct channel *chan UNNEE
 			    const int type UNNEEDED, const struct bitcoin_txid *txid UNNEEDED,
 			   const u32 input_num UNNEEDED, const u32 blockheight UNNEEDED)
 { fprintf(stderr, "wallet_channeltxs_add called!\n"); abort(); }
-/* Generated stub for wallet_htlcs_load_for_channel */
-bool wallet_htlcs_load_for_channel(struct wallet *wallet UNNEEDED,
-				   struct channel *chan UNNEEDED,
-				   struct htlc_in_map *htlcs_in UNNEEDED,
-				   struct htlc_out_map *htlcs_out UNNEEDED)
-{ fprintf(stderr, "wallet_htlcs_load_for_channel called!\n"); abort(); }
+/* Generated stub for wallet_htlcs_load_in_for_channel */
+bool wallet_htlcs_load_in_for_channel(struct wallet *wallet UNNEEDED,
+				      struct channel *chan UNNEEDED,
+				      struct htlc_in_map *htlcs_in UNNEEDED)
+{ fprintf(stderr, "wallet_htlcs_load_in_for_channel called!\n"); abort(); }
+/* Generated stub for wallet_htlcs_load_out_for_channel */
+bool wallet_htlcs_load_out_for_channel(struct wallet *wallet UNNEEDED,
+				       struct channel *chan UNNEEDED,
+				       struct htlc_out_map *htlcs_out UNNEEDED,
+				       struct htlc_in_map *remaining_htlcs_in UNNEEDED)
+{ fprintf(stderr, "wallet_htlcs_load_out_for_channel called!\n"); abort(); }
 /* Generated stub for wallet_init_channels */
 bool wallet_init_channels(struct wallet *w UNNEEDED)
 { fprintf(stderr, "wallet_init_channels called!\n"); abort(); }

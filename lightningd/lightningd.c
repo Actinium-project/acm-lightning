@@ -161,6 +161,10 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	htlc_in_map_init(&ld->htlcs_in);
 	htlc_out_map_init(&ld->htlcs_out);
 
+	/*~ For multi-part payments, we need to keep some incoming payments
+	 * in limbo until we get all the parts, or we time them out. */
+	htlc_set_map_init(&ld->htlc_sets);
+
 	/*~ We have a multi-entry log-book infrastructure: we define a 100MB log
 	 * book to hold all the entries (and trims as necessary), and multiple
 	 * log objects which each can write into it, each with a unique
@@ -630,7 +634,7 @@ int main(int argc, char *argv[])
 	int stop_fd;
 	struct timers *timers;
 	const char *stop_response;
-	struct htlc_in_map *unprocessed_htlcs;
+	struct htlc_in_map *unconnected_htlcs_in;
 	struct rlimit nofile = {1024, 1024};
 
 	/*~ Make sure that we limit ourselves to something reasonable. Modesty
@@ -778,7 +782,7 @@ int main(int argc, char *argv[])
 	 *  topology is initialized since some decisions rely on being able to
 	 *  know the blockheight. */
 	db_begin_transaction(ld->wallet->db);
-	unprocessed_htlcs = load_channels_from_wallet(ld);
+	unconnected_htlcs_in = load_channels_from_wallet(ld);
 	db_commit_transaction(ld->wallet->db);
 
 	/*~ Create RPC socket: now lightning-cli can send us JSON RPC commands
@@ -791,8 +795,11 @@ int main(int argc, char *argv[])
 
 	/*~ Process any HTLCs we were in the middle of when we exited, now
 	 * that plugins (who might want to know via htlc_accepted hook) are
-	 * active. */
-	htlcs_resubmit(ld, unprocessed_htlcs);
+	 * active.  These will immediately fail, since no peers are connected,
+	 * however partial payments may still be absorbed into htlc_set. */
+	db_begin_transaction(ld->wallet->db);
+	htlcs_resubmit(ld, unconnected_htlcs_in);
+	db_commit_transaction(ld->wallet->db);
 
 	/*~ Activate connect daemon.  Needs to be after the initialization of
 	 * chaintopology, otherwise peers may connect and ask for

@@ -97,16 +97,16 @@ void   fatal(const char *fmt UNNEEDED, ...)
 bool fromwire_channel_dev_memleak_reply(const void *p UNNEEDED, bool *leak UNNEEDED)
 { fprintf(stderr, "fromwire_channel_dev_memleak_reply called!\n"); abort(); }
 /* Generated stub for fromwire_channel_got_commitsig */
-bool fromwire_channel_got_commitsig(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u64 *commitnum UNNEEDED, u32 *feerate UNNEEDED, struct bitcoin_signature *signature UNNEEDED, secp256k1_ecdsa_signature **htlc_signature UNNEEDED, struct added_htlc **added UNNEEDED, struct secret **shared_secret UNNEEDED, struct fulfilled_htlc **fulfilled UNNEEDED, struct failed_htlc ***failed UNNEEDED, struct changed_htlc **changed UNNEEDED, struct bitcoin_tx **tx UNNEEDED)
+bool fromwire_channel_got_commitsig(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u64 *commitnum UNNEEDED, struct fee_states **fee_states UNNEEDED, struct bitcoin_signature *signature UNNEEDED, secp256k1_ecdsa_signature **htlc_signature UNNEEDED, struct added_htlc **added UNNEEDED, struct secret **shared_secret UNNEEDED, struct fulfilled_htlc **fulfilled UNNEEDED, struct failed_htlc ***failed UNNEEDED, struct changed_htlc **changed UNNEEDED, struct bitcoin_tx **tx UNNEEDED)
 { fprintf(stderr, "fromwire_channel_got_commitsig called!\n"); abort(); }
 /* Generated stub for fromwire_channel_got_revoke */
-bool fromwire_channel_got_revoke(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u64 *revokenum UNNEEDED, struct secret *per_commitment_secret UNNEEDED, struct pubkey *next_per_commit_point UNNEEDED, u32 *feerate UNNEEDED, struct changed_htlc **changed UNNEEDED)
+bool fromwire_channel_got_revoke(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u64 *revokenum UNNEEDED, struct secret *per_commitment_secret UNNEEDED, struct pubkey *next_per_commit_point UNNEEDED, struct fee_states **fee_states UNNEEDED, struct changed_htlc **changed UNNEEDED)
 { fprintf(stderr, "fromwire_channel_got_revoke called!\n"); abort(); }
 /* Generated stub for fromwire_channel_offer_htlc_reply */
 bool fromwire_channel_offer_htlc_reply(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u64 *id UNNEEDED, u16 *failure_code UNNEEDED, u8 **failurestr UNNEEDED)
 { fprintf(stderr, "fromwire_channel_offer_htlc_reply called!\n"); abort(); }
 /* Generated stub for fromwire_channel_sending_commitsig */
-bool fromwire_channel_sending_commitsig(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u64 *commitnum UNNEEDED, u32 *feerate UNNEEDED, struct changed_htlc **changed UNNEEDED, struct bitcoin_signature *commit_sig UNNEEDED, secp256k1_ecdsa_signature **htlc_sigs UNNEEDED)
+bool fromwire_channel_sending_commitsig(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u64 *commitnum UNNEEDED, struct fee_states **fee_states UNNEEDED, struct changed_htlc **changed UNNEEDED, struct bitcoin_signature *commit_sig UNNEEDED, secp256k1_ecdsa_signature **htlc_sigs UNNEEDED)
 { fprintf(stderr, "fromwire_channel_sending_commitsig called!\n"); abort(); }
 /* Generated stub for fromwire_connect_peer_connected */
 bool fromwire_connect_peer_connected(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, struct node_id *id UNNEEDED, struct wireaddr_internal *addr UNNEEDED, struct per_peer_state **pps UNNEEDED, u8 **features UNNEEDED)
@@ -130,6 +130,12 @@ bool htlc_is_trimmed(enum side htlc_owner UNNEEDED,
 		     struct amount_sat dust_limit UNNEEDED,
 		     enum side side UNNEEDED)
 { fprintf(stderr, "htlc_is_trimmed called!\n"); abort(); }
+/* Generated stub for htlc_set_add */
+void htlc_set_add(struct lightningd *ld UNNEEDED,
+		  struct htlc_in *hin UNNEEDED,
+		  struct amount_msat total_msat UNNEEDED,
+		  const struct secret *payment_secret UNNEEDED)
+{ fprintf(stderr, "htlc_set_add called!\n"); abort(); }
 /* Generated stub for invoices_create */
 bool invoices_create(struct invoices *invoices UNNEEDED,
 		     struct invoice *pinvoice UNNEEDED,
@@ -203,13 +209,6 @@ void invoices_waitone(const tal_t *ctx UNNEEDED,
 		      void (*cb)(const struct invoice * UNNEEDED, void*) UNNEEDED,
 		      void *cbarg UNNEEDED)
 { fprintf(stderr, "invoices_waitone called!\n"); abort(); }
-/* Generated stub for invoice_try_pay */
-void invoice_try_pay(struct lightningd *ld UNNEEDED,
-		     struct htlc_in *hin UNNEEDED,
-		     const struct sha256 *payment_hash UNNEEDED,
-		     const struct amount_msat msat UNNEEDED,
-		     const struct secret *payment_secret UNNEEDED)
-{ fprintf(stderr, "invoice_try_pay called!\n"); abort(); }
 /* Generated stub for json_add_address */
 void json_add_address(struct json_stream *response UNNEEDED, const char *fieldname UNNEEDED,
 		      const struct wireaddr *addr UNNEEDED)
@@ -395,6 +394,10 @@ enum watch_result onchaind_funding_spent(struct channel *channel UNNEEDED,
 					 const struct bitcoin_tx *tx UNNEEDED,
 					 u32 blockheight UNNEEDED)
 { fprintf(stderr, "onchaind_funding_spent called!\n"); abort(); }
+/* Generated stub for onion_decode */
+struct onion_payload *onion_decode(const tal_t *ctx UNNEEDED,
+				   const struct route_step *rs UNNEEDED)
+{ fprintf(stderr, "onion_decode called!\n"); abort(); }
 /* Generated stub for onion_type_name */
 const char *onion_type_name(int e UNNEEDED)
 { fprintf(stderr, "onion_type_name called!\n"); abort(); }
@@ -473,17 +476,17 @@ struct command_result *param_tok(struct command *cmd UNNEEDED, const char *name 
 				 const jsmntok_t **out UNNEEDED)
 { fprintf(stderr, "param_tok called!\n"); abort(); }
 /* Generated stub for parse_onionpacket */
-struct onionpacket *parse_onionpacket(const tal_t *ctx UNNEEDED,
-				      const void *src UNNEEDED,
-				      const size_t srclen UNNEEDED,
-				      enum onion_type *why_bad UNNEEDED)
+enum onion_type parse_onionpacket(const u8 *src UNNEEDED,
+				  const size_t srclen UNNEEDED,
+				  struct onionpacket *dest UNNEEDED)
 { fprintf(stderr, "parse_onionpacket called!\n"); abort(); }
 /* Generated stub for payment_failed */
 void payment_failed(struct lightningd *ld UNNEEDED, const struct htlc_out *hout UNNEEDED,
 		    const char *localfail UNNEEDED)
 { fprintf(stderr, "payment_failed called!\n"); abort(); }
 /* Generated stub for payment_store */
-void payment_store(struct lightningd *ld UNNEEDED, const struct sha256 *payment_hash UNNEEDED)
+void payment_store(struct lightningd *ld UNNEEDED,
+		   const struct sha256 *payment_hash UNNEEDED, u64 partid UNNEEDED)
 { fprintf(stderr, "payment_store called!\n"); abort(); }
 /* Generated stub for payment_succeeded */
 void payment_succeeded(struct lightningd *ld UNNEEDED, struct htlc_out *hout UNNEEDED,
@@ -545,10 +548,6 @@ void subd_req_(const tal_t *ctx UNNEEDED,
 /* Generated stub for subd_send_msg */
 void subd_send_msg(struct subd *sd UNNEEDED, const u8 *msg_out UNNEEDED)
 { fprintf(stderr, "subd_send_msg called!\n"); abort(); }
-/* Generated stub for tlv_payload_is_valid */
-bool tlv_payload_is_valid(const struct tlv_tlv_payload *record UNNEEDED,
-			  size_t *err_index UNNEEDED)
-{ fprintf(stderr, "tlv_payload_is_valid called!\n"); abort(); }
 /* Generated stub for topology_add_sync_waiter_ */
 void topology_add_sync_waiter_(const tal_t *ctx UNNEEDED,
 			       struct chain_topology *topo UNNEEDED,
@@ -934,6 +933,17 @@ static bool channelseq(struct channel *c1, struct channel *c2)
 	CHECK(pubkey_eq(&ci1->remote_per_commit, &ci2->remote_per_commit));
 	CHECK(pubkey_eq(&ci1->old_remote_per_commit, &ci2->old_remote_per_commit));
 	CHECK(ci1->their_config.id != 0 && ci1->their_config.id == ci2->their_config.id);
+	CHECK(fee_states_valid(ci1->fee_states, c1->funder));
+	CHECK(fee_states_valid(ci2->fee_states, c2->funder));
+	for (enum htlc_state i = 0; i < ARRAY_SIZE(ci1->fee_states->feerate);
+	     i++) {
+		if (ci1->fee_states->feerate[i] == NULL) {
+			CHECK(ci2->fee_states->feerate[i] == NULL);
+		} else {
+			CHECK(*ci1->fee_states->feerate[i]
+			      == *ci2->fee_states->feerate[i]);
+		}
+	}
 
 	CHECK(c1->our_config.id != 0 && c1->our_config.id == c2->our_config.id);
 	CHECK((lc1 != NULL) ==  (lc2 != NULL));
@@ -994,6 +1004,7 @@ static bool test_channel_crud(struct lightningd *ld, const tal_t *ctx)
 	secp256k1_ecdsa_signature *node_sig1 = tal(w, secp256k1_ecdsa_signature);
 	secp256k1_ecdsa_signature *bitcoin_sig1 = tal(w, secp256k1_ecdsa_signature);
 	secp256k1_ecdsa_signature *node_sig2, *bitcoin_sig2;
+	u32 feerate;
 	bool load;
 
 	memset(&c1, 0, sizeof(c1));
@@ -1007,7 +1018,8 @@ static bool test_channel_crud(struct lightningd *ld, const tal_t *ctx)
 	mempat(last_commit, tal_bytelen(last_commit));
 	pubkey_from_der(tal_hexdata(w, "02a1633cafcc01ebfb6d78e39f687a1f0995c62fc95f51ead10a02ee0be551b5dc", 66), 33, &pk);
 	node_id_from_pubkey(&id, &pk);
-	ci->feerate_per_kw[LOCAL] = ci->feerate_per_kw[REMOTE] = 31337;
+	feerate = 31337;
+	ci->fee_states = new_fee_states(w, c1.funder, &feerate);
 	mempat(scriptpubkey, tal_count(scriptpubkey));
 	c1.first_blocknum = 1;
 	parse_wireaddr_internal("localhost:1234", &addr, 0, false, false, false,
@@ -1156,7 +1168,7 @@ static bool test_htlc_crud(struct lightningd *ld, const tal_t *ctx)
 	struct channel *chan = tal(ctx, struct channel);
 	struct peer *peer = talz(ctx, struct peer);
 	struct wallet *w = create_test_wallet(ld, ctx);
-	struct htlc_in_map *htlcs_in = tal(ctx, struct htlc_in_map);
+	struct htlc_in_map *htlcs_in = tal(ctx, struct htlc_in_map), *rem;
 	struct htlc_out_map *htlcs_out = tal(ctx, struct htlc_out_map);
 
 	/* Make sure we have our references correct */
@@ -1220,11 +1232,16 @@ static bool test_htlc_crud(struct lightningd *ld, const tal_t *ctx)
 	db_begin_transaction(w->db);
 	CHECK(!wallet_err);
 
-	CHECK_MSG(wallet_htlcs_load_for_channel(w, chan, htlcs_in, htlcs_out),
-		  "Failed loading HTLCs");
+	CHECK_MSG(wallet_htlcs_load_in_for_channel(w, chan, htlcs_in),
+		  "Failed loading in HTLCs");
+	/* Freed by htlcs_resubmit */
+	rem = tal(NULL, struct htlc_in_map);
+	htlc_in_map_copy(rem, htlcs_in);
+	CHECK_MSG(wallet_htlcs_load_out_for_channel(w, chan, htlcs_out, rem),
+		  "Failed loading out HTLCs");
 	db_commit_transaction(w->db);
 
-	htlcs_resubmit(w->ld, htlcs_reconnect(w->ld, htlcs_in, htlcs_out));
+	htlcs_resubmit(w->ld, rem);
 	CHECK(!wallet_err);
 
 	hin = htlc_in_map_get(htlcs_in, &in.key);
@@ -1255,29 +1272,36 @@ static bool test_payment_crud(struct lightningd *ld, const tal_t *ctx)
 	t->id = 0;
 	t->msatoshi = AMOUNT_MSAT(100);
 	t->msatoshi_sent = AMOUNT_MSAT(101);
+	t->total_msat = t->msatoshi;
 	t->status = PAYMENT_PENDING;
 	t->payment_preimage = NULL;
 	memset(&t->payment_hash, 1, sizeof(t->payment_hash));
+	t->partid = 0;
 
 	db_begin_transaction(w->db);
 	wallet_payment_setup(w, tal_dup(NULL, struct wallet_payment, t));
-	wallet_payment_store(w, &t->payment_hash);
-	t2 = wallet_payment_by_hash(ctx, w, &t->payment_hash);
+	wallet_payment_store(w, &t->payment_hash, 0);
+	t2 = wallet_payment_by_hash(ctx, w, &t->payment_hash, 0);
 	CHECK(t2 != NULL);
 	CHECK(t2->status == t->status);
+	CHECK(sha256_eq(&t2->payment_hash, &t->payment_hash));
+	CHECK(t2->partid == t->partid);
 	CHECK(node_id_cmp(t2->destination, t->destination) == 0);
 	CHECK(amount_msat_eq(t2->msatoshi, t->msatoshi));
 	CHECK(amount_msat_eq(t2->msatoshi_sent, t->msatoshi_sent));
+	CHECK(amount_msat_eq(t2->total_msat, t->total_msat));
 	CHECK(!t2->payment_preimage);
 
 	t->status = PAYMENT_COMPLETE;
 	t->payment_preimage = tal(w, struct preimage);
 	memset(t->payment_preimage, 2, sizeof(*t->payment_preimage));
-	wallet_payment_set_status(w, &t->payment_hash, t->status,
+	wallet_payment_set_status(w, &t->payment_hash, t->partid, t->status,
 				  t->payment_preimage);
-	t2 = wallet_payment_by_hash(ctx, w, &t->payment_hash);
+	t2 = wallet_payment_by_hash(ctx, w, &t->payment_hash, t->partid);
 	CHECK(t2 != NULL);
 	CHECK(t2->status == t->status);
+	CHECK(sha256_eq(&t2->payment_hash, &t->payment_hash));
+	CHECK(t2->partid == t->partid);
 	CHECK(node_id_eq(t2->destination, t->destination));
 	CHECK(amount_msat_eq(t2->msatoshi, t->msatoshi));
 	CHECK(amount_msat_eq(t2->msatoshi_sent, t->msatoshi_sent));

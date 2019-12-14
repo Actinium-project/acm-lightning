@@ -3,8 +3,8 @@
  * For example, in the spec tests we use the following:
  *
  * lightning/devtools/mkcommit 0 41085b995c1f591cfc3ae79ccde012bf0b37c7bde23d80a61c9732bdd6210b2f 0 999878sat 253 999878sat local \
-   5 546 9900sat						\
-   6 546 9900sat							\
+   5 546 9998sat						\
+   6 546 9998sat							\
    0000000000000000000000000000000000000000000000000000000000000020 0000000000000000000000000000000000000000000000000000000000000000 0000000000000000000000000000000000000000000000000000000000000021 0000000000000000000000000000000000000000000000000000000000000022 0000000000000000000000000000000000000000000000000000000000000023 0000000000000000000000000000000000000000000000000000000000000024 \
    0000000000000000000000000000000000000000000000000000000000000010 FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF 0000000000000000000000000000000000000000000000000000000000000011 0000000000000000000000000000000000000000000000000000000000000012 0000000000000000000000000000000000000000000000000000000000000013 0000000000000000000000000000000000000000000000000000000000000014
  */
@@ -16,6 +16,7 @@
 #include <channeld/full_channel.h>
 #include <common/amount.h>
 #include <common/derive_basepoints.h>
+#include <common/fee_states.h>
 #include <common/htlc_wire.h>
 #include <common/key_derive.h>
 #include <common/keyset.h>
@@ -251,7 +252,7 @@ int main(int argc, char *argv[])
 	struct amount_sat funding_amount;
 	struct bitcoin_txid funding_txid;
 	unsigned int funding_outnum;
-	u32 feerate_per_kw[NUM_SIDES];
+	u32 feerate_per_kw;
 	struct pubkey local_per_commit_point, remote_per_commit_point;
 	struct bitcoin_signature local_sig, remote_sig;
 	struct channel_config localconfig, remoteconfig;
@@ -318,7 +319,7 @@ int main(int argc, char *argv[])
 	if (!parse_amount_sat(&funding_amount, argv[argnum], strlen(argv[argnum])))
 		errx(1, "Bad funding-amount");
 	argnum++;
-	feerate_per_kw[LOCAL] = feerate_per_kw[REMOTE] = atoi(argv[argnum++]);
+	feerate_per_kw = atoi(argv[argnum++]);
 	if (!parse_amount_msat(&local_msat,
 			       argv[argnum], strlen(argv[argnum])))
 		errx(1, "Bad local-msat");
@@ -384,7 +385,8 @@ int main(int argc, char *argv[])
 				   &funding_txid, funding_outnum, 1,
 				   funding_amount,
 				   local_msat,
-				   feerate_per_kw,
+				   take(new_fee_states(NULL, fee_payer,
+						       &feerate_per_kw)),
 				   &localconfig, &remoteconfig,
 				   &localbase, &remotebase,
 				   &funding_localkey, &funding_remotekey,

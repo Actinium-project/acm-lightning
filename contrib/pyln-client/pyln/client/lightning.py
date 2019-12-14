@@ -5,8 +5,6 @@ import warnings
 from decimal import Decimal
 from math import floor, log10
 
-__version__ = "0.7.3"
-
 
 class RpcError(ValueError):
     def __init__(self, method, payload, error):
@@ -888,12 +886,15 @@ class LightningRpc(UnixDomainSocketRpc):
         if 'description' in kwargs:
             return self._deprecated_sendpay(route, payment_hash, *args, **kwargs)
 
-        def _sendpay(route, payment_hash, label=None, msatoshi=None):
+        def _sendpay(route, payment_hash, label=None, msatoshi=None, bolt11=None, payment_secret=None, partid=None):
             payload = {
                 "route": route,
                 "payment_hash": payment_hash,
                 "label": label,
                 "msatoshi": msatoshi,
+                "bolt11": bolt11,
+                "payment_secret": payment_secret,
+                "partid": partid,
             }
             return self.call("sendpay", payload)
 
@@ -937,13 +938,14 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("waitinvoice", payload)
 
-    def waitsendpay(self, payment_hash, timeout=None):
+    def waitsendpay(self, payment_hash, timeout=None, partid=None):
         """
         Wait for payment for preimage of {payment_hash} to complete
         """
         payload = {
             "payment_hash": payment_hash,
-            "timeout": timeout
+            "timeout": timeout,
+            "partid": partid,
         }
         return self.call("waitsendpay", payload)
 

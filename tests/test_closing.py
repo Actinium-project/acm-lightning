@@ -298,7 +298,7 @@ def test_closing_negotiation_reconnect(node_factory, bitcoind):
 
 
 @unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1")
-def test_closing_specified_destination(node_factory, bitcoind):
+def test_closing_specified_destination(node_factory, bitcoind, chainparams):
     l1, l2, l3, l4 = node_factory.get_nodes(4)
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
@@ -314,7 +314,7 @@ def test_closing_specified_destination(node_factory, bitcoind):
     l1.pay(l4, 100000000)
 
     bitcoind.generate_block(5)
-    addr = 'bcrt1qeyyk6sl5pr49ycpqyckvmttus5ttj25pd0zpvg'
+    addr = chainparams['example_addr']
     l1.rpc.close(chan12, None, addr)
     l1.rpc.call('close', {'id': chan13, 'destination': addr})
     l1.rpc.call('close', [chan14, None, addr])
@@ -327,47 +327,42 @@ def test_closing_specified_destination(node_factory, bitcoind):
     assert bitcoind.rpc.getmempoolinfo()['size'] == 3
 
     # Now grab the close transaction
-    closetxid = bitcoind.rpc.getrawmempool(False)
-    assert len(closetxid) == 3
-
-    idindex = {}
-    for n in [l2, l3, l4]:
-        billboard = only_one(l1.rpc.listpeers(n.info['id'])['peers'][0]['channels'])['status']
-        idindex[n] = [i for i in range(3) if billboard == [
-            'CLOSINGD_SIGEXCHANGE:We agreed on a closing fee of 5430 satoshi for tx:{}'.format(closetxid[i]),
-        ]][0]
-        assert idindex[n] in range(3)
+    closetxs = {}
+    for i, n in enumerate([l2, l3, l4]):
+        billboard = only_one(l1.rpc.listpeers(n.info['id'])['peers'][0]['channels'])['status'][0]
+        m = re.search(r'CLOSINGD_SIGEXCHANGE.* tx:([a-f0-9]{64})', billboard)
+        closetxs[n] = m.group(1)
 
     bitcoind.generate_block(1)
     sync_blockheight(bitcoind, [l1, l2, l3, l4])
 
     # l1 can't spent the output to addr.
-    assert not l1.daemon.is_in_log(r'Owning output.* \(SEGWIT\).* txid %s.* CONFIRMED' % closetxid[0])
-    assert not l1.daemon.is_in_log(r'Owning output.* \(SEGWIT\).* txid %s.* CONFIRMED' % closetxid[1])
-    assert not l1.daemon.is_in_log(r'Owning output.* \(SEGWIT\).* txid %s.* CONFIRMED' % closetxid[2])
+    for txid in closetxs.values():
+        assert not l1.daemon.is_in_log(r'Owning output.* \(SEGWIT\).* txid {}.* CONFIRMED'.format(txid))
+
     # Check the txid has at least 1 confirmation
-    l2.daemon.wait_for_log(r'Owning output.* \(SEGWIT\).* txid %s.* CONFIRMED' % closetxid[idindex[l2]])
-    l3.daemon.wait_for_log(r'Owning output.* \(SEGWIT\).* txid %s.* CONFIRMED' % closetxid[idindex[l3]])
-    l4.daemon.wait_for_log(r'Owning output.* \(SEGWIT\).* txid %s.* CONFIRMED' % closetxid[idindex[l4]])
+    for n, txid in closetxs.items():
+        n.daemon.wait_for_log(r'Owning output.* \(SEGWIT\).* txid {}.* CONFIRMED'.format(txid))
 
     for n in [l2, l3, l4]:
         # Make sure both nodes have grabbed their close tx funds
+        closetx = closetxs[n]
         outputs = n.rpc.listfunds()['outputs']
-        assert closetxid[idindex[n]] in set([o['txid'] for o in outputs])
-        output_num2 = [o for o in outputs if o['txid'] == closetxid[idindex[n]]][0]['output']
+        assert closetx in set([o['txid'] for o in outputs])
+        output_num2 = [o for o in outputs if o['txid'] == closetx][0]['output']
         output_num1 = 0 if output_num2 == 1 else 1
         # Check the another address is addr
-        assert addr == bitcoind.rpc.gettxout(closetxid[idindex[n]], output_num1)['scriptPubKey']['addresses'][0]
-        assert 1 == bitcoind.rpc.gettxout(closetxid[idindex[n]], output_num1)['confirmations']
+        assert addr == bitcoind.rpc.gettxout(closetx, output_num1)['scriptPubKey']['addresses'][0]
+        assert 1 == bitcoind.rpc.gettxout(closetx, output_num1)['confirmations']
 
 
 @unittest.skipIf(not COMPAT, "needs COMPAT=1")
-def test_deprecated_closing_compat(node_factory, bitcoind):
+def test_deprecated_closing_compat(node_factory, bitcoind, chainparams):
     """ The old-style close command is:
         close {id} {force} {timeout}
     """
     l1, l2 = node_factory.get_nodes(2, opts=[{'allow-deprecated-apis': True}, {}])
-    addr = 'bcrt1qeyyk6sl5pr49ycpqyckvmttus5ttj25pd0zpvg'
+    addr = chainparams['example_addr']
     nodeid = l2.info['id']
 
     l1.rpc.check(command_to_check='close', id=nodeid)
@@ -1613,7 +1608,7 @@ def test_shutdown(node_factory):
 
 @flaky
 @unittest.skipIf(not DEVELOPER, "needs to set upfront_shutdown_script")
-def test_option_upfront_shutdown_script(node_factory, bitcoind):
+def test_option_upfront_shutdown_script(node_factory, bitcoind, executor):
     l1 = node_factory.get_node(start=False)
     # Insist on upfront script we're not going to match.
     l1.daemon.env["DEV_OPENINGD_UPFRONT_SHUTDOWN_SCRIPT"] = "76a91404b61f7dc1ea0dc99424464cc4064dc564d91e8988ac"
@@ -1623,14 +1618,16 @@ def test_option_upfront_shutdown_script(node_factory, bitcoind):
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     l1.fund_channel(l2, 1000000, False)
 
-    l1.rpc.close(l2.info['id'])
+    # This will block, as l12 will send an error but l2 will retry.
+    fut = executor.submit(l1.rpc.close, l2.info['id'])
 
     # l2 will close unilaterally when it dislikes shutdown script.
-    l1.daemon.wait_for_log(r'received ERROR.*scriptpubkey .* is not as agreed upfront \(76a91404b61f7dc1ea0dc99424464cc4064dc564d91e8988ac\)')
+    l1.daemon.wait_for_log(r'scriptpubkey .* is not as agreed upfront \(76a91404b61f7dc1ea0dc99424464cc4064dc564d91e8988ac\)')
 
     # Clear channel.
     wait_for(lambda: len(bitcoind.rpc.getrawmempool()) != 0)
     bitcoind.generate_block(1)
+    fut.result(TIMEOUT)
     wait_for(lambda: [c['state'] for c in only_one(l1.rpc.listpeers()['peers'])['channels']] == ['ONCHAIN'])
     wait_for(lambda: [c['state'] for c in only_one(l2.rpc.listpeers()['peers'])['channels']] == ['ONCHAIN'])
 
@@ -1641,7 +1638,7 @@ def test_option_upfront_shutdown_script(node_factory, bitcoind):
     l2.rpc.close(l1.info['id'])
 
     # l2 will close unilaterally when it dislikes shutdown script.
-    l1.daemon.wait_for_log(r'received ERROR.*scriptpubkey .* is not as agreed upfront \(76a91404b61f7dc1ea0dc99424464cc4064dc564d91e8988ac\)')
+    l1.daemon.wait_for_log(r'scriptpubkey .* is not as agreed upfront \(76a91404b61f7dc1ea0dc99424464cc4064dc564d91e8988ac\)')
 
     # Clear channel.
     wait_for(lambda: len(bitcoind.rpc.getrawmempool()) != 0)

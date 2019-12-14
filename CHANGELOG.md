@@ -4,26 +4,80 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.0-rc2] - 2019-12-13: "Blockchain Good, Orange Coin Bad"
+
+This release was named by Michael Schmoock @m-schmoock.
 
 ### Added
 
+ - JSON API: Added `createonion` and `sendonion` JSON-RPC methods allowing the implementation of custom protocol extensions that are not directly implemented in c-lightning itself. ([3260](https://github.com/ElementsProject/lightning/pull/3260))
+ - JSON API: `listinvoices` now displays the payment preimage if the invoice was paid. ([3295](https://github.com/ElementsProject/lightning/pull/3295))
+ - JSON API: `listpeers` channels now include `close_to` and `close_to_addr` iff a `close_to` address was specified at channel open ([3223](https://github.com/ElementsProject/lightning/pull/3223))
+ - The new `pyln-testing` package now contains the testing infrastructure so it can be reused to test against c-lightning in external projects ([3218](https://github.com/ElementsProject/lightning/pull/3218))
+ - config: configuration files now support `include`. ([3268](https://github.com/ElementsProject/lightning/pull/3268))
+ - options: Allow the Tor inbound service port differ from 9735 ([3155](https://github.com/ElementsProject/lightning/pull/3155))
+ - options: Persistent Tor address support ([3155](https://github.com/ElementsProject/lightning/pull/3155))
+ - plugins: A new plugin hook, `rpc_command` allows a plugin to take over `lightningd` for any RPC command. ([2925](https://github.com/ElementsProject/lightning/pull/2925))
+ - plugins: Allow the `accepter` to specify an upfront_shutdown_script for a channel via a `close_to` field in the openchannel hook result ([3280](https://github.com/ElementsProject/lightning/pull/3280))
+ - plugins: Plugins may now handle modern TLV-style payloads via the `htlc_accepted` hook ([3260](https://github.com/ElementsProject/lightning/pull/3260))
+ - plugins: libplugin now supports writing plugins which register to hooks ([3317](https://github.com/ElementsProject/lightning/pull/3317))
+ - plugins: libplugin now supports writing plugins which register to notifications ([3317](https://github.com/ElementsProject/lightning/pull/3317))
+ - protocol: Payment amount fuzzing is restored, but through shadow routing. ([3212](https://github.com/ElementsProject/lightning/pull/3212))
+ - protocol: We now signal the network we are running on at init. ([3300](https://github.com/ElementsProject/lightning/pull/3300))
+ - protocol: can now send and receive TLV-style onion messages. ([3335](https://github.com/ElementsProject/lightning/pull/3335))
+ - protocol: can now send and receive BOLT11 payment_secrets. ([3335](https://github.com/ElementsProject/lightning/pull/3335))
+ - protocol: can now receive basic multi-part payments. ([3335](https://github.com/ElementsProject/lightning/pull/3335))
+ - JSON RPC: low-level commands sendpay and waitsendpay can now be used to manually send multi-part payments. ([3335](https://github.com/ElementsProject/lightning/pull/3335))
+ - quirks: Workaround LND's `reply_channel_range` issues instead of sending error. ([3264](https://github.com/ElementsProject/lightning/pull/3264))
+ - tools: A new command, `guesstoremote`, is added to the hsmtool. It is meant to be used to recover funds after an unilateral close of a channel with `option_static_remotekey` enabled. ([3292](https://github.com/ElementsProject/lightning/pull/3292))
+
 ### Changed
+
+:warning: The default network and the default location of the lightning home directory changed. Please make sure that the configuration, key file and database are moved into the network-specific subdirectory.
+
+ - config: Default network (new installs) is now bitcoin, not testnet. ([3268](https://github.com/ElementsProject/lightning/pull/3268))
+ - config: Lightning directory, plugins and files moved into `<network>/` subdir ([3268](https://github.com/ElementsProject/lightning/pull/3268))
+ - JSON API: The `fundchannel` command now tries to connect to the peer before funding the channel, no need to `connect` before `fundchannel` if an address for the peer is known ([3314](https://github.com/ElementsProject/lightning/pull/3314))
+ - JSON API: `htlc_accepted` hook has `type` (currently `legacy` or `tlv`) and other fields directly inside `onion`. ([3167](https://github.com/ElementsProject/lightning/pull/3167))
+ - JSON API: `lightning_` prefixes removed from subdaemon names, including in listpeers `owner` field. ([3241](https://github.com/ElementsProject/lightning/pull/3241))
+ - JSON API: `listconfigs` now structures plugins and include their options ([3283](https://github.com/ElementsProject/lightning/pull/3283))
+ - JSON API: the `raw_payload` now includes the first byte, i.e., the realm byte, of the payload as well. This allows correct decoding of a TLV payload in the plugins. ([3261](https://github.com/ElementsProject/lightning/pull/3261))
+ - logging: formatting made uniform: [NODEID-]SUBSYSTEM: MESSAGE ([3241](https://github.com/ElementsProject/lightning/pull/3241))
+ - options: `config` and `<network>/config` read by default. ([3268](https://github.com/ElementsProject/lightning/pull/3268))
+ - options: log-level can now specify different levels for different subsystems. ([3241](https://github.com/ElementsProject/lightning/pull/3241))
+ - protocol: The TLV payloads for the onion packets are no longer considered an experimental feature and generally available. ([3260](https://github.com/ElementsProject/lightning/pull/3260))
+ - quirks: We'll now reconnect and retry if we get an error on an established channel. This works around lnd sending error messages that may be non-fatal. ([3340](https://github.com/ElementsProject/lightning/pull/3340))
+
+:warning: If you don't have a config file, you now may need to specify the network to `lightning-cli` ([3268](https://github.com/ElementsProject/lightning/pull/3268))
 
 ### Deprecated
 
 Note: You should always set `allow-deprecated-apis=false` to test for changes.
 
+ - JSON API: `listconfigs` duplicated "plugin" paths ([3283](https://github.com/ElementsProject/lightning/pull/3283))
+ - JSON API: `htlc_accepted` hook `per_hop_v0` object deprecated, as is `short_channel_id` for the final hop. ([3167](https://github.com/ElementsProject/lightning/pull/3167))
+
 ### Removed
+
+ - JSON: `listpays` won't shown payments made via sendpay without a bolt11 string, or before 0.7.0. ([3309](https://github.com/ElementsProject/lightning/pull/3309))
 
 ### Fixed
 
-### Security
+ - JSON API: #3231 `listtransactions` crash ([3256](https://github.com/ElementsProject/lightning/pull/3256))
+ - JSON API: `listconfigs` appends '...' to truncated config options. ([3268](https://github.com/ElementsProject/lightning/pull/3268))
+ - `pyln-client` now handles unicode characters in JSON-RPC requests and responses correctly. ([3018](https://github.com/ElementsProject/lightning/pull/3018))
+ - bitcoin: If bitcoind goes backwards (e.g. reindex) refuse to start (unless forced with --rescan). ([3274](https://github.com/ElementsProject/lightning/pull/3274))
+ - bug: `gossipd` crash on huge number of unknown channels. ([3273](https://github.com/ElementsProject/lightning/pull/3273))
+ - gossip: No longer discard most `node_announcements` (fixes #3194) ([3262](https://github.com/ElementsProject/lightning/pull/3262))
+ - options: We disable all dns even on startup the scan for bogus dns servers, if `--always-use-proxy` is set true ([3251](https://github.com/ElementsProject/lightning/pull/3251))
+ - protocol: "Bad commitment signature" closing channels when we sent back-to-back update_fee messages across multiple reconnects. ([3329](https://github.com/ElementsProject/lightning/pull/3329))
+ - protocol: Unlikely corner case is simultanous HTLCs near balance limits fixed. ([3286](https://github.com/ElementsProject/lightning/pull/3286))
 
+### Security
 
 ## [0.7.3] - 2019-10-18: "Bitcoin's Proof of Stake"
 
-This release named by @trueptolemy.
+This release was named by @trueptolemy.
 
 ### Added
 
@@ -86,7 +140,7 @@ Note: You should always set `allow-deprecated-apis=false` to test for changes.
 
 ## [0.7.2.1] - 2019-08-19: "Nakamoto's Pre-approval by US Congress"
 
-This release named by Antoine Poinsot @darosior.
+This release was named by Antoine Poinsot @darosior.
 
 (Technically a .1 release, as it contains last-minute fixes after 0.7.2 was tagged)
 
@@ -138,7 +192,7 @@ changes.
 
 ## [0.7.1] - 2019-06-29: "The Unfailing Twitter Consensus Algorithm"
 
-This release named by (C-Lightning Core Team member) Lisa Neigut @niftynei.
+This release was named by (C-Lightning Core Team member) Lisa Neigut @niftynei.
 
 ### Added
 
@@ -203,7 +257,7 @@ changes.
 
 ## [0.7.0] - 2019-02-28: "Actually an Altcoin"
 
-This release named by Mark Beckwith @wythe.
+This release was named by Mark Beckwith @wythe.
 
 ### Added
 
@@ -284,7 +338,7 @@ provide appropriate suffixes for JSON input fields.
 
 ## [0.6.3] - 2019-01-09: "The Smallblock Conspiracy"
 
-This release named by @molxyz and [@ctrlbreak](https://twitter.com/ctrlbreak).
+This release was named by @molxyz and [@ctrlbreak](https://twitter.com/ctrlbreak).
 
 ### Added
 
@@ -332,7 +386,7 @@ changes.
 
 ## [0.6.2] - 2018-10-20: "The Consensus Loving Nasal Daemon"
 
-This release named by practicalswift.
+This release was named by practicalswift.
 
 ### Added
 
@@ -389,7 +443,7 @@ changes.
 
 ## [0.6.1] - 2018-09-11: "Principled Opposition To Segwit"
 
-This release named by ZmnSCPxj.
+This release was named by ZmnSCPxj.
 
 ### Added
 
@@ -475,7 +529,7 @@ This release named by ZmnSCPxj.
 In the prehistory of c-lightning, no changelog was kept.  But major
 JSON API changes are tracked.
 
-This release named by Fabrice Drouin.
+This release was named by Fabrice Drouin.
 
 ### Deprecated
 
@@ -513,7 +567,8 @@ There predate the BOLT specifications, and are only of vague historic interest:
 6. [0.5.1] - 2016-10-21
 7. [0.5.2] - 2016-11-21: "Bitcoin Savings & Trust Daily Interest II"
 
-[Unreleased]: https://github.com/ElementsProject/lightning/compare/v0.7.3...HEAD
+[Unreleased]: https://github.com/ElementsProject/lightning/compare/v0.8.0...HEAD
+[0.8.0-rc1]: https://github.com/ElementsProject/lightning/releases/tag/v0.8.0-rc1
 [0.7.3]: https://github.com/ElementsProject/lightning/releases/tag/v0.7.3
 [0.7.2.1]: https://github.com/ElementsProject/lightning/releases/tag/v0.7.2.1
 [0.7.1]: https://github.com/ElementsProject/lightning/releases/tag/v0.7.1

@@ -20,6 +20,7 @@
 #include <common/crypto_sync.h>
 #include <common/derive_basepoints.h>
 #include <common/features.h>
+#include <common/fee_states.h>
 #include <common/funding_tx.h>
 #include <common/gen_peer_status_wire.h>
 #include <common/gossip_rcvd_filter.h>
@@ -431,7 +432,7 @@ static u8 *opening_negotiate_msg(const tal_t *ctx, struct state *state,
 					wire_sync_write(REQ_FD, take(msg));
 				}
 				peer_failed_received_errmsg(state->pps, err,
-							    NULL);
+							    NULL, false);
 			}
 			negotiation_aborted(state, am_funder,
 					    tal_fmt(tmpctx, "They sent error %s",
@@ -670,7 +671,8 @@ static bool funder_finalize_channel_setup(struct state *state,
 					     state->minimum_depth,
 					     state->funding,
 					     local_msat,
-					     state->feerate_per_kw,
+					     take(new_fee_states(NULL, LOCAL,
+								 &state->feerate_per_kw)),
 					     &state->localconf,
 					     &state->remoteconf,
 					     &state->our_points,
@@ -1136,7 +1138,8 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 					     state->minimum_depth,
 					     state->funding,
 					     state->push_msat,
-					     state->feerate_per_kw,
+					     take(new_fee_states(NULL, REMOTE,
+								 &state->feerate_per_kw)),
 					     &state->localconf,
 					     &state->remoteconf,
 					     &state->our_points, &theirs,
@@ -1280,7 +1283,7 @@ static u8 *handle_peer_in(struct state *state)
 
 	/* Handles standard cases, and legal unknown ones. */
 	if (handle_peer_gossip_or_error(state->pps,
-					&state->channel_id, msg))
+					&state->channel_id, false, msg))
 		return NULL;
 
 	sync_crypto_write(state->pps,

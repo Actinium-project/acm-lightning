@@ -481,6 +481,114 @@ static struct migration dbmigrations[] = {
     {SQL("UPDATE forwarded_payments SET received_time=0 WHERE received_time IS NULL;"),
 	 NULL},
     {SQL("ALTER TABLE invoices ADD COLUMN features BLOB DEFAULT '';"), NULL},
+   /* We can now have multiple payments in progress for a single hash, so
+    * add two fields; combination of payment_hash & partid is unique. */
+    {SQL("ALTER TABLE payments RENAME TO temp_payments;"), NULL},
+    {SQL("CREATE TABLE payments ("
+	 " id BIGSERIAL"
+	 ", timestamp INTEGER"
+	 ", status INTEGER"
+	 ", payment_hash BLOB"
+	 ", destination BLOB"
+	 ", msatoshi BIGINT"
+	 ", payment_preimage BLOB"
+	 ", path_secrets BLOB"
+	 ", route_nodes BLOB"
+	 ", route_channels BLOB"
+	 ", failonionreply BLOB"
+	 ", faildestperm INTEGER"
+	 ", failindex INTEGER"
+	 ", failcode INTEGER"
+	 ", failnode BLOB"
+	 ", failchannel TEXT"
+	 ", failupdate BLOB"
+	 ", msatoshi_sent BIGINT"
+	 ", faildetail TEXT"
+	 ", description TEXT"
+	 ", faildirection INTEGER"
+	 ", bolt11 TEXT"
+	 ", total_msat BIGINT"
+	 ", partid BIGINT"
+	 ", PRIMARY KEY (id)"
+	 ", UNIQUE (payment_hash, partid))"), NULL},
+    {SQL("INSERT INTO payments ("
+	 "id"
+	 ", timestamp"
+	 ", status"
+	 ", payment_hash"
+	 ", destination"
+	 ", msatoshi"
+	 ", payment_preimage"
+	 ", path_secrets"
+	 ", route_nodes"
+	 ", route_channels"
+	 ", failonionreply"
+	 ", faildestperm"
+	 ", failindex"
+	 ", failcode"
+	 ", failnode"
+	 ", failchannel"
+	 ", failupdate"
+	 ", msatoshi_sent"
+	 ", faildetail"
+	 ", description"
+	 ", faildirection"
+	 ", bolt11)"
+	 "SELECT id"
+	 ", timestamp"
+	 ", status"
+	 ", payment_hash"
+	 ", destination"
+	 ", msatoshi"
+	 ", payment_preimage"
+	 ", path_secrets"
+	 ", route_nodes"
+	 ", route_channels"
+	 ", failonionreply"
+	 ", faildestperm"
+	 ", failindex"
+	 ", failcode"
+	 ", failnode"
+	 ", failchannel"
+	 ", failupdate"
+	 ", msatoshi_sent"
+	 ", faildetail"
+	 ", description"
+	 ", faildirection"
+	 ", bolt11 FROM temp_payments;"), NULL},
+    {SQL("UPDATE payments SET total_msat = msatoshi;"), NULL},
+    {SQL("UPDATE payments SET partid = 0;"), NULL},
+    {SQL("DROP TABLE temp_payments;"), NULL},
+    {SQL("ALTER TABLE channel_htlcs ADD partid BIGINT;"), NULL},
+    {SQL("UPDATE channel_htlcs SET partid = 0;"), NULL},
+    {SQL("CREATE TABLE channel_feerates ("
+	 "  channel_id BIGINT REFERENCES channels(id) ON DELETE CASCADE,"
+	 "  hstate INTEGER,"
+	 "  feerate_per_kw INTEGER,"
+	 "  UNIQUE (channel_id, hstate)"
+	 ");"),
+     NULL},
+    /* Cast old-style per-side feerates into most likely layout for statewise
+     * feerates. */
+    /* If we're funder (LOCAL=0):
+     *   Then our feerate is set last (SENT_ADD_ACK_REVOCATION = 4) */
+    {SQL("INSERT INTO channel_feerates(channel_id, hstate, feerate_per_kw)"
+	 " SELECT id, 4, local_feerate_per_kw FROM channels WHERE funder = 0;"),
+     NULL},
+    /*   If different, assume their feerate is in state SENT_ADD_COMMIT = 1 */
+    {SQL("INSERT INTO channel_feerates(channel_id, hstate, feerate_per_kw)"
+	 " SELECT id, 1, remote_feerate_per_kw FROM channels WHERE funder = 0 and local_feerate_per_kw != remote_feerate_per_kw;"),
+     NULL},
+    /* If they're funder (REMOTE=1):
+     *   Then their feerate is set last (RCVD_ADD_ACK_REVOCATION = 14) */
+    {SQL("INSERT INTO channel_feerates(channel_id, hstate, feerate_per_kw)"
+	 " SELECT id, 14, remote_feerate_per_kw FROM channels WHERE funder = 1;"),
+     NULL},
+    /*   If different, assume their feerate is in state RCVD_ADD_COMMIT = 11 */
+    {SQL("INSERT INTO channel_feerates(channel_id, hstate, feerate_per_kw)"
+	 " SELECT id, 11, local_feerate_per_kw FROM channels WHERE funder = 1 and local_feerate_per_kw != remote_feerate_per_kw;"),
+     NULL},
+    /* FIXME: Remove now-unused local_feerate_per_kw and remote_feerate_per_kw from channels */
 };
 
 /* Leak tracking. */

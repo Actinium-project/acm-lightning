@@ -9,6 +9,7 @@
 #include <channeld/commit_tx.h>
 #include <channeld/full_channel.h>
 #include <common/channel_config.h>
+#include <common/fee_states.h>
 #include <common/htlc.h>
 #include <common/htlc_trim.h>
 #include <common/htlc_tx.h>
@@ -91,7 +92,7 @@ struct channel *new_full_channel(const tal_t *ctx,
 				 u32 minimum_depth,
 				 struct amount_sat funding,
 				 struct amount_msat local_msat,
-				 const u32 feerate_per_kw[NUM_SIDES],
+				 const struct fee_states *fee_states,
 				 const struct channel_config *local,
 				 const struct channel_config *remote,
 				 const struct basepoints *local_basepoints,
@@ -107,7 +108,7 @@ struct channel *new_full_channel(const tal_t *ctx,
 						      minimum_depth,
 						      funding,
 						      local_msat,
-						      feerate_per_kw[LOCAL],
+						      fee_states,
 						      local, remote,
 						      local_basepoints,
 						      remote_basepoints,
@@ -117,8 +118,6 @@ struct channel *new_full_channel(const tal_t *ctx,
 						      funder);
 
 	if (channel) {
-		/* Feerates can be different. */
-		channel->view[REMOTE].feerate_per_kw = feerate_per_kw[REMOTE];
 		channel->htlcs = tal(channel, struct htlc_map);
 		htlc_map_init(channel->htlcs);
 		memleak_add_helper(channel->htlcs, memleak_help_htlcmap);
@@ -231,7 +230,7 @@ static void add_htlcs(struct bitcoin_tx ***txs,
 {
 	size_t i;
 	struct bitcoin_txid txid;
-	u32 feerate_per_kw = channel->view[side].feerate_per_kw;
+	u32 feerate_per_kw = channel_feerate(channel, side);
 
 	/* Get txid of commitment transaction */
 	bitcoin_txid((*txs)[0], &txid);
@@ -306,7 +305,7 @@ struct bitcoin_tx **channel_txs(const tal_t *ctx,
 	    ctx, &channel->funding_txid, channel->funding_txout,
 	    channel->funding, channel->funder,
 	    channel->config[!side].to_self_delay, &keyset,
-	    channel->view[side].feerate_per_kw,
+	    channel_feerate(channel, side),
 	    channel->config[side].dust_limit, channel->view[side].owed[side],
 	    channel->view[side].owed[!side], committed, htlcmap,
 	    commitment_number ^ channel->commitment_number_obscurer, side);
@@ -370,7 +369,7 @@ static struct amount_sat fee_for_htlcs(const struct channel *channel,
 				       const struct htlc **removing,
 				       enum side side)
 {
-	u32 feerate = view->feerate_per_kw;
+	u32 feerate = channel_feerate(channel, side);
 	struct amount_sat dust_limit = channel->config[side].dust_limit;
 	size_t untrimmed;
 
@@ -622,13 +621,6 @@ static enum channel_add_err add_htlc(struct channel *channel,
 	if (htlcp)
 		*htlcp = htlc;
 
-	/* This is simply setting changes_pending[receiver] unless it's
-	 * an exotic state (i.e. channel_force_htlcs) */
-	if (htlc_state_flags(htlc->state) & HTLC_LOCAL_F_PENDING)
-		channel->changes_pending[LOCAL] = true;
-	if (htlc_state_flags(htlc->state) & HTLC_REMOTE_F_PENDING)
-		channel->changes_pending[REMOTE] = true;
-
 	return CHANNEL_ERR_ADD_OK;
 }
 
@@ -718,8 +710,6 @@ enum channel_remove_err channel_fulfill_htlc(struct channel *channel,
 			     htlc->id, htlc_state_name(htlc->state));
 		return CHANNEL_ERR_HTLC_NOT_IRREVOCABLE;
 	}
-	/* The HTLC owner is the recipient of the fulfillment. */
-	channel->changes_pending[owner] = true;
 
 	dump_htlc(htlc, "FULFILL:");
 
@@ -763,8 +753,6 @@ enum channel_remove_err channel_fail_htlc(struct channel *channel,
 			     htlc->id, htlc_state_name(htlc->state));
 		return CHANNEL_ERR_HTLC_NOT_IRREVOCABLE;
 	}
-	/* The HTLC owner is the recipient of the failure. */
-	channel->changes_pending[owner] = true;
 
 	dump_htlc(htlc, "FAIL:");
 	if (htlcp)
@@ -812,6 +800,37 @@ static void htlc_incstate(struct channel *channel,
 	}
 }
 
+/* Returns true if a change was made. */
+static bool fee_incstate(struct channel *channel,
+			 enum side sidechanged,
+			 enum htlc_state hstate)
+{
+	int preflags, postflags;
+	const int committed_f = HTLC_FLAG(sidechanged, HTLC_F_COMMITTED);
+
+	preflags = htlc_state_flags(hstate);
+	postflags = htlc_state_flags(hstate + 1);
+
+	/* You can't change sides. */
+	assert((preflags & (HTLC_LOCAL_F_OWNER|HTLC_REMOTE_F_OWNER))
+	       == (postflags & (HTLC_LOCAL_F_OWNER|HTLC_REMOTE_F_OWNER)));
+
+	/* These only advance through ADDING states. */
+	if (!(htlc_state_flags(hstate) & HTLC_ADDING))
+		return false;
+
+	if (!inc_fee_state(channel->fee_states, hstate))
+		return false;
+
+	if (!(preflags & committed_f) && (postflags & committed_f))
+		status_debug("Feerate: %s->%s %s now %u",
+			     htlc_state_name(hstate),
+			     htlc_state_name(hstate+1),
+			     side_to_str(sidechanged),
+			     *channel->fee_states->feerate[hstate+1]);
+	return true;
+}
+
 /* Returns flags which were changed. */
 static int change_htlcs(struct channel *channel,
 			enum side sidechanged,
@@ -853,6 +872,13 @@ static int change_htlcs(struct channel *channel,
 						     &channel->view[sidechanged].owed[i]),
 				      owed[i].msat);
 		}
+	}
+
+	/* Update fees. */
+	for (i = 0; i < n_hstates; i++) {
+		if (fee_incstate(channel, sidechanged, htlc_states[i]))
+			cflags |= (htlc_state_flags(htlc_states[i])
+				   ^ htlc_state_flags(htlc_states[i]+1));
 	}
 
 	return cflags;
@@ -967,34 +993,24 @@ bool channel_update_feerate(struct channel *channel, u32 feerate_per_kw)
 	status_debug("Setting %s feerate to %u",
 		     side_to_str(!channel->funder), feerate_per_kw);
 
-	channel->view[!channel->funder].feerate_per_kw = feerate_per_kw;
-	channel->changes_pending[!channel->funder] = true;
+	start_fee_update(channel->fee_states, channel->funder, feerate_per_kw);
 	return true;
-}
-
-u32 channel_feerate(const struct channel *channel, enum side side)
-{
-	return channel->view[side].feerate_per_kw;
 }
 
 bool channel_sending_commit(struct channel *channel,
 			    const struct htlc ***htlcs)
 {
+	int change;
 	const enum htlc_state states[] = { SENT_ADD_HTLC,
 					   SENT_REMOVE_REVOCATION,
 					   SENT_ADD_REVOCATION,
 					   SENT_REMOVE_HTLC };
 	status_debug("Trying commit");
 
-	if (!channel->changes_pending[REMOTE]) {
-		assert(change_htlcs(channel, REMOTE, states, ARRAY_SIZE(states),
-				    htlcs, "testing sending_commit") == 0);
+	change = change_htlcs(channel, REMOTE, states, ARRAY_SIZE(states),
+			      htlcs, "sending_commit");
+	if (!change)
 		return false;
-	}
-
-	change_htlcs(channel, REMOTE, states, ARRAY_SIZE(states),
-		     htlcs, "sending_commit");
-	channel->changes_pending[REMOTE] = false;
 
 	return true;
 }
@@ -1013,42 +1029,23 @@ bool channel_rcvd_revoke_and_ack(struct channel *channel,
 			      htlcs, "rcvd_revoke_and_ack");
 
 	/* Their ack can queue changes on our side. */
-	if (change & HTLC_LOCAL_F_PENDING)
-		channel->changes_pending[LOCAL] = true;
-
-	/* For funder, ack also means time to apply new feerate locally. */
-	if (channel->funder == LOCAL &&
-	    (channel->view[LOCAL].feerate_per_kw
-	     != channel->view[REMOTE].feerate_per_kw)) {
-		status_debug("Applying feerate %u to LOCAL",
-			     channel->view[REMOTE].feerate_per_kw);
-		channel->view[LOCAL].feerate_per_kw
-			= channel->view[REMOTE].feerate_per_kw;
-		channel->changes_pending[LOCAL] = true;
-	}
-
-	return channel->changes_pending[LOCAL];
+	return (change & HTLC_LOCAL_F_PENDING);
 }
 
 /* FIXME: We can actually merge these two... */
 bool channel_rcvd_commit(struct channel *channel, const struct htlc ***htlcs)
 {
+	int change;
 	const enum htlc_state states[] = { RCVD_ADD_REVOCATION,
 					   RCVD_REMOVE_HTLC,
 					   RCVD_ADD_HTLC,
 					   RCVD_REMOVE_REVOCATION };
 
 	status_debug("Received commit");
-	if (!channel->changes_pending[LOCAL]) {
-		assert(change_htlcs(channel, LOCAL, states, ARRAY_SIZE(states),
-				    htlcs, "testing rcvd_commit") == 0);
+	change = change_htlcs(channel, LOCAL, states, ARRAY_SIZE(states),
+			      htlcs, "rcvd_commit");
+	if (!change)
 		return false;
-	}
-
-	change_htlcs(channel, LOCAL, states, ARRAY_SIZE(states), htlcs,
-		     "rcvd_commit");
-
-	channel->changes_pending[LOCAL] = false;
 	return true;
 }
 
@@ -1064,21 +1061,7 @@ bool channel_sending_revoke_and_ack(struct channel *channel)
 			      "sending_revoke_and_ack");
 
 	/* Our ack can queue changes on their side. */
-	if (change & HTLC_REMOTE_F_PENDING)
-		channel->changes_pending[REMOTE] = true;
-
-	/* For non-funder, sending ack means we apply any fund changes to them */
-	if (channel->funder == REMOTE
-	    && (channel->view[LOCAL].feerate_per_kw
-		!= channel->view[REMOTE].feerate_per_kw)) {
-		status_debug("Applying feerate %u to REMOTE",
-			     channel->view[LOCAL].feerate_per_kw);
-		channel->view[REMOTE].feerate_per_kw
-			= channel->view[LOCAL].feerate_per_kw;
-		channel->changes_pending[REMOTE] = true;
-	}
-
-	return channel->changes_pending[REMOTE];
+	return (change & HTLC_REMOTE_F_PENDING);
 }
 
 size_t num_channel_htlcs(const struct channel *channel)

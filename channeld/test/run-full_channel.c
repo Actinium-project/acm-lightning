@@ -1,3 +1,4 @@
+#include "../../common/fee_states.c"
 #include "../../common/initial_channel.c"
 #include "../../common/keyset.c"
 #include "../full_channel.c"
@@ -468,7 +469,8 @@ int main(void)
 	lchannel = new_full_channel(tmpctx,
 				    &funding_txid, funding_output_index, 0,
 				    funding_amount, to_local,
-				    feerate_per_kw,
+				    take(new_fee_states(NULL, LOCAL,
+							&feerate_per_kw[LOCAL])),
 				    local_config,
 				    remote_config,
 				    &localbase, &remotebase,
@@ -478,7 +480,8 @@ int main(void)
 	rchannel = new_full_channel(tmpctx,
 				    &funding_txid, funding_output_index, 0,
 				    funding_amount, to_remote,
-				    feerate_per_kw,
+				    take(new_fee_states(NULL, REMOTE,
+							&feerate_per_kw[REMOTE])),
 				    remote_config,
 				    local_config,
 				    &remotebase, &localbase,
@@ -629,8 +632,10 @@ int main(void)
 	for (i = 0; i < ARRAY_SIZE(feerates); i++) {
 		feerate_per_kw[LOCAL] = feerate_per_kw[REMOTE] = feerates[i];
 
-		lchannel->view[LOCAL].feerate_per_kw = feerate_per_kw[LOCAL];
-		rchannel->view[REMOTE].feerate_per_kw = feerate_per_kw[REMOTE];
+		*lchannel->fee_states->feerate[SENT_ADD_ACK_REVOCATION]
+			= feerate_per_kw[LOCAL];
+		*rchannel->fee_states->feerate[RCVD_ADD_ACK_REVOCATION]
+			= feerate_per_kw[REMOTE];
 
 		raw_tx = commit_tx(
 		    tmpctx, &funding_txid, funding_output_index,
@@ -652,6 +657,7 @@ int main(void)
 
 	/* No memory leaks please */
 	wally_cleanup(0);
+	take_cleanup();
 	tal_free(tmpctx);
 
 	/* FIXME: Do BOLT comparison! */

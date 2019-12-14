@@ -170,7 +170,7 @@ def node_factory(request, directory, test_name, bitcoind, executor, db_provider,
     def map_node_error(nodes, f, msg):
         for n in nodes:
             if n and f(n):
-                teardown_checks.add_node_error(n, msg)
+                teardown_checks.add_node_error(n, msg.format(n=n))
 
     map_node_error(nf.nodes, printValgrindErrors, "reported valgrind errors")
     map_node_error(nf.nodes, printCrashLog, "had crash.log files")
@@ -181,9 +181,7 @@ def node_factory(request, directory, test_name, bitcoind, executor, db_provider,
     map_node_error(nf.nodes, lambda n: n.daemon.is_in_log('bad hsm request'), "had bad hsm requests")
     map_node_error(nf.nodes, lambda n: n.daemon.is_in_log(r'Accessing a null column'), "Accessing a null column")
     map_node_error(nf.nodes, checkMemleak, "had memleak messages")
-
-    if not ok:
-        teardown_checks.add_error("At least one lightning exited with unexpected non-zero return code")
+    map_node_error(nf.nodes, lambda n: n.rc != 0 and not n.may_fail, "Node exited with return code {n.rc}")
 
 
 def getValgrindErrors(node):
@@ -304,6 +302,12 @@ def executor(teardown_checks):
 
 @pytest.fixture
 def chainparams():
+    """Return the chainparams for the TEST_NETWORK.
+
+     - chain_hash is in network byte order, not the RPC return order.
+     - example_addr doesn't belong to any node in the test (randomly generated)
+
+    """
     chainparams = {
         'regtest': {
             "bip173_prefix": "bcrt",
@@ -313,6 +317,7 @@ def chainparams():
             "elements": False,
             "example_addr": "bcrt1qeyyk6sl5pr49ycpqyckvmttus5ttj25pd0zpvg",
             "feeoutput": False,
+            "chain_hash": '06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f',
         },
         'liquid-regtest': {
             "bip173_prefix": "ert",
@@ -320,8 +325,9 @@ def chainparams():
             "name": "liquid-regtest",
             "p2sh_prefix": 'X',
             "elements": True,
-            "example_addr": "ert1qq8adjz4u6enf0cjey9j8yt0y490tact9fahkwf",
+            "example_addr": "ert1qjsesxflhs3632syhcz7llpfx20p5tr0kpllfve",
             "feeoutput": True,
+            "chain_hash": "9f87eb580b9e5f11dc211e9fb66abb3699999044f8fe146801162393364286c6",
         }
     }
 

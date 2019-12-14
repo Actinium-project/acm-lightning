@@ -584,25 +584,24 @@ static struct secret *get_shared_secret(const tal_t *ctx,
 					enum onion_type *why_bad,
 					struct sha256 *next_onion_sha)
 {
-	struct onionpacket *op;
+	struct onionpacket op;
 	struct secret *secret = tal(ctx, struct secret);
 	const u8 *msg;
 	struct route_step *rs;
 
 	/* We unwrap the onion now. */
-	op = parse_onionpacket(tmpctx, htlc->routing, TOTAL_PACKET_SIZE,
-			       why_bad);
-	if (!op)
+	*why_bad = parse_onionpacket(htlc->routing, TOTAL_PACKET_SIZE, &op);
+	if (*why_bad != 0)
 		return tal_free(secret);
 
 	/* Because wire takes struct pubkey. */
-	msg = hsm_req(tmpctx, towire_hsm_ecdh_req(tmpctx, &op->ephemeralkey));
+	msg = hsm_req(tmpctx, towire_hsm_ecdh_req(tmpctx, &op.ephemeralkey));
 	if (!fromwire_hsm_ecdh_resp(msg, secret))
 		status_failed(STATUS_FAIL_HSM_IO, "Reading ecdh response");
 
 	/* We make sure we can parse onion packet, so we know if shared secret
 	 * is actually valid (this checks hmac). */
-	rs = process_onionpacket(tmpctx, op, secret->data,
+	rs = process_onionpacket(tmpctx, &op, secret->data,
 				 htlc->rhash.u.u8,
 				 sizeof(htlc->rhash));
 	if (!rs) {
@@ -722,7 +721,7 @@ static struct changed_htlc *changed_htlc_arr(const tal_t *ctx,
 
 static u8 *sending_commitsig_msg(const tal_t *ctx,
 				 u64 remote_commit_index,
-				 u32 remote_feerate,
+				 const struct fee_states *fee_states,
 				 const struct htlc **changed_htlcs,
 				 const struct bitcoin_signature *commit_sig,
 				 const secp256k1_ecdsa_signature *htlc_sigs)
@@ -734,7 +733,7 @@ static u8 *sending_commitsig_msg(const tal_t *ctx,
 	 * committed to. */
 	changed = changed_htlc_arr(tmpctx, changed_htlcs);
 	msg = towire_channel_sending_commitsig(ctx, remote_commit_index,
-					       remote_feerate,
+					       fee_states,
 					       changed, commit_sig, htlc_sigs);
 	return msg;
 }
@@ -961,11 +960,9 @@ static u8 *make_failmsg(const tal_t *ctx,
 		/* FIXME: wire this into tlv parser somehow. */
 		msg = towire_invalid_onion_payload(ctx, 0, 0);
 		goto done;
-#if EXPERIMENTAL_FEATURES
 	case WIRE_MPP_TIMEOUT:
 		msg = towire_mpp_timeout(ctx);
 		goto done;
-#endif /* EXPERIMENTAL_FEATURES */
 	}
 	status_failed(STATUS_FAIL_INTERNAL_ERROR,
 		      "Asked to create failmsg %u (%s)",
@@ -1181,7 +1178,7 @@ static void send_commit(struct peer *peer)
 	status_debug("Telling master we're about to commit...");
 	/* Tell master to save this next commit to database, then wait. */
 	msg = sending_commitsig_msg(NULL, peer->next_index[REMOTE],
-				    channel_feerate(peer->channel, REMOTE),
+				    peer->channel->fee_states,
 				    changed_htlcs,
 				    &commit_sig,
 				    htlc_sigs);
@@ -1260,44 +1257,20 @@ static u8 *make_revocation_msg(const struct peer *peer, u64 revoke_index,
 				     point);
 }
 
-static void send_revocation(struct peer *peer)
+/* Convert changed htlcs into parts which lightningd expects. */
+static void marshall_htlc_info(const tal_t *ctx,
+			       const struct htlc **changed_htlcs,
+			       struct changed_htlc **changed,
+			       struct fulfilled_htlc **fulfilled,
+			       const struct failed_htlc ***failed,
+			       struct added_htlc **added,
+			       struct secret **shared_secret)
 {
-	/* Revoke previous commit, get new point. */
-	u8 *msg = make_revocation_msg(peer, peer->next_index[LOCAL]-1,
-				      &peer->next_local_per_commit);
-
-	/* From now on we apply changes to the next commitment */
-	peer->next_index[LOCAL]++;
-
-	/* If this queues more changes on the other end, send commit. */
-	if (channel_sending_revoke_and_ack(peer->channel)) {
-		status_debug("revoke_and_ack made pending: commit timer");
-		start_commit_timer(peer);
-	}
-
-	sync_crypto_write_no_delay(peer->pps, take(msg));
-}
-
-static u8 *got_commitsig_msg(const tal_t *ctx,
-			     u64 local_commit_index,
-			     u32 local_feerate,
-			     const struct bitcoin_signature *commit_sig,
-			     const secp256k1_ecdsa_signature *htlc_sigs,
-			     const struct htlc **changed_htlcs,
-			     const struct bitcoin_tx *committx)
-{
-	struct changed_htlc *changed;
-	struct fulfilled_htlc *fulfilled;
-	const struct failed_htlc **failed;
-	struct added_htlc *added;
-	struct secret *shared_secret;
-	u8 *msg;
-
-	changed = tal_arr(tmpctx, struct changed_htlc, 0);
-	added = tal_arr(tmpctx, struct added_htlc, 0);
-	shared_secret = tal_arr(tmpctx, struct secret, 0);
-	failed = tal_arr(tmpctx, const struct failed_htlc *, 0);
-	fulfilled = tal_arr(tmpctx, struct fulfilled_htlc, 0);
+	*changed = tal_arr(ctx, struct changed_htlc, 0);
+	*added = tal_arr(ctx, struct added_htlc, 0);
+	*shared_secret = tal_arr(ctx, struct secret, 0);
+	*failed = tal_arr(ctx, const struct failed_htlc *, 0);
+	*fulfilled = tal_arr(ctx, struct fulfilled_htlc, 0);
 
 	for (size_t i = 0; i < tal_count(changed_htlcs); i++) {
 		const struct htlc *htlc = changed_htlcs[i];
@@ -1318,25 +1291,25 @@ static u8 *got_commitsig_msg(const tal_t *ctx,
 				memset(&s, 0, sizeof(s));
 			else
 				s = *htlc->shared_secret;
-			tal_arr_expand(&added, a);
-			tal_arr_expand(&shared_secret, s);
+			tal_arr_expand(added, a);
+			tal_arr_expand(shared_secret, s);
 		} else if (htlc->state == RCVD_REMOVE_COMMIT) {
 			if (htlc->r) {
 				struct fulfilled_htlc f;
 				assert(!htlc->fail && !htlc->failcode);
 				f.id = htlc->id;
 				f.payment_preimage = *htlc->r;
-				tal_arr_expand(&fulfilled, f);
+				tal_arr_expand(fulfilled, f);
 			} else {
 				struct failed_htlc *f;
 				assert(htlc->fail || htlc->failcode);
-				f = tal(failed, struct failed_htlc);
+				f = tal(*failed, struct failed_htlc);
 				f->id = htlc->id;
 				f->failcode = htlc->failcode;
 				f->failreason = cast_const(u8 *, htlc->fail);
 				f->scid = cast_const(struct short_channel_id *,
 							htlc->failed_scid);
-				tal_arr_expand(&failed, f);
+				tal_arr_expand(failed, f);
 			}
 		} else {
 			struct changed_htlc c;
@@ -1345,21 +1318,67 @@ static u8 *got_commitsig_msg(const tal_t *ctx,
 
 			c.id = htlc->id;
 			c.newstate = htlc->state;
-			tal_arr_expand(&changed, c);
+			tal_arr_expand(changed, c);
 		}
 	}
+}
 
-	msg = towire_channel_got_commitsig(ctx, local_commit_index,
-					   local_feerate,
-					   commit_sig,
-					   htlc_sigs,
-					   added,
-					   shared_secret,
-					   fulfilled,
-					   failed,
-					   changed,
-					   committx);
-	return msg;
+static void send_revocation(struct peer *peer,
+			    const struct bitcoin_signature *commit_sig,
+			    const secp256k1_ecdsa_signature *htlc_sigs,
+			    const struct htlc **changed_htlcs,
+			    const struct bitcoin_tx *committx)
+{
+	struct changed_htlc *changed;
+	struct fulfilled_htlc *fulfilled;
+	const struct failed_htlc **failed;
+	struct added_htlc *added;
+	struct secret *shared_secret;
+	const u8 *msg_for_master;
+
+	/* Marshall it now before channel_sending_revoke_and_ack changes htlcs */
+	/* FIXME: Make infrastructure handle state post-revoke_and_ack! */
+	marshall_htlc_info(tmpctx,
+			   changed_htlcs,
+			   &changed,
+			   &fulfilled,
+			   &failed,
+			   &added,
+			   &shared_secret);
+
+	/* Revoke previous commit, get new point. */
+	u8 *msg = make_revocation_msg(peer, peer->next_index[LOCAL]-1,
+				      &peer->next_local_per_commit);
+
+	/* From now on we apply changes to the next commitment */
+	peer->next_index[LOCAL]++;
+
+	/* If this queues more changes on the other end, send commit. */
+	if (channel_sending_revoke_and_ack(peer->channel)) {
+		status_debug("revoke_and_ack made pending: commit timer");
+		start_commit_timer(peer);
+	}
+
+	/* Tell master daemon about commitsig (and by implication, that we're
+	 * sending revoke_and_ack), then wait for it to ack. */
+	/* We had to do this after channel_sending_revoke_and_ack, since we
+	 * want it to save the fee_states produced there. */
+	msg_for_master
+		= towire_channel_got_commitsig(NULL,
+					       peer->next_index[LOCAL] - 1,
+					       peer->channel->fee_states,
+					       commit_sig, htlc_sigs,
+					       added,
+					       shared_secret,
+					       fulfilled,
+					       failed,
+					       changed,
+					       committx);
+	master_wait_sync_reply(tmpctx, peer, take(msg_for_master),
+			       WIRE_CHANNEL_GOT_COMMITSIG_REPLY);
+
+	/* Now we can finally send revoke_and_ack to peer */
+	sync_crypto_write_no_delay(peer->pps, take(msg));
 }
 
 static void handle_peer_commit_sig(struct peer *peer, const u8 *msg)
@@ -1393,11 +1412,11 @@ static void handle_peer_commit_sig(struct peer *peer, const u8 *msg)
 	/* We were supposed to check this was affordable as we go. */
 	if (peer->channel->funder == REMOTE) {
 		status_debug("Feerates are %u/%u",
-			     peer->channel->view[LOCAL].feerate_per_kw,
-			     peer->channel->view[REMOTE].feerate_per_kw);
+			     channel_feerate(peer->channel, LOCAL),
+			     channel_feerate(peer->channel, REMOTE));
 		assert(can_funder_afford_feerate(peer->channel,
-						 peer->channel->view[LOCAL]
-						 .feerate_per_kw));
+						 channel_feerate(peer->channel,
+								 LOCAL)));
 	}
 
 	if (!fromwire_commitment_signed(tmpctx, msg,
@@ -1444,7 +1463,7 @@ static void handle_peer_commit_sig(struct peer *peer, const u8 *msg)
 			    type_to_string(msg, struct pubkey,
 					   &peer->channel->funding_pubkey
 					   [REMOTE]),
-			    peer->channel->view[LOCAL].feerate_per_kw);
+			    channel_feerate(peer->channel, LOCAL));
 	}
 
 	/* BOLT #2:
@@ -1489,21 +1508,15 @@ static void handle_peer_commit_sig(struct peer *peer, const u8 *msg)
 	status_debug("Received commit_sig with %zu htlc sigs",
 		     tal_count(htlc_sigs));
 
-	/* Tell master daemon, then wait for ack. */
-	msg = got_commitsig_msg(NULL, peer->next_index[LOCAL],
-				channel_feerate(peer->channel, LOCAL),
-				&commit_sig, htlc_sigs, changed_htlcs, txs[0]);
-
-	master_wait_sync_reply(tmpctx, peer, take(msg),
-			       WIRE_CHANNEL_GOT_COMMITSIG_REPLY);
-	return send_revocation(peer);
+	return send_revocation(peer,
+			       &commit_sig, htlc_sigs, changed_htlcs, txs[0]);
 }
 
 static u8 *got_revoke_msg(const tal_t *ctx, u64 revoke_num,
 			  const struct secret *per_commitment_secret,
 			  const struct pubkey *next_per_commit_point,
 			  const struct htlc **changed_htlcs,
-			  u32 feerate)
+			  const struct fee_states *fee_states)
 {
 	u8 *msg;
 	struct changed_htlc *changed = tal_arr(tmpctx, struct changed_htlc, 0);
@@ -1522,7 +1535,7 @@ static u8 *got_revoke_msg(const tal_t *ctx, u64 revoke_num,
 	}
 
 	msg = towire_channel_got_revoke(ctx, revoke_num, per_commitment_secret,
-					next_per_commit_point, feerate, changed);
+					next_per_commit_point, fee_states, changed);
 	return msg;
 }
 
@@ -1582,7 +1595,7 @@ static void handle_peer_revoke_and_ack(struct peer *peer, const u8 *msg)
 	msg = got_revoke_msg(NULL, peer->revocations_received++,
 			     &old_commit_secret, &next_per_commit,
 			     changed_htlcs,
-			     channel_feerate(peer->channel, LOCAL));
+			     peer->channel->fee_states);
 	master_wait_sync_reply(tmpctx, peer, take(msg),
 			       WIRE_CHANNEL_GOT_REVOKE_REPLY);
 
@@ -1811,7 +1824,9 @@ static void peer_in(struct peer *peer, const u8 *msg)
 		return;
 	}
 
-	if (handle_peer_gossip_or_error(peer->pps, &peer->channel_id, msg))
+	/* Since LND seems to send errors which aren't actually fatal events,
+	 * we treat errors here as soft. */
+	if (handle_peer_gossip_or_error(peer->pps, &peer->channel_id, true, msg))
 		return;
 
 	/* Must get funding_locked before almost anything. */
@@ -2309,7 +2324,8 @@ static void peer_reconnect(struct peer *peer,
 	do {
 		clean_tmpctx();
 		msg = sync_crypto_read(tmpctx, peer->pps);
-	} while (handle_peer_gossip_or_error(peer->pps, &peer->channel_id, msg)
+	} while (handle_peer_gossip_or_error(peer->pps, &peer->channel_id, true,
+					     msg)
 		 || capture_premature_msg(&premature_msgs, msg));
 
 	if (peer->channel->option_static_remotekey) {
@@ -2517,15 +2533,6 @@ static void peer_reconnect(struct peer *peer,
 		if (htlc->state == SENT_REMOVE_HTLC)
 			send_fail_or_fulfill(peer, htlc);
 	}
-
-	/* Corner case: we will get upset with them if they send
-	 * commitment_signed with no changes.  But it could be that we sent a
-	 * feechange, they acked, and now they want to commit it; we can't
-	 * even tell by seeing if fees are different (short of saving full fee
-	 * state in database) since it could be a tiny feechange, or two
-	 * feechanges which cancelled out. */
-	if (peer->channel->funder == LOCAL)
-		peer->channel->changes_pending[LOCAL] = true;
 
 	peer_billboard(true, "Reconnected, and reestablished.");
 
@@ -2941,7 +2948,7 @@ static void init_channel(struct peer *peer)
 	bool reconnected;
 	u8 *funding_signed;
 	const u8 *msg;
-	u32 feerate_per_kw[NUM_SIDES];
+	struct fee_states *fee_states;
 	u32 minimum_depth, failheight;
 	struct secret last_remote_per_commit_secret;
 	secp256k1_ecdsa_signature *remote_ann_node_sig;
@@ -2959,7 +2966,7 @@ static void init_channel(struct peer *peer)
 				   &funding,
 				   &minimum_depth,
 				   &conf[LOCAL], &conf[REMOTE],
-				   feerate_per_kw,
+				   &fee_states,
 				   &peer->feerate_min, &peer->feerate_max,
 				   &peer->their_commit_sig,
 				   &peer->pps,
@@ -3016,7 +3023,7 @@ static void init_channel(struct peer *peer)
 		     " next_idx_local = %"PRIu64
 		     " next_idx_remote = %"PRIu64
 		     " revocations_received = %"PRIu64
-		     " feerates %u/%u (range %u-%u)",
+		     " feerates %s range %u-%u",
 		     side_to_str(funder),
 		     type_to_string(tmpctx, struct pubkey,
 				    &peer->remote_per_commit),
@@ -3024,7 +3031,7 @@ static void init_channel(struct peer *peer)
 				    &peer->old_remote_per_commit),
 		     peer->next_index[LOCAL], peer->next_index[REMOTE],
 		     peer->revocations_received,
-		     feerate_per_kw[LOCAL], feerate_per_kw[REMOTE],
+		     type_to_string(tmpctx, struct fee_states, fee_states),
 		     peer->feerate_min, peer->feerate_max);
 
 	status_debug("option_static_remotekey = %u", option_static_remotekey);
@@ -3058,7 +3065,7 @@ static void init_channel(struct peer *peer)
 					 minimum_depth,
 					 funding,
 					 local_msat,
-					 feerate_per_kw,
+					 take(fee_states),
 					 &conf[LOCAL], &conf[REMOTE],
 					 &points[LOCAL], &points[REMOTE],
 					 &funding_pubkey[LOCAL],
@@ -3093,7 +3100,7 @@ static void init_channel(struct peer *peer)
 
 	/* Default desired feerate is the feerate we set for them last. */
 	if (peer->channel->funder == LOCAL)
-		peer->desired_feerate = feerate_per_kw[REMOTE];
+		peer->desired_feerate = channel_feerate(peer->channel, REMOTE);
 
 	/* from now we need keep watch over WIRE_CHANNEL_FUNDING_DEPTH */
 	peer->depth_togo = minimum_depth;
