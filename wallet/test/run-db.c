@@ -47,7 +47,7 @@ static void db_test_fatal(const char *fmt, ...)
 	va_end(ap);
 }
 
-void plugin_hook_db_sync(struct db *db UNNEEDED, const char **changes UNNEEDED, const char *final UNNEEDED)
+void plugin_hook_db_sync(struct db *db UNNEEDED)
 {
 }
 
@@ -63,6 +63,7 @@ static struct db *create_test_db(void)
 
 	dsn = tal_fmt(NULL, "sqlite3://%s", filename);
 	db = db_open(NULL, dsn);
+	db->data_version = 0;
 	tal_free(dsn);
 	return db;
 }
@@ -73,8 +74,9 @@ static bool test_empty_db_migrate(struct lightningd *ld)
 	CHECK(db);
 	db_begin_transaction(db);
 	CHECK(db_get_version(db) == -1);
-	db_commit_transaction(db);
 	db_migrate(ld, db);
+	db_commit_transaction(db);
+
 	db_begin_transaction(db);
 	CHECK(db_get_version(db) == ARRAY_SIZE(dbmigrations) - 1);
 	db_commit_transaction(db);
@@ -106,6 +108,10 @@ static bool test_primitives(void)
 	CHECK_MSG(db_err, "Failing SQL command");
 	tal_free(stmt);
 	db_err = tal_free(db_err);
+
+	/* We didn't migrate the DB, so don't have the vars table. Pretend we
+	 * didn't change anything so we don't bump the data_version. */
+	db->dirty = false;
 	db_commit_transaction(db);
 	CHECK(!db->in_transaction);
 	tal_free(db);
@@ -118,9 +124,9 @@ static bool test_vars(struct lightningd *ld)
 	struct db *db = create_test_db();
 	char *varname = "testvar";
 	CHECK(db);
-	db_migrate(ld, db);
 
 	db_begin_transaction(db);
+	db_migrate(ld, db);
 	/* Check default behavior */
 	CHECK(db_get_intvar(db, varname, 42) == 42);
 

@@ -589,6 +589,7 @@ static struct migration dbmigrations[] = {
 	 " SELECT id, 11, local_feerate_per_kw FROM channels WHERE funder = 1 and local_feerate_per_kw != remote_feerate_per_kw;"),
      NULL},
     /* FIXME: Remove now-unused local_feerate_per_kw and remote_feerate_per_kw from channels */
+    {SQL("INSERT INTO vars (name, intval) VALUES ('data_version', 0);"), NULL},
 };
 
 /* Leak tracking. */
@@ -763,8 +764,13 @@ static void db_report_changes(struct db *db, const char *final, size_t min)
 	assert(db->changes);
 	assert(tal_count(db->changes) >= min);
 
+	/* Having changes implies that we have a dirty TX. The opposite is
+	 * currently not true, e.g., the postgres driver doesn't record
+	 * changes yet. */
+	assert(!tal_count(db->changes) || db->dirty);
+
 	if (tal_count(db->changes) > min)
-		plugin_hook_db_sync(db, db->changes, final);
+		plugin_hook_db_sync(db);
 	db->changes = tal_free(db->changes);
 }
 
@@ -785,6 +791,9 @@ void db_begin_transaction_(struct db *db, const char *location)
 	if (db->in_transaction)
 		db_fatal("Already in transaction from %s", db->in_transaction);
 
+	/* No writes yet. */
+	db->dirty = false;
+
 	db_prepare_for_changes(db);
 	ok = db->config->begin_tx_fn(db);
 	if (!ok)
@@ -793,11 +802,44 @@ void db_begin_transaction_(struct db *db, const char *location)
 	db->in_transaction = location;
 }
 
+/* By making the update conditional on the current value we expect we
+ * are implementing an optimistic lock: if the update results in
+ * changes on the DB we know that the data_version did not change
+ * under our feet and no other transaction ran in the meantime.
+ *
+ * Notice that this update effectively locks the row, so that other
+ * operations attempting to change this outside the transaction will
+ * wait for this transaction to complete. The external change will
+ * ultimately fail the changes test below, it'll just delay its abort
+ * until our transaction is committed.
+ */
+static void db_data_version_incr(struct db *db)
+{
+       struct db_stmt *stmt = db_prepare_v2(
+	       db, SQL("UPDATE vars "
+		       "SET intval = intval + 1 "
+		       "WHERE name = 'data_version'"
+		       " AND intval = ?"));
+       db_bind_int(stmt, 0, db->data_version);
+       db_exec_prepared_v2(stmt);
+       if (db_count_changes(stmt) != 1)
+	       fatal("Optimistic lock on the database failed. There may be a "
+                     "concurrent access to the database. Aborting since "
+                     "concurrent access is unsafe.");
+       tal_free(stmt);
+       db->data_version++;
+}
+
 void db_commit_transaction(struct db *db)
 {
 	bool ok;
 	assert(db->in_transaction);
 	db_assert_no_outstanding_statements(db);
+
+	/* Increment before reporting changes to an eventual plugin. */
+	if (db->dirty)
+		db_data_version_incr(db);
+
 	db_report_changes(db, NULL, 0);
 	ok = db->config->commit_tx_fn(db);
 
@@ -805,6 +847,7 @@ void db_commit_transaction(struct db *db)
 		db_fatal("Failed to commit DB transaction: %s", db->error);
 
 	db->in_transaction = NULL;
+	db->dirty = false;
 }
 
 static struct db_config *db_config_find(const char *dsn)
@@ -905,8 +948,6 @@ static void db_migrate(struct lightningd *ld, struct db *db)
 	int current, orig, available;
 	struct db_stmt *stmt;
 
-	db_begin_transaction(db);
-
 	orig = current = db_get_version(db);
 	available = ARRAY_SIZE(dbmigrations) - 1;
 
@@ -946,15 +987,31 @@ static void db_migrate(struct lightningd *ld, struct db *db)
 		db_exec_prepared_v2(stmt);
 		tal_free(stmt);
 	}
+}
 
-	db_commit_transaction(db);
+u32 db_data_version_get(struct db *db)
+{
+	struct db_stmt *stmt;
+	u32 version;
+	stmt = db_prepare_v2(db, SQL("SELECT intval FROM vars WHERE name = 'data_version'"));
+	db_query_prepared(stmt);
+	db_step(stmt);
+	version = db_column_int(stmt, 0);
+	tal_free(stmt);
+	return version;
 }
 
 struct db *db_setup(const tal_t *ctx, struct lightningd *ld)
 {
 	struct db *db = db_open(ctx, ld->wallet_dsn);
 	db->log = new_log(db, ld->log_book, NULL, "database");
+
+	db_begin_transaction(db);
+
 	db_migrate(ld, db);
+
+	db->data_version = db_data_version_get(db);
+	db_commit_transaction(db);
 	return db;
 }
 
@@ -1355,6 +1412,10 @@ void db_column_txid(struct db_stmt *stmt, int pos, struct bitcoin_txid *t)
 bool db_exec_prepared_v2(struct db_stmt *stmt TAKES)
 {
 	bool ret = stmt->db->config->exec_fn(stmt);
+
+	/* If this was a write we need to bump the data_version upon commit. */
+	stmt->db->dirty = stmt->db->dirty || !stmt->query->readonly;
+
 	stmt->executed = true;
 	list_del_from(&stmt->db->pending_statements, &stmt->list);
 
@@ -1398,4 +1459,9 @@ void db_changes_add(struct db_stmt *stmt, const char * expanded)
 	}
 
 	tal_arr_expand(&db->changes, tal_strdup(db->changes, expanded));
+}
+
+const char **db_changes(struct db *db)
+{
+	return db->changes;
 }

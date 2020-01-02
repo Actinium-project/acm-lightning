@@ -650,7 +650,7 @@ u8 *wire_sync_read(const tal_t *ctx UNNEEDED, int fd UNNEEDED)
 {
 	return NULL;
 }
-void plugin_hook_db_sync(struct db *db UNNEEDED, const char **changes UNNEEDED, const char *final UNNEEDED)
+void plugin_hook_db_sync(struct db *db UNNEEDED)
 {
 }
 bool fromwire_hsm_get_channel_basepoints_reply(const void *p UNNEEDED,
@@ -747,7 +747,10 @@ static struct wallet *create_test_wallet(struct lightningd *ld, const tal_t *ctx
 				  w->bip32_base) == WALLY_OK);
 
 	CHECK_MSG(w->db, "Failed opening the db");
+	db_begin_transaction(w->db);
 	db_migrate(ld, w->db);
+	w->db->data_version = 0;
+	db_commit_transaction(w->db);
 	CHECK_MSG(!wallet_err, "DB migration failed");
 	w->max_channel_dbid = 0;
 
