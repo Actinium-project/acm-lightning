@@ -1123,8 +1123,6 @@ struct bitcoind *new_bitcoind(const tal_t *ctx,
 {
 	struct bitcoind *bitcoind = tal(ctx, struct bitcoind);
 
-	/* Use Actinium by default, change later if we want another network */
-	bitcoind->chainparams = chainparams_for_network("actinium");
 	bitcoind->cli = NULL;
 	bitcoind->datadir = NULL;
 	bitcoind->ld = ld;
