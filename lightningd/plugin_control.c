@@ -1,5 +1,8 @@
+#include <lightningd/options.h>
 #include <lightningd/plugin_control.h>
 #include <lightningd/plugin_hook.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 /* A dummy structure used to give multiple arguments to callbacks. */
 struct dynamic_plugin {
@@ -107,6 +110,7 @@ static void plugin_dynamic_manifest_callback(const char *buffer,
 static struct command_result *plugin_start(struct dynamic_plugin *dp)
 {
 	int stdin, stdout;
+	mode_t prev_mask;
 	char **p_cmd;
 	struct jsonrpc_request *req;
 	struct plugin *p = dp->plugin;
@@ -114,7 +118,10 @@ static struct command_result *plugin_start(struct dynamic_plugin *dp)
 	p->dynamic = true;
 	p_cmd = tal_arrz(NULL, char *, 2);
 	p_cmd[0] = p->cmd;
+	/* In case the plugin create files, this is a better default. */
+	prev_mask = umask(dp->cmd->ld->initial_umask);
 	p->pid = pipecmdarr(&stdin, &stdout, &pipecmd_preserve, p_cmd);
+	umask(prev_mask);
 	if (p->pid == -1)
 		return plugin_dynamic_error(dp, "Error running command");
 	else
@@ -206,7 +213,11 @@ plugin_dynamic_stop(struct command *cmd, const char *plugin_name)
 			plugin_kill(p, "%s stopped by lightningd via RPC", plugin_name);
 			tal_free(p);
 			response = json_stream_success(cmd);
-			json_add_string(response, "",
+			if (deprecated_apis)
+				json_add_string(response, "",
+			                    take(tal_fmt(NULL, "Successfully stopped %s.",
+			                                 plugin_name)));
+			json_add_string(response, "result",
 			                take(tal_fmt(NULL, "Successfully stopped %s.",
 			                             plugin_name)));
 			return command_success(cmd, response);

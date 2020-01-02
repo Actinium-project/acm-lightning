@@ -30,7 +30,7 @@ struct peer {
 static bool contains_common_chain(struct bitcoin_blkid *chains)
 {
 	for (size_t i = 0; i < tal_count(chains); i++) {
-		if (bitcoin_blkid_eq(&chains[0], &chainparams->genesis_blockhash))
+		if (bitcoin_blkid_eq(&chains[i], &chainparams->genesis_blockhash))
 			return true;
 	}
 	return false;
@@ -75,17 +75,13 @@ static struct io_plan *peer_init_received(struct io_conn *conn,
 	 *    - MAY fail the connection.
 	 */
 	if (tlvs->networks) {
-		if (!tlvs->networks->chains) {
-			status_peer_debug(&peer->id,
-			                  "bad networks TLV in init '%s', closing",
-			                  tal_hex(tmpctx, msg));
-			return io_close(conn);
-		}
 		if (!contains_common_chain(tlvs->networks->chains)) {
 			status_peer_debug(&peer->id,
 			                  "No common chain with this peer '%s', closing",
 			                  tal_hex(tmpctx, msg));
-			return io_close(conn);
+			msg = towire_errorfmt(NULL, NULL, "No common network");
+			msg = cryptomsg_encrypt_msg(NULL, &peer->cs, take(msg));
+			return io_write(conn, msg, tal_count(msg), io_close_cb, NULL);
 		}
 	}
 
