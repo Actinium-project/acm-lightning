@@ -136,6 +136,7 @@ def test_invoice_routeboost(node_factory, bitcoind):
     # Check routeboost.
     assert 'warning_capacity' not in inv
     assert 'warning_offline' not in inv
+    assert 'warning_deadends' not in inv
     # Route array has single route with single element.
     r = only_one(only_one(l1.rpc.decodepay(inv['bolt11'])['routes']))
     assert r['pubkey'] == l1.info['id']
@@ -153,6 +154,7 @@ def test_invoice_routeboost(node_factory, bitcoind):
     # Check warning
     assert 'warning_capacity' in inv
     assert 'warning_offline' not in inv
+    assert 'warning_deadends' not in inv
 
     l1.rpc.disconnect(l2.info['id'], True)
     wait_for(lambda: not only_one(l2.rpc.listpeers(l1.info['id'])['peers'])['connected'])
@@ -160,6 +162,7 @@ def test_invoice_routeboost(node_factory, bitcoind):
     inv = l2.rpc.invoice(123456, label="inv3", description="?")
     # Check warning.
     assert 'warning_capacity' not in inv
+    assert 'warning_deadends' not in inv
     assert 'warning_offline' in inv
 
     # Close l0, l2 will not use l1 at all.
@@ -171,7 +174,8 @@ def test_invoice_routeboost(node_factory, bitcoind):
     wait_for(lambda: len(l2.rpc.listchannels()['channels']) == 2)
     inv = l2.rpc.invoice(123456, label="inv4", description="?")
     # Check warning.
-    assert 'warning_capacity' in inv
+    assert 'warning_deadends' in inv
+    assert 'warning_capacity' not in inv
     assert 'warning_offline' not in inv
 
 
@@ -181,20 +185,23 @@ def test_invoice_routeboost_private(node_factory, bitcoind):
     """
     l1, l2 = node_factory.line_graph(2, fundamount=16777215, announce_channels=False)
 
+    scid = l1.get_channel_scid(l2)
+
     # Attach public channel to l1 so it doesn't look like a dead-end.
     l0 = node_factory.get_node()
     l0.rpc.connect(l1.info['id'], 'localhost', l1.port)
-    scid = l0.fund_channel(l1, 2 * (10**5))
+    scid_dummy = l0.fund_channel(l1, 2 * (10**5))
     bitcoind.generate_block(5)
 
     # Make sure channel is totally public.
-    wait_for(lambda: [c['public'] for c in l2.rpc.listchannels(scid)['channels']] == [True, True])
+    wait_for(lambda: [c['public'] for c in l2.rpc.listchannels(scid_dummy)['channels']] == [True, True])
 
     # Since there's only one route, it will reluctantly hint that even
     # though it's private
     inv = l2.rpc.invoice(msatoshi=123456, label="inv0", description="?")
     assert 'warning_capacity' not in inv
     assert 'warning_offline' not in inv
+    assert 'warning_deadends' not in inv
     # Route array has single route with single element.
     r = only_one(only_one(l1.rpc.decodepay(inv['bolt11'])['routes']))
     assert r['pubkey'] == l1.info['id']
@@ -206,29 +213,91 @@ def test_invoice_routeboost_private(node_factory, bitcoind):
     # If we explicitly say not to, it won't expose.
     inv = l2.rpc.invoice(msatoshi=123456, label="inv1", description="?", exposeprivatechannels=False)
     assert 'warning_capacity' in inv
+    assert 'warning_offline' not in inv
+    assert 'warning_deadends' not in inv
     assert 'routes' not in l1.rpc.decodepay(inv['bolt11'])
+
+    # If we ask for it, we get it.
+    inv = l2.rpc.invoice(msatoshi=123456, label="inv1a", description="?", exposeprivatechannels=scid)
+    assert 'warning_capacity' not in inv
+    assert 'warning_offline' not in inv
+    assert 'warning_deadends' not in inv
+    # Route array has single route with single element.
+    r = only_one(only_one(l1.rpc.decodepay(inv['bolt11'])['routes']))
+    assert r['pubkey'] == l1.info['id']
+    assert r['short_channel_id'] == l1.rpc.listchannels()['channels'][0]['short_channel_id']
+    assert r['fee_base_msat'] == 1
+    assert r['fee_proportional_millionths'] == 10
+    assert r['cltv_expiry_delta'] == 6
+
+    # Similarly if we ask for an array.
+    inv = l2.rpc.invoice(msatoshi=123456, label="inv1b", description="?", exposeprivatechannels=[scid])
+    assert 'warning_capacity' not in inv
+    assert 'warning_offline' not in inv
+    assert 'warning_deadends' not in inv
+    # Route array has single route with single element.
+    r = only_one(only_one(l1.rpc.decodepay(inv['bolt11'])['routes']))
+    assert r['pubkey'] == l1.info['id']
+    assert r['short_channel_id'] == l1.rpc.listchannels()['channels'][0]['short_channel_id']
+    assert r['fee_base_msat'] == 1
+    assert r['fee_proportional_millionths'] == 10
+    assert r['cltv_expiry_delta'] == 6
 
     # The existence of a public channel, even without capacity, will suppress
     # the exposure of private channels.
     l3 = node_factory.get_node()
     l3.rpc.connect(l2.info['id'], 'localhost', l2.port)
-    scid = l3.fund_channel(l2, (10**5))
+    scid2 = l3.fund_channel(l2, (10**5))
     bitcoind.generate_block(5)
 
     # Make sure channel is totally public.
-    wait_for(lambda: [c['public'] for c in l3.rpc.listchannels(scid)['channels']] == [True, True])
+    wait_for(lambda: [c['public'] for c in l2.rpc.listchannels(scid2)['channels']] == [True, True])
 
     inv = l2.rpc.invoice(msatoshi=10**7, label="inv2", description="?")
-    assert 'warning_capacity' in inv
+    assert 'warning_deadends' in inv
+    assert 'warning_capacity' not in inv
+    assert 'warning_offline' not in inv
 
     # Unless we tell it to include it.
     inv = l2.rpc.invoice(msatoshi=10**7, label="inv3", description="?", exposeprivatechannels=True)
     assert 'warning_capacity' not in inv
     assert 'warning_offline' not in inv
+    assert 'warning_deadends' not in inv
     # Route array has single route with single element.
     r = only_one(only_one(l1.rpc.decodepay(inv['bolt11'])['routes']))
     assert r['pubkey'] == l1.info['id']
     assert r['short_channel_id'] == l1.rpc.listchannels()['channels'][0]['short_channel_id']
+    assert r['fee_base_msat'] == 1
+    assert r['fee_proportional_millionths'] == 10
+    assert r['cltv_expiry_delta'] == 6
+
+    inv = l2.rpc.invoice(msatoshi=10**7, label="inv4", description="?", exposeprivatechannels=scid)
+    assert 'warning_capacity' not in inv
+    assert 'warning_offline' not in inv
+    assert 'warning_deadends' not in inv
+    # Route array has single route with single element.
+    r = only_one(only_one(l1.rpc.decodepay(inv['bolt11'])['routes']))
+    assert r['pubkey'] == l1.info['id']
+    assert r['short_channel_id'] == scid
+    assert r['fee_base_msat'] == 1
+    assert r['fee_proportional_millionths'] == 10
+    assert r['cltv_expiry_delta'] == 6
+
+    # Ask it explicitly to use a channel it can't (insufficient capacity)
+    inv = l2.rpc.invoice(msatoshi=10, label="inv5", description="?", exposeprivatechannels=scid2)
+    assert 'warning_deadends' in inv
+    assert 'warning_capacity' not in inv
+    assert 'warning_offline' not in inv
+
+    # Give it two options and it will pick one with suff capacity.
+    inv = l2.rpc.invoice(msatoshi=10, label="inv6", description="?", exposeprivatechannels=[scid2, scid])
+    assert 'warning_capacity' not in inv
+    assert 'warning_offline' not in inv
+    assert 'warning_deadends' not in inv
+    # Route array has single route with single element.
+    r = only_one(only_one(l1.rpc.decodepay(inv['bolt11'])['routes']))
+    assert r['pubkey'] == l1.info['id']
+    assert r['short_channel_id'] == scid
     assert r['fee_base_msat'] == 1
     assert r['fee_proportional_millionths'] == 10
     assert r['cltv_expiry_delta'] == 6

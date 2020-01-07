@@ -379,6 +379,7 @@ static struct route_info **select_inchan(const tal_t *ctx,
 					 struct lightningd *ld,
 					 struct amount_msat amount_needed,
 					 const struct route_info *inchans,
+					 const bool *deadends,
 					 bool *any_offline)
 {
 	/* BOLT11 struct wants an array of arrays (can provide multiple routes) */
@@ -411,6 +412,10 @@ static struct route_info **select_inchan(const tal_t *ctx,
 		/* Does it have a channel in state CHANNELD_NORMAL */
 		c = peer_normal_channel(peer);
 		if (!c)
+			continue;
+
+		/* Is it a dead-end? */
+		if (deadends[i])
 			continue;
 
 		/* Channel balance as seen by our node:
@@ -494,12 +499,53 @@ static struct route_info **select_inchan(const tal_t *ctx,
 }
 
 /* Encapsulating struct while we wait for gossipd to give us incoming channels */
+struct chanhints {
+	bool expose_all_private;
+	struct short_channel_id *hints;
+};
+
 struct invoice_info {
 	struct command *cmd;
 	struct preimage payment_preimage;
 	struct bolt11 *b11;
 	struct json_escape *label;
+	struct chanhints *chanhints;
 };
+
+static void append_routes(struct route_info **dst, const struct route_info *src)
+{
+	size_t n = tal_count(*dst);
+
+	tal_resize(dst, n + tal_count(src));
+	memcpy(*dst + n, src, tal_count(src) * sizeof(*src));
+}
+
+static void append_bools(bool **dst, const bool *src)
+{
+	size_t n = tal_count(*dst);
+
+	tal_resize(dst, n + tal_count(src));
+	memcpy(*dst + n, src, tal_count(src) * sizeof(*src));
+}
+
+static bool all_true(const bool *barr, size_t n)
+{
+	for (size_t i = 0; i < n; i++) {
+		if (!barr[i])
+			return false;
+	}
+	return true;
+}
+
+static bool scid_in_arr(const struct short_channel_id *scidarr,
+			const struct short_channel_id *scid)
+{
+	for (size_t i = 0; i < tal_count(scidarr); i++)
+		if (short_channel_id_eq(&scidarr[i], scid))
+			return true;
+
+	return false;
+}
 
 static void gossipd_incoming_channels_reply(struct subd *gossipd,
 					    const u8 *msg,
@@ -507,16 +553,63 @@ static void gossipd_incoming_channels_reply(struct subd *gossipd,
 					    struct invoice_info *info)
 {
 	struct json_stream *response;
-	struct route_info *inchans;
+	struct route_info *inchans, *private;
+	bool *inchan_deadends, *private_deadends;
 	bool any_offline;
 	struct invoice invoice;
 	char *b11enc;
 	const struct invoice_details *details;
 	struct wallet *wallet = info->cmd->ld->wallet;
+	const struct chanhints *chanhints = info->chanhints;
 
-	if (!fromwire_gossip_get_incoming_channels_reply(tmpctx, msg, &inchans))
+	if (!fromwire_gossip_get_incoming_channels_reply(tmpctx, msg,
+							 &inchans,
+							 &inchan_deadends,
+							 &private,
+							 &private_deadends))
 		fatal("Gossip gave bad GOSSIP_GET_INCOMING_CHANNELS_REPLY %s",
 		      tal_hex(msg, msg));
+
+	/* fromwire explicitly makes empty arrays into NULL */
+	if (!inchans) {
+		inchans = tal_arr(tmpctx, struct route_info, 0);
+		inchan_deadends = tal_arr(tmpctx, bool, 0);
+	}
+
+	if (chanhints && chanhints->expose_all_private) {
+		append_routes(&inchans, private);
+		append_bools(&inchan_deadends, private_deadends);
+	} else if (chanhints && chanhints->hints) {
+		/* Start by considering all channels as candidates */
+		append_routes(&inchans, private);
+		append_bools(&inchan_deadends, private_deadends);
+
+		/* Consider only hints they gave */
+		for (size_t i = 0; i < tal_count(inchans); i++) {
+			if (!scid_in_arr(chanhints->hints,
+					 &inchans[i].short_channel_id)) {
+				tal_arr_remove(&inchans, i);
+				tal_arr_remove(&inchan_deadends, i);
+			}
+		}
+
+		/* If they told us to use scids and we couldn't, fail. */
+		if (tal_count(inchans) == 0
+		    && tal_count(chanhints->hints) != 0) {
+			was_pending(command_fail(info->cmd,
+						 INVOICE_HINTS_GAVE_NO_ROUTES,
+						 "None of those hints were suitable local channels"));
+			return;
+		}
+	} else {
+		assert(!chanhints);
+		/* By default, only consider private channels if there are
+		 * no public channels *at all* */
+		if (tal_count(inchans) == 0) {
+			append_routes(&inchans, private);
+			append_bools(&inchan_deadends, private_deadends);
+		}
+	}
 
 #if DEVELOPER
 	/* dev-routes overrides this. */
@@ -528,6 +621,7 @@ static void gossipd_incoming_channels_reply(struct subd *gossipd,
 				info->cmd->ld,
 				info->b11->msat ? *info->b11->msat : AMOUNT_MSAT(1),
 				inchans,
+				inchan_deadends,
 				&any_offline);
 
 	/* FIXME: add private routes if necessary! */
@@ -578,14 +672,19 @@ static void gossipd_incoming_channels_reply(struct subd *gossipd,
 			    any_offline
 			    ? " (among currently connected peers)" : "");
 
-		if (any_offline)
+		if (tal_count(inchans) == 0)
+			json_add_string(response, "warning_capacity",
+					"No channels");
+		else if (all_true(inchan_deadends, tal_count(inchans)))
+			json_add_string(response, "warning_deadends",
+					"No channel with a peer that is not a dead end");
+		else if (any_offline)
 			json_add_string(response, "warning_offline",
 					"No channel with a peer that is currently connected"
 					" has sufficient incoming capacity");
 		else
 			json_add_string(response, "warning_capacity",
-					"No channel with a peer that is not a dead end,"
-					" has sufficient incoming capacity");
+					"No channel with a peer that has sufficient incoming capacity");
 	}
 
 	was_pending(command_success(info->cmd, response));
@@ -718,6 +817,50 @@ static struct command_result *param_time(struct command *cmd, const char *name,
 			    name, tok->end - tok->start, buffer + tok->start);
 }
 
+static struct command_result *param_chanhints(struct command *cmd,
+					      const char *name,
+					      const char *buffer,
+					      const jsmntok_t *tok,
+					      struct chanhints **chanhints)
+{
+	bool boolhint;
+
+	*chanhints = tal(cmd, struct chanhints);
+
+	/* Could be simply "true" or "false" */
+	if (json_to_bool(buffer, tok, &boolhint)) {
+		(*chanhints)->expose_all_private = boolhint;
+		(*chanhints)->hints
+			= tal_arr(*chanhints, struct short_channel_id, 0);
+		return NULL;
+	}
+
+	(*chanhints)->expose_all_private = false;
+	/* Could be a single short_channel_id or an array */
+	if (tok->type == JSMN_ARRAY) {
+		size_t i;
+		const jsmntok_t *t;
+
+		(*chanhints)->hints
+			= tal_arr(*chanhints, struct short_channel_id,
+				  tok->size);
+		json_for_each_arr(i, t, tok) {
+			if (!json_to_short_channel_id(buffer, t,
+						      &(*chanhints)->hints[i])) {
+				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+						    "'%s' should be a short channel id, not '%.*s'",
+						    name, json_tok_full_len(t),
+						    json_tok_full(buffer, t));
+			}
+		}
+		return NULL;
+	}
+
+	/* Otherwise should be a short_channel_id */
+	return param_short_channel_id(cmd, name, buffer, tok,
+				      &(*chanhints)->hints);
+}
+
 static struct command_result *json_invoice(struct command *cmd,
 					   const char *buffer,
 					   const jsmntok_t *obj UNNEEDED,
@@ -731,7 +874,6 @@ static struct command_result *json_invoice(struct command *cmd,
 	const u8 **fallback_scripts = NULL;
 	u64 *expiry;
 	struct sha256 rhash;
-	bool *exposeprivate;
 	struct secret payment_secret;
 #if DEVELOPER
 	const jsmntok_t *routes;
@@ -747,7 +889,8 @@ static struct command_result *json_invoice(struct command *cmd,
 		   p_opt_def("expiry", param_time, &expiry, 3600*24*7),
 		   p_opt("fallbacks", param_array, &fallbacks),
 		   p_opt("preimage", param_tok, &preimagetok),
-		   p_opt("exposeprivatechannels", param_bool, &exposeprivate),
+		   p_opt("exposeprivatechannels", param_chanhints,
+			 &info->chanhints),
 #if DEVELOPER
 		   p_opt("dev-routes", param_array, &routes),
 #endif
@@ -829,10 +972,8 @@ static struct command_result *json_invoice(struct command *cmd,
 	if (fallback_scripts)
 		info->b11->fallbacks = tal_steal(info->b11, fallback_scripts);
 
-	log_debug(cmd->ld->log, "exposeprivate = %s",
-		  exposeprivate ? (*exposeprivate ? "TRUE" : "FALSE") : "NULL");
 	subd_req(cmd, cmd->ld->gossip,
-		 take(towire_gossip_get_incoming_channels(NULL, exposeprivate)),
+		 take(towire_gossip_get_incoming_channels(NULL)),
 		 -1, 0, gossipd_incoming_channels_reply, info);
 
 	return command_still_pending(cmd);
