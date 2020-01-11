@@ -30,7 +30,7 @@
 #define SOCK_REQ_V5_LEN			5
 #define SOCK_REQ_V5_HEADER_LEN	7
 
-/* some crufts can not forward ipv6*/
+/* some crufts can not forward ipv6 */
 #undef BIND_FIRST_TO_IPV6
 
 struct connecting_socks {
@@ -40,6 +40,32 @@ struct connecting_socks {
 	char *host;
 	struct connecting *connect;
 };
+
+static const char* socks5strerror(const tal_t *ctx, u8 code)
+{
+	/* Error codes defined in https://tools.ietf.org/html/rfc1928#section-6 */
+	switch (code) {
+	case 0:
+		return tal_strdup(ctx, "success");
+	case 1:
+		return tal_strdup(ctx, "general SOCKS server failure");
+	case 2:
+		return tal_strdup(ctx, "connection not allowed by ruleset");
+	case 3:
+		return tal_strdup(ctx, "network unreachable");
+	case 4:
+		return tal_strdup(ctx, "host unreachable");
+	case 5:
+		return tal_strdup(ctx, "connection refused");
+	case 6:
+		return tal_strdup(ctx, "TTL expired");
+	case 7:
+		return tal_strdup(ctx, "command not supported");
+	case 8:
+		return tal_strdup(ctx, "address type not supported");
+	}
+	return tal_fmt(ctx, "unknown error: %d", code);
+}
 
 static struct io_plan *connect_finish2(struct io_conn *conn,
 				       struct connecting_socks *connect)
@@ -57,6 +83,9 @@ static struct io_plan *connect_finish(struct io_conn *conn,
 	status_io(LOG_IO_IN, NULL, "proxy",
 		  connect->buffer, SIZE_OF_IPV4_RESPONSE + SIZE_OF_RESPONSE);
 
+	/* buffer[1] contains the reply status code and 0 means "success",
+	 * see https://tools.ietf.org/html/rfc1928#section-6
+	 */
 	if ( connect->buffer[1] == '\0') {
 		if ( connect->buffer[3] == SOCKS_TYP_IPV6) {
 			/* Read rest of response */
@@ -73,13 +102,15 @@ static struct io_plan *connect_finish(struct io_conn *conn,
 			return connection_out(conn, connect->connect);
 		} else {
 			status_debug
-			    ("Tor connect out for host %s error invalid type return ",
-			     connect->host);
+			    ("Tor connect out for host %s error invalid "
+			     "type return: %0x", connect->host,
+			     connect->buffer[3]);
 			return io_close(conn);
 		}
 	} else {
-		status_debug("Tor connect out for host %s error: %x ",
-			     connect->host, connect->buffer[1]);
+		status_debug("Error connecting to %s: Tor server reply: %s",
+			     connect->host,
+			     socks5strerror(tmpctx, connect->buffer[1]));
 		return io_close(conn);
 	}
 }
@@ -103,26 +134,37 @@ static struct io_plan *io_tor_connect_after_resp_to_connect(struct io_conn
 	status_io(LOG_IO_IN, NULL, "proxy", connect->buffer, 2);
 
 	if (connect->buffer[1] == SOCKS_ERROR) {
-		status_debug("Connected out for %s error", connect->host);
+		/* The Tor socks5 server did not like any of our authentication
+		 * methods and we provided only "no auth".
+		 */
+		status_debug("Connected out for %s error: authentication required",
+			     connect->host);
 		return io_close(conn);
 	}
-	/* make the V5 request */
-	connect->hlen = strlen(connect->host);
-	connect->buffer[0] = SOCKS_V5;
-	connect->buffer[1] = SOCKS_CONNECT;
-	connect->buffer[2] = 0;
-	connect->buffer[3] = SOCKS_DOMAIN;
-	connect->buffer[4] = connect->hlen;
+	if (connect->buffer[1] == '\0') {
+		/* make the V5 request */
+		connect->hlen = strlen(connect->host);
+		connect->buffer[0] = SOCKS_V5;
+		connect->buffer[1] = SOCKS_CONNECT;
+		connect->buffer[2] = 0;
+		connect->buffer[3] = SOCKS_DOMAIN;
+		connect->buffer[4] = connect->hlen;
 
-	memcpy(connect->buffer + SOCK_REQ_V5_LEN, connect->host, connect->hlen);
-	memcpy(connect->buffer + SOCK_REQ_V5_LEN + strlen(connect->host),
-	       &(connect->port), sizeof connect->port);
+		memcpy(connect->buffer + SOCK_REQ_V5_LEN, connect->host, connect->hlen);
+		memcpy(connect->buffer + SOCK_REQ_V5_LEN + strlen(connect->host),
+				&(connect->port), sizeof connect->port);
 
-	status_io(LOG_IO_OUT, NULL, "proxy", connect->buffer,
-		  SOCK_REQ_V5_HEADER_LEN + connect->hlen);
-	return io_write(conn, connect->buffer,
-			SOCK_REQ_V5_HEADER_LEN + connect->hlen,
-			connect_out, connect);
+		status_io(LOG_IO_OUT, NULL, "proxy", connect->buffer,
+				SOCK_REQ_V5_HEADER_LEN + connect->hlen);
+		return io_write(conn, connect->buffer,
+				SOCK_REQ_V5_HEADER_LEN + connect->hlen,
+				connect_out, connect);
+	} else {
+		status_debug("Connected out for %s error: unexpected connect answer %0x from the tor socks5 proxy",
+				connect->host,
+				connect->buffer[1]);
+		return io_close(conn);
+	}
 }
 
 static struct io_plan *io_tor_connect_after_req_to_connect(struct io_conn *conn,
@@ -146,7 +188,7 @@ static struct io_plan *io_tor_connect_do_req(struct io_conn *conn,
 			&io_tor_connect_after_req_to_connect, connect);
 }
 
-// called when we want to connect to TOR SOCKS5
+/* called when we want to connect to TOR SOCKS5 */
 struct io_plan *io_tor_connect(struct io_conn *conn,
 			       const struct addrinfo *tor_proxyaddr,
 			       const char *host, u16 port,
