@@ -17,6 +17,7 @@
 #include <common/key_derive.h>
 #include <common/keyset.h>
 #include <common/memleak.h>
+#include <common/onionreply.h>
 #include <common/status.h>
 #include <common/type_to_string.h>
 #include <inttypes.h>
@@ -1244,7 +1245,7 @@ bool channel_force_htlcs(struct channel *channel,
 		if (!htlc_has(htlc, HTLC_REMOVING)) {
 			status_broken("Fail %s HTLC %"PRIu64" state %s",
 				     failed_sides[i] == LOCAL ? "out" : "in",
-				     fulfilled[i].id,
+				     failed[i]->id,
 				     htlc_state_name(htlc->state));
 			return false;
 		}
@@ -1254,10 +1255,7 @@ bool channel_force_htlcs(struct channel *channel,
 		 * a hint. */
 		htlc->failblock = failheight;
 		if (failed[i]->failreason)
-			htlc->fail = tal_dup_arr(htlc, u8,
-						 failed[i]->failreason,
-						 tal_count(failed[i]->failreason),
-						 0);
+			htlc->fail = dup_onionreply(htlc, failed[i]->failreason);
 		else
 			htlc->fail = NULL;
 		if (failed[i]->scid)

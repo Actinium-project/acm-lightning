@@ -231,13 +231,14 @@ void delay_then_reconnect(struct channel *channel, u32 seconds_delay,
 static void connect_failed(struct lightningd *ld, const u8 *msg)
 {
 	struct node_id id;
-	char *err;
+	int errcode;
+	char *errmsg;
 	struct connect *c;
 	u32 seconds_to_delay;
 	struct wireaddr_internal *addrhint;
 	struct channel *channel;
 
-	if (!fromwire_connectctl_connect_failed(tmpctx, msg, &id, &err,
+	if (!fromwire_connectctl_connect_failed(tmpctx, msg, &id, &errcode, &errmsg,
 						&seconds_to_delay, &addrhint))
 		fatal("Connect gave bad CONNECTCTL_CONNECT_FAILED message %s",
 		      tal_hex(msg, msg));
@@ -245,7 +246,7 @@ static void connect_failed(struct lightningd *ld, const u8 *msg)
 	/* We can have multiple connect commands: fail them all */
 	while ((c = find_connect(ld, &id)) != NULL) {
 		/* They delete themselves from list */
-		was_pending(command_fail(c->cmd, LIGHTNINGD, "%s", err));
+		was_pending(command_fail(c->cmd, errcode, "%s", errmsg));
 	}
 
 	/* If we have an active channel, then reconnect. */
