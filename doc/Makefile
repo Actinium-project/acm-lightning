@@ -16,6 +16,7 @@ MANPAGES := doc/lightning-cli.1 \
 	doc/lightning-decodepay.7 \
 	doc/lightning-delexpiredinvoice.7 \
 	doc/lightning-delinvoice.7 \
+	doc/lightning-dev-sendcustommsg.7 \
 	doc/lightning-disconnect.7 \
 	doc/lightning-fundchannel.7 \
 	doc/lightning-fundchannel_start.7 \
@@ -96,6 +97,6 @@ doc-clean:
 	$(RM) doc/deployable-lightning.{aux,bbl,blg,dvi,log,out,tex}
 
 doc/index.rst:
-	(grep -v '^   lightning.*\.[0-9]\.md>$$' $@; for m in $$(cd doc && echo "$$(ls lightningd*.[0-9].md | sort)\n$$(ls lightning-*.[0-9].md | sort)"); do echo "   $$(echo $$m | sed 's/.[0-9].md//') <$$m>"; done) > $@.tmp.$$$$ && mv $@.tmp.$$$$ $@
+	(grep -v '^   lightning.*\.[0-9]\.md>$$' $@; for m in $$(cd doc && ls lightningd*.[0-9].md lightning-*.[0-9].md); do echo "   $${m%.[0-9].md} <$$m>"; done |$(SORT)) > $@.tmp.$$$$ && mv $@.tmp.$$$$ $@
 
 .PHONY: doc/index.rst

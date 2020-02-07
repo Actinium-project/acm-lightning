@@ -9,6 +9,7 @@
 #include <common/amount.h>
 #include <common/bech32.h>
 #include <common/bolt11.h>
+#include <common/configdir.h>
 #include <common/features.h>
 #include <common/json_command.h>
 #include <common/json_helpers.h>
@@ -16,6 +17,7 @@
 #include <common/overflows.h>
 #include <common/param.h>
 #include <common/pseudorand.h>
+#include <common/timeout.h>
 #include <common/utils.h>
 #include <errno.h>
 #include <gossipd/gen_gossip_wire.h>
@@ -81,8 +83,7 @@ static struct command_result *tell_waiter(struct command *cmd,
 		json_add_invoice(response, details);
 		return command_success(cmd, response);
 	} else {
-		/* FIXME: -2 should be a constant in jsonrpc_errors.h.  */
-		response = json_stream_fail(cmd, -2,
+		response = json_stream_fail(cmd, INVOICE_EXPIRED_DURING_WAIT,
 					    "invoice expired during wait");
 		json_add_invoice(response, details);
 		json_object_end(response);
@@ -101,6 +102,12 @@ static void wait_on_invoice(const struct invoice *invoice, void *cmd)
 		tell_waiter((struct command *) cmd, invoice);
 	else
 		tell_waiter_deleted((struct command *) cmd);
+}
+static void wait_timed_out(struct command *cmd)
+{
+	was_pending(command_fail(cmd, INVOICE_WAIT_TIMED_OUT,
+				 "Timed out while waiting "
+				 "for invoice to be paid"));
 }
 
 /* We derive invoice secret using 1-way function from payment_preimage
@@ -155,10 +162,12 @@ static void invoice_payload_remove_set(struct htlc_set *set,
 	payload->set = NULL;
 }
 
-static bool hook_gives_failcode(const char *buffer,
+static bool hook_gives_failcode(struct log *log,
+				const char *buffer,
 				const jsmntok_t *toks,
 				enum onion_type *failcode)
 {
+	const jsmntok_t *resulttok;
 	const jsmntok_t *t;
 	unsigned int val;
 
@@ -166,9 +175,39 @@ static bool hook_gives_failcode(const char *buffer,
 	if (!buffer)
 		return false;
 
+	resulttok = json_get_member(buffer, toks, "result");
+	if (resulttok) {
+		if (json_tok_streq(buffer, resulttok, "continue")) {
+			return false;
+		} else if (json_tok_streq(buffer, resulttok, "reject")) {
+			*failcode = WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS;
+			return true;
+		} else
+			fatal("Invalid invoice_payment hook result: %.*s",
+			      toks[0].end - toks[0].start, buffer);
+	}
+
 	t = json_get_member(buffer, toks, "failure_code");
-	if (!t)
+#ifdef COMPAT_V080
+	if (!t && deprecated_apis) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			log_unusual(log,
+				    "Plugin did not return object with "
+				    "'result' or 'failure_code' fields.  "
+				    "This is now deprecated and you should "
+				    "return {'result': 'continue' } or "
+				    "{'result': 'reject'} or "
+				    "{'failure_code': 42} instead.");
+		}
 		return false;
+	}
+#endif /* defined(COMPAT_V080) */
+	if (!t)
+		fatal("Invalid invoice_payment_hook response, expecting "
+		      "'result' or 'failure_code' field: %.*s",
+		      toks[0].end - toks[0].start, buffer);
 
 	if (!json_to_number(buffer, t, &val))
 		fatal("Invalid invoice_payment_hook failure_code: %.*s",
@@ -216,7 +255,7 @@ invoice_payment_hook_cb(struct invoice_payment_hook_payload *payload,
 	}
 
 	/* Did we have a hook result? */
-	if (hook_gives_failcode(buffer, toks, &failcode)) {
+	if (hook_gives_failcode(ld->log, buffer, toks, &failcode)) {
 		htlc_set_fail(payload->set, failcode);
 		return;
 	}
@@ -259,7 +298,7 @@ invoice_check_payment(const tal_t *ctx,
 
 	details = wallet_invoice_details(ctx, ld->wallet, invoice);
 
-	/* BOLT-9441a66faad63edc8cd89860b22fbf24a86f0dcd #4:
+	/* BOLT #4:
 	 *  - if the `payment_secret` doesn't match the expected value for that
 	 *     `payment_hash`, or the `payment_secret` is required and is not
 	 *     present:
@@ -1129,12 +1168,24 @@ static struct command_result *json_waitanyinvoice(struct command *cmd,
 						  const jsmntok_t *params)
 {
 	u64 *pay_index;
+	u64 *timeout;
 	struct wallet *wallet = cmd->ld->wallet;
 
 	if (!param(cmd, buffer, params,
 		   p_opt_def("lastpay_index", param_u64, &pay_index, 0),
+		   p_opt("timeout", &param_u64, &timeout),
 		   NULL))
 		return command_param_failed();
+
+	/*~ We allocate the timeout and the wallet-waitanyinvoice
+	 * in the cmd context, so whichever one manages to complete
+	 * the command first (and destroy the cmd context)
+	 * auto-cancels the other, is not tal amazing?
+	 */
+	if (timeout)
+		(void) new_reltimer(cmd->ld->timers, cmd,
+				    time_from_sec(*timeout),
+				    &wait_timed_out, cmd);
 
 	/* Set command as pending. We do not know if
 	 * wallet_invoice_waitany will return immediately
@@ -1155,7 +1206,8 @@ static const struct json_command waitanyinvoice_command = {
 	"waitanyinvoice",
 	"payment",
 	json_waitanyinvoice,
-	"Wait for the next invoice to be paid, after {lastpay_index} (if supplied)"
+	"Wait for the next invoice to be paid, after {lastpay_index} (if supplied).  "
+	"If {timeout} seconds is reached while waiting, fail with an error."
 };
 AUTODATA(json_command, &waitanyinvoice_command);
 

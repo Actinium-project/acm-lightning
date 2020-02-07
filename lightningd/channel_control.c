@@ -23,6 +23,7 @@
 #include <lightningd/log.h>
 #include <lightningd/peer_control.h>
 #include <lightningd/subd.h>
+#include <wire/gen_common_wire.h>
 #include <wire/wire_sync.h>
 
 static void update_feerates(struct lightningd *ld, struct channel *channel)
@@ -319,6 +320,19 @@ static unsigned channel_msg(struct subd *sd, const u8 *msg, const int *fds)
 		break;
 	}
 
+	switch ((enum common_wire_type)t) {
+#if DEVELOPER
+	case WIRE_CUSTOMMSG_IN:
+		handle_custommsg_in(sd->ld, sd->node_id, msg);
+		break;
+#else
+	case WIRE_CUSTOMMSG_IN:
+#endif
+	/* We send these. */
+	case WIRE_CUSTOMMSG_OUT:
+		break;
+	}
+
 	return 0;
 }
 
@@ -478,7 +492,8 @@ void peer_start_channeld(struct channel *channel,
 				      /* Set at channel open, even if not
 				       * negotiated now! */
 				      channel->option_static_remotekey,
-				      IFDEV(ld->dev_fast_gossip, false));
+				      IFDEV(ld->dev_fast_gossip, false),
+				      IFDEV(dev_fail_process_onionpacket, false));
 
 	/* We don't expect a response: we are triggered by funding_depth_cb. */
 	subd_send_msg(channel->owner, take(initmsg));

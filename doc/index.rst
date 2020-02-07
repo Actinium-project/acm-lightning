@@ -27,8 +27,6 @@ c-lightning Documentation
    :maxdepth: 1
    :caption: Manpages
 
-   lightningd-config <lightningd-config.5.md>
-   lightningd <lightningd.8.md>
    lightning-autocleaninvoice <lightning-autocleaninvoice.7.md>
    lightning-check <lightning-check.7.md>
    lightning-checkmessage <lightning-checkmessage.7.md>
@@ -39,6 +37,7 @@ c-lightning Documentation
    lightning-decodepay <lightning-decodepay.7.md>
    lightning-delexpiredinvoice <lightning-delexpiredinvoice.7.md>
    lightning-delinvoice <lightning-delinvoice.7.md>
+   lightning-dev-sendcustommsg <lightning-dev-sendcustommsg.7.md>
    lightning-disconnect <lightning-disconnect.7.md>
    lightning-fundchannel <lightning-fundchannel.7.md>
    lightning-fundchannel_cancel <lightning-fundchannel_cancel.7.md>
@@ -68,3 +67,5 @@ c-lightning Documentation
    lightning-waitinvoice <lightning-waitinvoice.7.md>
    lightning-waitsendpay <lightning-waitsendpay.7.md>
    lightning-withdraw <lightning-withdraw.7.md>
+   lightningd <lightningd.8.md>
+   lightningd-config <lightningd-config.5.md>

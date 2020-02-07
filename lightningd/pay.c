@@ -172,14 +172,14 @@ json_add_routefail_info(struct json_stream *js,
 
 void json_sendpay_fail_fields(struct json_stream *js,
 			      const struct wallet_payment *payment,
-			      int pay_errcode,
+			      errcode_t pay_errcode,
 			      const struct onionreply *onionreply,
 			      const struct routing_failure *fail)
 {
 	/* "immediate_routing_failure" is before payment creation. */
 	if (payment)
 		json_add_payment_fields(js, payment);
-	if (pay_errcode == PAY_UNPARSEABLE_ONION)
+	if (pay_errcode == PAY_UNPARSEABLE_ONION && onionreply)
 		json_add_hex_talarr(js, "onionreply", onionreply->contents);
 	else
 		json_add_routefail_info(js,
@@ -191,7 +191,7 @@ void json_sendpay_fail_fields(struct json_stream *js,
 					fail->msg);
 }
 
-static const char *sendpay_errmsg_fmt(const tal_t *ctx, int pay_errcode,
+static const char *sendpay_errmsg_fmt(const tal_t *ctx, errcode_t pay_errcode,
 				      const struct routing_failure *fail,
 				      const char *details)
 {
@@ -210,7 +210,7 @@ static const char *sendpay_errmsg_fmt(const tal_t *ctx, int pay_errcode,
 static struct command_result *
 sendpay_fail(struct command *cmd,
 	     const struct wallet_payment *payment,
-	     int pay_errcode,
+	     errcode_t pay_errcode,
 	     const struct onionreply *onionreply,
 	     const struct routing_failure *fail,
 	     const char *errmsg)
@@ -235,7 +235,7 @@ json_sendpay_in_progress(struct command *cmd,
 {
 	struct json_stream *response = json_stream_success(cmd);
 	json_add_string(response, "message",
-			"Monitor status with listpayments or waitsendpay");
+			"Monitor status with listpays or waitsendpay");
 	json_add_payment_fields(response, payment);
 	return command_success(cmd, response);
 }
@@ -243,7 +243,7 @@ json_sendpay_in_progress(struct command *cmd,
 static void tell_waiters_failed(struct lightningd *ld,
 				const struct sha256 *payment_hash,
 				const struct wallet_payment *payment,
-				int pay_errcode,
+				errcode_t pay_errcode,
 				const struct onionreply *onionreply,
 				const struct routing_failure *fail,
 				const char *details)
@@ -377,7 +377,7 @@ remote_routing_failure(const tal_t *ctx,
 		       const u8 *failuremsg,
 		       int origin_index,
 		       struct log *log,
-		       int *pay_errcode)
+		       errcode_t *pay_errcode)
 {
 	enum onion_type failcode = fromwire_peektype(failuremsg);
 	struct routing_failure *routing_failure;
@@ -487,6 +487,30 @@ remote_routing_failure(const tal_t *ctx,
 	return routing_failure;
 }
 
+/* If our immediate peer says WIRE_UPDATE_FAIL_MALFORMED_HTLC, we only get a
+ * code, no onion msg. */
+static struct routing_failure *
+badonion_routing_failure(const tal_t *ctx,
+			 struct lightningd *ld,
+			 const struct wallet_payment *payment,
+			 enum onion_type failcode)
+{
+	struct routing_failure *rf;
+
+	rf = tal(ctx, struct routing_failure);
+
+	rf->erring_index = 0;
+	rf->failcode = failcode;
+	rf->msg = NULL;
+	rf->erring_node = tal_dup(rf, struct node_id,
+				  &payment->route_nodes[0]);
+	rf->erring_channel = tal_dup(rf, struct short_channel_id,
+				     &payment->route_channels[0]);
+	rf->channel_dir = node_id_idx(&ld->id, &payment->route_nodes[0]);
+
+	return rf;
+}
+
 void payment_store(struct lightningd *ld, struct wallet_payment *payment TAKES)
 {
 	struct sendpay_command *pc;
@@ -515,7 +539,7 @@ void payment_failed(struct lightningd *ld, const struct htlc_out *hout,
 	struct wallet_payment *payment;
 	struct routing_failure* fail = NULL;
 	const char *failmsg;
-	int pay_errcode;
+	errcode_t pay_errcode;
 
 	payment = wallet_payment_by_hash(tmpctx, ld->wallet,
 					 &hout->payment_hash,
@@ -551,8 +575,15 @@ void payment_failed(struct lightningd *ld, const struct htlc_out *hout,
 		pay_errcode = PAY_UNPARSEABLE_ONION;
 		fail = NULL;
 		failmsg = NULL;
+	} else if (hout->failcode) {
+		/* Direct peer told channeld it's a malformed onion using
+		 * update_fail_malformed_htlc. */
+		failmsg = "malformed onion";
+		fail = badonion_routing_failure(tmpctx, ld, payment,
+						hout->failcode);
+		pay_errcode = PAY_UNPARSEABLE_ONION;
 	} else {
-		/* Must be remote fail. */
+		/* Must be normal remote fail with an onion-wrapped error. */
 		assert(!hout->failcode);
 		failmsg = "reply from remote";
 		/* Try to parse reply. */
@@ -631,7 +662,7 @@ static struct command_result *wait_payment(struct lightningd *ld,
 	char *faildetail;
 	struct routing_failure *fail;
 	int faildirection;
-	int rpcerrorcode;
+	errcode_t rpcerrorcode;
 
 	payment = wallet_payment_by_hash(tmpctx, ld->wallet,
 					 payment_hash, partid);
@@ -844,7 +875,7 @@ send_payment_core(struct lightningd *ld,
  		}
 	}
 
-	/* BOLT-9441a66faad63edc8cd89860b22fbf24a86f0dcd #4:
+	/* BOLT #4:
 	 *
 	 * - MUST NOT send another HTLC if the total `amount_msat` of the HTLC
 	 *   set is already greater or equal to `total_msat`.
@@ -992,7 +1023,7 @@ send_payment(struct lightningd *ld,
 	assert(ret);
 
 	final_tlv = should_use_tlv(route[i].style);
-	/* BOLT-9441a66faad63edc8cd89860b22fbf24a86f0dcd #4:
+	/* BOLT #4:
 	 * - Unless `node_announcement`, `init` message or the
 	 *   [BOLT #11](11-payment-encoding.md#tagged-fields) offers feature
 	 *   `var_onion_optin`:
@@ -1297,31 +1328,33 @@ static struct command_result *json_sendpay(struct command *cmd,
 		route[i].direction = direction ? *direction : 0;
 	}
 
-	/* The given msatoshi is the actual payment that the payee is
-	 * requesting. The final hop amount is what we actually give, which can
-	 * be from the msatoshi to twice msatoshi. */
-
 	if (*partid && !msat)
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 				    "Must specify msatoshi with partid");
 
-	/* finalhop.amount > 2 * msatoshi, fail. */
-	if (msat) {
-		struct amount_msat limit;
+	const struct amount_msat final_amount = route[routetok->size-1].amount;
 
-		if (!amount_msat_add(&limit, *msat, *msat))
+	if (msat && !*partid && !amount_msat_eq(*msat, final_amount))
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Do not specify msatoshi (%s) without"
+				    " partid: if you do, it must be exactly"
+				    " the final amount (%s)",
+				    type_to_string(tmpctx, struct amount_msat,
+						   msat),
+				    type_to_string(tmpctx, struct amount_msat,
+						   &final_amount));
+
+	/* For MPP, the total we send must *exactly* equal the amount
+	 * we promise to send (msatoshi).  So no single payment can be
+	 * > than that. */
+	if (*partid) {
+		if (amount_msat_greater(final_amount, *msat))
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "Unbelievable msatoshi %s",
+					    "Final amount %s is greater than"
+					    " %s, despite MPP",
 					    type_to_string(tmpctx,
 							   struct amount_msat,
-							   msat));
-
-		if (amount_msat_greater(route[routetok->size-1].amount, limit))
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "final %s more than twice msatoshi %s",
-					    type_to_string(tmpctx,
-							   struct amount_msat,
-							   &route[routetok->size-1].amount),
+							   &final_amount),
 					    type_to_string(tmpctx,
 							   struct amount_msat,
 							   msat));
@@ -1333,8 +1366,8 @@ static struct command_result *json_sendpay(struct command *cmd,
 
 	return send_payment(cmd->ld, cmd, rhash, *partid,
 			    route,
-			    route[routetok->size-1].amount,
-			    msat ? *msat : route[routetok->size-1].amount,
+			    final_amount,
+			    msat ? *msat : final_amount,
 			    label, b11str, payment_secret);
 }
 

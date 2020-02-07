@@ -55,6 +55,7 @@
 #include <inttypes.h>
 #include <secp256k1.h>
 #include <stdio.h>
+#include <wire/gen_common_wire.h>
 #include <wire/gen_onion_wire.h>
 #include <wire/peer_wire.h>
 #include <wire/wire.h>
@@ -994,7 +995,10 @@ static secp256k1_ecdsa_signature *calc_commitsigs(const tal_t *ctx,
 
 	msg = towire_hsm_sign_remote_commitment_tx(NULL, txs[0],
 						   &peer->channel->funding_pubkey[REMOTE],
-						   *txs[0]->input_amounts[0]);
+						   *txs[0]->input_amounts[0],
+						   (const struct witscript **) txs[0]->output_witscripts,
+						   &peer->remote_per_commit,
+						   peer->channel->option_static_remotekey);
 
 	msg = hsm_req(tmpctx, take(msg));
 	if (!fromwire_hsm_sign_tx_reply(msg, commit_sig))
@@ -1817,6 +1821,27 @@ static void handle_peer_shutdown(struct peer *peer, const u8 *shutdown)
 	billboard_update(peer);
 }
 
+/* Try to handle a custommsg Returns true if it was a custom message and has
+ * been handled, false if the message was not handled.
+ */
+static bool channeld_handle_custommsg(const u8 *msg)
+{
+#if DEVELOPER
+	enum wire_type type = fromwire_peektype(msg);
+	if (type % 2 == 1 && !wire_type_is_defined(type)) {
+		/* The message is not part of the messages we know how to
+		 * handle. Assuming this is a custommsg, we just forward it to the
+		 * master. */
+		wire_sync_write(MASTER_FD, take(towire_custommsg_in(NULL, msg)));
+		return true;
+	} else {
+		return false;
+	}
+#else
+	return false;
+#endif
+}
+
 static void peer_in(struct peer *peer, const u8 *msg)
 {
 	enum wire_type type = fromwire_peektype(msg);
@@ -1828,6 +1853,9 @@ static void peer_in(struct peer *peer, const u8 *msg)
 		peer->expecting_pong = false;
 		return;
 	}
+
+	if (channeld_handle_custommsg(msg))
+		return;
 
 	/* Since LND seems to send errors which aren't actually fatal events,
 	 * we treat errors here as soft. */
@@ -2329,9 +2357,10 @@ static void peer_reconnect(struct peer *peer,
 	do {
 		clean_tmpctx();
 		msg = sync_crypto_read(tmpctx, peer->pps);
-	} while (handle_peer_gossip_or_error(peer->pps, &peer->channel_id, true,
-					     msg)
-		 || capture_premature_msg(&premature_msgs, msg));
+	} while (channeld_handle_custommsg(msg) ||
+		 handle_peer_gossip_or_error(peer->pps, &peer->channel_id, true,
+					     msg) ||
+		 capture_premature_msg(&premature_msgs, msg));
 
 	if (peer->channel->option_static_remotekey) {
 		struct pubkey ignore;
@@ -2851,6 +2880,14 @@ static void handle_dev_memleak(struct peer *peer, const u8 *msg)
 			 take(towire_channel_dev_memleak_reply(NULL,
 							       found_leak)));
 }
+
+/* We were told to send a custommsg to the peer by `lightningd`. All the
+ * verification is done on the side of `lightningd` so we should be good to
+ * just forward it here. */
+static void channeld_send_custommsg(struct peer *peer, const u8 *msg)
+{
+	sync_crypto_write(peer->pps, take(msg));
+}
 #endif /* DEVELOPER */
 
 static void req_in(struct peer *peer, const u8 *msg)
@@ -2911,6 +2948,21 @@ static void req_in(struct peer *peer, const u8 *msg)
 	case WIRE_CHANNEL_SEND_ERROR_REPLY:
 		break;
 	}
+
+	/* Now handle common messages. */
+	switch ((enum common_wire_type)t) {
+#if DEVELOPER
+	case WIRE_CUSTOMMSG_OUT:
+		channeld_send_custommsg(peer, msg);
+		return;
+#else
+	case WIRE_CUSTOMMSG_OUT:
+#endif
+	/* We send these. */
+	case WIRE_CUSTOMMSG_IN:
+		break;
+	}
+
 	master_badmsg(-1, msg);
 }
 
@@ -2958,6 +3010,9 @@ static void init_channel(struct peer *peer)
 	secp256k1_ecdsa_signature *remote_ann_node_sig;
 	secp256k1_ecdsa_signature *remote_ann_bitcoin_sig;
 	bool option_static_remotekey;
+#if !DEVELOPER
+	bool dev_fail_process_onionpacket; /* Ignored */
+#endif
 
 	assert(!(fcntl(MASTER_FD, F_GETFL) & O_NONBLOCK));
 
@@ -3017,8 +3072,9 @@ static void init_channel(struct peer *peer)
 				   &remote_ann_node_sig,
 				   &remote_ann_bitcoin_sig,
 				   &option_static_remotekey,
-				   &dev_fast_gossip)) {
-					   master_badmsg(WIRE_CHANNEL_INIT, msg);
+				   &dev_fast_gossip,
+				   &dev_fail_process_onionpacket)) {
+		master_badmsg(WIRE_CHANNEL_INIT, msg);
 	}
 	/* stdin == requests, 3 == peer, 4 = gossip, 5 = gossip_store, 6 = HSM */
 	per_peer_state_set_fds(peer->pps, 3, 4, 5);

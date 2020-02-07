@@ -4,12 +4,14 @@
 #include <bitcoin/chainparams.h>
 #include <bitcoin/privkey.h>
 #include <ccan/container_of/container_of.h>
+#include <ccan/strmap/strmap.h>
 #include <ccan/time/time.h>
 #include <ccan/timer/timer.h>
 #include <lightningd/htlc_end.h>
 #include <lightningd/htlc_set.h>
 #include <lightningd/plugin.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <wallet/txfilter.h>
 #include <wallet/wallet.h>
 
@@ -76,6 +78,8 @@ struct config {
 	struct secret *keypass;
 };
 
+typedef STRMAP(const char *) alt_subdaemon_map;
+
 struct lightningd {
 	/* The directory to find all the subdaemons. */
 	const char *daemon_dir;
@@ -91,6 +95,8 @@ struct lightningd {
 
 	/* Location of the RPC socket. */
 	char *rpc_filename;
+	/* Mode of the RPC filename. */
+	mode_t rpc_filemode;
 
 	/* The root of the jsonrpc interface. Can be shut down
 	 * separately from the rest of the daemon to allow a clean
@@ -254,11 +260,19 @@ struct lightningd {
 
 	/* Outstanding waitblockheight commands.  */
 	struct list_head waitblockheight_commands;
+
+	alt_subdaemon_map alt_subdaemons;
 };
 
 /* Turning this on allows a tal allocation to return NULL, rather than aborting.
  * Use only on carefully tested code! */
 extern bool tal_oom_ok;
+
+/* Returns true if called with a recognized subdaemon, eg: "hsmd" */
+bool is_subdaemon(const char *sdname);
+
+/* Returns the path to the subdaemon. Considers alternate subdaemon paths. */
+const char *subdaemon_path(const tal_t *ctx, const struct lightningd *ld, const char *name);
 
 /* Check we can run subdaemons, and check their versions */
 void test_subdaemons(const struct lightningd *ld);

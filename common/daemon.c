@@ -18,8 +18,6 @@
 #include <unistd.h>
 #include <wally_core.h>
 
-struct backtrace_state *backtrace_state;
-
 #if BACKTRACE_SUPPORTED
 static void (*bt_print)(const char *fmt, ...) PRINTF_FMT(1,2);
 static void (*bt_exit)(void);
@@ -151,7 +149,7 @@ void daemon_setup(const char *argv0,
 	 * not start if it cannot do its job correctly. */
 	if (sodium_init() == -1)
 		errx(1, "Could not initialize libsodium. Maybe not enough entropy"
-		         " available ?");
+		     " available ?");
 
 	/* We handle write returning errors! */
 	signal(SIGPIPE, SIG_IGN);

@@ -425,7 +425,7 @@ struct onionpacket *create_onionpacket(
 	/* Note that this is just hop_payloads: the rest of the packet is
 	 * overwritten below or above anyway. */
 	generate_key(padkey, "pad", 3, sp->session_key);
-	generate_cipher_stream(stream, padkey, ROUTING_INFO_SIZE);
+	generate_cipher_stream(packet->routinginfo, padkey, ROUTING_INFO_SIZE);
 
 	generate_header_padding(filler, sizeof(filler), sp, params);
 
@@ -459,6 +459,10 @@ struct onionpacket *create_onionpacket(
 	return packet;
 }
 
+#if DEVELOPER
+bool dev_fail_process_onionpacket;
+#endif
+
 /*
  * Given an onionpacket msg extract the information for the current
  * node and unwrap the remainder so that the node can forward it.
@@ -487,7 +491,8 @@ struct route_step *process_onionpacket(
 
 	compute_packet_hmac(msg, assocdata, assocdatalen, keys.mu, hmac);
 
-	if (memcmp(msg->mac, hmac, sizeof(hmac)) != 0) {
+	if (memcmp(msg->mac, hmac, sizeof(hmac)) != 0
+	    || IFDEV(dev_fail_process_onionpacket, false)) {
 		/* Computed MAC does not match expected MAC, the message was modified. */
 		return tal_free(step);
 	}

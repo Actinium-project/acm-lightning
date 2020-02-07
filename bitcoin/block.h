@@ -10,6 +10,12 @@
 
 struct chainparams;
 
+enum dynafed_params_type {
+	DYNAFED_PARAMS_NULL,
+	DYNAFED_PARAMS_COMPACT,
+	DYNAFED_PARAMS_FULL,
+};
+
 struct bitcoin_blkid {
 	struct sha256_double shad;
 };
@@ -23,21 +29,11 @@ struct bitcoin_block_hdr {
 	le32 timestamp;
 	le32 target;
 	le32 nonce;
-};
-
-struct elements_block_proof {
-	u8 *challenge;
-	u8 *solution;
-};
-
-struct elements_block_hdr {
-	u32 block_height;
-	struct elements_block_proof proof;
+	struct bitcoin_blkid hash;
 };
 
 struct bitcoin_block {
 	struct bitcoin_block_hdr hdr;
-	struct elements_block_hdr *elements_hdr;
 	/* tal_count shows now many */
 	struct bitcoin_tx **tx;
 };

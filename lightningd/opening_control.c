@@ -29,10 +29,10 @@
 #include <lightningd/notification.h>
 #include <lightningd/opening_control.h>
 #include <lightningd/options.h>
-#include <lightningd/peer_control.h>
 #include <lightningd/plugin_hook.h>
 #include <lightningd/subd.h>
 #include <openingd/gen_opening_wire.h>
+#include <wire/gen_common_wire.h>
 #include <wire/wire.h>
 #include <wire/wire_sync.h>
 
@@ -922,6 +922,20 @@ static unsigned int openingd_msg(struct subd *openingd,
 	case WIRE_OPENING_DEV_MEMLEAK_REPLY:
 		break;
 	}
+
+	switch ((enum common_wire_type)t) {
+#if DEVELOPER
+	case WIRE_CUSTOMMSG_IN:
+		handle_custommsg_in(openingd->ld, openingd->node_id, msg);
+		return 0;
+#else
+	case WIRE_CUSTOMMSG_IN:
+#endif
+	/* We send these. */
+	case WIRE_CUSTOMMSG_OUT:
+		break;
+	}
+
 	log_broken(openingd->log, "Unexpected msg %s: %s",
 		   opening_wire_type_name(t), tal_hex(tmpctx, msg));
 	tal_free(openingd);
@@ -1323,3 +1337,16 @@ void opening_dev_memleak(struct command *cmd)
 	opening_memleak_req_next(cmd, NULL);
 }
 #endif /* DEVELOPER */
+
+struct subd *peer_get_owning_subd(struct peer *peer)
+{
+	struct channel *channel;
+	channel = peer_active_channel(peer);
+
+	if (channel != NULL) {
+		return channel->owner;
+	} else if (peer->uncommitted_channel != NULL) {
+		return peer->uncommitted_channel->openingd;
+	}
+	return NULL;
+}

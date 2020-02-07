@@ -105,6 +105,30 @@ static char *opt_set_s32(const char *arg, s32 *u)
 	return NULL;
 }
 
+static char *opt_set_mode(const char *arg, mode_t *m)
+{
+	char *endp;
+	long l;
+
+	assert(arg != NULL);
+
+	/* Ensure length, and starts with 0.  */
+	if (strlen(arg) != 4 || arg[0] != '0')
+		return tal_fmt(NULL, "'%s' is not a file mode", arg);
+
+	/* strtol, manpage, yech.  */
+	errno = 0;
+	l = strtol(arg, &endp, 8); /* Octal.  */
+	if (errno || *endp)
+		return tal_fmt(NULL, "'%s' is not a file mode", arg);
+	*m = l;
+	/* Range check not needed, previous strlen checks ensures only
+	 * 9-bit, which fits mode_t (unless your Unix is seriously borked).
+	 */
+
+	return NULL;
+}
+
 static char *opt_add_addr_withtype(const char *arg,
 				   struct lightningd *ld,
 				   enum addr_listen_announce ala,
@@ -191,6 +215,33 @@ static char *opt_add_addr(const char *arg, struct lightningd *ld)
 	return opt_add_addr_withtype(arg, ld, ADDR_LISTEN_AND_ANNOUNCE, true);
 }
 
+static char *opt_subdaemon(const char *arg, struct lightningd *ld)
+{
+	char *subdaemon;
+	char *sdpath;
+
+	/* example arg: "hsmd:remote_hsmd" */
+
+	size_t colonoff = strcspn(arg, ":");
+	if (!arg[colonoff])
+		return tal_fmt(NULL, "argument must contain ':'");
+
+	subdaemon = tal_strndup(ld, arg, colonoff);
+	if (!is_subdaemon(subdaemon))
+		return tal_fmt(NULL, "\"%s\" is not a subdaemon", subdaemon);
+
+	/* Make the value a tal-child of the subdaemon */
+	sdpath = tal_strdup(subdaemon, arg + colonoff + 1);
+
+	/* Remove any preexisting alt subdaemon mapping (and
+	 * implicitly, the sdpath). */
+	tal_free(strmap_del(&ld->alt_subdaemons, subdaemon, NULL));
+
+	strmap_add(&ld->alt_subdaemons, subdaemon, sdpath);
+
+	return NULL;
+}
+
 static char *opt_add_bind_addr(const char *arg, struct lightningd *ld)
 {
 	struct wireaddr_internal addr;
@@ -223,6 +274,11 @@ static void opt_show_u32(char buf[OPT_SHOW_LEN], const u32 *u)
 static void opt_show_s32(char buf[OPT_SHOW_LEN], const s32 *u)
 {
 	snprintf(buf, OPT_SHOW_LEN, "%"PRIi32, *u);
+}
+
+static void opt_show_mode(char buf[OPT_SHOW_LEN], const mode_t *m)
+{
+	snprintf(buf, OPT_SHOW_LEN, "\"%04o\"", (int) *m);
 }
 
 static char *opt_set_rgb(const char *arg, struct lightningd *ld)
@@ -497,6 +553,9 @@ static void dev_register_opts(struct lightningd *ld)
 	opt_register_noarg("--dev-no-htlc-timeout", opt_set_bool,
 			   &ld->dev_no_htlc_timeout,
 			   "Don't kill channeld if HTLCs not confirmed within 30 seconds");
+	opt_register_noarg("--dev-fail-process-onionpacket", opt_set_bool,
+			   &dev_fail_process_onionpacket,
+			   "Force all processing of onion packets to fail");
 }
 #endif /* DEVELOPER */
 
@@ -842,6 +901,21 @@ static void register_opts(struct lightningd *ld)
 	                   "Set the password to encrypt hsm_secret with. If no password is passed through command line, "
 	                   "you will be prompted to enter it.");
 
+	opt_register_arg("--rpc-file-mode", &opt_set_mode, &opt_show_mode,
+			 &ld->rpc_filemode,
+			 "Set the file mode (permissions) for the "
+			 "JSON-RPC socket");
+
+	opt_register_arg("--subdaemon", opt_subdaemon, NULL,
+			 ld, "Arg specified as SUBDAEMON:PATH. "
+			 "Specifies an alternate subdaemon binary. "
+			 "If the supplied path is relative the subdaemon "
+			 "binary is found in the working directory. "
+			 "This option may be specified multiple times. "
+			 "For example, "
+			 "--subdaemon=hsmd:remote_signer "
+			 "would use a hypothetical remote signing subdaemon.");
+
 	opt_register_logging(ld);
 	opt_register_version();
 
@@ -885,6 +959,16 @@ static void promote_missing_files(struct lightningd *ld)
 			continue;
 
 		fullname = path_join(tmpctx, ld->config_basedir, d->d_name);
+
+		/* Simply remove rpc file: if they use --rpc-file to place it
+		 * here explicitly it will get recreated, but moving it would
+		 * be confusing as it would be unused. */
+		if (streq(d->d_name, "lightning-rpc")) {
+			if (unlink(fullname) != 0)
+				log_unusual(ld->log, "Could not unlink %s: %s",
+					    fullname, strerror(errno));
+			continue;
+		}
 
 		/* Ignore any directories. */
 		if (lstat(fullname, &st) != 0)
@@ -1080,12 +1164,37 @@ static void json_add_opt_addrs(struct json_stream *response,
 	}
 }
 
+struct json_add_opt_alt_subdaemon_args {
+	const char *name0;
+	struct json_stream *response;
+};
+
+static bool json_add_opt_alt_subdaemon(const char *member,
+				       const char *value,
+				       struct json_add_opt_alt_subdaemon_args *argp)
+{
+	json_add_string(argp->response,
+			argp->name0,
+			tal_fmt(argp->name0, "%s:%s", member, value));
+	return true;
+}
+
+static void json_add_opt_subdaemons(struct json_stream *response,
+				    const char *name0,
+				    alt_subdaemon_map *alt_subdaemons)
+{
+	struct json_add_opt_alt_subdaemon_args args;
+	args.name0 = name0;
+	args.response = response;
+	strmap_iterate(alt_subdaemons, json_add_opt_alt_subdaemon, &args);
+}
+
 static void add_config(struct lightningd *ld,
 		       struct json_stream *response,
 		       const struct opt_table *opt,
 		       const char *name, size_t len)
 {
-	char *name0 = tal_strndup(response, name, len);
+	char *name0 = tal_strndup(tmpctx, name, len);
 	const char *answer = NULL;
 	char buf[OPT_SHOW_LEN + sizeof("...")];
 
@@ -1174,6 +1283,10 @@ static void add_config(struct lightningd *ld,
 					   ld->proposed_listen_announce,
 					   ADDR_ANNOUNCE);
 			return;
+		} else if (opt->cb_arg == (void *)opt_subdaemon) {
+			json_add_opt_subdaemons(response, name0,
+						    &ld->alt_subdaemons);
+			return;
 		} else if (opt->cb_arg == (void *)opt_add_proxy_addr) {
 			if (ld->proxyaddr)
 				answer = fmt_wireaddr(name0, ld->proxyaddr);
@@ -1200,7 +1313,6 @@ static void add_config(struct lightningd *ld,
 		struct json_escape *esc = json_escape(NULL, answer);
 		json_add_escaped_string(response, name0, take(esc));
 	}
-	tal_free(name0);
 }
 
 static struct command_result *json_listconfigs(struct command *cmd,

@@ -1,8 +1,8 @@
 /* lightningd/json_stream.h
  * Helpers for outputting JSON results into a membuf.
  */
-#ifndef LIGHTNING_LIGHTNINGD_JSON_STREAM_H
-#define LIGHTNING_LIGHTNINGD_JSON_STREAM_H
+#ifndef LIGHTNING_COMMON_JSON_STREAM_H
+#define LIGHTNING_COMMON_JSON_STREAM_H
 #include "config.h"
 #include <ccan/membuf/membuf.h>
 #include <ccan/short_types/short_types.h>
@@ -14,8 +14,27 @@
 
 struct command;
 struct io_conn;
-struct json_stream;
 struct log;
+
+struct json_stream {
+	/* NULL if we ran OOM! */
+	struct json_out *jout;
+
+	/* Who is writing to this buffer now; NULL if nobody is. */
+	struct command *writer;
+
+	/* Who is io_writing from this buffer now: NULL if nobody is. */
+	struct io_conn *reader;
+	struct io_plan *(*reader_cb)(struct io_conn *conn,
+				     struct json_stream *js,
+				     void *arg);
+	void *reader_arg;
+	size_t len_read;
+
+	/* Where to log I/O */
+	struct log *log;
+};
+
 
 /**
  * new_json_stream - create a new JSON stream.
@@ -131,4 +150,4 @@ struct io_plan *json_stream_output_(struct json_stream *js,
 
 void json_stream_flush(struct json_stream *js);
 
-#endif /* LIGHTNING_LIGHTNINGD_JSON_STREAM_H */
+#endif /* LIGHTNING_COMMON_JSON_STREAM_H */

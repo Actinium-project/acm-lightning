@@ -103,7 +103,7 @@ static struct command_result *tx_abort(struct command *cmd,
 	/* We need to call txdiscard, and forward the actual cause for the
 	 * error after we've cleaned up. We swallow any errors returned by
 	 * this call, as we don't really care if it succeeds or not */
-	return send_outreq(cmd, "txdiscard",
+	return send_outreq(cmd->plugin, cmd, "txdiscard",
 			   send_prior, send_prior,
 			   fr, take(ret));
 }
@@ -143,7 +143,7 @@ static struct command_result *send_tx(struct command *cmd,
 	tok = json_get_member(buf, result, "commitments_secured");
 	if (!json_to_bool(buf, tok, &commitments_secured) || !commitments_secured)
 		/* TODO: better failure path? this should never fail though. */
-		plugin_err("Commitment not secured.");
+		plugin_err(cmd->plugin, "Commitment not secured.");
 
 	/* Stash the channel_id so we can return it when finalized */
 	tok = json_get_member(buf, result, "channel_id");
@@ -155,7 +155,7 @@ static struct command_result *send_tx(struct command *cmd,
 			type_to_string(tmpctx, struct bitcoin_txid, &fr->tx_id));
 	json_out_end(ret, '}');
 
-	return send_outreq(cmd, "txsend",
+	return send_outreq(cmd->plugin, cmd, "txsend",
 			   finish, tx_abort,
 			   fr, take(ret));
 }
@@ -175,16 +175,16 @@ static struct command_result *tx_prepare_done(struct command *cmd,
 
 	txid_tok = json_get_member(buf, result, "txid");
 	if (!txid_tok)
-		plugin_err("txprepare missing 'txid' field");
+		plugin_err(cmd->plugin, "txprepare missing 'txid' field");
 
 	tx_tok = json_get_member(buf, result, "unsigned_tx");
 	if (!tx_tok)
-		plugin_err("txprepare missing 'unsigned_tx' field");
+		plugin_err(cmd->plugin, "txprepare missing 'unsigned_tx' field");
 
 	hex = json_strdup(tmpctx, buf, tx_tok);
 	tx = bitcoin_tx_from_hex(fr, hex, strlen(hex));
 	if (!tx)
-		plugin_err("Unable to parse tx %s", hex);
+		plugin_err(cmd->plugin, "Unable to parse tx %s", hex);
 
 	/* Find the txout */
 	outnum_found = false;
@@ -197,14 +197,14 @@ static struct command_result *tx_prepare_done(struct command *cmd,
 		}
 	}
 	if (!outnum_found)
-		plugin_err("txprepare doesn't include our funding output. "
+		plugin_err(cmd->plugin, "txprepare doesn't include our funding output. "
 			   "tx: %s, output: %s",
 			   type_to_string(tmpctx, struct bitcoin_tx, tx),
 			   tal_hex(tmpctx, fr->out_script));
 
 	hex = json_strdup(tmpctx, buf, txid_tok);
 	if (!bitcoin_txid_from_hex(hex, strlen(hex), &fr->tx_id))
-		plugin_err("Unable to parse txid %s", hex);
+		plugin_err(cmd->plugin, "Unable to parse txid %s", hex);
 
 	ret = json_out_new(NULL);
 	json_out_start(ret, NULL, '{');
@@ -214,7 +214,7 @@ static struct command_result *tx_prepare_done(struct command *cmd,
 	json_out_add(ret, "txout", false, "%u", outnum);
 	json_out_end(ret, '}');
 
-	return send_outreq(cmd, "fundchannel_complete",
+	return send_outreq(cmd->plugin, cmd, "fundchannel_complete",
 			   send_tx, tx_abort,
 			   fr, take(ret));
 }
@@ -234,7 +234,7 @@ static struct command_result *cancel_start(struct command *cmd,
 	json_out_addstr(ret, "id", node_id_to_hexstr(tmpctx, fr->id));
 	json_out_end(ret, '}');
 
-	return send_outreq(cmd, "fundchannel_cancel",
+	return send_outreq(cmd->plugin, cmd, "fundchannel_cancel",
 			   send_prior, send_prior,
 			   fr, take(ret));
 }
@@ -274,7 +274,7 @@ static struct command_result *prepare_actual(struct command *cmd,
 
 	ret = txprepare(cmd, fr, fr->funding_addr);
 
-	return send_outreq(cmd, "txprepare",
+	return send_outreq(cmd->plugin, cmd, "txprepare",
 			   tx_prepare_done, cancel_start,
 			   fr, take(ret));
 }
@@ -301,7 +301,7 @@ static struct command_result *fundchannel_start_done(struct command *cmd,
 			type_to_string(tmpctx, struct bitcoin_txid, &fr->tx_id));
 	json_out_end(ret, '}');
 
-	return send_outreq(cmd, "txdiscard",
+	return send_outreq(cmd->plugin, cmd, "txdiscard",
 			   prepare_actual, cancel_start,
 			   fr, take(ret));
 }
@@ -330,7 +330,7 @@ static struct command_result *fundchannel_start(struct command *cmd,
 	json_out_end(ret, '}');
 	json_out_finished(ret);
 
-	return send_outreq(cmd, "fundchannel_start",
+	return send_outreq(cmd->plugin, cmd, "fundchannel_start",
 			   fundchannel_start_done, tx_abort,
 			   fr, take(ret));
 }
@@ -350,7 +350,7 @@ static struct command_result *post_dryrun(struct command *cmd,
 	/* Stash the 'reserved' txid to unreserve later */
 	hex = json_strdup(tmpctx, buf, json_get_member(buf, result, "txid"));
 	if (!bitcoin_txid_from_hex(hex, strlen(hex), &fr->tx_id))
-		plugin_err("Unable to parse reserved txid %s", hex);
+		plugin_err(cmd->plugin, "Unable to parse reserved txid %s", hex);
 
 
 	hex = json_strdup(tmpctx, buf, json_get_member(buf, result, "unsigned_tx"));
@@ -376,7 +376,7 @@ static struct command_result *post_dryrun(struct command *cmd,
 	}
 
 	if (!funding_found)
-		plugin_err("Error creating placebo funding tx, funding_out not found. %s", hex);
+		plugin_err(cmd->plugin, "Error creating placebo funding tx, funding_out not found. %s", hex);
 
 	/* Update funding to actual amount */
 	if (fr->funding_all && amount_sat_greater(funding, chainparams->max_funding))
@@ -397,7 +397,7 @@ static struct command_result *exec_dryrun(struct command *cmd,
 	 * so we can get an accurate idea of the funding amount */
 	ret = txprepare(cmd, fr, placeholder_funding_addr);
 
-	return send_outreq(cmd, "txprepare",
+	return send_outreq(cmd->plugin, cmd, "txprepare",
 			   post_dryrun, forward_error,
 			   fr, take(ret));
 
@@ -413,7 +413,7 @@ static struct command_result *connect_to_peer(struct command *cmd,
 	json_out_end(ret, '}');
 	json_out_finished(ret);
 
-	return send_outreq(cmd, "connect",
+	return send_outreq(cmd->plugin, cmd, "connect",
 			   exec_dryrun, forward_error,
 			   fr, take(ret));
 }
@@ -485,17 +485,17 @@ static struct command_result *json_fundchannel(struct command *cmd,
 	return connect_to_peer(cmd, fr);
 }
 
-static void init(struct plugin_conn *rpc,
+static void init(struct plugin *p,
 		 const char *buf UNUSED, const jsmntok_t *config UNUSED)
 {
 	/* Figure out what the 'placeholder' addr is */
 	const char *network_name;
 	u8 *placeholder = tal_hexdata(tmpctx, placeholder_script, strlen(placeholder_script));
 
-	network_name = rpc_delve(tmpctx, "listconfigs",
+	network_name = rpc_delve(tmpctx, p, "listconfigs",
 				 take(json_out_obj(NULL, "config",
 						   "network")),
-			         rpc, ".network");
+				 ".network");
 	chainparams = chainparams_for_network(network_name);
 	placeholder_funding_addr = encode_scriptpubkey_to_addr(NULL, chainparams,
 							       placeholder);

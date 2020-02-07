@@ -6,31 +6,11 @@
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
 #include <common/daemon.h>
+#include <common/json_stream.h>
 #include <common/utils.h>
-#include <lightningd/json.h>
-#include <lightningd/json_stream.h>
-#include <lightningd/log.h>
 #include <stdarg.h>
 #include <stdio.h>
 
-struct json_stream {
-	/* NULL if we ran OOM! */
-	struct json_out *jout;
-
-	/* Who is writing to this buffer now; NULL if nobody is. */
-	struct command *writer;
-
-	/* Who is io_writing from this buffer now: NULL if nobody is. */
-	struct io_conn *reader;
-	struct io_plan *(*reader_cb)(struct io_conn *conn,
-				     struct json_stream *js,
-				     void *arg);
-	void *reader_arg;
-	size_t len_read;
-
-	/* Where to log I/O */
-	struct log *log;
-};
 
 static void adjust_io_write(struct json_out *jout,
 			    ptrdiff_t delta,
@@ -208,8 +188,6 @@ static struct io_plan *json_stream_output_write(struct io_conn *conn,
 	}
 
 	js->reader = conn;
-	if (js->log)
-		log_io(js->log, LOG_IO_OUT, NULL, "", p, js->len_read);
 	return io_write(conn,
 			p, js->len_read,
 			json_stream_output_write, js);

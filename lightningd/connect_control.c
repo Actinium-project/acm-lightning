@@ -2,9 +2,11 @@
 #include <ccan/fdpass/fdpass.h>
 #include <ccan/list/list.h>
 #include <ccan/tal/str/str.h>
+#include <common/errcode.h>
 #include <common/features.h>
 #include <common/json_command.h>
 #include <common/json_helpers.h>
+#include <common/json_stream.h>
 #include <common/jsonrpc_errors.h>
 #include <common/memleak.h>
 #include <common/node_id.h>
@@ -20,7 +22,6 @@
 #include <lightningd/connect_control.h>
 #include <lightningd/hsm_control.h>
 #include <lightningd/json.h>
-#include <lightningd/json_stream.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
@@ -231,7 +232,7 @@ void delay_then_reconnect(struct channel *channel, u32 seconds_delay,
 static void connect_failed(struct lightningd *ld, const u8 *msg)
 {
 	struct node_id id;
-	int errcode;
+	errcode_t errcode;
 	char *errmsg;
 	struct connect *c;
 	u32 seconds_to_delay;

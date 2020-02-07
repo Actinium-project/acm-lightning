@@ -473,6 +473,10 @@ Hooks are considered to be an advanced feature due to the fact that
 carefully, and make sure your plugins always return a valid response
 to any hook invocation.
 
+As a convention, for all hooks, returning the object
+`{ "result" : "continue" }` results in `lightningd` behaving exactly as if
+no plugin is registered on the hook.
+
 ### Hook Types
 
 #### `peer_connected`
@@ -514,16 +518,67 @@ It is currently extremely restricted:
    commands, as these may become intermingled and break rule #1.
 3. the hook will be called before your plugin is initialized!
 
+This hook, unlike all the other hooks, is also strongly synchronous:
+`lightningd` will stop almost all the other processing until this
+hook responds.
+
 ```json
 {
+  "data_version": 42,
   "writes": [
     "PRAGMA foreign_keys = ON"
   ]
 }
 ```
 
-Any response but "true" will cause lightningd to error without
+This hook is intended for creating continuous backups.
+The intent is that your backup plugin maintains three
+pieces of information (possibly in separate files):
+(1) a snapshot of the database, (2) a log of database queries
+that will bring that snapshot up-to-date, and (3) the previous
+`data_version`.
+
+`data_version` is an unsigned 32-bit number that will always
+increment by 1 each time `db_write` is called.
+Note that this will wrap around on the limit of 32-bit numbers.
+
+`writes` is an array of strings, each string being a database query
+that modifies the database.
+If the `data_version` above is validated correctly, then you can
+simply append this to the log of database queries.
+
+Your plugin **MUST** validate the `data_version`.
+It **MUST** keep track of the previous `data_version` it got,
+and:
+
+1. If the new `data_version` is ***exactly*** one higher than
+   the previous, then this is the ideal case and nothing bad
+   happened and we should save this and continue.
+2. If the new `data_version` is ***exactly*** the same value
+   as the previous, then the previous set of queries was not
+   committed.
+   Your plugin **MAY** overwrite the previous set of queries with
+   the current set, or it **MAY** overwrite its entire backup
+   with a new snapshot of the database and the current `writes`
+   array (treating this case as if `data_version` were two or
+   more higher than the previous).
+3. If the new `data_version` is ***less than*** the previous,
+   your plugin **MUST** halt and catch fire, and have the
+   operator inspect what exactly happend here.
+4. Otherwise, some queries were lost and your plugin **SHOULD**
+   recover by creating a new snapshot of the database: copy the
+   database file, back up the given `writes` array, then delete
+   (or atomically `rename` if in a POSIX filesystem) the previous
+   backups of the database and SQL statements, or you **MAY**
+   fail the hook to abort `lightningd`.
+
+The "rolling up" of the database could be done periodically as well
+if the log of SQL statements has grown large.
+
+Any response other than `{"result": "continue"}` will cause lightningd
+to error without
 committing to the database!
+This is the expected way to halt and catch fire.
 
 #### `invoice_payment`
 
@@ -542,8 +597,9 @@ This hook is called whenever a valid payment for an unpaid invoice has arrived.
 The hook is sparse on purpose, since the plugin can use the JSON-RPC
 `listinvoices` command to get additional details about this invoice.
 It can return a non-zero `failure_code` field as defined for final
-nodes in [BOLT 4][bolt4-failure-codes], or otherwise an empty object
-to accept the payment.
+nodes in [BOLT 4][bolt4-failure-codes], a `result` field with the string
+`reject` to fail it with `incorrect_or_unknown_payment_details`, or a
+`result` field with the string `continue` to accept the payment.
 
 
 #### `openchannel`
@@ -719,7 +775,7 @@ Let `lightningd` execute the command with
 
 ```json
 {
-    "continue": true
+    "result" : "continue"
 }
 ```
 Replace the request made to `lightningd`:
@@ -760,8 +816,44 @@ Return a custom error to the request sender:
 }
 ```
 
+
+#### `custommsg`
+
+The `custommsg` plugin hook is the receiving counterpart to the
+[`dev-sendcustommsg`][sendcustommsg] RPC method and allows plugins to handle
+messages that are not handled internally. The goal of these two components is
+to allow the implementation of custom protocols or prototypes on top of a
+c-lightning node, without having to change the node's implementation itself.
+
+The payload for a call follows this format:
+
+```json
+{
+	"peer_id": "02df5ffe895c778e10f7742a6c5b8a0cefbe9465df58b92fadeb883752c8107c8f",
+	"message": "1337ffffffff"
+}
+```
+
+This payload would have been sent by the peer with the `node_id` matching
+`peer_id`, and the message has type `0x1337` and contents `ffffffff`. Notice
+that the messages are currently limited to odd-numbered types and must not
+match a type that is handled internally by c-lightning. These limitations are
+in place in order to avoid conflicts with the internal state tracking, and
+avoiding disconnections or channel closures, since odd-numbered message can be
+ignored by nodes (see ["it's ok to be odd" in the specification][oddok] for
+details). The plugin must implement the parsing of the message, including the
+type prefix, since c-lightning does not know how to parse the message.
+
+The result for this hook is currently being discarded. For future uses of the
+result we suggest just returning `{'result': 'continue'}`.
+This will ensure backward
+compatibility should the semantics be changed in future.
+
+
 [jsonrpc-spec]: https://www.jsonrpc.org/specification
 [jsonrpc-notification-spec]: https://www.jsonrpc.org/specification#notification
 [bolt4]: https://github.com/lightningnetwork/lightning-rfc/blob/master/04-onion-routing.md
 [bolt4-failure-codes]: https://github.com/lightningnetwork/lightning-rfc/blob/master/04-onion-routing.md#failure-messages
 [bolt2-open-channel]: https://github.com/lightningnetwork/lightning-rfc/blob/master/02-peer-protocol.md#the-open_channel-message
+[sendcustommsg]: lightning-dev-sendcustommsg.7.html
+[oddok]: https://github.com/lightningnetwork/lightning-rfc/blob/master/00-introduction.md#its-ok-to-be-odd

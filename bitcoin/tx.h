@@ -12,6 +12,10 @@
 
 #define BITCOIN_TX_DEFAULT_SEQUENCE 0xFFFFFFFF
 
+struct witscript {
+    u8 *ptr;
+};
+
 struct bitcoin_txid {
 	struct sha256_double shad;
 };
@@ -23,6 +27,9 @@ struct bitcoin_tx {
 	 * unknown) */
 	struct amount_sat **input_amounts;
 	struct wally_tx *wtx;
+
+	/* Need the output wscripts in the HSM to validate transaction */
+	struct witscript **output_witscripts;
 
 	/* Keep a reference to the ruleset we have to abide by */
 	const struct chainparams *chainparams;
@@ -57,7 +64,8 @@ size_t bitcoin_tx_weight(const struct bitcoin_tx *tx);
  * zeroed with inputs' sequence_number set to FFFFFFFF) */
 struct bitcoin_tx *bitcoin_tx(const tal_t *ctx,
 			      const struct chainparams *chainparams,
-			      varint_t input_count, varint_t output_count);
+			      varint_t input_count, varint_t output_count,
+			      u32 nlocktime);
 
 /* This takes a raw bitcoin tx in hex. */
 struct bitcoin_tx *bitcoin_tx_from_hex(const tal_t *ctx, const char *hex,

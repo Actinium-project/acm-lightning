@@ -285,6 +285,7 @@ class UnixDomainSocketRpc(object):
         # FIXME: we open a new socket for every readobj call...
         sock = UnixSocket(self.socket_path)
         self._writeobj(sock, {
+            "jsonrpc": "2.0",
             "method": method,
             "params": payload,
             "id": self.next_id,
@@ -987,14 +988,18 @@ class LightningRpc(UnixDomainSocketRpc):
         """
         return self.call("stop")
 
-    def waitanyinvoice(self, lastpay_index=None):
+    def waitanyinvoice(self, lastpay_index=None, timeout=None, **kwargs):
         """
         Wait for the next invoice to be paid, after {lastpay_index}
         (if supplied)
+        Fail after {timeout} seconds has passed without an invoice
+        being paid.
         """
         payload = {
-            "lastpay_index": lastpay_index
+            "lastpay_index": lastpay_index,
+            "timeout": timeout
         }
+        payload.update({k: v for k, v in kwargs.items()})
         return self.call("waitanyinvoice", payload)
 
     def waitblockheight(self, blockheight, timeout=None):
@@ -1068,7 +1073,7 @@ class LightningRpc(UnixDomainSocketRpc):
         if 'destination' in kwargs or 'satoshi' in kwargs:
             return self._deprecated_txprepare(*args, **kwargs)
 
-        if not isinstance(args[0], list):
+        if len(args) and not isinstance(args[0], list):
             return self._deprecated_txprepare(*args, **kwargs)
 
         def _txprepare(outputs, feerate=None, minconf=None, utxos=None):

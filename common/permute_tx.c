@@ -35,7 +35,7 @@ static size_t find_best_in(struct wally_tx_input *inputs, size_t num)
 }
 
 static void swap_wally_inputs(struct wally_tx_input *inputs,
-                             const void **map,
+			     const void **map,
                              size_t i1, size_t i2)
 {
        struct wally_tx_input tmpinput;
@@ -174,5 +174,12 @@ void permute_outputs(struct bitcoin_tx *tx, u32 *cltvs, const void **map)
 
 		/* Swap best into first place. */
 		swap_wally_outputs(tx->wtx->outputs, map, cltvs, i, best_pos);
+
+		/* If output_witscripts are present, swap them to match. */
+		if (tx->output_witscripts) {
+			struct witscript *tmp = tx->output_witscripts[i];
+			tx->output_witscripts[i] = tx->output_witscripts[best_pos];
+			tx->output_witscripts[best_pos] = tmp;
+		}
 	}
 }

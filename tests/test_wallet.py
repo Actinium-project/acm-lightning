@@ -265,6 +265,21 @@ def test_deprecated_txprepare(node_factory, bitcoind):
     l1.rpc.call('txprepare', {'destination': addr, 'satoshi': Millisatoshi(amount * 100)})
 
 
+def test_txprepare_multi(node_factory, bitcoind):
+    amount = 10000000
+    l1 = node_factory.get_node(random_hsm=True)
+
+    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'], amount / 10**8)
+    bitcoind.generate_block(1)
+    wait_for(lambda: len(l1.rpc.listfunds()['outputs']) == 1)
+
+    outputs = []
+    for i in range(9):
+        outputs.append({l1.rpc.newaddr()['bech32']: Millisatoshi(amount * 100)})
+    prep = l1.rpc.txprepare(outputs=outputs)
+    l1.rpc.txdiscard(prep['txid'])
+
+
 def test_txprepare(node_factory, bitcoind, chainparams):
     amount = 1000000
     l1 = node_factory.get_node(random_hsm=True)
@@ -280,7 +295,7 @@ def test_txprepare(node_factory, bitcoind, chainparams):
     bitcoind.generate_block(1)
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) == 10)
 
-    prep = l1.rpc.txprepare([{addr: Millisatoshi(amount * 3 * 1000)}])
+    prep = l1.rpc.txprepare(outputs=[{addr: Millisatoshi(amount * 3 * 1000)}])
     decode = bitcoind.rpc.decoderawtransaction(prep['unsigned_tx'])
     assert decode['txid'] == prep['txid']
     # 4 inputs, 2 outputs (3 if we have a fee output).
@@ -683,3 +698,44 @@ def test_fundchannel_listtransaction(node_factory, bitcoind):
 
     tx = [t for t in txs if t['hash'] == txid][0]
     assert tx['blockheight'] == 0
+
+
+def test_withdraw_nlocktime(node_factory):
+    """
+    Test that we don't set the nLockTime to 0 for withdrawal transactions.
+    """
+    l1 = node_factory.get_node(1)
+    l1.fundwallet(10**4)
+
+    addr = l1.rpc.newaddr()["bech32"]
+    tx = l1.rpc.withdraw(addr, 10**3)["tx"]
+    nlocktime = node_factory.bitcoind.rpc.decoderawtransaction(tx)["locktime"]
+    tip = node_factory.bitcoind.rpc.getblockcount()
+
+    assert nlocktime > 0 and nlocktime <= tip
+
+
+@flaky
+@unittest.skipIf(VALGRIND, "A big loop is used to check fuzz.")
+def test_withdraw_nlocktime_fuzz(node_factory, bitcoind):
+    """
+    Test that we eventually fuzz nLockTime for withdrawal transactions.
+    Marked flaky "just in case" as we fuzz from 0 to 100 with a 10%
+    probability.
+    """
+    l1 = node_factory.get_node(1)
+    l1.fundwallet(10**8)
+
+    for i in range(100):
+        addr = l1.rpc.newaddr()["bech32"]
+        withdraw = l1.rpc.withdraw(addr, 10**3)
+        bitcoind.generate_block(1)
+        l1.daemon.wait_for_log('Owning output .* txid {} CONFIRMED'.
+                               format(withdraw["txid"]))
+        decoded = bitcoind.rpc.decoderawtransaction(withdraw["tx"])
+        tip = node_factory.bitcoind.rpc.getblockcount()
+        assert decoded["locktime"] > 0
+        if decoded["locktime"] < tip:
+            return
+    else:
+        raise Exception("No transaction with fuzzed nLockTime !")

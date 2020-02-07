@@ -464,7 +464,7 @@ struct command_result *command_failed(struct command *cmd,
 	return command_raw_complete(cmd, result);
 }
 
-struct command_result *command_fail(struct command *cmd, int code,
+struct command_result *command_fail(struct command *cmd, errcode_t code,
 				    const char *fmt, ...)
 {
 	const char *errmsg;
@@ -502,7 +502,7 @@ static void json_command_malformed(struct json_connection *jcon,
 	json_add_string(js, "jsonrpc", "2.0");
 	json_add_literal(js, "id", id, strlen(id));
 	json_object_start(js, "error");
-	json_add_member(js, "code", false, "%d", JSONRPC2_INVALID_REQUEST);
+	json_add_member(js, "code", false, "%" PRIerrcode, JSONRPC2_INVALID_REQUEST);
 	json_add_string(js, "message", error);
 	json_object_end(js);
 	json_object_compat_end(js);
@@ -553,7 +553,7 @@ struct json_stream *json_stream_success(struct command *cmd)
 }
 
 struct json_stream *json_stream_fail_nodata(struct command *cmd,
-					    int code,
+					    errcode_t code,
 					    const char *errmsg)
 {
 	struct json_stream *js = json_start(cmd);
@@ -561,14 +561,14 @@ struct json_stream *json_stream_fail_nodata(struct command *cmd,
 	assert(code);
 
 	json_object_start(js, "error");
-	json_add_member(js, "code", false, "%d", code);
+	json_add_member(js, "code", false, "%" PRIerrcode, code);
 	json_add_string(js, "message", errmsg);
 
 	return js;
 }
 
 struct json_stream *json_stream_fail(struct command *cmd,
-				     int code,
+				     errcode_t code,
 				     const char *errmsg)
 {
 	struct json_stream *r = json_stream_fail_nodata(cmd, code, errmsg);
@@ -667,9 +667,9 @@ static void
 rpc_command_hook_callback(struct rpc_command_hook_payload *p,
                           const char *buffer, const jsmntok_t *resulttok)
 {
-	const jsmntok_t *tok, *params, *custom_return, *tok_continue;
+	const jsmntok_t *tok, *params, *custom_return;
+	const jsmntok_t *innerresulttok;
 	struct json_stream *response;
-	bool exec;
 
 	params = json_get_member(p->buffer, p->request, "params");
 
@@ -678,11 +678,37 @@ rpc_command_hook_callback(struct rpc_command_hook_payload *p,
 	if (buffer == NULL)
 	    return was_pending(command_exec(p->cmd->jcon, p->cmd, p->buffer,
 		                                p->request, params));
-	else {
+
+#ifdef COMPAT_V080
+	if (deprecated_apis) {
+		const jsmntok_t *tok_continue;
+		bool exec;
 		tok_continue = json_get_member(buffer, resulttok, "continue");
-		if (tok_continue && json_to_bool(buffer, tok_continue, &exec) && exec)
+		if (tok_continue && json_to_bool(buffer, tok_continue, &exec) && exec) {
+			static bool warned = false;
+			if (!warned) {
+				warned = true;
+				log_unusual(p->cmd->ld->log,
+					    "Plugin returned 'continue' : true "
+					    "to rpc_command hook.  "
+					    "This is now deprecated and "
+					    "you should return with "
+					    "{'result': 'continue'} instead.");
+			}
 			return was_pending(command_exec(p->cmd->jcon, p->cmd, p->buffer,
 			                                p->request, params));
+		}
+	}
+#endif /* defined(COMPAT_V080) */
+
+	innerresulttok = json_get_member(buffer, resulttok, "result");
+	if (innerresulttok) {
+		if (json_tok_streq(buffer, innerresulttok, "continue")) {
+			return was_pending(command_exec(p->cmd->jcon, p->cmd, p->buffer,
+							p->request, params));
+		}
+		return was_pending(command_fail(p->cmd, JSONRPC2_INVALID_REQUEST,
+						"Bad 'result' to 'rpc_command' hook."));
 	}
 
 	/* If the registered plugin did not respond with continue,
@@ -704,10 +730,11 @@ rpc_command_hook_callback(struct rpc_command_hook_payload *p,
 
 		custom_return = json_get_member(buffer, tok, "error");
 		if (custom_return) {
-			int code;
+			errcode_t code;
 			const char *errmsg;
-			if (!json_to_int(buffer, json_get_member(buffer, custom_return, "code"),
-			                 &code))
+			if (!json_to_errcode(buffer,
+					     json_get_member(buffer, custom_return, "code"),
+					     &code))
 				return was_pending(command_fail(p->cmd, JSONRPC2_INVALID_REQUEST,
 				                                "Bad response to 'rpc_command' hook: "
 				                                "'error' object does not contain a code."));
@@ -1074,7 +1101,7 @@ bool command_check_only(const struct command *cmd)
 void jsonrpc_listen(struct jsonrpc *jsonrpc, struct lightningd *ld)
 {
 	struct sockaddr_un addr;
-	int fd, old_umask;
+	int fd, old_umask, new_umask;
 	const char *rpc_filename = ld->rpc_filename;
 
 	/* Should not initialize it twice. */
@@ -1103,8 +1130,9 @@ void jsonrpc_listen(struct jsonrpc *jsonrpc, struct lightningd *ld)
 		errx(1, "rpc filename '%s' in use", rpc_filename);
 	unlink(rpc_filename);
 
-	/* This file is only rw by us! */
-	old_umask = umask(0177);
+	/* Set the umask according to the desired file mode.  */
+	new_umask = ld->rpc_filemode ^ 0777;
+	old_umask = umask(new_umask);
 	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)))
 		err(1, "Binding rpc socket to '%s'", rpc_filename);
 	umask(old_umask);
