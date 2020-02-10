@@ -27,6 +27,26 @@ enum plugin_restartability {
 	PLUGIN_RESTARTABLE
 };
 
+struct out_req {
+	/* The unique id of this request. */
+	u64 id;
+	/* The command which is why we're calling this rpc. */
+	struct command *cmd;
+	/* The request stream. */
+	struct json_stream *js;
+	/* The callback when we get a response. */
+	struct command_result *(*cb)(struct command *command,
+				     const char *buf,
+				     const jsmntok_t *result,
+				     void *arg);
+	/* The callback when we get an error. */
+	struct command_result *(*errcb)(struct command *command,
+					const char *buf,
+					const jsmntok_t *error,
+					void *arg);
+	void *arg;
+};
+
 struct command {
 	u64 *id;
 	const char *methodname;
@@ -70,6 +90,54 @@ struct plugin_hook {
 	                                 const jsmntok_t *params);
 };
 
+/* Helper to create a JSONRPC2 request stream. Send it with `send_outreq`. */
+struct out_req *
+jsonrpc_request_start_(struct plugin *plugin, struct command *cmd,
+		       const char *method,
+		       struct command_result *(*cb)(struct command *command,
+						    const char *buf,
+						    const jsmntok_t *result,
+						    void *arg),
+		       struct command_result *(*errcb)(struct command *command,
+						       const char *buf,
+						       const jsmntok_t *result,
+						       void *arg),
+		       void *arg);
+
+#define jsonrpc_request_start(plugin, cmd, method, cb, errcb, arg)	\
+	jsonrpc_request_start_((plugin), (cmd), (method),		\
+		     typesafe_cb_preargs(struct command_result *, void *, \
+					 (cb), (arg),			\
+					 struct command *command,	\
+					 const char *buf,		\
+					 const jsmntok_t *result),	\
+		     typesafe_cb_preargs(struct command_result *, void *, \
+					 (errcb), (arg),		\
+					 struct command *command,	\
+					 const char *buf,		\
+					 const jsmntok_t *result),	\
+		     (arg))
+
+
+/* Helper to create a JSONRPC2 response stream with a "result" object. */
+struct json_stream *jsonrpc_stream_success(struct command *cmd);
+
+/* Helper to create a JSONRPC2 response stream with an "error" object. */
+struct json_stream *jsonrpc_stream_fail(struct command *cmd,
+					int code,
+					const char *err);
+
+/* Helper to create a JSONRPC2 response stream with an "error" object,
+ * to which will be added a "data" object. */
+struct json_stream *jsonrpc_stream_fail_data(struct command *cmd,
+					     int code,
+					     const char *err);
+
+/* This command is finished, here's the response (the content of the
+ * "result" or "error" field) */
+struct command_result *WARN_UNUSED_RESULT
+command_finished(struct command *cmd, struct json_stream *response);
+
 /* Helper to create a zero or single-value JSON object; if @str is NULL,
  * object is empty. */
 struct json_out *json_out_obj(const tal_t *ctx,
@@ -112,38 +180,9 @@ const char *rpc_delve(const tal_t *ctx,
 		      const struct json_out *params TAKES,
 		      const char *guide);
 
-/* Async rpc request.
- * @cmd can be NULL if we're coming from a timer callback.
- * @params can be NULL, otherwise it's an array or object.
- */
+/* Send an async rpc request to lightningd. */
 struct command_result *
-send_outreq_(struct plugin *plugin,
-	     struct command *cmd,
-	     const char *method,
-	     struct command_result *(*cb)(struct command *command,
-					  const char *buf,
-					  const jsmntok_t *result,
-					  void *arg),
-	     struct command_result *(*errcb)(struct command *command,
-					     const char *buf,
-					     const jsmntok_t *result,
-					     void *arg),
-	     void *arg,
-	     const struct json_out *params TAKES);
-
-#define send_outreq(plugin, cmd, method, cb, errcb, arg, params)	\
-	send_outreq_((plugin), (cmd), (method),				\
-		     typesafe_cb_preargs(struct command_result *, void *, \
-					 (cb), (arg),			\
-					 struct command *command,	\
-					 const char *buf,		\
-					 const jsmntok_t *result),	\
-		     typesafe_cb_preargs(struct command_result *, void *, \
-					 (errcb), (arg),		\
-					 struct command *command,	\
-					 const char *buf,		\
-					 const jsmntok_t *result),	\
-		     (arg), (params))
+send_outreq(struct plugin *plugin, const struct out_req *req);
 
 /* Callback to just forward error and close request; @cmd cannot be NULL */
 struct command_result *forward_error(struct command *cmd,
