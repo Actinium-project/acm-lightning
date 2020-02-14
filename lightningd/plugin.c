@@ -3,6 +3,7 @@
 #include <ccan/opt/opt.h>
 #include <ccan/tal/str/str.h>
 #include <ccan/utf8/utf8.h>
+#include <common/features.h>
 #include <common/utils.h>
 #include <common/version.h>
 #include <lightningd/json.h>
@@ -46,6 +47,18 @@ struct plugins *plugins_new(const tal_t *ctx, struct log_book *log_book,
 	return p;
 }
 
+u8 *plugins_collect_featurebits(const tal_t *ctx, const struct plugins *plugins,
+				enum plugin_features_type type)
+{
+	struct plugin *p;
+	u8 *res = tal_arr(ctx, u8, 0);
+	list_for_each(&plugins->plugins, p, list) {
+		if (p->featurebits[type])
+			res = featurebits_or(ctx, take(res), p->featurebits[type]);
+	}
+	return res;
+}
+
 static void destroy_plugin(struct plugin *p)
 {
 	plugin_hook_unregister_all(p);
@@ -68,6 +81,9 @@ struct plugin *plugin_register(struct plugins *plugins, const char* path TAKES)
 	p = tal(plugins, struct plugin);
 	p->plugins = plugins;
 	p->cmd = tal_strdup(p, path);
+
+	for (int i = 0; i < NUM_PLUGIN_FEATURES_TYPE; i++)
+		p->featurebits[i] = NULL;
 
 	p->plugin_state = UNCONFIGURED;
 	p->js_arr = tal_arr(p, struct json_stream *, 0);
@@ -595,21 +611,21 @@ static void plugin_rpcmethod_cb(const char *buffer,
 	command_raw_complete(cmd, response);
 }
 
-static struct plugin *find_plugin_for_command(struct command *cmd)
+struct plugin *find_plugin_for_command(struct lightningd *ld,
+				       const char *cmd_name)
 {
-	struct plugins *plugins = cmd->ld->plugins;
+	struct plugins *plugins = ld->plugins;
 	struct plugin *plugin;
 
 	/* Find the plugin that registered this RPC call */
 	list_for_each(&plugins->plugins, plugin, list) {
 		for (size_t i=0; i<tal_count(plugin->methods); i++) {
-			if (streq(cmd->json_cmd->name, plugin->methods[i]))
+			if (streq(cmd_name, plugin->methods[i]))
 				return plugin;
 		}
 	}
-	/* This should never happen, it'd mean that a plugin didn't
-	 * cleanup after dying */
-	abort();
+
+	return NULL;
 }
 
 static struct command_result *plugin_rpcmethod_dispatch(struct command *cmd,
@@ -625,7 +641,9 @@ static struct command_result *plugin_rpcmethod_dispatch(struct command *cmd,
 	if (cmd->mode == CMD_CHECK)
 		return command_param_failed();
 
-	plugin = find_plugin_for_command(cmd);
+	plugin = find_plugin_for_command(cmd->ld, cmd->json_cmd->name);
+	if (!plugin)
+		fatal("No plugin for %s ?", cmd->json_cmd->name);
 
 	/* Find ID again (We've parsed them before, this should not fail!) */
 	idtok = json_get_member(buffer, toks, "id");
@@ -811,12 +829,17 @@ static void plugin_manifest_timeout(struct plugin *plugin)
 	fatal("Can't recover from plugin failure, terminating.");
 }
 
+/* List of JSON keys matching `plugin_features_type`. */
+static const char *plugin_features_type_names[] = {"node", "init", "invoice"};
+
 bool plugin_parse_getmanifest_response(const char *buffer,
                                        const jsmntok_t *toks,
                                        const jsmntok_t *idtok,
                                        struct plugin *plugin)
 {
-	const jsmntok_t *resulttok, *dynamictok;
+	const jsmntok_t *resulttok, *dynamictok, *featurestok, *tok;
+	bool have_featurebits = false;
+	u8 *featurebits;
 
 	resulttok = json_get_member(buffer, toks, "result");
 	if (!resulttok || resulttok->type != JSMN_OBJECT)
@@ -827,6 +850,44 @@ bool plugin_parse_getmanifest_response(const char *buffer,
 		plugin_kill(plugin, "Bad 'dynamic' field ('%.*s')",
 			    json_tok_full_len(dynamictok),
 			    json_tok_full(buffer, dynamictok));
+
+	featurestok = json_get_member(buffer, resulttok, "featurebits");
+
+	if (featurestok) {
+		for (int i = 0; i < NUM_PLUGIN_FEATURES_TYPE; i++) {
+			tok = json_get_member(buffer, featurestok,
+					      plugin_features_type_names[i]);
+
+			if (!tok)
+				continue;
+
+			featurebits =
+			    json_tok_bin_from_hex(plugin, buffer, tok);
+
+			have_featurebits |= tal_bytelen(featurebits) > 0;
+
+			if (featurebits) {
+				plugin->featurebits[i] = featurebits;
+			} else {
+				plugin_kill(
+				    plugin,
+				    "Featurebits returned by plugin is not a "
+				    "valid hexadecimal string: %.*s",
+				    tok->end - tok->start, buffer + tok->start);
+				return true;
+			}
+		}
+	}
+
+	if (plugin->dynamic && have_featurebits) {
+		plugin_kill(plugin,
+			    "Custom featurebits only allows for non-dynamic "
+			    "plugins: dynamic=%d, featurebits=%.*s",
+			    plugin->dynamic,
+			    featurestok->end - featurestok->start,
+			    buffer + featurestok->start);
+		return true;
+	}
 
 	if (!plugin_opts_add(plugin, buffer, resulttok) ||
 	    !plugin_rpcmethods_add(plugin, buffer, resulttok) ||

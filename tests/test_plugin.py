@@ -1,9 +1,11 @@
 from collections import OrderedDict
 from fixtures import *  # noqa: F401,F403
 from flaky import flaky  # noqa: F401
+from hashlib import sha256
 from pyln.client import RpcError, Millisatoshi
+from pyln.proto import Invoice
 from utils import (
-    DEVELOPER, only_one, sync_blockheight, TIMEOUT, wait_for, TEST_NETWORK
+    DEVELOPER, only_one, sync_blockheight, TIMEOUT, wait_for, TEST_NETWORK, expected_features
 )
 
 import json
@@ -791,7 +793,6 @@ def test_rpc_command_hook(node_factory):
     l1.rpc.plugin_stop('rpc_command.py')
 
 
-@flaky
 def test_libplugin(node_factory):
     """Sanity checks for plugins made with libplugin"""
     plugin = os.path.join(os.getcwd(), "tests/plugins/test_libplugin")
@@ -823,3 +824,191 @@ def test_libplugin(node_factory):
 
     # Test RPC calls FIXME: test concurrent ones ?
     assert l1.rpc.call("testrpc") == l1.rpc.getinfo()
+
+
+@unittest.skipIf(not DEVELOPER, "needs LIGHTNINGD_DEV_LOG_IO")
+def test_plugin_feature_announce(node_factory):
+    """Check that features registered by plugins show up in messages.
+
+    l1 is the node under test, l2 only serves as the counterparty for a
+    channel to check the featurebits in the `channel_announcement`. The plugin
+    registers an individual featurebit for each of the locations we can stash
+    feature bits in:
+
+     - 1 << 101 for `init` messages
+     - 1 << 103 for `node_announcement`
+     - 1 << 105 for bolt11 invoices
+
+    """
+    plugin = os.path.join(os.path.dirname(__file__), 'plugins/feature-test.py')
+    l1, l2 = node_factory.line_graph(
+        2, opts=[{'plugin': plugin, 'log-level': 'io'}, {}],
+        wait_for_announce=True
+    )
+
+    # Check the featurebits we've set in the `init` message from
+    # feature-test.py. (1 << 101) results in 13 bytes featutebits (000d) and
+    # has a leading 0x20.
+    assert l1.daemon.is_in_log(r'\[OUT\] 001000.*000d20{:0>24}'.format(expected_features()))
+
+    # Check the invoice featurebit we set in feature-test.py
+    inv = l1.rpc.invoice(123, 'lbl', 'desc')['bolt11']
+    details = Invoice.decode(inv)
+    assert(details.featurebits.int & (1 << 105) != 0)
+
+    # Check the featurebit set in the `node_announcement`
+    node = l1.rpc.listnodes(l1.info['id'])['nodes'][0]
+    assert(int(node['features'], 16) & (1 << 103) != 0)
+
+
+def test_hook_chaining(node_factory):
+    """Check that hooks are called in order and the chain exits correctly
+
+    We start two nodes, l2 will have two plugins registering the same hook
+    (`htlc_accepted`) but handle different cases:
+
+    - the `odd` plugin only handles the "AA"*32 preimage
+    - the `even` plugin only handles the "BB"*32 preimage
+
+    We check that plugins are called in the order they are registering the
+    hook, and that they exit the call chain as soon as one plugin returns a
+    result that isn't `continue`. On exiting the chain the remaining plugins
+    are not called. If no plugin exits the chain we continue to handle
+    internally as usual.
+
+    """
+    l1, l2 = node_factory.line_graph(2)
+
+    # Start the plugins manually instead of specifying them on the command
+    # line, otherwise we cannot guarantee the order in which the hooks are
+    # registered.
+    p1 = os.path.join(os.path.dirname(__file__), "plugins/hook-chain-odd.py")
+    p2 = os.path.join(os.path.dirname(__file__), "plugins/hook-chain-even.py")
+    l2.rpc.plugin_start(p1)
+    l2.rpc.plugin_start(p2)
+
+    preimage1 = b'\xAA' * 32
+    preimage2 = b'\xBB' * 32
+    preimage3 = b'\xCC' * 32
+    hash1 = sha256(preimage1).hexdigest()
+    hash2 = sha256(preimage2).hexdigest()
+    hash3 = sha256(preimage3).hexdigest()
+
+    inv = l2.rpc.invoice(123, 'odd', "Odd payment handled by the first plugin",
+                         preimage="AA" * 32)['bolt11']
+    l1.rpc.pay(inv)
+
+    # The first plugin will handle this, the second one should not be called.
+    assert(l2.daemon.is_in_log(
+        r'plugin-hook-chain-odd.py: htlc_accepted called for payment_hash {}'.format(hash1)
+    ))
+    assert(not l2.daemon.is_in_log(
+        r'plugin-hook-chain-even.py: htlc_accepted called for payment_hash {}'.format(hash1)
+    ))
+
+    # The second run is with a payment_hash that `hook-chain-even.py` knows
+    # about. `hook-chain-odd.py` is called, it returns a `continue`, and then
+    # `hook-chain-even.py` resolves it.
+    inv = l2.rpc.invoice(
+        123, 'even', "Even payment handled by the second plugin", preimage="BB" * 32
+    )['bolt11']
+    l1.rpc.pay(inv)
+    assert(l2.daemon.is_in_log(
+        r'plugin-hook-chain-odd.py: htlc_accepted called for payment_hash {}'.format(hash2)
+    ))
+    assert(l2.daemon.is_in_log(
+        r'plugin-hook-chain-even.py: htlc_accepted called for payment_hash {}'.format(hash2)
+    ))
+
+    # And finally an invoice that neither know about, so it should get settled
+    # by the internal invoice handling.
+    inv = l2.rpc.invoice(123, 'neither', "Neither plugin handles this",
+                         preimage="CC" * 32)['bolt11']
+    l1.rpc.pay(inv)
+    assert(l2.daemon.is_in_log(
+        r'plugin-hook-chain-odd.py: htlc_accepted called for payment_hash {}'.format(hash3)
+    ))
+    assert(l2.daemon.is_in_log(
+        r'plugin-hook-chain-even.py: htlc_accepted called for payment_hash {}'.format(hash3)
+    ))
+
+
+def test_bitcoin_backend(node_factory, bitcoind):
+    """
+    This tests interaction with the Bitcoin backend, but not specifically bcli
+    """
+    l1 = node_factory.get_node(start=False, options={"disable-plugin": "bcli"},
+                               may_fail=True, allow_broken_log=True)
+
+    # We don't start if we haven't all the required methods registered.
+    plugin = os.path.join(os.getcwd(), "tests/plugins/bitcoin/part1.py")
+    l1.daemon.opts["plugin"] = plugin
+    try:
+        l1.daemon.start()
+    except ValueError:
+        assert l1.daemon.is_in_log("Missing a Bitcoin plugin command")
+        # Now we should start if all the commands are registered, even if they
+        # are registered by two distincts plugins.
+        del l1.daemon.opts["plugin"]
+        l1.daemon.opts["plugin-dir"] = os.path.join(os.getcwd(),
+                                                    "tests/plugins/bitcoin/")
+        try:
+            l1.daemon.start()
+        except ValueError:
+            msg = "All Bitcoin plugin commands registered"
+            assert l1.daemon.is_in_log(msg)
+        else:
+            raise Exception("We registered all commands but couldn't start!")
+    else:
+        raise Exception("We could start without all commands registered !!")
+
+    # But restarting with just bcli is ok
+    del l1.daemon.opts["plugin-dir"]
+    del l1.daemon.opts["disable-plugin"]
+    l1.start()
+    assert l1.daemon.is_in_log("bitcoin-cli initialized and connected to"
+                               " bitcoind")
+
+
+def test_bcli(node_factory, bitcoind, chainparams):
+    """
+    This tests the bcli plugin, used to gather Bitcoin data from a local
+    bitcoind.
+    Mostly sanity checks of the interface..
+    """
+    l1, l2 = node_factory.get_nodes(2)
+
+    # We cant stop it dynamically
+    with pytest.raises(RpcError):
+        l1.rpc.plugin_stop("bcli")
+
+    # Failure case of feerate is tested in test_misc.py
+    assert "feerate" in l1.rpc.call("getfeerate", {"blocks": 3,
+                                                   "mode": "CONSERVATIVE"})
+
+    resp = l1.rpc.call("getchaininfo")
+    assert resp["chain"] == chainparams['name']
+    for field in ["headercount", "blockcount", "ibd"]:
+        assert field in resp
+
+    # We shouldn't get upset if we ask for an unknown-yet block
+    resp = l1.rpc.call("getrawblockbyheight", {"height": 500})
+    assert resp["blockhash"] is resp["block"] is None
+    resp = l1.rpc.call("getrawblockbyheight", {"height": 50})
+    assert resp["blockhash"] is not None and resp["blockhash"] is not None
+    # Some other bitcoind-failure cases for this call are covered in
+    # tests/test_misc.py
+
+    l1.fundwallet(10**5)
+    l1.connect(l2)
+    txid = l1.rpc.fundchannel(l2.info["id"], 10**4)["txid"]
+    txo = l1.rpc.call("getutxout", {"txid": txid, "vout": 0})
+    assert (Millisatoshi(txo["amount"]) == Millisatoshi(10**4 * 10**3)
+            and txo["script"].startswith("0020"))
+    l1.rpc.close(l2.info["id"])
+    # When output is spent, it should give us null !
+    txo = l1.rpc.call("getutxout", {"txid": txid, "vout": 0})
+    assert txo["amount"] is txo["script"] is None
+
+    resp = l1.rpc.call("sendrawtransaction", {"tx": "dummy"})
+    assert not resp["success"] and "decode failed" in resp["errmsg"]

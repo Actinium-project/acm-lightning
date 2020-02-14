@@ -28,7 +28,7 @@
 /* Mutual recursion via timer. */
 static void try_extend_tip(struct chain_topology *topo);
 
-/* get_init_blockhash sets topo->root, start_fee_estimate clears
+/* init_topo sets topo->root, start_fee_estimate clears
  * feerate_uninitialized (even if unsuccessful) */
 static void maybe_completed_init(struct chain_topology *topo)
 {
@@ -127,13 +127,13 @@ struct txs_to_broadcast {
 
 /* We just sent the last entry in txs[].  Shrink and send the next last. */
 static void broadcast_remainder(struct bitcoind *bitcoind,
-				int exitstatus, const char *msg,
+				bool success, const char *msg,
 				struct txs_to_broadcast *txs)
 {
 	/* These are expected. */
 	if (strstr(msg, "txn-mempool-conflict")
 	    || strstr(msg, "transaction already in block chain")
-	    || exitstatus)
+	    || !success)
 		log_debug(bitcoind->log,
 			  "Expected error broadcasting tx %s: %s",
 			  txs->txs[txs->cursor], msg);
@@ -174,7 +174,7 @@ static void rebroadcast_txs(struct chain_topology *topo, struct command *cmd)
 
 	/* Let this do the dirty work. */
 	txs->cursor = (size_t)-1;
-	broadcast_remainder(topo->bitcoind, 0, "", txs);
+	broadcast_remainder(topo->bitcoind, true, "", txs);
 }
 
 static void destroy_outgoing_tx(struct outgoing_tx *otx)
@@ -190,7 +190,7 @@ static void clear_otx_channel(struct channel *channel, struct outgoing_tx *otx)
 }
 
 static void broadcast_done(struct bitcoind *bitcoind,
-			   int exitstatus, const char *msg,
+			   bool success, const char *msg,
 			   struct outgoing_tx *otx)
 {
 	/* Channel gone?  Stop. */
@@ -203,7 +203,7 @@ static void broadcast_done(struct bitcoind *bitcoind,
 	tal_del_destructor2(otx->channel, clear_otx_channel, otx);
 
 	if (otx->failed_or_success) {
-		otx->failed_or_success(otx->channel, exitstatus, msg);
+		otx->failed_or_success(otx->channel, success, msg);
 		tal_free(otx);
 	} else {
 		/* For continual rebroadcasting, until channel freed. */
@@ -216,7 +216,7 @@ static void broadcast_done(struct bitcoind *bitcoind,
 void broadcast_tx(struct chain_topology *topo,
 		  struct channel *channel, const struct bitcoin_tx *tx,
 		  void (*failed_or_success)(struct channel *channel,
-				 int exitstatus, const char *err))
+					    bool success, const char *err))
 {
 	/* Channel might vanish: topo owns it to start with. */
 	struct outgoing_tx *otx = tal(topo, struct outgoing_tx);
@@ -742,14 +742,21 @@ static void remove_tip(struct chain_topology *topo)
 	tal_free(b);
 }
 
-static void have_new_block(struct bitcoind *bitcoind UNUSED,
-			   struct bitcoin_block *blk,
-			   struct chain_topology *topo)
+static void get_new_block(struct bitcoind *bitcoind,
+			  struct bitcoin_blkid *blkid,
+			  struct bitcoin_block *blk,
+			  struct chain_topology *topo)
 {
-	/* Annotate all transactions with the chainparams */
-	for (size_t i=0; i<tal_count(blk->tx); i++)
-		blk->tx[i]->chainparams = chainparams;
+	if (!blkid && !blk) {
+		/* No such block, we're done. */
+		updates_complete(topo);
+		return;
+	}
+	assert(blkid && blk);
 
+	/* Annotate all transactions with the chainparams */
+	for (size_t i = 0; i < tal_count(blk->tx); i++)
+		blk->tx[i]->chainparams = chainparams;
 
 	/* Unexpected predecessor?  Free predecessor, refetch it. */
 	if (!bitcoin_blkid_eq(&topo->tip->blkid, &blk->hdr.prev_hash))
@@ -761,25 +768,14 @@ static void have_new_block(struct bitcoind *bitcoind UNUSED,
 	try_extend_tip(topo);
 }
 
-static void get_new_block(struct bitcoind *bitcoind,
-			  const struct bitcoin_blkid *blkid,
-			  struct chain_topology *topo)
-{
-	if (!blkid) {
-		/* No such block, we're done. */
-		updates_complete(topo);
-		return;
-	}
-	bitcoind_getrawblock(bitcoind, blkid, have_new_block, topo);
-}
-
 static void try_extend_tip(struct chain_topology *topo)
 {
-	bitcoind_getblockhash(topo->bitcoind, topo->tip->height + 1,
-			      get_new_block, topo);
+	bitcoind_getrawblockbyheight(topo->bitcoind, topo->tip->height + 1,
+				     get_new_block, topo);
 }
 
 static void init_topo(struct bitcoind *bitcoind UNUSED,
+		      struct bitcoin_blkid *blkid UNUSED,
 		      struct bitcoin_block *blk,
 		      struct chain_topology *topo)
 {
@@ -793,45 +789,6 @@ static void init_topo(struct bitcoind *bitcoind UNUSED,
 		      "last_processed_block", topo->tip->height);
 
 	maybe_completed_init(topo);
-}
-
-static void get_init_block(struct bitcoind *bitcoind,
-			   const struct bitcoin_blkid *blkid,
-			   struct chain_topology *topo)
-{
-	bitcoind_getrawblock(bitcoind, blkid, init_topo, topo);
-}
-
-static void get_init_blockhash(struct bitcoind *bitcoind, u32 blockcount,
-			       struct chain_topology *topo)
-{
-	/* If bitcoind's current blockheight is below the requested
-	 * height, refuse.  You can always explicitly request a reindex from
-	 * that block number using --rescan=. */
-	if (blockcount < topo->max_blockheight) {
-		/* UINT32_MAX == no blocks in database */
-		if (topo->max_blockheight == UINT32_MAX) {
-			/* Relative rescan, but we didn't know the blockheight */
-			/* Protect against underflow in subtraction.
-			 * Possible in regtest mode. */
-			if (blockcount < bitcoind->ld->config.rescan)
-				topo->max_blockheight = 0;
-			else
-				topo->max_blockheight = blockcount - bitcoind->ld->config.rescan;
-		} else
-			fatal("bitcoind has gone backwards from %u to %u blocks!",
-			      topo->max_blockheight, blockcount);
-	}
-
-	/* Rollback to the given blockheight, so we start track
-	 * correctly again */
-	wallet_blocks_rollback(topo->ld->wallet, topo->max_blockheight);
-	/* This may have unconfirmed txs: reconfirm as we add blocks. */
-	watch_for_utxo_reconfirmation(topo, topo->ld->wallet);
-
-	/* Get up to speed with topology. */
-	bitcoind_getblockhash(bitcoind, topo->max_blockheight,
-			      get_init_block, topo);
 }
 
 u32 get_block_height(const struct chain_topology *topo)
@@ -942,7 +899,93 @@ struct chain_topology *new_topology(struct lightningd *ld, struct log *log)
 	topo->root = NULL;
 	topo->sync_waiters = tal(topo, struct list_head);
 	list_head_init(topo->sync_waiters);
+
 	return topo;
+}
+
+static void check_blockcount(struct chain_topology *topo, u32 blockcount)
+{
+	/* If bitcoind's current blockheight is below the requested
+	 * height, refuse.  You can always explicitly request a reindex from
+	 * that block number using --rescan=. */
+	if (blockcount < topo->max_blockheight) {
+		/* UINT32_MAX == no blocks in database */
+		if (topo->max_blockheight == UINT32_MAX) {
+			/* Relative rescan, but we didn't know the blockheight */
+			/* Protect against underflow in subtraction.
+			 * Possible in regtest mode. */
+			if (blockcount < topo->bitcoind->ld->config.rescan)
+				topo->max_blockheight = 0;
+			else
+				topo->max_blockheight = blockcount - topo->bitcoind->ld->config.rescan;
+		} else
+			fatal("bitcoind has gone backwards from %u to %u blocks!",
+			      topo->max_blockheight, blockcount);
+	}
+
+	/* Rollback to the given blockheight, so we start track
+	 * correctly again */
+	wallet_blocks_rollback(topo->ld->wallet, topo->max_blockheight);
+	/* This may have unconfirmed txs: reconfirm as we add blocks. */
+	watch_for_utxo_reconfirmation(topo, topo->ld->wallet);
+}
+
+static void retry_check_chain(struct chain_topology *topo);
+
+static void
+check_chain(struct bitcoind *bitcoind, const char *chain,
+	    const u32 headercount, const u32 blockcount, const bool ibd,
+	    const bool first_call, struct chain_topology *topo)
+{
+	if (!streq(chain, chainparams->bip70_name))
+		fatal("Wrong network! Our Bitcoin backend is running on '%s',"
+		      " but we expect '%s'.", chain, chainparams->bip70_name);
+
+	if (first_call) {
+		/* Has the Bitcoin backend gone backward ? */
+		check_blockcount(topo, blockcount);
+		/* Get up to speed with topology. */
+		bitcoind_getrawblockbyheight(topo->bitcoind, topo->max_blockheight,
+					     init_topo, topo);
+	}
+
+	if (ibd) {
+		if (first_call)
+			log_unusual(bitcoind->log,
+				    "Waiting for initial block download (this can take"
+				    " a while!)");
+		else
+			log_debug(bitcoind->log,
+				  "Still waiting for initial block download");
+	} else if (headercount != blockcount) {
+		if (first_call)
+			log_unusual(bitcoind->log,
+				    "Waiting for bitcoind to catch up"
+				    " (%u blocks of %u)",
+				    blockcount, headercount);
+		else
+			log_debug(bitcoind->log,
+				  "Waiting for bitcoind to catch up"
+				  " (%u blocks of %u)",
+				  blockcount, headercount);
+	} else {
+		if (!first_call)
+			log_unusual(bitcoind->log,
+				    "Bitcoin backend now synced.");
+		bitcoind->synced = true;
+		return;
+	}
+
+	notleak(new_reltimer(bitcoind->ld->timers, bitcoind,
+			     /* Be 4x more aggressive in this case. */
+			     time_divide(time_from_sec(bitcoind->ld->topology
+						       ->poll_seconds), 4),
+			     retry_check_chain, bitcoind->ld->topology));
+	}
+
+static void retry_check_chain(struct chain_topology *topo)
+{
+	bitcoind_getchaininfo(topo->bitcoind, false, check_chain, topo);
 }
 
 void setup_topology(struct chain_topology *topo,
@@ -955,12 +998,14 @@ void setup_topology(struct chain_topology *topo,
 	topo->min_blockheight = min_blockheight;
 	topo->max_blockheight = max_blockheight;
 
-	/* Make sure bitcoind is started, and ready */
-	wait_for_bitcoind(topo->bitcoind);
+	/* This waits for bitcoind. */
+	bitcoind_check_commands(topo->bitcoind);
 
-	bitcoind_getclientversion(topo->bitcoind);
+	/* For testing.. */
+	log_debug(topo->ld->log, "All Bitcoin plugin commands registered");
 
-	bitcoind_getblockcount(topo->bitcoind, get_init_blockhash, topo);
+	/* Sanity checks, then topology initialization. */
+	bitcoind_getchaininfo(topo->bitcoind, true, check_chain, topo);
 
 	tal_add_destructor(topo, destroy_chain_topology);
 

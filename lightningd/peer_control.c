@@ -553,7 +553,10 @@ static struct amount_sat commit_txfee(const struct channel *channel,
 			num_untrimmed_htlcs++;
 	}
 
-	return commit_tx_base_fee(local_feerate, num_untrimmed_htlcs);
+	/* Funder is conservative: makes sure it allows an extra HTLC
+	 * even if feerate increases 50% */
+	return commit_tx_base_fee(local_feerate + local_feerate / 2,
+				  num_untrimmed_htlcs + 1);
 }
 
 static void subtract_offered_htlcs(const struct channel *channel,
@@ -908,7 +911,8 @@ send_error:
 	tal_free(payload);
 }
 
-REGISTER_PLUGIN_HOOK(peer_connected, peer_connected_hook_cb,
+REGISTER_PLUGIN_HOOK(peer_connected, PLUGIN_HOOK_SINGLE,
+		     peer_connected_hook_cb,
 		     struct peer_connected_hook_payload *,
 		     peer_connected_serialize,
 		     struct peer_connected_hook_payload *);
@@ -2262,10 +2266,10 @@ static struct command_result *json_dev_forget_channel(struct command *cmd,
 				    "or `dev-fail` instead.");
 	}
 
-	bitcoind_gettxout(cmd->ld->topology->bitcoind,
-			  &forget->channel->funding_txid,
-			  forget->channel->funding_outnum,
-			  process_dev_forget_channel, forget);
+	bitcoind_getutxout(cmd->ld->topology->bitcoind,
+			   &forget->channel->funding_txid,
+			   forget->channel->funding_outnum,
+			   process_dev_forget_channel, forget);
 	return command_still_pending(cmd);
 }
 
@@ -2393,8 +2397,9 @@ static void custommsg_payload_serialize(struct custommsg_payload *payload,
 	json_add_node_id(stream, "peer_id", &payload->peer_id);
 }
 
-REGISTER_PLUGIN_HOOK(custommsg, custommsg_callback, struct custommsg_payload *,
-		     custommsg_payload_serialize, struct custommsg_payload *);
+REGISTER_PLUGIN_HOOK(custommsg, PLUGIN_HOOK_SINGLE, custommsg_callback,
+		     struct custommsg_payload *, custommsg_payload_serialize,
+		     struct custommsg_payload *);
 
 void handle_custommsg_in(struct lightningd *ld, const struct node_id *peer_id,
 			 const u8 *msg)

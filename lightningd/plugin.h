@@ -27,6 +27,22 @@ enum plugin_state {
 };
 
 /**
+ * A plugin may register any number of featurebits that should be added to
+ * various messages as part of their manifest. The following enum enumerates
+ * the possible locations the featurebits can be added to, and are used as
+ * indices into the array of featurebits in the plugin struct itself.
+ *
+ * If you edit this make sure that there is a matching entry in the
+ * `plugin_features_type_names[]` array in plugin.c.
+ */
+enum plugin_features_type {
+	PLUGIN_FEATURES_NODE,
+	PLUGIN_FEATURES_INIT,
+	PLUGIN_FEATURES_INVOICE,
+};
+#define NUM_PLUGIN_FEATURES_TYPE (PLUGIN_FEATURES_INVOICE+1)
+
+/**
  * A plugin, exposed as a stub so we can pass it as an argument.
  */
 struct plugin {
@@ -66,6 +82,11 @@ struct plugin {
 
 	/* An array of subscribed topics */
 	char **subscriptions;
+
+	/* Featurebits for various locations that the plugin
+	 * registered. Indices correspond to the `plugin_features_type`
+	 * enum. */
+	u8 *featurebits[NUM_PLUGIN_FEATURES_TYPE];
 };
 
 /**
@@ -160,6 +181,13 @@ bool plugin_remove(struct plugins *plugins, const char *name);
 void plugin_kill(struct plugin *plugin, char *fmt, ...) PRINTF_FMT(2,3);
 
 /**
+ * Returns the plugin which registers the command with name {cmd_name}
+ */
+struct plugin *find_plugin_for_command(struct lightningd *ld,
+				       const char *cmd_name);
+
+
+/**
  * Send the configure message to all plugins.
  *
  * Once we've collected all the command line arguments we can go ahead
@@ -244,5 +272,9 @@ struct log *plugin_get_log(struct plugin *plugin);
  * call both! */
 struct plugin_destroyed *plugin_detect_destruction(const struct plugin *plugin);
 bool was_plugin_destroyed(struct plugin_destroyed *destroyed);
+
+/* Gather all the features of the given type that plugins registered. */
+u8 *plugins_collect_featurebits(const tal_t *ctx, const struct plugins *plugins,
+				enum plugin_features_type type);
 
 #endif /* LIGHTNING_LIGHTNINGD_PLUGIN_H */

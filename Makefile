@@ -266,7 +266,7 @@ ifeq ($(PYTEST),)
 	exit 1
 else
 # Explicitly hand DEVELOPER and VALGRIND so you can override on make cmd line.
-	PYTHONPATH=`pwd`/contrib/pyln-client:`pwd`/contrib/pyln-testing:`pwd`/contrib/pylightning:$$PYTHONPATH TEST_DEBUG=1 DEVELOPER=$(DEVELOPER) VALGRIND=$(VALGRIND) $(PYTEST) tests/ $(PYTEST_OPTS)
+	PYTHONPATH=`pwd`/contrib/pyln-client:`pwd`/contrib/pyln-testing:`pwd`/contrib/pylightning:`pwd`/contrib/pyln-proto/:$(PYTHONPATH) TEST_DEBUG=1 DEVELOPER=$(DEVELOPER) VALGRIND=$(VALGRIND) $(PYTEST) tests/ $(PYTEST_OPTS)
 endif
 
 # Keep includes in alpha order.
@@ -503,7 +503,7 @@ PKGLIBEXEC_PROGRAMS = \
 	       lightningd/lightning_hsmd \
 	       lightningd/lightning_onchaind \
 	       lightningd/lightning_openingd
-PLUGINS=plugins/pay plugins/autoclean plugins/fundchannel
+PLUGINS=plugins/pay plugins/autoclean plugins/fundchannel plugins/bcli
 
 install-program: installdirs $(BIN_PROGRAMS) $(PKGLIBEXEC_PROGRAMS) $(PLUGINS)
 	@$(NORMAL_INSTALL)

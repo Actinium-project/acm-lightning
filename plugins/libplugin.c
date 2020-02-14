@@ -25,7 +25,8 @@ bool deprecated_apis;
 
 struct plugin_timer {
 	struct timer timer;
-	struct command_result *(*cb)(struct plugin *p);
+	void (*cb)(void *cb_arg);
+	void *cb_arg;
 };
 
 struct rpc_conn {
@@ -215,6 +216,12 @@ command_finished(struct command *cmd, struct json_stream *response)
 	json_object_end(response);
 
 	return command_complete(cmd, response);
+}
+
+struct command_result *WARN_UNUSED_RESULT
+command_still_pending(struct command *cmd)
+{
+	return &pending;
 }
 
 struct json_out *json_out_obj(const tal_t *ctx,
@@ -630,7 +637,8 @@ static bool rpc_read_response_one(struct plugin *plugin)
 
 	jrtok = json_get_member(plugin->rpc_buffer, toks, "jsonrpc");
 	if (!jrtok) {
-		plugin_err(plugin, "JSON-RPC message does not contain \"jsonrpc\" field");
+		plugin_err(plugin, "JSON-RPC message does not contain \"jsonrpc\" field: '%.*s'",
+                                   (int)plugin->rpc_used, plugin->rpc_buffer);
 		return false;
 	}
 
@@ -712,6 +720,7 @@ static struct command_result *handle_init(struct command *cmd,
 	char *dir, *network;
 	struct json_out *param_obj;
 	struct plugin *p = cmd->plugin;
+	bool with_rpc = true;
 
 	configtok = json_delve(buf, params, ".configuration");
 
@@ -735,16 +744,19 @@ static struct command_result *handle_init(struct command *cmd,
 	addr.sun_path[rpctok->end - rpctok->start] = '\0';
 	addr.sun_family = AF_UNIX;
 
-	if (connect(p->rpc_conn->fd, (struct sockaddr *)&addr, sizeof(addr)) != 0)
-		plugin_err(p, "Connecting to '%.*s': %s",
+	if (connect(p->rpc_conn->fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+		with_rpc = false;
+		plugin_log(p, LOG_UNUSUAL, "Could not connect to '%.*s': %s",
 			   rpctok->end - rpctok->start, buf + rpctok->start,
 			   strerror(errno));
+	} else {
+		param_obj = json_out_obj(NULL, "config", "allow-deprecated-apis");
+		deprecated_apis = streq(rpc_delve(tmpctx, p, "listconfigs",
+						  take(param_obj),
+						  ".allow-deprecated-apis"),
+					"true");
+	}
 
-	param_obj = json_out_obj(NULL, "config", "allow-deprecated-apis");
-	deprecated_apis = streq(rpc_delve(tmpctx, p, "listconfigs",
-					  take(param_obj),
-					  ".allow-deprecated-apis"),
-				  "true");
 	opttok = json_get_member(buf, params, "options");
 	json_for_each_obj(i, t, opttok) {
 		char *opt = json_strdup(NULL, buf, t);
@@ -765,7 +777,8 @@ static struct command_result *handle_init(struct command *cmd,
 	if (p->init)
 		p->init(p, buf, configtok);
 
-	io_new_conn(p, p->rpc_conn->fd, rpc_conn_init, p);
+	if (with_rpc)
+		io_new_conn(p, p->rpc_conn->fd, rpc_conn_init, p);
 
 	return command_success_str(cmd, NULL);
 }
@@ -814,7 +827,7 @@ static void call_plugin_timer(struct plugin *p, struct timer *timer)
 	p->in_timer++;
 	/* Free this if they don't. */
 	tal_steal(tmpctx, t);
-	t->cb(p);
+	t->cb(t->cb_arg);
 }
 
 static void destroy_plugin_timer(struct plugin_timer *timer, struct plugin *p)
@@ -823,10 +836,12 @@ static void destroy_plugin_timer(struct plugin_timer *timer, struct plugin *p)
 }
 
 struct plugin_timer *plugin_timer(struct plugin *p, struct timerel t,
-				  struct command_result *(*cb)(struct plugin *p))
+				  void (*cb)(void *cb_arg),
+				  void *cb_arg)
 {
 	struct plugin_timer *timer = tal(NULL, struct plugin_timer);
 	timer->cb = cb;
+	timer->cb_arg = cb_arg;
 	timer_init(&timer->timer);
 	timer_addrel(&p->timers, &timer->timer, t);
 	tal_add_destructor2(timer, destroy_plugin_timer, p);
@@ -967,7 +982,7 @@ static void ld_command_handle(struct plugin *plugin,
 static bool ld_read_json_one(struct plugin *plugin)
 {
 	bool valid;
-	const jsmntok_t *toks, *jrtok;
+	const jsmntok_t *toks;
 	struct command *cmd = tal(plugin, struct command);
 
 	/* FIXME: This could be done more efficiently by storing the
@@ -991,12 +1006,8 @@ static bool ld_read_json_one(struct plugin *plugin)
 		return false;
 	}
 
-	jrtok = json_get_member(plugin->buffer, toks, "jsonrpc");
-	if (!jrtok) {
-		plugin_err(plugin, "JSON-RPC message does not contain \"jsonrpc\" field");
-		return false;
-	}
-
+	/* FIXME: Spark doesn't create proper jsonrpc 2.0!  So we don't
+	 * check for "jsonrpc" here. */
 	ld_command_handle(plugin, cmd, toks);
 
 	/* Move this object out of the buffer */
