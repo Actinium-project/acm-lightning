@@ -4,7 +4,10 @@
 #include <bitcoin/preimage.h>
 #include <bitcoin/privkey.h>
 #include <bitcoin/pubkey.h>
+#include <bitcoin/short_channel_id.h>
+#include <bitcoin/tx.h>
 #include <ccan/build_assert/build_assert.h>
+#include <ccan/json_escape/json_escape.h>
 #include <ccan/mem/mem.h>
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
@@ -13,8 +16,11 @@
 #include <common/json.h>
 #include <common/json_stream.h>
 #include <common/node_id.h>
+#include <common/overflows.h>
+#include <common/type_to_string.h>
 #include <common/utils.h>
 #include <common/wireaddr.h>
+#include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <stdarg.h>
@@ -97,13 +103,45 @@ bool json_to_s64(const char *buffer, const jsmntok_t *tok, s64 *num)
 	return true;
 }
 
-bool json_to_double(const char *buffer, const jsmntok_t *tok, double *num)
+bool json_to_millionths(const char *buffer, const jsmntok_t *tok,
+			u64 *millionths)
 {
-	char *end;
+	int decimal_places = -1;
+	bool has_digits = 0;
 
-	*num = strtod(buffer + tok->start, &end);
-	if (end != buffer + tok->end)
+	*millionths = 0;
+	for (int i = tok->start; i < tok->end; i++) {
+		if (isdigit(buffer[i])) {
+			has_digits = true;
+			/* Ignore too much precision */
+			if (decimal_places >= 0 && ++decimal_places > 6)
+				continue;
+			if (mul_overflows_u64(*millionths, 10))
+				return false;
+			*millionths *= 10;
+			if (add_overflows_u64(*millionths, buffer[i] - '0'))
+				return false;
+			*millionths += buffer[i] - '0';
+		} else if (buffer[i] == '.') {
+			if (decimal_places != -1)
+				return false;
+			decimal_places = 0;
+		} else
+			return false;
+	}
+
+	if (!has_digits)
 		return false;
+
+	if (decimal_places == -1)
+		decimal_places = 0;
+
+	while (decimal_places < 6) {
+		if (mul_overflows_u64(*millionths, 10))
+			return false;
+		*millionths *= 10;
+		decimal_places++;
+	}
 	return true;
 }
 
@@ -545,11 +583,6 @@ void json_add_address_internal(struct json_stream *response,
 void json_add_num(struct json_stream *result, const char *fieldname, unsigned int value)
 {
 	json_add_member(result, fieldname, false, "%u", value);
-}
-
-void json_add_double(struct json_stream *result, const char *fieldname, double value)
-{
-	json_add_member(result, fieldname, false, "%f", value);
 }
 
 void json_add_u64(struct json_stream *result, const char *fieldname,

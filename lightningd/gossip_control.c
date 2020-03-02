@@ -138,7 +138,7 @@ static unsigned gossip_msg(struct subd *gossip, const u8 *msg, const int *fds)
 	case WIRE_GOSSIP_GETROUTE_REQUEST:
 	case WIRE_GOSSIP_GETCHANNELS_REQUEST:
 	case WIRE_GOSSIP_PING:
-	case WIRE_GOSSIP_GET_CHANNEL_PEER:
+	case WIRE_GOSSIP_GET_STRIPPED_CUPDATE:
 	case WIRE_GOSSIP_GET_TXOUT_REPLY:
 	case WIRE_GOSSIP_OUTPOINT_SPENT:
 	case WIRE_GOSSIP_PAYMENT_FAILURE:
@@ -154,10 +154,10 @@ static unsigned gossip_msg(struct subd *gossip, const u8 *msg, const int *fds)
 	case WIRE_GOSSIP_GETNODES_REPLY:
 	case WIRE_GOSSIP_GETROUTE_REPLY:
 	case WIRE_GOSSIP_GETCHANNELS_REPLY:
-	case WIRE_GOSSIP_GET_CHANNEL_PEER_REPLY:
 	case WIRE_GOSSIP_GET_INCOMING_CHANNELS_REPLY:
 	case WIRE_GOSSIP_DEV_MEMLEAK_REPLY:
 	case WIRE_GOSSIP_DEV_COMPACT_STORE_REPLY:
+	case WIRE_GOSSIP_GET_STRIPPED_CUPDATE_REPLY:
 		break;
 
 	case WIRE_GOSSIP_PING_REPLY:
@@ -381,7 +381,8 @@ static struct command_result *json_getroute(struct command *cmd,
 	const jsmntok_t *excludetok;
 	struct amount_msat *msat;
 	u32 *cltv;
-	double *riskfactor;
+	/* risk factor 12.345% -> riskfactor_millionths = 12345000 */
+	u64 *riskfactor_millionths;
 	const struct exclude_entry **excluded;
 	u32 *max_hops;
 
@@ -390,23 +391,23 @@ static struct command_result *json_getroute(struct command *cmd,
 	 * randomization (the higher-fee paths become more likely to
 	 * be selected) at the cost of increasing the probability of
 	 * selecting the higher-fee paths. */
-	double *fuzz;
+	u64 *fuzz_millionths; /* fuzz 12.345% -> fuzz_millionths = 12345000 */
 
-	if (!param(cmd, buffer, params,
-		   p_req("id", param_node_id, &destination),
-		   p_req("msatoshi", param_msat, &msat),
-		   p_req("riskfactor", param_double, &riskfactor),
-		   p_opt_def("cltv", param_number, &cltv, 9),
-		   p_opt("fromid", param_node_id, &source),
-		   p_opt_def("fuzzpercent", param_percent, &fuzz, 5.0),
-		   p_opt("exclude", param_array, &excludetok),
-		   p_opt_def("maxhops", param_number, &max_hops,
-			     ROUTING_MAX_HOPS),
-		   NULL))
+	if (!param(
+		cmd, buffer, params, p_req("id", param_node_id, &destination),
+		p_req("msatoshi", param_msat, &msat),
+		p_req("riskfactor", param_millionths, &riskfactor_millionths),
+		p_opt_def("cltv", param_number, &cltv, 9),
+		p_opt("fromid", param_node_id, &source),
+		p_opt_def("fuzzpercent", param_millionths, &fuzz_millionths,
+			  5000000),
+		p_opt("exclude", param_array, &excludetok),
+		p_opt_def("maxhops", param_number, &max_hops, ROUTING_MAX_HOPS),
+		NULL))
 		return command_param_failed();
 
 	/* Convert from percentage */
-	*fuzz = *fuzz / 100.0;
+	*fuzz_millionths /= 100;
 
 	if (excludetok) {
 		const jsmntok_t *t;
@@ -442,12 +443,9 @@ static struct command_result *json_getroute(struct command *cmd,
 		excluded = NULL;
 	}
 
-	u8 *req = towire_gossip_getroute_request(cmd, source, destination,
-						 *msat,
-						 *riskfactor * 1000000.0,
-						 *cltv, fuzz,
-						 excluded,
-						 *max_hops);
+	u8 *req = towire_gossip_getroute_request(
+	    cmd, source, destination, *msat, *riskfactor_millionths, *cltv,
+	    *fuzz_millionths, excluded, *max_hops);
 	subd_req(ld->gossip, ld->gossip, req, -1, 0, json_getroute_reply, cmd);
 	return command_still_pending(cmd);
 }

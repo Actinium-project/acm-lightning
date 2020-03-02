@@ -883,11 +883,13 @@ static struct io_plan *getroute_req(struct io_conn *conn, struct daemon *daemon,
 	struct node_id *source, destination;
 	struct amount_msat msat;
 	u32 final_cltv;
-	u64 riskfactor_by_million;
+	/* risk factor 12.345% -> riskfactor_millionths = 12345000 */
+	u64 riskfactor_millionths;
 	u32 max_hops;
 	u8 *out;
 	struct route_hop *hops;
-	double fuzz;
+	/* fuzz 12.345% -> fuzz_millionths = 12345000 */
+	u64 fuzz_millionths;
 	struct exclude_entry **excluded;
 
 	/* To choose between variations, we need to know how much we're
@@ -901,12 +903,9 @@ static struct io_plan *getroute_req(struct io_conn *conn, struct daemon *daemon,
 	 * for a route from ourselves (the usual case): in that case,
 	 * we don't have to consider fees on our own outgoing channels.
 	 */
-	if (!fromwire_gossip_getroute_request(msg, msg,
-					      &source, &destination,
-					      &msat, &riskfactor_by_million,
-					      &final_cltv, &fuzz,
-					      &excluded,
-					      &max_hops))
+	if (!fromwire_gossip_getroute_request(
+		msg, msg, &source, &destination, &msat, &riskfactor_millionths,
+		&final_cltv, &fuzz_millionths, &excluded, &max_hops))
 		master_badmsg(WIRE_GOSSIP_GETROUTE_REQUEST, msg);
 
 	status_debug("Trying to find a route from %s to %s for %s",
@@ -916,9 +915,10 @@ static struct io_plan *getroute_req(struct io_conn *conn, struct daemon *daemon,
 		     type_to_string(tmpctx, struct amount_msat, &msat));
 
 	/* routing.c does all the hard work; can return NULL. */
-	hops = get_route(tmpctx, daemon->rstate, source, &destination,
-			 msat, riskfactor_by_million / 1000000.0, final_cltv,
-			 fuzz, pseudorand_u64(), excluded, max_hops);
+	hops = get_route(tmpctx, daemon->rstate, source, &destination, msat,
+			 riskfactor_millionths / 1000000.0, final_cltv,
+			 fuzz_millionths / 1000000.0, pseudorand_u64(),
+			 excluded, max_hops);
 
 	out = towire_gossip_getroute_reply(NULL, hops);
 	daemon_conn_send(daemon->master, take(out));
@@ -1335,27 +1335,43 @@ static struct io_plan *dev_gossip_set_time(struct io_conn *conn,
 }
 #endif /* DEVELOPER */
 
-/*~ lightningd: so, tell me about this channel, so we can forward to it. */
-static struct io_plan *get_channel_peer(struct io_conn *conn,
-					struct daemon *daemon, const u8 *msg)
+/*~ lightningd: so, get me the latest update for this local channel,
+ *  so I can include it in an error message. */
+static struct io_plan *get_stripped_cupdate(struct io_conn *conn,
+					    struct daemon *daemon, const u8 *msg)
 {
 	struct short_channel_id scid;
 	struct local_chan *local_chan;
-	const struct node_id *key;
+	const u8 *stripped_update;
 
-	if (!fromwire_gossip_get_channel_peer(msg, &scid))
-		master_badmsg(WIRE_GOSSIP_GET_CHANNEL_PEER, msg);
+	if (!fromwire_gossip_get_stripped_cupdate(msg, &scid))
+		master_badmsg(WIRE_GOSSIP_GET_STRIPPED_CUPDATE, msg);
 
 	local_chan = local_chan_map_get(&daemon->rstate->local_chan_map, &scid);
 	if (!local_chan) {
 		status_debug("Failed to resolve local channel %s",
 			     type_to_string(tmpctx, struct short_channel_id, &scid));
-		key = NULL;
+		stripped_update = NULL;
 	} else {
-		key = &local_chan->chan->nodes[!local_chan->direction]->id;
+		const struct half_chan *hc;
+
+		/* Since we're going to use it, make sure it's up-to-date. */
+		refresh_local_channel(daemon, local_chan, false);
+
+		hc = &local_chan->chan->half[local_chan->direction];
+		if (is_halfchan_defined(hc)) {
+			const u8 *update;
+
+			update = gossip_store_get(tmpctx, daemon->rstate->gs,
+						  hc->bcast.index);
+			stripped_update = tal_dup_arr(tmpctx, u8, update + 2,
+						      tal_count(update) - 2, 0);
+		} else
+			stripped_update = NULL;
 	}
 	daemon_conn_send(daemon->master,
-			 take(towire_gossip_get_channel_peer_reply(NULL, key)));
+			 take(towire_gossip_get_stripped_cupdate_reply(NULL,
+							   stripped_update)));
 	return daemon_conn_read_next(conn, daemon->master);
 }
 
@@ -1403,8 +1419,7 @@ static u8 *patch_channel_update(const tal_t *ctx, u8 *channel_update TAKES)
 			tal_free(channel_update);
 		return fixed;
 	} else {
-		return tal_dup_arr(ctx, u8,
-				   channel_update, tal_count(channel_update), 0);
+		return tal_dup_talarr(ctx, u8, channel_update);
 	}
 }
 
@@ -1554,8 +1569,8 @@ static struct io_plan *recv_req(struct io_conn *conn,
 	case WIRE_GOSSIP_GETCHANNELS_REQUEST:
 		return getchannels_req(conn, daemon, msg);
 
-	case WIRE_GOSSIP_GET_CHANNEL_PEER:
-		return get_channel_peer(conn, daemon, msg);
+	case WIRE_GOSSIP_GET_STRIPPED_CUPDATE:
+		return get_stripped_cupdate(conn, daemon, msg);
 
 	case WIRE_GOSSIP_GET_TXOUT_REPLY:
 		return handle_txout_reply(conn, daemon, msg);
@@ -1603,7 +1618,7 @@ static struct io_plan *recv_req(struct io_conn *conn,
 	case WIRE_GOSSIP_GETROUTE_REPLY:
 	case WIRE_GOSSIP_GETCHANNELS_REPLY:
 	case WIRE_GOSSIP_PING_REPLY:
-	case WIRE_GOSSIP_GET_CHANNEL_PEER_REPLY:
+	case WIRE_GOSSIP_GET_STRIPPED_CUPDATE_REPLY:
 	case WIRE_GOSSIP_GET_INCOMING_CHANNELS_REPLY:
 	case WIRE_GOSSIP_GET_TXOUT:
 	case WIRE_GOSSIP_DEV_MEMLEAK_REPLY:

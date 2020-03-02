@@ -149,9 +149,8 @@ static void dump_htlc(const struct htlc *htlc, const char *prefix)
 		     htlc->id,
 		     htlc_state_name(htlc->state),
 		     htlc_state_name(remote_state),
-		     htlc->r ? "FULFILLED" : htlc->fail ? "FAILED" :
-		     htlc->failcode
-		     ? tal_fmt(tmpctx, "FAILCODE:%u", htlc->failcode) : "");
+		     htlc->r ? "FULFILLED" : htlc->failed ? "FAILED"
+		     : "");
 }
 
 void dump_htlcs(const struct channel *channel, const char *prefix)
@@ -466,7 +465,6 @@ static enum channel_add_err add_htlc(struct channel *channel,
 	htlc->id = id;
 	htlc->amount = amount;
 	htlc->state = state;
-	htlc->shared_secret = NULL;
 
 	/* FIXME: Change expiry to simple u32 */
 
@@ -483,9 +481,7 @@ static enum channel_add_err add_htlc(struct channel *channel,
 	}
 
 	htlc->rhash = *payment_hash;
-	htlc->fail = NULL;
-	htlc->failcode = 0;
-	htlc->failed_scid = NULL;
+	htlc->failed = NULL;
 	htlc->r = NULL;
 	htlc->routing = tal_dup_arr(htlc, u8, routing, TOTAL_PACKET_SIZE, 0);
 
@@ -1168,7 +1164,7 @@ static bool adjust_balance(struct balance view_owed[NUM_SIDES][NUM_SIDES],
 		if (htlc_has(htlc, HTLC_FLAG(side, HTLC_F_COMMITTED)))
 			continue;
 
-		if (!htlc->fail && !htlc->failcode && !htlc->r) {
+		if (!htlc->failed && !htlc->r) {
 			status_broken("%s HTLC %"PRIu64
 				      " %s neither fail nor fulfill?",
 				      htlc_state_owner(htlc->state) == LOCAL
@@ -1188,9 +1184,8 @@ bool channel_force_htlcs(struct channel *channel,
 			 const enum htlc_state *hstates,
 			 const struct fulfilled_htlc *fulfilled,
 			 const enum side *fulfilled_sides,
-			 const struct failed_htlc **failed,
-			 const enum side *failed_sides,
-			 u32 failheight)
+			 const struct failed_htlc **failed_in,
+			 const u64 *failed_out)
 {
 	size_t i;
 	struct htlc *htlc;
@@ -1206,12 +1201,6 @@ bool channel_force_htlcs(struct channel *channel,
 	if (tal_count(fulfilled) != tal_count(fulfilled_sides)) {
 		status_broken("#fulfilled sides %zu != #fulfilled %zu",
 			     tal_count(fulfilled_sides), tal_count(fulfilled));
-		return false;
-	}
-
-	if (tal_count(failed) != tal_count(failed_sides)) {
-		status_broken("#failed sides %zu != #failed %zu",
-			     tal_count(failed_sides), tal_count(failed));
 		return false;
 	}
 
@@ -1259,16 +1248,10 @@ bool channel_force_htlcs(struct channel *channel,
 				     fulfilled[i].id);
 			return false;
 		}
-		if (htlc->fail) {
+		if (htlc->failed) {
 			status_broken("Fulfill %s HTLC %"PRIu64" already failed",
 				     fulfilled_sides[i] == LOCAL ? "out" : "in",
 				     fulfilled[i].id);
-			return false;
-		}
-		if (htlc->failcode) {
-			status_broken("Fulfill %s HTLC %"PRIu64" already fail %u",
-				     fulfilled_sides[i] == LOCAL ? "out" : "in",
-				     fulfilled[i].id, htlc->failcode);
 			return false;
 		}
 		if (!htlc_has(htlc, HTLC_REMOVING)) {
@@ -1282,56 +1265,56 @@ bool channel_force_htlcs(struct channel *channel,
 				  &fulfilled[i].payment_preimage);
 	}
 
-	for (i = 0; i < tal_count(failed); i++) {
+	for (i = 0; i < tal_count(failed_in); i++) {
 		struct htlc *htlc;
-		htlc = channel_get_htlc(channel, failed_sides[i],
-					failed[i]->id);
+		htlc = channel_get_htlc(channel, REMOTE, failed_in[i]->id);
 		if (!htlc) {
-			status_broken("Fail %s HTLC %"PRIu64" not found",
-				     failed_sides[i] == LOCAL ? "out" : "in",
-				     failed[i]->id);
+			status_broken("Fail in HTLC %"PRIu64" not found",
+				     failed_in[i]->id);
 			return false;
 		}
 		if (htlc->r) {
-			status_broken("Fail %s HTLC %"PRIu64" already fulfilled",
-				     failed_sides[i] == LOCAL ? "out" : "in",
-				     failed[i]->id);
+			status_broken("Fail in HTLC %"PRIu64" already fulfilled",
+				     failed_in[i]->id);
 			return false;
 		}
-		if (htlc->fail) {
-			status_broken("Fail %s HTLC %"PRIu64" already failed",
-				     failed_sides[i] == LOCAL ? "out" : "in",
-				     failed[i]->id);
+		if (htlc->failed) {
+			status_broken("Fail in HTLC %"PRIu64" already failed_in",
+				     failed_in[i]->id);
 			return false;
 		}
-		if (htlc->failcode) {
-			status_broken("Fail %s HTLC %"PRIu64" already fail %u",
-				     failed_sides[i] == LOCAL ? "out" : "in",
-				     failed[i]->id, htlc->failcode);
+		htlc->failed = tal_steal(htlc, failed_in[i]);
+	}
+
+	for (i = 0; i < tal_count(failed_out); i++) {
+		struct htlc *htlc;
+
+		htlc = channel_get_htlc(channel, LOCAL, failed_out[i]);
+		if (!htlc) {
+			status_broken("Fail out HTLC %"PRIu64" not found",
+				      failed_out[i]);
+			return false;
+		}
+		if (htlc->r) {
+			status_broken("Fail out HTLC %"PRIu64" already fulfilled",
+				      failed_out[i]);
+			return false;
+		}
+		if (htlc->failed) {
+			status_broken("Fail out HTLC %"PRIu64" already failed",
+				      failed_out[i]);
 			return false;
 		}
 		if (!htlc_has(htlc, HTLC_REMOVING)) {
-			status_broken("Fail %s HTLC %"PRIu64" state %s",
-				     failed_sides[i] == LOCAL ? "out" : "in",
-				     failed[i]->id,
-				     htlc_state_name(htlc->state));
+			status_broken("Fail out HTLC %"PRIu64" state %s",
+				      failed_out[i],
+				      htlc_state_name(htlc->state));
 			return false;
 		}
-		htlc->failcode = failed[i]->failcode;
-		/* We assume they all failed at the same height, which is
-		 * not necessarily true in case of restart.  But it's only
-		 * a hint. */
-		htlc->failblock = failheight;
-		if (failed[i]->failreason)
-			htlc->fail = dup_onionreply(htlc, failed[i]->failreason);
-		else
-			htlc->fail = NULL;
-		if (failed[i]->scid)
-			htlc->failed_scid = tal_dup(htlc,
-						    struct short_channel_id,
-						    failed[i]->scid);
-		else
-			htlc->failed_scid = NULL;
+
+		/* Now, we don't really care why our htlcs failed: lightningd
+		 * already knows.  Just mark it failed using anything. */
+		htlc->failed = tal(htlc, struct failed_htlc);
 	}
 
 	/* You'd think, since we traverse HTLCs in ID order, this would never

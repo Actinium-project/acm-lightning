@@ -35,8 +35,8 @@ void peer_htlcs(const tal_t *ctx,
 		enum htlc_state **htlc_states,
 		struct fulfilled_htlc **fulfilled_htlcs,
 		enum side **fulfilled_sides,
-		const struct failed_htlc ***failed_htlcs,
-		enum side **failed_sides);
+		const struct failed_htlc ***failed_in,
+		u64 **failed_out);
 
 void free_htlcs(struct lightningd *ld, const struct channel *channel);
 
@@ -47,13 +47,16 @@ void peer_got_revoke(struct channel *channel, const u8 *msg);
 void update_per_commit_point(struct channel *channel,
 			     const struct pubkey *per_commitment_point);
 
-enum onion_type send_htlc_out(struct channel *out,
-			      struct amount_msat amount, u32 cltv,
-			      const struct sha256 *payment_hash,
-			      u64 partid,
-			      const u8 *onion_routing_packet,
-			      struct htlc_in *in,
-			      struct htlc_out **houtp);
+/* Returns NULL on success, otherwise failmsg (and sets *needs_update_appended)*/
+const u8 *send_htlc_out(const tal_t *ctx,
+			struct channel *out,
+			struct amount_msat amount, u32 cltv,
+			const struct sha256 *payment_hash,
+			u64 partid,
+			const u8 *onion_routing_packet,
+			struct htlc_in *in,
+			struct htlc_out **houtp,
+			bool *needs_update_appended);
 
 void onchain_failed_our_htlc(const struct channel *channel,
 			     const struct htlc_stub *htlc,
@@ -71,11 +74,18 @@ void htlcs_resubmit(struct lightningd *ld,
 
 /* For HTLCs which terminate here, invoice payment calls one of these. */
 void fulfill_htlc(struct htlc_in *hin, const struct preimage *preimage);
-void fail_htlc(struct htlc_in *hin, enum onion_type failcode);
+void local_fail_in_htlc(struct htlc_in *hin, const u8 *failmsg TAKES);
+void local_fail_in_htlc_needs_update(struct htlc_in *hin,
+				     const u8 *failmsg_needs_update TAKES,
+				     const struct short_channel_id *failmsg_scid);
 
 /* This json process will be used as the serialize method for
  * forward_event_notification_gen and be used in
  * `listforwardings_add_forwardings()`. */
 void json_format_forwarding_object(struct json_stream *response, const char *fieldname,
 				   const struct forwarding *cur);
+
+/* Helper to create (common) WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS */
+const u8 *failmsg_incorrect_or_unknown(const tal_t *ctx,
+				       const struct htlc_in *hin);
 #endif /* LIGHTNING_LIGHTNINGD_PEER_HTLCS_H */

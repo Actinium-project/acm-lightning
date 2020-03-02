@@ -127,7 +127,8 @@ static struct migration dbmigrations[] = {
 	 "  payment_hash BLOB,"
 	 "  payment_key BLOB,"
 	 "  routing_onion BLOB,"
-	 "  failuremsg BLOB,"
+	 "  failuremsg BLOB," /* Note: This is in fact the failure onionreply,
+			       * but renaming columns is hard! */
 	 "  malformed_onion INTEGER,"
 	 "  hstate INTEGER,"
 	 "  shared_secret BLOB,"
@@ -591,6 +592,10 @@ static struct migration dbmigrations[] = {
      NULL},
     /* FIXME: Remove now-unused local_feerate_per_kw and remote_feerate_per_kw from channels */
     {SQL("INSERT INTO vars (name, intval) VALUES ('data_version', 0);"), NULL},
+    /* For outgoing HTLCs, we now keep a localmsg instead of a failcode.
+     * Turn anything in transition into a WIRE_TEMPORARY_NODE_FAILURE. */
+    {SQL("ALTER TABLE channel_htlcs ADD localfailmsg BLOB;"), NULL},
+    {SQL("UPDATE channel_htlcs SET localfailmsg=decode('2002', 'hex') WHERE malformed_onion != 0 AND direction = 1;"), NULL},
 };
 
 /* Leak tracking. */

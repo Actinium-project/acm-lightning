@@ -162,10 +162,11 @@ static void invoice_payload_remove_set(struct htlc_set *set,
 	payload->set = NULL;
 }
 
-static bool hook_gives_failcode(struct log *log,
-				const char *buffer,
-				const jsmntok_t *toks,
-				enum onion_type *failcode)
+static const u8 *hook_gives_failmsg(const tal_t *ctx,
+				    struct log *log,
+				    const struct htlc_in *hin,
+				    const char *buffer,
+				    const jsmntok_t *toks)
 {
 	const jsmntok_t *resulttok;
 	const jsmntok_t *t;
@@ -173,53 +174,60 @@ static bool hook_gives_failcode(struct log *log,
 
 	/* No plugin registered on hook at all? */
 	if (!buffer)
-		return false;
+		return NULL;
 
 	resulttok = json_get_member(buffer, toks, "result");
 	if (resulttok) {
 		if (json_tok_streq(buffer, resulttok, "continue")) {
-			return false;
+			return NULL;
 		} else if (json_tok_streq(buffer, resulttok, "reject")) {
-			*failcode = WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS;
-			return true;
+			return failmsg_incorrect_or_unknown(ctx, hin);
 		} else
 			fatal("Invalid invoice_payment hook result: %.*s",
 			      toks[0].end - toks[0].start, buffer);
 	}
 
+	t = json_get_member(buffer, toks, "failure_message");
+	if (t) {
+		const u8 *failmsg = json_tok_bin_from_hex(ctx, buffer, t);
+		if (!failmsg)
+			fatal("Invalid invoice_payment_hook failure_message: %.*s",
+			      toks[0].end - toks[1].start, buffer);
+		return failmsg;
+	}
+
+	if (!deprecated_apis)
+		return NULL;
+
 	t = json_get_member(buffer, toks, "failure_code");
-#ifdef COMPAT_V080
-	if (!t && deprecated_apis) {
+	if (!t) {
 		static bool warned = false;
 		if (!warned) {
 			warned = true;
 			log_unusual(log,
 				    "Plugin did not return object with "
-				    "'result' or 'failure_code' fields.  "
+				    "'result' or 'failure_message' fields.  "
 				    "This is now deprecated and you should "
 				    "return {'result': 'continue' } or "
 				    "{'result': 'reject'} or "
-				    "{'failure_code': 42} instead.");
+				    "{'failure_message'... instead.");
 		}
-		return false;
+		return failmsg_incorrect_or_unknown(ctx, hin);
 	}
-#endif /* defined(COMPAT_V080) */
-	if (!t)
-		fatal("Invalid invoice_payment_hook response, expecting "
-		      "'result' or 'failure_code' field: %.*s",
-		      toks[0].end - toks[0].start, buffer);
 
 	if (!json_to_number(buffer, t, &val))
 		fatal("Invalid invoice_payment_hook failure_code: %.*s",
 		      toks[0].end - toks[1].start, buffer);
 
-	/* UPDATE isn't valid for final nodes to return, and I think
-	 * we assert elsewhere that we don't do this! */
-	if (val & UPDATE)
-		fatal("Invalid invoice_payment_hook UPDATE failure_code: %.*s",
-		      toks[0].end - toks[1].start, buffer);
-	*failcode = val;
-	return true;
+	if (val == WIRE_TEMPORARY_NODE_FAILURE)
+		return towire_temporary_node_failure(ctx);
+	if (val != WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS)
+		log_broken(hin->key.channel->log,
+			   "invoice_payment hook returned failcode %u,"
+			   " changing to incorrect_or_unknown_payment_details",
+			   val);
+
+	return failmsg_incorrect_or_unknown(ctx, hin);
 }
 
 static void
@@ -229,7 +237,7 @@ invoice_payment_hook_cb(struct invoice_payment_hook_payload *payload,
 {
 	struct lightningd *ld = payload->ld;
 	struct invoice invoice;
-	enum onion_type failcode;
+	const u8 *failmsg;
 
 	/* We notify here to benefit from the payload and because the hook callback is
 	 * called even if the hook is not registered. */
@@ -249,14 +257,16 @@ invoice_payment_hook_cb(struct invoice_payment_hook_payload *payload,
 	/* If invoice gets paid meanwhile (plugin responds out-of-order?) then
 	 * we can also fail */
 	if (!wallet_invoice_find_by_label(ld->wallet, &invoice, payload->label)) {
-		failcode = WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS;
-		htlc_set_fail(payload->set, failcode);
+		htlc_set_fail(payload->set, take(failmsg_incorrect_or_unknown(
+							 NULL, payload->set->htlcs[0])));
 		return;
 	}
 
 	/* Did we have a hook result? */
-	if (hook_gives_failcode(ld->log, buffer, toks, &failcode)) {
-		htlc_set_fail(payload->set, failcode);
+	failmsg = hook_gives_failmsg(NULL, ld->log,
+				     payload->set->htlcs[0], buffer, toks);
+	if (failmsg) {
+		htlc_set_fail(payload->set, take(failmsg));
 		return;
 	}
 

@@ -231,9 +231,8 @@ size_t num_channel_htlcs(const struct channel *channel);
  * @hstates: the states for the htlcs (tal_arr of same size)
  * @fulfilled: htlcs of those which are fulfilled
  * @fulfilled_sides: sides for ids in @fulfilled
- * @failed: htlcs of those which are failed
- * @failed_sides: sides for ids in @failed
- * @failheight: block number which htlcs failed at.
+ * @failed_in: incoming htlcs which are failed (stolen!)
+ * @failed_out: outgoing htlc ids which are failed
  *
  * This is used for restoring a channel state.
  */
@@ -242,9 +241,8 @@ bool channel_force_htlcs(struct channel *channel,
 			 const enum htlc_state *hstates,
 			 const struct fulfilled_htlc *fulfilled,
 			 const enum side *fulfilled_sides,
-			 const struct failed_htlc **failed,
-			 const enum side *failed_sides,
-			 u32 failheight);
+			 const struct failed_htlc **failed_in,
+			 const u64 *failed_out);
 
 /**
  * dump_htlcs: debugging dump of all HTLCs

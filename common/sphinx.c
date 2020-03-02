@@ -62,8 +62,7 @@ struct sphinx_path {
 struct sphinx_path *sphinx_path_new(const tal_t *ctx, const u8 *associated_data)
 {
 	struct sphinx_path *sp = tal(ctx, struct sphinx_path);
-	sp->associated_data = tal_dup_arr(sp, u8, associated_data,
-					  tal_bytelen(associated_data), 0);
+	sp->associated_data = tal_dup_talarr(sp, u8, associated_data);
 	sp->session_key = NULL;
 	sp->hops = tal_arr(sp, struct sphinx_hop, 0);
 	return sp;
@@ -95,7 +94,7 @@ void sphinx_add_hop(struct sphinx_path *path, const struct pubkey *pubkey,
 		    const u8 *payload TAKES)
 {
 	struct sphinx_hop sp;
-	sp.raw_payload = tal_dup_arr(path, u8, payload, tal_count(payload), 0);
+	sp.raw_payload = tal_dup_talarr(path, u8, payload);
 	sp.pubkey = *pubkey;
 	tal_arr_expand(&path->hops, sp);
 }
@@ -175,9 +174,17 @@ static void xorbytes(uint8_t *d, const uint8_t *a, const uint8_t *b, size_t len)
  */
 static void generate_cipher_stream(void *dst, const u8 *k, size_t dstlen)
 {
-	u8 nonce[8] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+	const u8 nonce[8] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 
 	crypto_stream_chacha20(dst, dstlen, nonce, k);
+}
+
+/* xor cipher stream into dst */
+static void xor_cipher_stream(void *dst, const u8 *k, size_t dstlen)
+{
+	const u8 nonce[8] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+
+	crypto_stream_chacha20_xor(dst, dst, dstlen, nonce, k);
 }
 
 static bool compute_hmac(
@@ -393,7 +400,6 @@ struct onionpacket *create_onionpacket(
 	struct keyset keys;
 	u8 padkey[KEY_LEN];
 	u8 nexthmac[HMAC_SIZE];
-	u8 stream[ROUTING_INFO_SIZE];
 	struct hop_params *params;
 	struct secret *secrets = tal_arr(ctx, struct secret, num_hops);
 
@@ -432,14 +438,14 @@ struct onionpacket *create_onionpacket(
 	for (i = num_hops - 1; i >= 0; i--) {
 		memcpy(sp->hops[i].hmac, nexthmac, HMAC_SIZE);
 		generate_key_set(&params[i].secret, &keys);
-		generate_cipher_stream(stream, keys.rho, ROUTING_INFO_SIZE);
 
 		/* Rightshift mix-header by FRAME_SIZE */
 		size_t shiftSize = sphinx_hop_size(&sp->hops[i]);
 		memmove(packet->routinginfo + shiftSize, packet->routinginfo,
 			ROUTING_INFO_SIZE-shiftSize);
 		sphinx_write_frame(packet->routinginfo, &sp->hops[i]);
-		xorbytes(packet->routinginfo, packet->routinginfo, stream, ROUTING_INFO_SIZE);
+		xor_cipher_stream(packet->routinginfo, keys.rho,
+				  ROUTING_INFO_SIZE);
 
 		if (i == num_hops - 1) {
 			memcpy(packet->routinginfo + ROUTING_INFO_SIZE - fillerSize, filler, fillerSize);
@@ -479,7 +485,6 @@ struct route_step *process_onionpacket(
 	u8 hmac[HMAC_SIZE];
 	struct keyset keys;
 	u8 blind[BLINDING_FACTOR_SIZE];
-	u8 stream[NUM_STREAM_BYTES];
 	u8 paddedheader[2*ROUTING_INFO_SIZE];
 	size_t payload_size;
 	bigsize_t shift_size;
@@ -498,11 +503,9 @@ struct route_step *process_onionpacket(
 	}
 
 	//FIXME:store seen secrets to avoid replay attacks
-	generate_cipher_stream(stream, keys.rho, sizeof(stream));
-
 	memset(paddedheader, 0, sizeof(paddedheader));
 	memcpy(paddedheader, msg->routinginfo, ROUTING_INFO_SIZE);
-	xorbytes(paddedheader, paddedheader, stream, sizeof(stream));
+	xor_cipher_stream(paddedheader, keys.rho, sizeof(paddedheader));
 
 	compute_blinding_factor(&msg->ephemeralkey, shared_secret, blind);
 	if (!blind_group_element(&step->next->ephemeralkey, &msg->ephemeralkey, blind))
@@ -597,8 +600,6 @@ struct onionreply *wrap_onionreply(const tal_t *ctx,
 				   const struct onionreply *reply)
 {
 	u8 key[KEY_LEN];
-	size_t streamlen = tal_count(reply->contents);
-	u8 stream[streamlen];
 	struct onionreply *result = tal(ctx, struct onionreply);
 
 	/* BOLT #4:
@@ -610,9 +611,8 @@ struct onionreply *wrap_onionreply(const tal_t *ctx,
 	 * The obfuscation step is repeated by every hop along the return path.
 	 */
 	generate_key(key, "ammag", 5, shared_secret);
-	generate_cipher_stream(stream, key, streamlen);
-	result->contents = tal_arr(result, u8, streamlen);
-	xorbytes(result->contents, stream, reply->contents, streamlen);
+	result->contents = tal_dup_talarr(result, u8, reply->contents);
+	xor_cipher_stream(result->contents, key, tal_bytelen(result->contents));
 	return result;
 }
 
