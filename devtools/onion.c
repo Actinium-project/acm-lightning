@@ -16,12 +16,14 @@
 #include <err.h>
 #include <secp256k1.h>
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 
 #define ASSOC_DATA_SIZE 32
 
 static void do_generate(int argc, char **argv,
-			const u8 assocdata[ASSOC_DATA_SIZE])
+			const u8 assocdata[ASSOC_DATA_SIZE],
+			const struct node_id *rvnode_id)
 {
 	const tal_t *ctx = talz(NULL, tal_t);
 	int num_hops = argc - 2;
@@ -30,12 +32,15 @@ static void do_generate(int argc, char **argv,
 	struct secret session_key;
 	struct secret *shared_secrets;
 	struct sphinx_path *sp;
-
+	struct sphinx_compressed_onion *comp;
+	u8 *serialized;
+	struct onionpacket *packet;
 	const u8* tmp_assocdata =tal_dup_arr(ctx, u8, assocdata,
 					  ASSOC_DATA_SIZE, 0);
 	memset(&session_key, 'A', sizeof(struct secret));
 
 	sp = sphinx_path_new_with_key(ctx, tmp_assocdata, &session_key);
+	sphinx_path_set_rendezvous(sp, rvnode_id);
 
 	for (int i = 0; i < num_hops; i++) {
 		size_t klen = strcspn(argv[2 + i], "/");
@@ -90,9 +95,17 @@ static void do_generate(int argc, char **argv,
 		}
 	}
 
-	struct onionpacket *res = create_onionpacket(ctx, sp, &shared_secrets);
+	packet = create_onionpacket(ctx, sp, &shared_secrets);
 
-	u8 *serialized = serialize_onionpacket(ctx, res);
+	if (rvnode_id != NULL) {
+		comp = sphinx_compress(ctx, packet, sp);
+		serialized = sphinx_compressed_onion_serialize(ctx, comp);
+		printf("Rendezvous onion: %s\n", tal_hex(ctx, serialized));
+	} else {
+		assert(sphinx_compress(ctx, packet, sp) == NULL);
+	}
+
+	serialized = serialize_onionpacket(ctx, packet);
 	if (!serialized)
 		errx(1, "Error serializing message.");
 	printf("%s\n", tal_hex(ctx, serialized));
@@ -170,6 +183,12 @@ static char *opt_set_ad(const char *arg, u8 *assocdata)
 static void opt_show_ad(char buf[OPT_SHOW_LEN], const u8 *assocdata)
 {
 	hex_encode(assocdata, ASSOC_DATA_SIZE, buf, OPT_SHOW_LEN);
+}
+
+static char *opt_set_node_id(const char *arg, struct node_id *node_id)
+{
+	node_id_from_hexstr(arg, strlen(arg), node_id);
+	return NULL;
 }
 
 /**
@@ -277,6 +296,47 @@ static void runtest(const char *filename)
 	tal_free(ctx);
 }
 
+static void decompress(char *hexprivkey, char *hexonion)
+{
+	struct privkey rendezvous_key;
+	size_t onionlen = hex_data_size(strlen(hexonion));
+	u8 *compressed;
+	struct pubkey ephkey;
+	struct secret shared_secret;
+	struct onionpacket *onion;
+	struct sphinx_compressed_onion *tinyonion;
+
+	if (!hex_decode(hexprivkey, strlen(hexprivkey), &rendezvous_key, sizeof(rendezvous_key)))
+		errx(1, "Invalid private key hex '%s'", hexprivkey);
+
+	compressed = tal_arr(NULL, u8, onionlen);
+	if (!hex_decode(hexonion, strlen(hexonion), compressed, onionlen))
+		errx(1, "Invalid onion hex '%s'", hexonion);
+
+	if (onionlen < HMAC_SIZE + 1 + PUBKEY_SIZE)
+		errx(1, "Onion is too short to contain the version, ephemeral key and HMAC");
+
+	pubkey_from_der(compressed + 1, PUBKEY_SIZE, &ephkey);
+
+	tinyonion = sphinx_compressed_onion_deserialize(NULL, compressed);
+	if (tinyonion == NULL)
+		errx(1, "Could not deserialize compressed onion");
+
+	if (!sphinx_create_shared_secret(&shared_secret,
+					 &tinyonion->ephemeralkey,
+					 &rendezvous_key.secret))
+		errx(1,
+		     "Could not generate shared secret from ephemeral key %s "
+		     "and private key %s",
+		     pubkey_to_hexstr(NULL, &ephkey), hexprivkey);
+
+	onion = sphinx_decompress(NULL, tinyonion, &shared_secret);
+	if (onion == NULL)
+		errx(1, "Could not decompress compressed onion");
+
+	printf("Decompressed Onion: %s\n", tal_hex(NULL, serialize_onionpacket(NULL, onion)));
+}
+
 /* Tal wrappers for opt. */
 static void *opt_allocfn(size_t size)
 {
@@ -301,15 +361,18 @@ int main(int argc, char **argv)
 	setup_locale();
 	const char *method;
 	u8 assocdata[ASSOC_DATA_SIZE];
+	struct node_id rendezvous_id;
 	memset(&assocdata, 'B', sizeof(assocdata));
+	memset(&rendezvous_id, 0, sizeof(struct node_id));
 
 	secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY |
 						 SECP256K1_CONTEXT_SIGN);
 
 	opt_set_alloc(opt_allocfn, tal_reallocfn, tal_freefn);
-	opt_register_arg("--assoc-data", opt_set_ad, opt_show_ad,
-			 assocdata,
+	opt_register_arg("--assoc-data", opt_set_ad, opt_show_ad, assocdata,
 			 "Associated data (usu. payment_hash of payment)");
+	opt_register_arg("--rendezvous-id", opt_set_node_id, NULL,
+			 &rendezvous_id, "Node ID of the rendez-vous node");
 	opt_register_noarg("--help|-h", opt_usage_and_exit,
 			   "\n\n\tdecode <onion_file> <privkey>\n"
 			   "\tgenerate <pubkey1> <pubkey2> ...\n"
@@ -333,7 +396,19 @@ int main(int argc, char **argv)
 			errx(1, "'runtest' requires a filename argument");
 		runtest(argv[2]);
 	} else if (streq(method, "generate")) {
-		do_generate(argc, argv, assocdata);
+		if (memeqzero(&rendezvous_id, sizeof(rendezvous_id)))
+			do_generate(argc, argv, assocdata, NULL);
+		else
+			do_generate(argc, argv, assocdata, &rendezvous_id);
+	} else if (streq(method, "decompress")) {
+		if (argc != 4) {
+			errx(2,
+			     "'%s decompress' requires a private key and a "
+			     "compressed onion",
+			     argv[0]);
+		}
+
+		decompress(argv[2], argv[3]);
 	} else if (streq(method, "decode")) {
 		do_decode(argc, argv, assocdata);
 	} else {
