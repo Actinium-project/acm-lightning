@@ -19,10 +19,8 @@
 #include <string.h>
 #include <unistd.h>
 
-#define ASSOC_DATA_SIZE 32
-
 static void do_generate(int argc, char **argv,
-			const u8 assocdata[ASSOC_DATA_SIZE],
+			const u8 *assocdata,
 			const struct node_id *rvnode_id)
 {
 	const tal_t *ctx = talz(NULL, tal_t);
@@ -35,11 +33,10 @@ static void do_generate(int argc, char **argv,
 	struct sphinx_compressed_onion *comp;
 	u8 *serialized;
 	struct onionpacket *packet;
-	const u8* tmp_assocdata =tal_dup_arr(ctx, u8, assocdata,
-					  ASSOC_DATA_SIZE, 0);
+
 	memset(&session_key, 'A', sizeof(struct secret));
 
-	sp = sphinx_path_new_with_key(ctx, tmp_assocdata, &session_key);
+	sp = sphinx_path_new_with_key(ctx, assocdata, &session_key);
 	sphinx_path_set_rendezvous(sp, rvnode_id);
 
 	for (int i = 0; i < num_hops; i++) {
@@ -131,12 +128,12 @@ static struct route_step *decode_with_privkey(const tal_t *ctx, const u8 *onion,
 		errx(1, "Error creating shared secret.");
 
 	step = process_onionpacket(ctx, &packet, &shared_secret, assocdata,
-				   tal_bytelen(assocdata));
+				   tal_bytelen(assocdata), true);
 	return step;
 
 }
 
-static void do_decode(int argc, char **argv, const u8 assocdata[ASSOC_DATA_SIZE])
+static void do_decode(int argc, char **argv, const u8 *assocdata)
 {
 	const tal_t *ctx = talz(NULL, tal_t);
 	u8 serialized[TOTAL_PACKET_SIZE];
@@ -145,7 +142,8 @@ static void do_decode(int argc, char **argv, const u8 assocdata[ASSOC_DATA_SIZE]
 	if (argc != 4)
 		opt_usage_exit_fail("Expect an filename and privkey with 'decode' method");
 
-	char *hextemp = grab_file(ctx, argv[2]);
+	/* "-" means stdin, which is NULL for grab_file */
+	char *hextemp = grab_file(ctx, streq(argv[2], "-") ? NULL : argv[2]);
 	size_t hexlen = strlen(hextemp);
 
 	// trim trailing whitespace
@@ -156,9 +154,7 @@ static void do_decode(int argc, char **argv, const u8 assocdata[ASSOC_DATA_SIZE]
 		errx(1, "Invalid onion hex '%s'", hextemp);
 	}
 
-	const u8* tmp_assocdata =tal_dup_arr(ctx, u8, assocdata,
-					  ASSOC_DATA_SIZE, 0);
-	step = decode_with_privkey(ctx, serialized, tal_strdup(ctx, argv[3]), tmp_assocdata);
+	step = decode_with_privkey(ctx, serialized, tal_strdup(ctx, argv[3]), assocdata);
 
 	if (!step || !step->next)
 		errx(1, "Error processing message.");
@@ -173,16 +169,17 @@ static void do_decode(int argc, char **argv, const u8 assocdata[ASSOC_DATA_SIZE]
 	tal_free(ctx);
 }
 
-static char *opt_set_ad(const char *arg, u8 *assocdata)
+static char *opt_set_ad(const char *arg, u8 **assocdata)
 {
-	if (!hex_decode(arg, strlen(arg), assocdata, ASSOC_DATA_SIZE))
+	*assocdata = tal_hexdata(NULL, arg, strlen(arg));
+	if (!*assocdata)
 		return "Bad hex string";
 	return NULL;
 }
 
-static void opt_show_ad(char buf[OPT_SHOW_LEN], const u8 *assocdata)
+static void opt_show_ad(char buf[OPT_SHOW_LEN], u8 *const *assocdata)
 {
-	hex_encode(assocdata, ASSOC_DATA_SIZE, buf, OPT_SHOW_LEN);
+	hex_encode(*assocdata, tal_bytelen(*assocdata), buf, OPT_SHOW_LEN);
 }
 
 static char *opt_set_node_id(const char *arg, struct node_id *node_id)
@@ -285,7 +282,7 @@ static void runtest(const char *filename)
 			errx(1, "Error serializing message.");
 		onion_payload_length(step->raw_payload,
 				     tal_bytelen(step->raw_payload),
-				     &valid, &type);
+				     true, &valid, &type);
 		assert(valid);
 		printf("  Type: %d\n", type);
 		printf("  Payload: %s\n", tal_hex(ctx, step->raw_payload));
@@ -360,16 +357,15 @@ int main(int argc, char **argv)
 {
 	setup_locale();
 	const char *method;
-	u8 assocdata[ASSOC_DATA_SIZE];
+	u8 *assocdata = NULL;
 	struct node_id rendezvous_id;
-	memset(&assocdata, 'B', sizeof(assocdata));
 	memset(&rendezvous_id, 0, sizeof(struct node_id));
 
 	secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY |
 						 SECP256K1_CONTEXT_SIGN);
 
 	opt_set_alloc(opt_allocfn, tal_reallocfn, tal_freefn);
-	opt_register_arg("--assoc-data", opt_set_ad, opt_show_ad, assocdata,
+	opt_register_arg("--assoc-data", opt_set_ad, opt_show_ad, &assocdata,
 			 "Associated data (usu. payment_hash of payment)");
 	opt_register_arg("--rendezvous-id", opt_set_node_id, NULL,
 			 &rendezvous_id, "Node ID of the rendez-vous node");
