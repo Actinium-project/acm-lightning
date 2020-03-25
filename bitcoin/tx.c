@@ -98,10 +98,20 @@ static struct amount_sat bitcoin_tx_compute_fee(const struct bitcoin_tx *tx)
 	return fee;
 }
 
-int elements_tx_add_fee_output(struct bitcoin_tx *tx)
+/**
+ * Add an explicit fee output if necessary.
+ *
+ * An explicit fee output is only necessary if we are using an elements
+ * transaction, and we have a non-zero fee. This method may be called multiple
+ * times.
+ *
+ * Returns the position of the fee output, or -1 in the case of non-elements
+ * transactions.
+ */
+static int elements_tx_add_fee_output(struct bitcoin_tx *tx)
 {
 	struct amount_sat fee = bitcoin_tx_compute_fee(tx);
-	int pos = -1;
+	int pos;
 	struct witscript *w;
 
 	/* If we aren't using elements, we don't add explicit fee outputs */
@@ -109,17 +119,21 @@ int elements_tx_add_fee_output(struct bitcoin_tx *tx)
 		return -1;
 
 	/* Try to find any existing fee output */
-	for (int i=0; i<tx->wtx->num_outputs; i++) {
-		if (elements_tx_output_is_fee(tx, i)) {
-			assert(pos == -1);
-			pos = i;
-		}
+	for (pos = 0; pos < tx->wtx->num_outputs; pos++) {
+		if (elements_tx_output_is_fee(tx, pos))
+			break;
 	}
 
-	if (pos == -1) {
+	if (pos == tx->wtx->num_outputs) {
 		w = tal(tx->output_witscripts, struct witscript);
 		w->ptr = tal_arr(w, u8, 0);
-		tx->output_witscripts[tx->wtx->num_outputs] = w;
+
+		/* Make sure we have a place to stash the witness script in. */
+		if (tal_count(tx->output_witscripts) < pos + 1) {
+			tal_resize(&tx->output_witscripts, pos + 1);
+		}
+		tx->output_witscripts[pos] = w;
+
 		return bitcoin_tx_add_output(tx, NULL, fee);
 	} else {
 		bitcoin_tx_output_set_amount(tx, pos, fee);
@@ -159,6 +173,12 @@ bool bitcoin_tx_check(const struct bitcoin_tx *tx)
 	u8 *newtx;
 	size_t written;
 	int flags = WALLY_TX_FLAG_USE_WITNESS;
+
+	if (tal_count(tx->input_amounts) != tx->wtx->num_inputs)
+		return false;
+
+	if (tal_count(tx->output_witscripts) != tx->wtx->num_outputs)
+		return false;
 
 	if (wally_tx_get_length(tx->wtx, flags, &written) != WALLY_OK)
 		return false;
@@ -408,6 +428,19 @@ struct bitcoin_tx *bitcoin_tx(const tal_t *ctx,
 	return tx;
 }
 
+void bitcoin_tx_finalize(struct bitcoin_tx *tx)
+{
+	size_t num_outputs, num_inputs;
+	elements_tx_add_fee_output(tx);
+
+	num_outputs = tx->wtx->num_outputs;
+	tal_resize(&(tx->output_witscripts), num_outputs);
+
+	num_inputs = tx->wtx->num_inputs;
+	tal_resize(&tx->input_amounts, num_inputs);
+	assert(bitcoin_tx_check(tx));
+}
+
 struct bitcoin_tx *pull_bitcoin_tx(const tal_t *ctx, const u8 **cursor,
 				   size_t *max)
 {
@@ -470,6 +503,12 @@ struct bitcoin_tx *bitcoin_tx_from_hex(const tal_t *ctx, const char *hex,
 		goto fail_free_tx;
 
 	tal_free(linear_tx);
+
+	tx->output_witscripts =
+	    tal_arrz(tx, struct witscript *, tx->wtx->num_outputs);
+	tx->input_amounts =
+	    tal_arrz(tx, struct amount_sat *, tx->wtx->num_inputs);
+
 	return tx;
 
 fail_free_tx:
