@@ -1,4 +1,5 @@
 from bitcoin.rpc import RawProxy as BitcoinProxy
+from pyln.client import RpcError
 from pyln.testing.btcproxy import BitcoinRpcProxy
 from collections import OrderedDict
 from decimal import Decimal
@@ -811,33 +812,44 @@ class LightningNode(object):
                     if 'htlcs' in channel:
                         wait_for(lambda: len(self.rpc.listpeers()['peers'][p]['channels'][c]['htlcs']) == 0)
 
+    # This sends money to a directly connected peer
     def pay(self, dst, amt, label=None):
         if not label:
             label = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(20))
 
+        # check we are connected
+        dst_id = dst.info['id']
+        assert len(self.rpc.listpeers(dst_id).get('peers')) == 1
+
+        # make an invoice
         rhash = dst.rpc.invoice(amt, label, label)['payment_hash']
         invoices = dst.rpc.listinvoices(label)['invoices']
         assert len(invoices) == 1 and invoices[0]['status'] == 'unpaid'
 
         routestep = {
             'msatoshi': amt,
-            'id': dst.info['id'],
+            'id': dst_id,
             'delay': 5,
-            'channel': '1x1x1'
+            'channel': '1x1x1'  # note: can be bogus for 1-hop direct payments
         }
 
-        def wait_pay():
-            # Up to 10 seconds for payment to succeed.
-            start_time = time.time()
-            while dst.rpc.listinvoices(label)['invoices'][0]['status'] != 'paid':
-                if time.time() > start_time + 10:
-                    raise TimeoutError('Payment timed out')
-                time.sleep(0.1)
         # sendpay is async now
         self.rpc.sendpay([routestep], rhash)
         # wait for sendpay to comply
         result = self.rpc.waitsendpay(rhash)
         assert(result.get('status') == 'complete')
+
+    # This helper sends all money to a peer until even 1 msat can't get through.
+    def drain(self, peer):
+        total = 0
+        msat = 16**9
+        while msat != 0:
+            try:
+                self.pay(peer, msat)
+                total += msat
+            except RpcError:
+                msat //= 2
+        return total
 
     # Note: this feeds through the smoother in update_feerate, so changing
     # it on a running daemon may not give expected result!
@@ -867,6 +879,15 @@ class LightningNode(object):
         # We wait until all three levels have been called.
         if wait_for_effect:
             wait_for(lambda: self.daemon.rpcproxy.mock_counts['estimatesmartfee'] >= 3)
+
+    # force new feerates by restarting and thus skipping slow smoothed process
+    # Note: testnode must be created with: opts={'may_reconnect': True}
+    def force_feerates(self, rate):
+        assert(self.may_reconnect)
+        self.set_feerates([rate] * 3, False)
+        self.restart()
+        self.daemon.wait_for_log('peer_out WIRE_UPDATE_FEE')
+        assert(self.rpc.feerates('perkw')['perkw']['normal'] == rate)
 
     def wait_for_onchaind_broadcast(self, name, resolve=None):
         """Wait for onchaind to drop tx name to resolve (if any)"""
