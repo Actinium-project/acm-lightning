@@ -4,6 +4,36 @@
 #include <ccan/short_types/short_types.h>
 #include <ccan/tal/tal.h>
 
+enum feature_place {
+	INIT_FEATURE,
+	GLOBAL_INIT_FEATURE,
+	NODE_ANNOUNCE_FEATURE,
+	CHANNEL_FEATURE,
+	BOLT11_FEATURE,
+};
+#define NUM_FEATURE_PLACE (BOLT11_FEATURE+1)
+
+/* The complete set of features for all contexts */
+struct feature_set {
+	u8 *bits[NUM_FEATURE_PLACE];
+};
+
+/* Initialize core features (for lightningd). */
+struct feature_set *features_core_init(const u8 *features TAKES);
+
+/* Initialize subdaemon features. */
+void features_init(struct feature_set *fset TAKES);
+
+/* Free feature allocations */
+void features_cleanup(void);
+
+struct feature_set *fromwire_feature_set(const tal_t *ctx,
+					 const u8 **ptr, size_t *max);
+void towire_feature_set(u8 **pptr, const struct feature_set *fset);
+
+/* Add features supplied by a plugin: returns false if we already have them */
+bool features_additional(const struct feature_set *feature_set);
+
 /* Returns -1 if we're OK with all these offered features, otherwise first
  * unsupported (even) feature. */
 int features_unsupported(const u8 *features);
@@ -13,6 +43,9 @@ u8 *get_offered_initfeatures(const tal_t *ctx);
 u8 *get_offered_globalinitfeatures(const tal_t *ctx);
 u8 *get_offered_nodefeatures(const tal_t *ctx);
 u8 *get_offered_bolt11features(const tal_t *ctx);
+
+/* For the features in channel_announcement */
+u8 *get_agreed_channelfeatures(const tal_t *ctx, const u8 *theirfeatures);
 
 /* Is this feature bit requested? (Either compulsory or optional) */
 bool feature_offered(const u8 *features, size_t f);

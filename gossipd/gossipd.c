@@ -613,7 +613,8 @@ static struct io_plan *connectd_new_peer(struct io_conn *conn,
 	 *
 	 * A node:
 	 *   - if the `gossip_queries` feature is negotiated:
-	 * 	- MUST NOT relay any gossip messages unless explicitly requested.
+	 * 	- MUST NOT relay any gossip messages it did not generate itself,
+	 *        unless explicitly requested.
 	 */
 	if (peer->gossip_queries_feature) {
 		gs = NULL;
@@ -827,11 +828,12 @@ static struct io_plan *gossip_init(struct io_conn *conn,
 	u32 *dev_gossip_time;
 	bool dev_fast_gossip, dev_fast_gossip_prune;
 	u32 timestamp;
+	struct feature_set *feature_set;
 
 	if (!fromwire_gossipctl_init(daemon, msg,
 				     &chainparams,
+				     &feature_set,
 				     &daemon->id,
-				     &daemon->nodefeatures,
 				     daemon->rgb,
 				     daemon->alias,
 				     &daemon->announcable,
@@ -841,6 +843,7 @@ static struct io_plan *gossip_init(struct io_conn *conn,
 		master_badmsg(WIRE_GOSSIPCTL_INIT, msg);
 	}
 
+	features_init(take(feature_set));
 	daemon->rstate = new_routing_state(daemon,
 					   &daemon->id,
 					   &daemon->peers,
