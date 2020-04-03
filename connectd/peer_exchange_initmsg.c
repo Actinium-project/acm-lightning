@@ -44,7 +44,6 @@ static struct io_plan *peer_init_received(struct io_conn *conn,
 {
 	u8 *msg = cryptomsg_decrypt_body(tmpctx, &peer->cs, peer->msg);
 	u8 *globalfeatures, *features;
-	int unsup;
 	struct tlv_init_tlvs *tlvs = tlv_init_tlvs_new(msg);
 
 	if (!msg)
@@ -88,23 +87,6 @@ static struct io_plan *peer_init_received(struct io_conn *conn,
 	/* The globalfeatures field is now unused, but there was a
 	 * window where it was: combine the two. */
 	features = featurebits_or(tmpctx, take(features), globalfeatures);
-
-	/* BOLT #1:
-	 *
-	 * The receiving node:
-	 * ...
-	 *  - upon receiving unknown _odd_ feature bits that are non-zero:
-	 *    - MUST ignore the bit.
-	 *  - upon receiving unknown _even_ feature bits that are non-zero:
-	 *    - MUST fail the connection.
-	 */
-	unsup = features_unsupported(features);
-	if (unsup != -1) {
-		msg = towire_errorfmt(NULL, NULL, "Unsupported feature %u",
-				      unsup);
-		msg = cryptomsg_encrypt_msg(NULL, &peer->cs, take(msg));
-		return io_write(conn, msg, tal_count(msg), io_close_cb, NULL);
-	}
 
 	/* Usually return io_close_taken_fd, but may wait for old peer to
 	 * be disconnected if it's a reconnect. */
@@ -153,6 +135,7 @@ static struct io_plan *peer_write_postclose(struct io_conn *conn,
 
 struct io_plan *peer_exchange_initmsg(struct io_conn *conn,
 				      struct daemon *daemon,
+				      const struct feature_set *our_features,
 				      const struct crypto_state *cs,
 				      const struct node_id *id,
 				      const struct wireaddr_internal *addr)
@@ -199,8 +182,8 @@ struct io_plan *peer_exchange_initmsg(struct io_conn *conn,
 	 * Finally, we agreed that bits below 13 could be put in both, but
 	 * from now on they'll all go in initfeatures. */
 	peer->msg = towire_init(NULL,
-				get_offered_globalinitfeatures(tmpctx),
-				get_offered_initfeatures(tmpctx),
+				our_features->bits[GLOBAL_INIT_FEATURE],
+				our_features->bits[INIT_FEATURE],
 				tlvs);
 	status_peer_io(LOG_IO_OUT, &peer->id, peer->msg);
 	peer->msg = cryptomsg_encrypt_msg(peer, &peer->cs, take(peer->msg));

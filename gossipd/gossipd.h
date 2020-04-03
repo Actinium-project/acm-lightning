@@ -57,6 +57,9 @@ struct daemon {
 
 	/* What, if any, gossip we're seeker from peers. */
 	struct seeker *seeker;
+
+	/* Features lightningd told us to set. */
+	struct feature_set *our_features;
 };
 
 /* This represents each peer we're gossiping with */

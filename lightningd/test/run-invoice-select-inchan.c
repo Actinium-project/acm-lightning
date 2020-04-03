@@ -23,6 +23,7 @@ void bitcoind_getutxout_(struct bitcoind *bitcoind UNNEEDED,
 { fprintf(stderr, "bitcoind_getutxout_ called!\n"); abort(); }
 /* Generated stub for bolt11_decode */
 struct bolt11 *bolt11_decode(const tal_t *ctx UNNEEDED, const char *str UNNEEDED,
+			     const struct feature_set *fset UNNEEDED,
 			     const char *description UNNEEDED, char **fail UNNEEDED)
 { fprintf(stderr, "bolt11_decode called!\n"); abort(); }
 /* Generated stub for bolt11_encode_ */
@@ -77,7 +78,7 @@ struct command_result *command_success(struct command *cmd UNNEEDED,
 
 { fprintf(stderr, "command_success called!\n"); abort(); }
 /* Generated stub for connect_succeeded */
-void connect_succeeded(struct lightningd *ld UNNEEDED, const struct node_id *id UNNEEDED)
+void connect_succeeded(struct lightningd *ld UNNEEDED, const struct peer *peer UNNEEDED)
 { fprintf(stderr, "connect_succeeded called!\n"); abort(); }
 /* Generated stub for delay_then_reconnect */
 void delay_then_reconnect(struct channel *channel UNNEEDED, u32 seconds_delay UNNEEDED,
@@ -137,9 +138,6 @@ u32 get_feerate(const struct fee_states *fee_states UNNEEDED,
 		enum side funder UNNEEDED,
 		enum side side UNNEEDED)
 { fprintf(stderr, "get_feerate called!\n"); abort(); }
-/* Generated stub for get_offered_bolt11features */
-u8 *get_offered_bolt11features(const tal_t *ctx UNNEEDED)
-{ fprintf(stderr, "get_offered_bolt11features called!\n"); abort(); }
 /* Generated stub for htlc_is_trimmed */
 bool htlc_is_trimmed(enum side htlc_owner UNNEEDED,
 		     struct amount_msat htlc_amount UNNEEDED,

@@ -8,7 +8,7 @@
 # Begin!  (passes gossipd-client fd)
 msgtype,channel_init,1000
 msgdata,channel_init,chainparams,chainparams,
-msgdata,channel_init,feature_set,feature_set,
+msgdata,channel_init,our_features,feature_set,
 msgdata,channel_init,funding_txid,bitcoin_txid,
 msgdata,channel_init,funding_txout,u16,
 msgdata,channel_init,funding_satoshi,amount_sat,
@@ -64,8 +64,8 @@ msgdata,channel_init,init_peer_pkt_len,u16,
 msgdata,channel_init,init_peer_pkt,u8,init_peer_pkt_len
 msgdata,channel_init,reached_announce_depth,bool,
 msgdata,channel_init,last_remote_secret,secret,
-msgdata,channel_init,lflen,u16,
-msgdata,channel_init,localfeatures,u8,lflen
+msgdata,channel_init,flen,u16,
+msgdata,channel_init,their_features,u8,flen
 msgdata,channel_init,upfront_shutdown_script_len,u16,
 msgdata,channel_init,upfront_shutdown_script,u8,upfront_shutdown_script_len
 msgdata,channel_init,remote_ann_node_sig,?secp256k1_ecdsa_signature,
@@ -208,3 +208,20 @@ msgdata,channel_send_error,reason,wirestring,
 
 # Tell master channeld has sent the error message.
 msgtype,channel_send_error_reply,1108
+
+# Tell lightningd we got a onion message (for us, or to fwd)
+msgtype,got_onionmsg_to_us,1142
+msgdata,got_onionmsg_to_us,reply_blinding,?pubkey,
+msgdata,got_onionmsg_to_us,reply_path_len,u16,
+msgdata,got_onionmsg_to_us,reply_path,onionmsg_path,reply_path_len
+
+msgtype,got_onionmsg_forward,1143
+msgdata,got_onionmsg_forward,next_scid,?short_channel_id,
+msgdata,got_onionmsg_forward,next_node_id,?node_id,
+msgdata,got_onionmsg_forward,next_blinding,?pubkey,
+msgdata,got_onionmsg_forward,next_onion,u8,1366
+
+# Lightningd tells us to send a onion message.
+msgtype,send_onionmsg,1040
+msgdata,send_onionmsg,onion,u8,1366
+msgdata,send_onionmsg,blinding,?pubkey,

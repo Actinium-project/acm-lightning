@@ -916,7 +916,7 @@ bool plugin_parse_getmanifest_response(const char *buffer,
 			return true;
 		}
 
-		if (!features_additional(fset)) {
+		if (!feature_set_or(plugin->plugins->ld->our_features, fset)) {
 			plugin_kill(plugin,
 				    "Custom featurebits already present");
 			return true;
@@ -1169,6 +1169,15 @@ plugin_populate_init_request(struct plugin *plugin, struct jsonrpc_request *req)
 	json_add_string(req->stream, "rpc-file", ld->rpc_filename);
 	json_add_bool(req->stream, "startup", plugin->plugins->startup);
 	json_add_string(req->stream, "network", chainparams->network_name);
+	json_object_start(req->stream, "feature_set");
+	for (enum feature_place fp = 0; fp < NUM_FEATURE_PLACE; fp++) {
+		if (plugin_feature_place_names[fp]) {
+			json_add_hex_talarr(req->stream,
+					    plugin_feature_place_names[fp],
+					    ld->our_features->bits[fp]);
+		}
+	}
+	json_object_end(req->stream);
 	json_object_end(req->stream);
 }
 

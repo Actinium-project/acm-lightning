@@ -692,7 +692,7 @@ static char *test_subdaemons_and_exit(struct lightningd *ld)
 
 static char *list_features_and_exit(struct lightningd *ld)
 {
-	const char **features = list_supported_features(ld);
+	const char **features = list_supported_features(tmpctx, ld->our_features);
 	for (size_t i = 0; i < tal_count(features); i++)
 		printf("%s\n", features[i]);
 	exit(0);
@@ -742,6 +742,14 @@ static char *opt_start_daemon(struct lightningd *ld)
 	errx(1, "Died with signal %u", WTERMSIG(exitcode));
 }
 
+static char *opt_set_wumbo(struct lightningd *ld)
+{
+	feature_set_or(ld->our_features,
+		       take(feature_set_for_feature(NULL,
+						    OPTIONAL_FEATURE(OPT_LARGE_CHANNELS))));
+	return NULL;
+}
+
 static void register_opts(struct lightningd *ld)
 {
 	/* This happens before plugins started */
@@ -773,6 +781,11 @@ static void register_opts(struct lightningd *ld)
 	opt_register_early_arg("--wallet", opt_set_talstr, NULL,
 			       &ld->wallet_dsn,
 			       "Location of the wallet database.");
+
+	/* This affects our features, so set early. */
+	opt_register_early_noarg("--large-channels|--wumbo",
+				 opt_set_wumbo, ld,
+				 "Allow channels larger than 0.16777215 BTC");
 
 	opt_register_noarg("--help|-h", opt_lightningd_usage, ld,
 				 "Print this message.");
@@ -1004,33 +1017,10 @@ void setup_color_and_alias(struct lightningd *ld)
 	}
 }
 
-static struct feature_set *setup_default_features(void)
-{
-	static const u32 default_features[] = {
-		OPTIONAL_FEATURE(OPT_DATA_LOSS_PROTECT),
-		OPTIONAL_FEATURE(OPT_UPFRONT_SHUTDOWN_SCRIPT),
-		OPTIONAL_FEATURE(OPT_GOSSIP_QUERIES),
-		OPTIONAL_FEATURE(OPT_VAR_ONION),
-		OPTIONAL_FEATURE(OPT_PAYMENT_SECRET),
-		OPTIONAL_FEATURE(OPT_BASIC_MPP),
-		OPTIONAL_FEATURE(OPT_GOSSIP_QUERIES_EX),
-		OPTIONAL_FEATURE(OPT_STATIC_REMOTEKEY),
-	};
-	u8 *f = tal_arr(NULL, u8, 0);
-
-	for (size_t i = 0; i < ARRAY_SIZE(default_features); i++)
-		set_feature_bit(&f, default_features[i]);
-
-	return features_core_init(take(f));
-}
-
 void handle_early_opts(struct lightningd *ld, int argc, char *argv[])
 {
 	/* Make ccan/opt use tal for allocations */
 	setup_option_allocators();
-
-	/* Make sure options are populated. */
-	ld->feature_set = setup_default_features();
 
 	/*~ List features immediately, before doing anything interesting */
 	opt_register_early_noarg("--list-features-only",
@@ -1211,6 +1201,11 @@ static void add_config(struct lightningd *ld,
 					 ? "false" : "true");
 		} else if (opt->cb == (void *)opt_set_hsm_password) {
 			json_add_bool(response, "encrypted-hsm", ld->encrypted_hsm);
+		} else if (opt->cb == (void *)opt_set_wumbo) {
+			json_add_bool(response, "wumbo",
+				      feature_offered(ld->our_features
+						      ->bits[INIT_FEATURE],
+						      OPT_LARGE_CHANNELS));
 		} else {
 			/* Insert more decodes here! */
 			assert(!"A noarg option was added but was not handled");

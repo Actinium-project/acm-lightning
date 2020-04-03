@@ -5,10 +5,6 @@
 #include <common/utils.h>
 #include <wire/peer_wire.h>
 
-/* We keep a map of our features for each context, with the assumption that
- * the init features is a superset of the others. */
-static struct feature_set *our_features;
-
 enum feature_copy_style {
 	/* Feature is not exposed (importantly, being 0, this is the default!). */
 	FEATURE_DONT_REPRESENT,
@@ -56,6 +52,10 @@ static const struct feature_style feature_styles[] = {
 	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
 			  [BOLT11_FEATURE] = FEATURE_REPRESENT } },
+	{ OPT_LARGE_CHANNELS,
+	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
+			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
+			  [CHANNEL_FEATURE] = FEATURE_REPRESENT_AS_OPTIONAL } },
 };
 
 static enum feature_copy_style feature_copy_style(u32 f, enum feature_place p)
@@ -67,84 +67,53 @@ static enum feature_copy_style feature_copy_style(u32 f, enum feature_place p)
 	abort();
 }
 
-static u8 *mkfeatures(const tal_t *ctx, enum feature_place place)
+struct feature_set *feature_set_for_feature(const tal_t *ctx, int feature)
 {
-	u8 *f = tal_arr(ctx, u8, 0);
-	const u8 *base = our_features->bits[INIT_FEATURE];
+	struct feature_set *fs = tal(ctx, struct feature_set);
 
-	assert(place != INIT_FEATURE);
-	for (size_t i = 0; i < tal_bytelen(base)*8; i++) {
-		if (!feature_is_set(base, i))
-			continue;
-
-		switch (feature_copy_style(i, place)) {
+	for (size_t i = 0; i < ARRAY_SIZE(fs->bits); i++) {
+		fs->bits[i] = tal_arr(fs, u8, 0);
+		switch (feature_copy_style(feature, i)) {
 		case FEATURE_DONT_REPRESENT:
 			continue;
 		case FEATURE_REPRESENT:
-			set_feature_bit(&f, i);
+			set_feature_bit(&fs->bits[i], feature);
 			continue;
 		case FEATURE_REPRESENT_AS_OPTIONAL:
-			set_feature_bit(&f, OPTIONAL_FEATURE(i));
+			set_feature_bit(&fs->bits[i], OPTIONAL_FEATURE(feature));
 			continue;
 		}
 		abort();
 	}
-	return f;
+	return fs;
 }
 
-struct feature_set *features_core_init(const u8 *feature_bits)
-{
-	assert(!our_features);
-	our_features = notleak(tal(NULL, struct feature_set));
-
-	our_features->bits[INIT_FEATURE]
-		= tal_dup_talarr(our_features, u8, feature_bits);
-
-	/* Make other masks too */
-	for (enum feature_place f = INIT_FEATURE+1; f < NUM_FEATURE_PLACE; f++)
-		our_features->bits[f] = mkfeatures(our_features, f);
-
-	return our_features;
-}
-
-void features_init(struct feature_set *fset TAKES)
-{
-	assert(!our_features);
-
-	if (taken(fset))
-		our_features = notleak(tal_steal(NULL, fset));
-	else {
-		our_features = notleak(tal(NULL, struct feature_set));
-		for (size_t i = 0; i < ARRAY_SIZE(fset->bits); i++)
-			our_features->bits[i] = tal_dup_talarr(our_features, u8,
-							       fset->bits[i]);
-	}
-}
-
-void features_cleanup(void)
-{
-	our_features = tal_free(our_features);
-}
-
-bool features_additional(const struct feature_set *newfset)
+bool feature_set_or(struct feature_set *a,
+		    const struct feature_set *b TAKES)
 {
 	/* Check first, before we change anything! */
-	for (size_t i = 0; i < ARRAY_SIZE(newfset->bits); i++) {
+	for (size_t i = 0; i < ARRAY_SIZE(b->bits); i++) {
 		/* FIXME: We could allow a plugin to upgrade an optional feature
 		 * to a compulsory one? */
-		for (size_t b = 0; b < tal_bytelen(newfset->bits[i])*8; b++) {
-			if (feature_is_set(newfset->bits[i], b)
-			    && feature_is_set(our_features->bits[i], b))
+		for (size_t j = 0; j < tal_bytelen(b->bits[i])*8; j++) {
+			if (feature_is_set(b->bits[i], j)
+			    && feature_offered(a->bits[i], j)) {
+				if (taken(b))
+					tal_free(b);
 				return false;
+			}
 		}
 	}
 
-	for (size_t i = 0; i < ARRAY_SIZE(newfset->bits); i++) {
-		for (size_t b = 0; b < tal_bytelen(newfset->bits[i])*8; b++) {
-			if (feature_is_set(newfset->bits[i], b))
-				set_feature_bit(&our_features->bits[i], b);
+	for (size_t i = 0; i < ARRAY_SIZE(a->bits); i++) {
+		for (size_t j = 0; j < tal_bytelen(b->bits[i])*8; j++) {
+			if (feature_is_set(b->bits[i], j))
+				set_feature_bit(&a->bits[i], j);
 		}
 	}
+
+	if (taken(b))
+		tal_free(b);
 	return true;
 }
 
@@ -172,21 +141,6 @@ static bool test_bit(const u8 *features, size_t byte, unsigned int bit)
 	return features[tal_count(features) - 1 - byte] & (1 << (bit % 8));
 }
 
-u8 *get_offered_nodefeatures(const tal_t *ctx)
-{
-	return tal_dup_talarr(ctx, u8, our_features->bits[NODE_ANNOUNCE_FEATURE]);
-}
-
-u8 *get_offered_initfeatures(const tal_t *ctx)
-{
-	return tal_dup_talarr(ctx, u8, our_features->bits[INIT_FEATURE]);
-}
-
-u8 *get_offered_globalinitfeatures(const tal_t *ctx)
-{
-	return tal_dup_talarr(ctx, u8, our_features->bits[GLOBAL_INIT_FEATURE]);
-}
-
 static void clear_feature_bit(u8 *features, u32 bit)
 {
 	size_t bytenum = bit / 8, bitnum = bit % 8, len = tal_count(features);
@@ -203,7 +157,9 @@ static void clear_feature_bit(u8 *features, u32 bit)
  *  - MUST set `len` to the minimum length required to hold the `features` bits
  *  it sets.
  */
-u8 *get_agreed_channelfeatures(const tal_t *ctx, const u8 *theirfeatures)
+u8 *get_agreed_channelfeatures(const tal_t *ctx,
+			       const struct feature_set *our_features,
+			       const u8 *their_features)
 {
 	u8 *f = tal_dup_talarr(ctx, u8, our_features->bits[CHANNEL_FEATURE]);
 	size_t max_len = 0;
@@ -212,7 +168,7 @@ u8 *get_agreed_channelfeatures(const tal_t *ctx, const u8 *theirfeatures)
 	for (size_t i = 0; i < 8 * tal_count(f); i += 2) {
 		if (!feature_offered(f, i))
 			continue;
-		if (!feature_offered(theirfeatures, i)) {
+		if (!feature_offered(their_features, i)) {
 			clear_feature_bit(f, COMPULSORY_FEATURE(i));
 			clear_feature_bit(f, OPTIONAL_FEATURE(i));
 			continue;
@@ -223,11 +179,6 @@ u8 *get_agreed_channelfeatures(const tal_t *ctx, const u8 *theirfeatures)
 	/* Trim to length */
 	tal_resize(&f, max_len);
 	return f;
-}
-
-u8 *get_offered_bolt11features(const tal_t *ctx)
-{
-	return tal_dup_talarr(ctx, u8, our_features->bits[BOLT11_FEATURE]);
 }
 
 bool feature_is_set(const u8 *features, size_t bit)
@@ -246,9 +197,10 @@ bool feature_offered(const u8 *features, size_t f)
 		|| feature_is_set(features, OPTIONAL_FEATURE(f));
 }
 
-bool feature_negotiated(const u8 *lfeatures, size_t f)
+bool feature_negotiated(const struct feature_set *our_features,
+			const u8 *their_features, size_t f)
 {
-	return feature_offered(lfeatures, f)
+	return feature_offered(their_features, f)
 		&& feature_offered(our_features->bits[INIT_FEATURE], f);
 }
 
@@ -263,7 +215,9 @@ bool feature_negotiated(const u8 *lfeatures, size_t f)
  *
  * Returns -1 on success, or first unsupported feature.
  */
-static int all_supported_features(const u8 *bitmap)
+static int all_supported_features(const struct feature_set *our_features,
+				  const u8 *bitmap,
+				  enum feature_place p)
 {
 	size_t len = tal_count(bitmap) * 8;
 
@@ -272,7 +226,7 @@ static int all_supported_features(const u8 *bitmap)
 		if (!test_bit(bitmap, bitnum/8, bitnum%8))
 			continue;
 
-		if (feature_offered(our_features->bits[INIT_FEATURE], bitnum))
+		if (feature_offered(our_features->bits[p], bitnum))
 			continue;
 
 		return bitnum;
@@ -280,15 +234,17 @@ static int all_supported_features(const u8 *bitmap)
 	return -1;
 }
 
-int features_unsupported(const u8 *features)
+int features_unsupported(const struct feature_set *our_features,
+			 const u8 *their_features,
+			 enum feature_place p)
 {
 	/* BIT 2 would logically be "compulsory initial_routing_sync", but
 	 * that does not exist, so we special case it. */
-	if (feature_is_set(features,
+	if (feature_is_set(their_features,
 			   COMPULSORY_FEATURE(OPT_INITIAL_ROUTING_SYNC)))
 		return COMPULSORY_FEATURE(OPT_INITIAL_ROUTING_SYNC);
 
-	return all_supported_features(features);
+	return all_supported_features(our_features, their_features, p);
 }
 
 static const char *feature_name(const tal_t *ctx, size_t f)
@@ -313,12 +269,13 @@ static const char *feature_name(const tal_t *ctx, size_t f)
 		       fnames[f / 2], (f & 1) ? "odd" : "even");
 }
 
-const char **list_supported_features(const tal_t *ctx)
+const char **list_supported_features(const tal_t *ctx,
+				     const struct feature_set *fset)
 {
 	const char **list = tal_arr(ctx, const char *, 0);
 
-	for (size_t i = 0; i < tal_bytelen(our_features->bits[INIT_FEATURE]) * 8; i++) {
-		if (test_bit(our_features->bits[INIT_FEATURE], i / 8, i % 8))
+	for (size_t i = 0; i < tal_bytelen(fset->bits[INIT_FEATURE]) * 8; i++) {
+		if (test_bit(fset->bits[INIT_FEATURE], i / 8, i % 8))
 			tal_arr_expand(&list, feature_name(list, i));
 	}
 

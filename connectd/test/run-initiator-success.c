@@ -40,9 +40,6 @@ u8 *fromwire_tal_arrn(const tal_t *ctx UNNEEDED,
 /* Generated stub for fromwire_u16 */
 u16 fromwire_u16(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
 { fprintf(stderr, "fromwire_u16 called!\n"); abort(); }
-/* Generated stub for notleak_ */
-void *notleak_(const void *ptr UNNEEDED, bool plus_children UNNEEDED)
-{ fprintf(stderr, "notleak_ called!\n"); abort(); }
 /* Generated stub for towire_u16 */
 void towire_u16(u8 **pptr UNNEEDED, u16 v UNNEEDED)
 { fprintf(stderr, "towire_u16 called!\n"); abort(); }
@@ -218,7 +215,7 @@ static struct io_plan *test_read(struct io_conn *conn,
 static struct io_plan *success(struct io_conn *conn UNUSED,
 			       const struct pubkey *them,
 			       const struct wireaddr_internal *addr UNUSED,
-			       const struct crypto_state *cs,
+			       struct crypto_state *cs,
 			       void *unused UNUSED)
 {
 	assert(pubkey_eq(them, &rs_pub));

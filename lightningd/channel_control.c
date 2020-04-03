@@ -21,6 +21,7 @@
 #include <lightningd/jsonrpc.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
+#include <lightningd/onion_message.h>
 #include <lightningd/peer_control.h>
 #include <lightningd/subd.h>
 #include <wire/gen_common_wire.h>
@@ -319,7 +320,17 @@ static unsigned channel_msg(struct subd *sd, const u8 *msg, const int *fds)
 	case WIRE_CHANNEL_SEND_ERROR_REPLY:
 		handle_error_channel(sd->channel, msg);
 		break;
-
+#if EXPERIMENTAL_FEATURES
+	case WIRE_GOT_ONIONMSG_TO_US:
+		handle_onionmsg_to_us(sd->channel, msg);
+		break;
+	case WIRE_GOT_ONIONMSG_FORWARD:
+		handle_onionmsg_forward(sd->channel, msg);
+		break;
+#else
+	case WIRE_GOT_ONIONMSG_TO_US:
+	case WIRE_GOT_ONIONMSG_FORWARD:
+#endif
 	/* And we never get these from channeld. */
 	case WIRE_CHANNEL_INIT:
 	case WIRE_CHANNEL_FUNDING_DEPTH:
@@ -334,7 +345,8 @@ static unsigned channel_msg(struct subd *sd, const u8 *msg, const int *fds)
 	case WIRE_CHANNEL_FEERATES:
 	case WIRE_CHANNEL_SPECIFIC_FEERATES:
 	case WIRE_CHANNEL_DEV_MEMLEAK:
-	/* Replies go to requests. */
+	case WIRE_SEND_ONIONMSG:
+		/* Replies go to requests. */
 	case WIRE_CHANNEL_OFFER_HTLC_REPLY:
 	case WIRE_CHANNEL_DEV_REENABLE_COMMIT_REPLY:
 	case WIRE_CHANNEL_DEV_MEMLEAK_REPLY:
@@ -459,7 +471,7 @@ void peer_start_channeld(struct channel *channel,
 
 	initmsg = towire_channel_init(tmpctx,
 				      chainparams,
- 				      ld->feature_set,
+ 				      ld->our_features,
 				      &channel->funding_txid,
 				      channel->funding_outnum,
 				      channel->funding,
@@ -505,7 +517,7 @@ void peer_start_channeld(struct channel *channel,
 				      funding_signed,
 				      reached_announce_depth,
 				      &last_remote_per_commit_secret,
-				      channel->peer->features,
+				      channel->peer->their_features,
 				      channel->remote_upfront_shutdown_script,
 				      remote_ann_node_sig,
 				      remote_ann_bitcoin_sig,

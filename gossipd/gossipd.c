@@ -488,6 +488,9 @@ static struct io_plan *peer_msg_in(struct io_conn *conn,
 	case WIRE_CHANNEL_REESTABLISH:
 	case WIRE_ANNOUNCEMENT_SIGNATURES:
 	case WIRE_GOSSIP_TIMESTAMP_FILTER:
+#if EXPERIMENTAL_FEATURES
+	case WIRE_ONION_MESSAGE:
+#endif
 		status_broken("peer %s: relayed unexpected msg of type %s",
 			      type_to_string(tmpctx, struct node_id, &peer->id),
 			      wire_type_name(fromwire_peektype(msg)));
@@ -828,11 +831,10 @@ static struct io_plan *gossip_init(struct io_conn *conn,
 	u32 *dev_gossip_time;
 	bool dev_fast_gossip, dev_fast_gossip_prune;
 	u32 timestamp;
-	struct feature_set *feature_set;
 
 	if (!fromwire_gossipctl_init(daemon, msg,
 				     &chainparams,
-				     &feature_set,
+				     &daemon->our_features,
 				     &daemon->id,
 				     daemon->rgb,
 				     daemon->alias,
@@ -843,7 +845,6 @@ static struct io_plan *gossip_init(struct io_conn *conn,
 		master_badmsg(WIRE_GOSSIPCTL_INIT, msg);
 	}
 
-	features_init(take(feature_set));
 	daemon->rstate = new_routing_state(daemon,
 					   &daemon->id,
 					   &daemon->peers,

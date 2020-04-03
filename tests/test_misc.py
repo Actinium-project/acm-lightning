@@ -10,6 +10,7 @@ from pyln.testing.utils import (
     TailableProc, env
 )
 from ephemeral_port_reserve import reserve
+from utils import EXPERIMENTAL_FEATURES
 
 import json
 import os
@@ -275,7 +276,7 @@ def test_htlc_sig_persistence(node_factory, bitcoind, executor):
     """
     # Feerates identical so we don't get gratuitous commit to update them
     l1 = node_factory.get_node(options={'dev-no-reconnect': None},
-                               feerates=(7500, 7500, 7500))
+                               feerates=(7500, 7500, 7500, 7500))
     l2 = node_factory.get_node(disconnect=['+WIRE_COMMITMENT_SIGNED'])
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
@@ -326,7 +327,7 @@ def test_htlc_out_timeout(node_factory, bitcoind, executor):
     # Feerates identical so we don't get gratuitous commit to update them
     l1 = node_factory.get_node(disconnect=disconnects,
                                options={'dev-no-reconnect': None},
-                               feerates=(7500, 7500, 7500))
+                               feerates=(7500, 7500, 7500, 7500))
     l2 = node_factory.get_node()
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
@@ -393,7 +394,7 @@ def test_htlc_in_timeout(node_factory, bitcoind, executor):
     # Feerates identical so we don't get gratuitous commit to update them
     l1 = node_factory.get_node(disconnect=disconnects,
                                options={'dev-no-reconnect': None},
-                               feerates=(7500, 7500, 7500))
+                               feerates=(7500, 7500, 7500, 7500))
     l2 = node_factory.get_node()
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
@@ -1280,11 +1281,11 @@ def test_htlc_send_timeout(node_factory, bitcoind):
     """Test that we don't commit an HTLC to an unreachable node."""
     # Feerates identical so we don't get gratuitous commit to update them
     l1 = node_factory.get_node(options={'log-level': 'io'},
-                               feerates=(7500, 7500, 7500))
+                               feerates=(7500, 7500, 7500, 7500))
     # Blackhole it after it sends HTLC_ADD to l3.
     l2 = node_factory.get_node(disconnect=['0WIRE_UPDATE_ADD_HTLC'],
                                options={'log-level': 'io'},
-                               feerates=(7500, 7500, 7500))
+                               feerates=(7500, 7500, 7500, 7500))
     l3 = node_factory.get_node()
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
@@ -1384,7 +1385,7 @@ def test_feerates(node_factory):
 
     # Now try setting them, one at a time.
     # Set CONSERVATIVE/2 feerate, for max and unilateral_close
-    l1.set_feerates((15000, 0, 0), True)
+    l1.set_feerates((15000, 0, 0, 0), True)
     wait_for(lambda: len(l1.rpc.feerates('perkw')['perkw']) == 3)
     feerates = l1.rpc.feerates('perkw')
     assert feerates['perkw']['unilateral_close'] == 15000
@@ -1393,13 +1394,27 @@ def test_feerates(node_factory):
     assert feerates['perkw']['max_acceptable'] == 15000 * 10
     assert feerates['perkw']['min_acceptable'] == 253
 
+    # Set CONSERVATIVE/3 feerate, for htlc_resolution and penalty
+    l1.set_feerates((15000, 11000, 0, 0), True)
+    wait_for(lambda: len(l1.rpc.feerates('perkw')['perkw']) == 5)
+    feerates = l1.rpc.feerates('perkw')
+    assert feerates['perkw']['unilateral_close'] == 15000
+    assert feerates['perkw']['htlc_resolution'] == 11000
+    assert feerates['perkw']['penalty'] == 11000
+    assert feerates['warning'] == 'Some fee estimates unavailable: bitcoind startup?'
+    assert 'perkb' not in feerates
+    assert feerates['perkw']['max_acceptable'] == 15000 * 10
+    assert feerates['perkw']['min_acceptable'] == 253
+
     # Set ECONOMICAL/4 feerate, for all but min
-    l1.set_feerates((15000, 6250, 0), True)
+    l1.set_feerates((15000, 11000, 6250, 0), True)
     wait_for(lambda: len(l1.rpc.feerates('perkb')['perkb']) == len(types) + 2)
     feerates = l1.rpc.feerates('perkb')
     assert feerates['perkb']['unilateral_close'] == 15000 * 4
+    assert feerates['perkb']['htlc_resolution'] == 11000 * 4
+    assert feerates['perkb']['penalty'] == 11000 * 4
     for t in types:
-        if t != "unilateral_close":
+        if t not in ("unilateral_close", "htlc_resolution", "penalty"):
             assert feerates['perkb'][t] == 25000
     assert feerates['warning'] == 'Some fee estimates unavailable: bitcoind startup?'
     assert 'perkw' not in feerates
@@ -1407,12 +1422,14 @@ def test_feerates(node_factory):
     assert feerates['perkb']['min_acceptable'] == 253 * 4
 
     # Set ECONOMICAL/100 feerate for min
-    l1.set_feerates((15000, 6250, 5000), True)
+    l1.set_feerates((15000, 11000, 6250, 5000), True)
     wait_for(lambda: len(l1.rpc.feerates('perkw')['perkw']) >= len(types) + 2)
     feerates = l1.rpc.feerates('perkw')
     assert feerates['perkw']['unilateral_close'] == 15000
+    assert feerates['perkw']['htlc_resolution'] == 11000
+    assert feerates['perkw']['penalty'] == 11000
     for t in types:
-        if t != "unilateral_close":
+        if t not in ("unilateral_close", "htlc_resolution", "penalty"):
             assert feerates['perkw'][t] == 25000 // 4
     assert 'warning' not in feerates
     assert 'perkb' not in feerates
@@ -2175,6 +2192,75 @@ def test_sendcustommsg(node_factory):
     l4.daemon.wait_for_log(
         r'Got a custom message {serialized} from peer {peer_id}'.format(
             serialized=serialized, peer_id=l2.info['id']))
+
+
+@unittest.skipIf(not EXPERIMENTAL_FEATURES, "Needs sendonionmessage")
+def test_sendonionmessage(node_factory):
+    l1, l2, l3 = node_factory.line_graph(3)
+
+    blindedpathtool = os.path.join(os.path.dirname(__file__), "..", "devtools", "blindedpath")
+
+    l1.rpc.call('sendonionmessage',
+                {'hops':
+                 [{'id': l2.info['id']},
+                  {'id': l3.info['id']}]})
+    assert l3.daemon.wait_for_log('Got onionmsg')
+
+    # Now by SCID.
+    l1.rpc.call('sendonionmessage',
+                {'hops':
+                 [{'id': l2.info['id'],
+                   'short_channel_id': l2.get_channel_scid(l3)},
+                  {'id': l3.info['id']}]})
+    assert l3.daemon.wait_for_log('Got onionmsg')
+
+    # Now test blinded path.
+    output = subprocess.check_output(
+        [blindedpathtool, '--simple-output', 'create', l2.info['id'], l3.info['id']]
+    ).decode('ASCII').strip()
+
+    # First line is blinding, then <peerid> then <encblob>.
+    blinding, p1, p1enc, p2 = output.split('\n')
+    # First hop can't be blinded!
+    assert p1 == l2.info['id']
+
+    l1.rpc.call('sendonionmessage',
+                {'hops':
+                 [{'id': l2.info['id'],
+                   'blinding': blinding,
+                   'enctlv': p1enc},
+                  {'id': p2}]})
+    assert l3.daemon.wait_for_log('Got onionmsg')
+
+
+@unittest.skipIf(not EXPERIMENTAL_FEATURES, "Needs sendonionmessage")
+def test_sendonionmessage_reply(node_factory):
+    blindedpathtool = os.path.join(os.path.dirname(__file__), "..", "devtools", "blindedpath")
+
+    plugin = os.path.join(os.path.dirname(__file__), "plugins", "onionmessage-reply.py")
+    l1, l2, l3 = node_factory.line_graph(3, opts={'plugin': plugin})
+
+    # Make reply path
+    output = subprocess.check_output(
+        [blindedpathtool, '--simple-output', 'create', l2.info['id'], l1.info['id']]
+    ).decode('ASCII').strip()
+
+    # First line is blinding, then <peerid> then <encblob>.
+    blinding, p1, p1enc, p2 = output.split('\n')
+    # First hop can't be blinded!
+    assert p1 == l2.info['id']
+
+    l1.rpc.call('sendonionmessage',
+                {'hops':
+                 [{'id': l2.info['id']},
+                  {'id': l3.info['id']}],
+                 'reply_path':
+                 {'blinding': blinding,
+                  'path': [{'id': p1, 'enctlv': p1enc}, {'id': p2}]}})
+
+    assert l3.daemon.wait_for_log('Got onionmsg reply_blinding reply_path')
+    assert l3.daemon.wait_for_log('Sent reply via')
+    assert l1.daemon.wait_for_log('Got onionmsg')
 
 
 @unittest.skipIf(not DEVELOPER, "needs --dev-force-privkey")
