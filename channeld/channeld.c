@@ -27,8 +27,10 @@
 #include <channeld/commit_tx.h>
 #include <channeld/full_channel.h>
 #include <channeld/gen_channel_wire.h>
+#include <common/blinding.h>
 #include <common/crypto_sync.h>
 #include <common/dev_disconnect.h>
+#include <common/ecdh_hsmd.h>
 #include <common/features.h>
 #include <common/gossip_constants.h>
 #include <common/gossip_store.h>
@@ -1629,37 +1631,6 @@ static bool channeld_handle_custommsg(const u8 *msg)
 }
 
 #if EXPERIMENTAL_FEATURES
-/* H(E(i) || ss(i)) */
-static struct sha256 hash_e_and_ss(const struct pubkey *e,
-				   const struct secret *ss)
-{
-	u8 der[PUBKEY_CMPR_LEN];
-	struct sha256_ctx shactx;
-	struct sha256 h;
-
-	pubkey_to_der(der, e);
-	sha256_init(&shactx);
-	sha256_update(&shactx, der, sizeof(der));
-	sha256_update(&shactx, ss->data, sizeof(ss->data));
-	sha256_done(&shactx, &h);
-
-	return h;
-}
-
-/* E(i-1) = H(E(i) || ss(i)) * E(i) */
-static struct pubkey next_pubkey(const struct pubkey *pk,
-				 const struct sha256 *h)
-{
-	struct pubkey ret;
-
-	ret = *pk;
-	if (secp256k1_ec_pubkey_tweak_mul(secp256k1_ctx, &ret.pubkey, h->u.u8)
-	    != 1)
-		abort();
-
-	return ret;
-}
-
 /* Peer sends onion msg. */
 static void handle_onion_message(struct peer *peer, const u8 *msg)
 {
@@ -1698,11 +1669,7 @@ static void handle_onion_message(struct peer *peer, const u8 *msg)
 		status_debug("blinding in = %s",
 			     type_to_string(tmpctx, struct pubkey, blinding_in));
 		blinding_ss = tal(msg, struct secret);
-		msg = hsm_req(tmpctx, towire_hsm_ecdh_req(tmpctx, blinding_in));
-
-		if (!fromwire_hsm_ecdh_resp(msg, blinding_ss))
-			status_failed(STATUS_FAIL_HSM_IO,
-				      "Reading ecdh response for blinding");
+		ecdh(blinding_in, blinding_ss);
 
 		/* b(i) = HMAC256("blinded_node_id", ss(i)) * k(i) */
 		subkey_from_hmac("blinded_node_id", blinding_ss, &hmac);
@@ -1721,9 +1688,7 @@ static void handle_onion_message(struct peer *peer, const u8 *msg)
 		blinding_in = NULL;
 	}
 
-	msg = hsm_req(tmpctx, towire_hsm_ecdh_req(tmpctx, &op.ephemeralkey));
-	if (!fromwire_hsm_ecdh_resp(msg, &ss))
-		status_failed(STATUS_FAIL_HSM_IO, "Reading ecdh response");
+	ecdh(&op.ephemeralkey, &ss);
 
 	/* We make sure we can parse onion packet, so we know if shared secret
 	 * is actually valid (this checks hmac). */
@@ -1763,11 +1728,7 @@ static void handle_onion_message(struct peer *peer, const u8 *msg)
 		*blinding_in = om->blinding->blinding;
 		blinding_ss = tal(msg, struct secret);
 
-		msg = hsm_req(tmpctx, towire_hsm_ecdh_req(tmpctx, blinding_in));
-
-		if (!fromwire_hsm_ecdh_resp(msg, blinding_ss))
-			status_failed(STATUS_FAIL_HSM_IO,
-				      "Reading ecdh response for om blinding");
+		ecdh(blinding_in, blinding_ss);
 	}
 
 	if (om->enctlv) {
@@ -1866,9 +1827,10 @@ static void handle_onion_message(struct peer *peer, const u8 *msg)
 
 		if (blinding_ss) {
 			/* E(i-1) = H(E(i) || ss(i)) * E(i) */
-			struct sha256 h = hash_e_and_ss(blinding_in, blinding_ss);
+			struct sha256 h;
+			blinding_hash_e_and_ss(blinding_in, blinding_ss, &h);
 			next_blinding = tal(msg, struct pubkey);
-			*next_blinding = next_pubkey(blinding_in, &h);
+			blinding_next_pubkey(blinding_in, &h, next_blinding);
 		} else
 			next_blinding = NULL;
 
@@ -3036,12 +2998,7 @@ static void init_channel(struct peer *peer)
 	struct channel_config conf[NUM_SIDES];
 	struct bitcoin_txid funding_txid;
 	enum side funder;
-	enum htlc_state *hstates;
-	struct fulfilled_htlc *fulfilled;
-	enum side *fulfilled_sides;
-	struct failed_htlc **failed_in;
-	u64 *failed_out;
-	struct added_htlc *htlcs;
+	struct existing_htlc **htlcs;
 	bool reconnected;
 	u8 *funding_signed;
 	const u8 *msg;
@@ -3092,11 +3049,6 @@ static void init_channel(struct peer *peer)
 				   &peer->revocations_received,
 				   &peer->htlc_id,
 				   &htlcs,
-				   &hstates,
-				   &fulfilled,
-				   &fulfilled_sides,
-				   &failed_in,
-				   &failed_out,
 				   &peer->funding_locked[LOCAL],
 				   &peer->funding_locked[REMOTE],
 				   &peer->short_channel_ids[LOCAL],
@@ -3148,6 +3100,8 @@ static void init_channel(struct peer *peer)
 		 * it directly!
 		 */
 		peer->short_channel_ids[REMOTE] = peer->short_channel_ids[LOCAL];
+		tal_free(remote_ann_node_sig);
+		tal_free(remote_ann_bitcoin_sig);
 	}
 
 	/* First commit is used for opening: if we've sent 0, we're on
@@ -3175,23 +3129,13 @@ static void init_channel(struct peer *peer)
 					 option_static_remotekey,
 					 funder);
 
-	if (!channel_force_htlcs(peer->channel, htlcs, hstates,
-				 fulfilled, fulfilled_sides,
-				 cast_const2(const struct failed_htlc **,
-					     failed_in),
-				 failed_out))
+	if (!channel_force_htlcs(peer->channel,
+			 cast_const2(const struct existing_htlc **, htlcs)))
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Could not restore HTLCs");
 
 	/* We don't need these any more, so free them. */
 	tal_free(htlcs);
-	tal_free(hstates);
-	tal_free(fulfilled);
-	tal_free(fulfilled_sides);
-	tal_free(failed_in);
-	tal_free(failed_out);
-	tal_free(remote_ann_node_sig);
-	tal_free(remote_ann_bitcoin_sig);
 
 	peer->channel_direction = node_id_idx(&peer->node_ids[LOCAL],
 					      &peer->node_ids[REMOTE]);
@@ -3266,6 +3210,9 @@ int main(int argc, char *argv[])
 		memset(&peer->announcement_bitcoin_sigs[i], 0,
 		       sizeof(peer->announcement_bitcoin_sigs[i]));
 	}
+
+	/* Prepare the ecdh() function for use */
+	ecdh_hsmd_setup(HSM_FD, status_failed);
 
 	/* Read init_channel message sync. */
 	init_channel(peer);

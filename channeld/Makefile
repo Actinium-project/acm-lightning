@@ -37,6 +37,7 @@ CHANNELD_COMMON_OBJS :=				\
 	common/base32.o				\
 	common/bigsize.o			\
 	common/bip32.o				\
+	common/blinding.o			\
 	common/channel_config.o			\
 	common/crypto_state.o			\
 	common/crypto_sync.o			\
@@ -45,6 +46,7 @@ CHANNELD_COMMON_OBJS :=				\
 	common/daemon_conn.o			\
 	common/derive_basepoints.o		\
 	common/dev_disconnect.o			\
+	common/ecdh_hsmd.o			\
 	common/features.o			\
 	common/fee_states.o			\
 	common/gen_status_wire.o		\

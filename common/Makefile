@@ -7,6 +7,7 @@ COMMON_SRC_NOGEN :=				\
 	common/bech32_util.c			\
 	common/bigsize.c			\
 	common/bip32.c				\
+	common/blinding.c			\
 	common/bolt11.c				\
 	common/channel_config.c			\
 	common/close_tx.c			\
@@ -19,6 +20,7 @@ COMMON_SRC_NOGEN :=				\
 	common/decode_array.c			\
 	common/derive_basepoints.c		\
 	common/dev_disconnect.c			\
+	common/ecdh_hsmd.c			\
 	common/features.c			\
 	common/fee_states.c			\
 	common/funding_tx.c			\
@@ -71,6 +73,7 @@ COMMON_SRC_NOGEN :=				\
 COMMON_SRC_GEN := common/gen_status_wire.c common/gen_peer_status_wire.c
 
 COMMON_HEADERS_NOGEN := $(COMMON_SRC_NOGEN:.c=.h)	\
+	common/ecdh.h					\
 	common/errcode.h				\
 	common/gossip_constants.h			\
 	common/htlc.h					\
