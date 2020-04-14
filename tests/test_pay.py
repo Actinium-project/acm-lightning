@@ -6,7 +6,7 @@ from pyln.client import RpcError, Millisatoshi
 from pyln.proto.onion import TlvPayload
 from utils import (
     DEVELOPER, wait_for, only_one, sync_blockheight, SLOW_MACHINE, TIMEOUT,
-    VALGRIND
+    VALGRIND, EXPERIMENTAL_FEATURES
 )
 import copy
 import os
@@ -15,6 +15,7 @@ import random
 import re
 import string
 import struct
+import subprocess
 import time
 import unittest
 
@@ -227,6 +228,9 @@ def test_pay_disconnect(node_factory, bitcoind):
     """If the remote node has disconnected, we fail payment, but can try again when it reconnects"""
     l1, l2 = node_factory.line_graph(2, opts={'dev-max-fee-multiplier': 5,
                                               'may_reconnect': True})
+
+    # Dummy payment to kick off update_fee messages
+    l1.pay(l2, 1000)
 
     inv = l2.rpc.invoice(123000, 'test_pay_disconnect', 'description')
     rhash = inv['payment_hash']
@@ -921,6 +925,18 @@ def test_decodepay(node_factory):
     # * `hzfxz7`: Bech32 checksum
     with pytest.raises(RpcError, match='unknown feature.*100'):
         l1.rpc.decodepay('lnbc25m1pvjluezpp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5vdhkven9v5sxyetpdees9q4pqqqqqqqqqqqqqqqqqqszk3ed62snp73037h4py4gry05eltlp0uezm2w9ajnerhmxzhzhsu40g9mgyx5v3ad4aqwkmvyftzk4k9zenz90mhjcy9hcevc7r3lx2sphzfxz7')
+
+    # Example of an invoice without a multiplier suffix to the amount. This
+    # should then be interpreted as 7 BTC according to the spec:
+    #
+    #   `amount`: optional number in that currency, followed by an optional
+    #   `multiplier` letter. The unit encoded here is the 'social' convention of
+    #   a payment unit -- in the case of Bitcoin the unit is 'bitcoin' NOT
+    #   satoshis.
+    b11 = "lnbcrt71p0g4u8upp5xn4k45tsp05akmn65s5k2063d5fyadhjse9770xz5sk7u4x6vcmqdqqcqzynxqrrssx94cf4p727jamncsvcd8m99n88k423ruzq4dxwevfatpp5gx2mksj2swshjlx4pe3j5w9yed5xjktrktzd3nc2a04kq8yu84l7twhwgpxjn3pw"
+    b11 = l1.rpc.decodepay(b11)
+    sat_per_btc = 10**8
+    assert(b11['msatoshi'] == 7 * sat_per_btc * 1000)
 
     with pytest.raises(RpcError):
         l1.rpc.decodepay('1111111')
@@ -2880,3 +2896,49 @@ def test_reject_invalid_payload(node_factory):
 
     with pytest.raises(RpcError, match=r'WIRE_INVALID_ONION_PAYLOAD'):
         l1.rpc.waitsendpay(inv['payment_hash'])
+
+
+@unittest.skipIf(not EXPERIMENTAL_FEATURES, "Needs blinding args to sendpay")
+def test_sendpay_blinding(node_factory):
+    l1, l2, l3, l4 = node_factory.line_graph(4)
+
+    blindedpathtool = os.path.join(os.path.dirname(__file__), "..", "devtools", "blindedpath")
+
+    # Create blinded path l2->l4
+    output = subprocess.check_output(
+        [blindedpathtool, '--simple-output', 'create',
+         l2.info['id'] + "/" + l2.get_channel_scid(l3),
+         l3.info['id'] + "/" + l3.get_channel_scid(l4),
+         l4.info['id']]
+    ).decode('ASCII').strip()
+
+    # First line is blinding, then <peerid> then <encblob>.
+    blinding, p1, p1enc, p2, p2enc, p3 = output.split('\n')
+    # First hop can't be blinded!
+    assert p1 == l2.info['id']
+
+    amt = 10**3
+    inv = l4.rpc.invoice(amt, "lbl", "desc")
+
+    route = [{'id': l2.info['id'],
+              'channel': l1.get_channel_scid(l2),
+              'amount_msat': Millisatoshi(1002),
+              'delay': 21,
+              'blinding': blinding,
+              'enctlv': p1enc},
+             {'id': p2,
+              'amount_msat': Millisatoshi(1001),
+              'delay': 15,
+              # FIXME: this is a dummy!
+              'channel': '0x0x0',
+              'enctlv': p2enc},
+             {'id': p3,
+              # FIXME: this is a dummy!
+              'channel': '0x0x0',
+              'amount_msat': Millisatoshi(1000),
+              'delay': 9,
+              'style': 'tlv'}]
+    l1.rpc.sendpay(route=route,
+                   payment_hash=inv['payment_hash'],
+                   bolt11=inv['bolt11'])
+    l1.rpc.waitsendpay(inv['payment_hash'])

@@ -621,17 +621,29 @@ static void handle_peer_add_htlc(struct peer *peer, const u8 *msg)
 	u8 onion_routing_packet[TOTAL_PACKET_SIZE];
 	enum channel_add_err add_err;
 	struct htlc *htlc;
+#if EXPERIMENTAL_FEATURES
+	struct tlv_update_add_tlvs *tlvs = tlv_update_add_tlvs_new(msg);
+#endif
+	struct pubkey *blinding = NULL;
 
 	if (!fromwire_update_add_htlc(msg, &channel_id, &id, &amount,
 				      &payment_hash, &cltv_expiry,
-				      onion_routing_packet))
+				      onion_routing_packet
+#if EXPERIMENTAL_FEATURES
+				      , tlvs
+#endif
+		    ))
 		peer_failed(peer->pps,
 			    &peer->channel_id,
 			    "Bad peer_add_htlc %s", tal_hex(msg, msg));
 
+#if EXPERIMENTAL_FEATURES
+	if (tlvs->blinding)
+		blinding = &tlvs->blinding->blinding;
+#endif
 	add_err = channel_add_htlc(peer->channel, REMOTE, id, amount,
 				   cltv_expiry, &payment_hash,
-				   onion_routing_packet, &htlc, NULL);
+				   onion_routing_packet, blinding, &htlc, NULL);
 	if (add_err != CHANNEL_ERR_ADD_OK)
 		peer_failed(peer->pps,
 			    &peer->channel_id,
@@ -1115,6 +1127,11 @@ static void marshall_htlc_info(const tal_t *ctx,
 			memcpy(a.onion_routing_packet,
 			       htlc->routing,
 			       sizeof(a.onion_routing_packet));
+			if (htlc->blinding) {
+				a.blinding = htlc->blinding;
+				ecdh(a.blinding, &a.blinding_ss);
+			} else
+				a.blinding = NULL;
 			tal_arr_expand(added, a);
 		} else if (htlc->state == RCVD_REMOVE_COMMIT) {
 			if (htlc->r) {
@@ -2045,12 +2062,25 @@ static void resend_commitment(struct peer *peer, const struct changed_htlc *last
 				    last[i].id);
 
 		if (h->state == SENT_ADD_COMMIT) {
+#if EXPERIMENTAL_FEATURES
+			struct tlv_update_add_tlvs *tlvs;
+			if (h->blinding) {
+				tlvs = tlv_update_add_tlvs_new(tmpctx);
+				tlvs->blinding = tal(tlvs, struct tlv_update_add_tlvs_blinding);
+				tlvs->blinding->blinding = *h->blinding;
+			} else
+				tlvs = NULL;
+#endif
 			u8 *msg = towire_update_add_htlc(NULL, &peer->channel_id,
 							 h->id, h->amount,
 							 &h->rhash,
 							 abs_locktime_to_blocks(
 								 &h->expiry),
-							 h->routing);
+							 h->routing
+#if EXPERIMENTAL_FEATURES
+							 , tlvs
+#endif
+				);
 			sync_crypto_write(peer->pps, take(msg));
 		} else if (h->state == SENT_REMOVE_COMMIT) {
 			send_fail_or_fulfill(peer, h);
@@ -2660,19 +2690,30 @@ static void handle_offer_htlc(struct peer *peer, const u8 *inmsg)
 	const u8 *failwiremsg;
 	const char *failstr;
 	struct amount_sat htlc_fee;
+	struct pubkey *blinding;
 
 	if (!peer->funding_locked[LOCAL] || !peer->funding_locked[REMOTE])
 		status_failed(STATUS_FAIL_MASTER_IO,
 			      "funding not locked for offer_htlc");
 
-	if (!fromwire_channel_offer_htlc(inmsg, &amount,
+	if (!fromwire_channel_offer_htlc(tmpctx, inmsg, &amount,
 					 &cltv_expiry, &payment_hash,
-					 onion_routing_packet))
+					 onion_routing_packet, &blinding))
 		master_badmsg(WIRE_CHANNEL_OFFER_HTLC, inmsg);
+
+#if EXPERIMENTAL_FEATURES
+	struct tlv_update_add_tlvs *tlvs;
+	if (blinding) {
+		tlvs = tlv_update_add_tlvs_new(tmpctx);
+		tlvs->blinding = tal(tlvs, struct tlv_update_add_tlvs_blinding);
+		tlvs->blinding->blinding = *blinding;
+	} else
+		tlvs = NULL;
+#endif
 
 	e = channel_add_htlc(peer->channel, LOCAL, peer->htlc_id,
 			     amount, cltv_expiry, &payment_hash,
-			     onion_routing_packet, NULL, &htlc_fee);
+			     onion_routing_packet, take(blinding), NULL, &htlc_fee);
 	status_debug("Adding HTLC %"PRIu64" amount=%s cltv=%u gave %s",
 		     peer->htlc_id,
 		     type_to_string(tmpctx, struct amount_msat, &amount),
@@ -2685,7 +2726,11 @@ static void handle_offer_htlc(struct peer *peer, const u8 *inmsg)
 		msg = towire_update_add_htlc(NULL, &peer->channel_id,
 					     peer->htlc_id, amount,
 					     &payment_hash, cltv_expiry,
-					     onion_routing_packet);
+					     onion_routing_packet
+#if EXPERIMENTAL_FEATURES
+					     , tlvs
+#endif
+			);
 		sync_crypto_write(peer->pps, take(msg));
 		start_commit_timer(peer);
 		/* Tell the master. */
@@ -2750,7 +2795,12 @@ static void handle_feerates(struct peer *peer, const u8 *inmsg)
 	 */
 	if (peer->channel->funder == LOCAL) {
 		peer->desired_feerate = feerate;
-		start_commit_timer(peer);
+		/* Don't do this for the first feerate, wait until something else
+		 * happens.  LND seems to get upset in some cases otherwise:
+		 * see https://github.com/ElementsProject/lightning/issues/3596 */
+		if (peer->next_index[LOCAL] != 1
+		    || peer->next_index[REMOTE] != 1)
+			start_commit_timer(peer);
 	} else {
 		/* BOLT #2:
 		 *

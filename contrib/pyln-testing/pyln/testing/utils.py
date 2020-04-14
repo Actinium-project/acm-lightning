@@ -1,3 +1,4 @@
+from bitcoin.core import COIN
 from bitcoin.rpc import RawProxy as BitcoinProxy
 from pyln.client import RpcError
 from pyln.testing.btcproxy import BitcoinRpcProxy
@@ -25,6 +26,7 @@ BITCOIND_CONFIG = {
     "regtest": 1,
     "rpcuser": "rpcuser",
     "rpcpassword": "rpcpass",
+    "fallbackfee": Decimal(1000) / COIN,
 }
 
 
@@ -1011,7 +1013,8 @@ class NodeFactory(object):
 
     def get_node(self, node_id=None, options=None, dbfile=None,
                  feerates=(15000, 11000, 7500, 3750), start=True,
-                 wait_for_bitcoind_sync=True, expect_fail=False, **kwargs):
+                 wait_for_bitcoind_sync=True, expect_fail=False,
+                 cleandir=True, **kwargs):
 
         node_id = self.get_node_id() if not node_id else node_id
         port = self.get_next_port()
@@ -1019,7 +1022,7 @@ class NodeFactory(object):
         lightning_dir = os.path.join(
             self.directory, "lightning-{}/".format(node_id))
 
-        if os.path.exists(lightning_dir):
+        if cleandir and os.path.exists(lightning_dir):
             shutil.rmtree(lightning_dir)
 
         # Get the DB backend DSN we should be using for this test and this

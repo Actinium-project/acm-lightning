@@ -732,12 +732,13 @@ static bool should_use_tlv(enum route_hop_style style)
 
 /* Returns failmsg on failure, tallocated off ctx */
 static const u8 *send_onion(const tal_t *ctx, struct lightningd *ld,
-				  const struct onionpacket *packet,
-				  const struct route_hop *first_hop,
-				  const struct sha256 *payment_hash,
-				  u64 partid,
-				  struct channel *channel,
-				  struct htlc_out **hout)
+			    const struct onionpacket *packet,
+			    const struct route_hop *first_hop,
+			    const struct sha256 *payment_hash,
+			    const struct pubkey *blinding,
+			    u64 partid,
+			    struct channel *channel,
+			    struct htlc_out **hout)
 {
 	const u8 *onion;
 	unsigned int base_expiry;
@@ -746,7 +747,7 @@ static const u8 *send_onion(const tal_t *ctx, struct lightningd *ld,
 	onion = serialize_onionpacket(tmpctx, packet);
 	return send_htlc_out(ctx, channel, first_hop->amount,
 			     base_expiry + first_hop->delay,
-			     payment_hash, partid, onion, NULL, hout,
+			     payment_hash, blinding, partid, onion, NULL, hout,
 			     &dont_care_about_channel_update);
 }
 
@@ -887,7 +888,7 @@ send_payment_core(struct lightningd *ld,
 		return command_failed(cmd, data);
 	}
 
-	failmsg = send_onion(tmpctx, ld, packet, first_hop, rhash, partid,
+	failmsg = send_onion(tmpctx, ld, packet, first_hop, rhash, NULL, partid,
 			      channel, &hout);
 
 	if (failmsg) {
@@ -995,7 +996,9 @@ send_payment(struct lightningd *ld,
 					should_use_tlv(route[i].style),
 					&route[i + 1].channel_id,
 					route[i + 1].amount,
-					base_expiry + route[i + 1].delay)));
+					base_expiry + route[i + 1].delay,
+					route[i].blinding,
+					route[i].enctlv)));
 	}
 
 	/* And finally set the final hop to the special values in
@@ -1024,7 +1027,8 @@ send_payment(struct lightningd *ld,
 				final_tlv,
 				route[i].amount,
 				base_expiry + route[i].delay,
-				total_msat, payment_secret);
+				total_msat, route[i].blinding, route[i].enctlv,
+				payment_secret);
 	if (!onion) {
 		return command_fail(cmd, PAY_DESTINATION_PERM_FAIL,
 				    "Destination does not support"
@@ -1214,7 +1218,9 @@ static struct command_result *param_route_hops(struct command *cmd,
 		struct node_id *id;
 		struct short_channel_id *channel;
 		unsigned *delay, *direction;
-		enum route_hop_style *style;
+		struct pubkey *blinding;
+		u8 *enctlv;
+		enum route_hop_style *style, default_style;
 
 		if (!param(cmd, buffer, t,
 			   /* Only *one* of these is required */
@@ -1225,8 +1231,9 @@ static struct command_result *param_route_hops(struct command *cmd,
 			   p_opt("delay", param_number, &delay),
 			   p_opt("channel", param_short_channel_id, &channel),
 			   p_opt("direction", param_number, &direction),
-			   p_opt_def("style", param_route_hop_style, &style,
-				     ROUTE_HOP_LEGACY),
+			   p_opt("style", param_route_hop_style, &style),
+			   p_opt("blinding", param_pubkey, &blinding),
+			   p_opt("enctlv", param_bin_from_hex, &enctlv),
 			   NULL))
 			return command_param_failed();
 
@@ -1251,11 +1258,21 @@ static struct command_result *param_route_hops(struct command *cmd,
 		if (!msat)
 			msat = amount_msat;
 
+		if (blinding || enctlv) {
+			if (style && *style == ROUTE_HOP_LEGACY)
+				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+						    "%s[%zi]: Can't have blinding or enctlv with legacy", name, i);
+			default_style = ROUTE_HOP_TLV;
+		} else
+			default_style = ROUTE_HOP_LEGACY;
+
 		(*hops)[i].amount = *msat;
 		(*hops)[i].nodeid = *id;
 		(*hops)[i].delay = *delay;
 		(*hops)[i].channel_id = *channel;
-		(*hops)[i].style = *style;
+		(*hops)[i].blinding = blinding;
+		(*hops)[i].enctlv = enctlv;
+		(*hops)[i].style = style ? *style : default_style;
 		/* FIXME: Actually ignored by sending code! */
 		(*hops)[i].direction = direction ? *direction : 0;
 	}
