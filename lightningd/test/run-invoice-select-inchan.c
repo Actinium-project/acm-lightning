@@ -92,6 +92,7 @@ char *encode_scriptpubkey_to_addr(const tal_t *ctx UNNEEDED,
 { fprintf(stderr, "encode_scriptpubkey_to_addr called!\n"); abort(); }
 /* Generated stub for failmsg_incorrect_or_unknown */
 const u8 *failmsg_incorrect_or_unknown(const tal_t *ctx UNNEEDED,
+				       struct lightningd *ld UNNEEDED,
 				       const struct htlc_in *hin UNNEEDED)
 { fprintf(stderr, "failmsg_incorrect_or_unknown called!\n"); abort(); }
 /* Generated stub for fatal */
@@ -374,8 +375,11 @@ void per_peer_state_set_fds(struct per_peer_state *pps UNNEEDED,
 { fprintf(stderr, "per_peer_state_set_fds called!\n"); abort(); }
 /* Generated stub for plugin_hook_call_ */
 void plugin_hook_call_(struct lightningd *ld UNNEEDED, const struct plugin_hook *hook UNNEEDED,
-		       void *payload UNNEEDED, void *cb_arg UNNEEDED)
+		       tal_t *cb_arg UNNEEDED)
 { fprintf(stderr, "plugin_hook_call_ called!\n"); abort(); }
+/* Generated stub for plugin_hook_continue */
+bool plugin_hook_continue(void *arg UNNEEDED, const char *buffer UNNEEDED, const jsmntok_t *toks UNNEEDED)
+{ fprintf(stderr, "plugin_hook_continue called!\n"); abort(); }
 /* Generated stub for subd_release_channel */
 void subd_release_channel(struct subd *owner UNNEEDED, void *channel UNNEEDED)
 { fprintf(stderr, "subd_release_channel called!\n"); abort(); }

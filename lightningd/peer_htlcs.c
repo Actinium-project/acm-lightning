@@ -278,11 +278,12 @@ void local_fail_in_htlc_needs_update(struct htlc_in *hin,
 
 /* Helper to create (common) WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS */
 const u8 *failmsg_incorrect_or_unknown(const tal_t *ctx,
+				       struct lightningd *ld,
 				       const struct htlc_in *hin)
 {
 	return towire_incorrect_or_unknown_payment_details(
 		ctx, hin->msat,
-		get_block_height(hin->key.channel->owner->ld->topology));
+		get_block_height(ld->topology));
 }
 
 /* localfail are for handing to the local payer if it's local. */
@@ -489,7 +490,7 @@ static void handle_localpay(struct htlc_in *hin,
 			  hin->cltv_expiry,
 			  get_block_height(ld->topology),
 			  ld->config.cltv_final);
-		failmsg = failmsg_incorrect_or_unknown(NULL, hin);
+		failmsg = failmsg_incorrect_or_unknown(NULL, ld, hin);
 		goto fail;
 	}
 
@@ -794,14 +795,6 @@ struct htlc_accepted_hook_payload {
 	size_t failtlvpos;
 };
 
-/* The possible return value types that a plugin may return for the
- * `htlc_accepted` hook. */
-enum htlc_accepted_result {
-	htlc_accepted_continue,
-	htlc_accepted_fail,
-	htlc_accepted_resolve,
-};
-
 /* We only handle the simplest cases here */
 static u8 *convert_failcode(const tal_t *ctx,
 			    struct lightningd *ld,
@@ -833,23 +826,63 @@ static u8 *convert_failcode(const tal_t *ctx,
 	}
 }
 
-/**
- * Parses the JSON-RPC response into a struct understood by the callback.
- */
-static enum htlc_accepted_result
-htlc_accepted_hook_deserialize(const tal_t *ctx,
-			       struct lightningd *ld,
-			       const char *buffer, const jsmntok_t *toks,
-			       /* If accepted */
-			       struct preimage *payment_preimage,
-			       /* If rejected (tallocated off ctx) */
-                               const u8 **failmsg)
+static void
+htlc_accepted_hook_try_resolve(struct htlc_accepted_hook_payload *request,
+			       struct preimage *payment_preimage)
 {
-	const jsmntok_t *resulttok, *paykeytok;
-	enum htlc_accepted_result result;
+	struct sha256 payment_hash;
+	struct htlc_in *hin = request->hin;
+	u8 *unknown_details;
+	/* Verify that the provided secret hashes to what we need. */
+	sha256(&payment_hash, payment_preimage, sizeof(struct preimage));
+
+	if (!sha256_eq(&payment_hash, &hin->payment_hash)) {
+		log_broken(
+		    request->channel->log,
+		    "Plugin returned a preimage (sha256(%s) = %s) that doesn't "
+		    "match the HTLC hash (%s) it tries to resolve.",
+		    type_to_string(tmpctx, struct preimage, payment_preimage),
+		    type_to_string(tmpctx, struct sha256, &payment_hash),
+		    type_to_string(tmpctx, struct sha256, &hin->payment_hash));
+
+		unknown_details = tal_arr(NULL, u8, 0);
+		towire_u16(&unknown_details, 0x400f);
+		local_fail_in_htlc(hin, take(unknown_details));
+	} else {
+		fulfill_htlc(hin, payment_preimage);
+	}
+}
+
+static u8 *prepend_length(const tal_t *ctx, const u8 *payload TAKES)
+{
+	u8 buf[BIGSIZE_MAX_LEN], *ret;
+	size_t len;
+
+	len = bigsize_put(buf, tal_bytelen(payload));
+	ret = tal_arr(ctx, u8, len + tal_bytelen(payload));
+	memcpy(ret, buf, len);
+	memcpy(ret + len, payload, tal_bytelen(payload));
+	if (taken(payload))
+		tal_free(payload);
+	return ret;
+}
+
+/**
+ * Callback when a plugin answers to the htlc_accepted hook
+ */
+static bool htlc_accepted_hook_deserialize(struct htlc_accepted_hook_payload *request,
+					   const char *buffer,
+					   const jsmntok_t *toks)
+{
+	struct route_step *rs = request->route_step;
+	struct htlc_in *hin = request->hin;
+	struct lightningd *ld = request->ld;
+	struct preimage payment_preimage;
+	const jsmntok_t *resulttok, *paykeytok, *payloadtok;
+	u8 *payload;
 
 	if (!toks || !buffer)
-		return htlc_accepted_continue;
+		return true;
 
 	resulttok = json_get_member(buffer, toks, "result");
 
@@ -860,19 +893,39 @@ htlc_accepted_hook_deserialize(const tal_t *ctx,
 		      json_strdup(tmpctx, buffer, toks));
 	}
 
+	payloadtok = json_get_member(buffer, toks, "payload");
+	if (payloadtok) {
+		payload = json_tok_bin_from_hex(rs, buffer, payloadtok);
+		if (!payload)
+			fatal("Bad payload for htlc_accepted"
+			      " hook: %.*s",
+			      payloadtok->end - payloadtok->start,
+			      buffer + payloadtok->start);
+		tal_free(request->payload);
+		tal_free(rs->raw_payload);
+
+		rs->raw_payload = prepend_length(rs, take(payload));
+		request->payload = onion_decode(request, rs,
+						hin->blinding, &hin->blinding_ss,
+						&request->failtlvtype,
+						&request->failtlvpos);
+
+	} else
+		payload = NULL;
+
 	if (json_tok_streq(buffer, resulttok, "continue")) {
-		return htlc_accepted_continue;
+		return true;
 	}
 
 	if (json_tok_streq(buffer, resulttok, "fail")) {
+		u8 *failmsg;
 		const jsmntok_t *failmsgtok, *failcodetok;
 
-		result = htlc_accepted_fail;
 		failmsgtok = json_get_member(buffer, toks, "failure_message");
 		if (failmsgtok) {
-			*failmsg = json_tok_bin_from_hex(ctx, buffer,
-							 failmsgtok);
-			if (!*failmsg)
+			failmsg = json_tok_bin_from_hex(NULL, buffer,
+							failmsgtok);
+			if (!failmsg)
 				fatal("Bad failure_message for htlc_accepted"
 				      " hook: %.*s",
 				      failmsgtok->end - failmsgtok->start,
@@ -887,11 +940,12 @@ htlc_accepted_hook_deserialize(const tal_t *ctx,
 				      failcodetok->end
 				      - failcodetok->start,
 				      buffer + failcodetok->start);
-			*failmsg = convert_failcode(ctx, ld, failcode);
+			failmsg = convert_failcode(NULL, ld, failcode);
 		} else
-			*failmsg = towire_temporary_node_failure(ctx);
+			failmsg = towire_temporary_node_failure(NULL);
+		local_fail_in_htlc(hin, take(failmsg));
+		return false;
 	} else if (json_tok_streq(buffer, resulttok, "resolve")) {
-		result = htlc_accepted_resolve;
 		paykeytok = json_get_member(buffer, toks, "payment_key");
 		if (!paykeytok)
 			fatal(
@@ -899,18 +953,16 @@ htlc_accepted_hook_deserialize(const tal_t *ctx,
 			    "value to the htlc_accepted hook: %s",
 			    json_strdup(tmpctx, buffer, resulttok));
 
-		if (!json_to_preimage(buffer, paykeytok,
-				      payment_preimage))
+		if (!json_to_preimage(buffer, paykeytok, &payment_preimage))
 			fatal("Plugin specified an invalid 'payment_key': %s",
 			      json_tok_full(buffer, resulttok));
+		htlc_accepted_hook_try_resolve(request, &payment_preimage);
+		return false;
 	} else {
 		fatal("Plugin responded with an unknown result to the "
 		      "htlc_accepted hook: %s",
 		      json_strdup(tmpctx, buffer, resulttok));
 	}
-
-	/* cppcheck-suppress uninitvar - false positive on fatal() above */
-	return result;
 }
 
 static void htlc_accepted_hook_serialize(struct htlc_accepted_hook_payload *p,
@@ -975,58 +1027,40 @@ static void htlc_accepted_hook_serialize(struct htlc_accepted_hook_payload *p,
  * Callback when a plugin answers to the htlc_accepted hook
  */
 static void
-htlc_accepted_hook_callback(struct htlc_accepted_hook_payload *request,
-			    const char *buffer, const jsmntok_t *toks)
+htlc_accepted_hook_final(struct htlc_accepted_hook_payload *request STEALS)
 {
 	struct route_step *rs = request->route_step;
 	struct htlc_in *hin = request->hin;
 	struct channel *channel = request->channel;
-	struct lightningd *ld = request->ld;
-	struct preimage payment_preimage;
-	enum htlc_accepted_result result;
-	const u8 *failmsg;
-	result = htlc_accepted_hook_deserialize(request, ld, buffer, toks, &payment_preimage, &failmsg);
 
-	switch (result) {
-	case htlc_accepted_continue:
-		/* *Now* we barf if it failed to decode */
-		if (!request->payload) {
-			log_debug(channel->log,
-				  "Failing HTLC because of an invalid payload");
-			local_fail_in_htlc(hin,
-					   take(towire_invalid_onion_payload(
-					       NULL, request->failtlvtype,
-					       request->failtlvpos)));
-		} else if (rs->nextcase == ONION_FORWARD) {
-			forward_htlc(hin, hin->cltv_expiry,
-				     request->payload->amt_to_forward,
-				     request->payload->outgoing_cltv,
-				     request->payload->forward_channel,
-				     serialize_onionpacket(tmpctx, rs->next),
-				     request->next_blinding);
-		} else
-			handle_localpay(hin,
-					request->payload->amt_to_forward,
-					request->payload->outgoing_cltv,
-					*request->payload->total_msat,
-					request->payload->payment_secret);
-		break;
-	case htlc_accepted_fail:
+	/* *Now* we barf if it failed to decode */
+	if (!request->payload) {
 		log_debug(channel->log,
-			  "Failing incoming HTLC as instructed by plugin hook");
-		local_fail_in_htlc(hin, take(failmsg));
-		break;
-	case htlc_accepted_resolve:
-		fulfill_htlc(hin, &payment_preimage);
-		break;
-	}
+			  "Failing HTLC because of an invalid payload");
+		local_fail_in_htlc(hin,
+				   take(towire_invalid_onion_payload(
+						NULL, request->failtlvtype,
+						request->failtlvpos)));
+	} else if (rs->nextcase == ONION_FORWARD) {
+		forward_htlc(hin, hin->cltv_expiry,
+			     request->payload->amt_to_forward,
+			     request->payload->outgoing_cltv,
+			     request->payload->forward_channel,
+			     serialize_onionpacket(tmpctx, rs->next),
+			     request->next_blinding);
+	} else
+		handle_localpay(hin,
+				request->payload->amt_to_forward,
+				request->payload->outgoing_cltv,
+				*request->payload->total_msat,
+				request->payload->payment_secret);
 
 	tal_free(request);
 }
 
-REGISTER_PLUGIN_HOOK(htlc_accepted, PLUGIN_HOOK_CHAIN,
-		     htlc_accepted_hook_callback,
-		     struct htlc_accepted_hook_payload *,
+REGISTER_PLUGIN_HOOK(htlc_accepted,
+		     htlc_accepted_hook_deserialize,
+		     htlc_accepted_hook_final,
 		     htlc_accepted_hook_serialize,
 		     struct htlc_accepted_hook_payload *);
 
@@ -1159,7 +1193,7 @@ static bool peer_accepted_htlc(const tal_t *ctx,
 		goto fail;
 	}
 
-	hook_payload = tal(hin, struct htlc_accepted_hook_payload);
+	hook_payload = tal(NULL, struct htlc_accepted_hook_payload);
 
 	hook_payload->route_step = tal_steal(hook_payload, rs);
 	hook_payload->payload = onion_decode(hook_payload, rs,
@@ -1185,7 +1219,7 @@ static bool peer_accepted_htlc(const tal_t *ctx,
 #endif
 		hook_payload->next_blinding = NULL;
 
-	plugin_hook_call_htlc_accepted(ld, hook_payload, hook_payload);
+	plugin_hook_call_htlc_accepted(ld, hook_payload);
 
 	/* Falling through here is ok, after all the HTLC locked */
 	return true;
