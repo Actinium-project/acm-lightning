@@ -4,7 +4,7 @@ from fixtures import *  # noqa: F401,F403
 from fixtures import TEST_NETWORK
 from pyln.client import RpcError
 from utils import (
-    wait_for, TIMEOUT, only_one, sync_blockheight, expected_features
+    wait_for, TIMEOUT, only_one, sync_blockheight, expected_node_features
 )
 
 import json
@@ -1029,7 +1029,7 @@ def test_node_reannounce(node_factory, bitcoind):
     wait_for(lambda: 'alias' in only_one(l2.rpc.listnodes(l1.info['id'])['nodes']))
     assert only_one(l2.rpc.listnodes(l1.info['id'])['nodes'])['alias'].startswith('JUNIORBEAM')
 
-    lfeatures = expected_features()
+    lfeatures = expected_node_features()
 
     # Make sure it gets features correct.
     assert only_one(l2.rpc.listnodes(l1.info['id'])['nodes'])['features'] == lfeatures
@@ -1456,7 +1456,7 @@ def test_gossip_store_compact_on_load(node_factory, bitcoind):
     l2.restart()
 
     wait_for(lambda: l2.daemon.is_in_log(r'gossip_store_compact_offline: [5-8] deleted, 9 copied'))
-    wait_for(lambda: l2.daemon.is_in_log(r'gossip_store: Read 1/4/2/0 cannounce/cupdate/nannounce/cdelete from store \(0 deleted\) in 1452 bytes'))
+    wait_for(lambda: l2.daemon.is_in_log(r'gossip_store: Read 1/4/2/0 cannounce/cupdate/nannounce/cdelete from store \(0 deleted\) in 1460 bytes'))
 
 
 def test_gossip_announce_invalid_block(node_factory, bitcoind):
