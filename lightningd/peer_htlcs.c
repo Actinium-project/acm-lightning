@@ -295,7 +295,8 @@ static void fail_out_htlc(struct htlc_out *hout,
 	assert(hout->failmsg || hout->failonion);
 
 	if (hout->am_origin) {
-		payment_failed(hout->key.channel->peer->ld, hout, localfail);
+		payment_failed(hout->key.channel->peer->ld, hout, localfail,
+			       failmsg_needs_update);
 		if (taken(failmsg_needs_update))
 			tal_free(failmsg_needs_update);
 	} else if (hout->in) {
@@ -549,7 +550,7 @@ static void rcvd_htlc_reply(struct subd *subd, const u8 *msg, const int *fds UNU
 			char *localfail = tal_fmt(msg, "%s: %s",
 						  onion_type_name(fromwire_peektype(failmsg)),
 						  failurestr);
-			payment_failed(ld, hout, localfail);
+			payment_failed(ld, hout, localfail, NULL);
 
 		} else if (hout->in) {
 			struct onionreply *failonion;
@@ -1422,7 +1423,7 @@ void onchain_failed_our_htlc(const struct channel *channel,
 		char *localfail = tal_fmt(channel, "%s: %s",
 					  onion_type_name(WIRE_PERMANENT_CHANNEL_FAILURE),
 					  why);
-		payment_failed(ld, hout, localfail);
+		payment_failed(ld, hout, localfail, NULL);
 		tal_free(localfail);
 	} else if (hout->in) {
 		local_fail_in_htlc(hout->in,
@@ -1676,7 +1677,7 @@ void peer_sending_commitsig(struct channel *channel, const u8 *msg)
 						&fee_states,
 						&changed_htlcs,
 						&commit_sig, &htlc_sigs)
-	    || !fee_states_valid(fee_states, channel->funder)) {
+	    || !fee_states_valid(fee_states, channel->opener)) {
 		channel_internal_error(channel, "bad channel_sending_commitsig %s",
 				       tal_hex(channel, msg));
 		return;
@@ -1716,7 +1717,7 @@ void peer_sending_commitsig(struct channel *channel, const u8 *msg)
 	channel->channel_info.fee_states = tal_steal(channel, fee_states);
 	adjust_channel_feerate_bounds(channel,
 				      get_feerate(fee_states,
-						  channel->funder,
+						  channel->opener,
 						  REMOTE));
 
 	if (!peer_save_commitsig_sent(channel, commitnum))
@@ -1871,7 +1872,7 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 					    &failed,
 					    &changed,
 					    &tx)
-	    || !fee_states_valid(fee_states, channel->funder)) {
+	    || !fee_states_valid(fee_states, channel->opener)) {
 		channel_internal_error(channel,
 				    "bad fromwire_channel_got_commitsig %s",
 				    tal_hex(channel, msg));
@@ -1901,7 +1902,7 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 	log_debug(channel->log,
 		  "got commitsig %"PRIu64
 		  ": feerate %u, %zu added, %zu fulfilled, %zu failed, %zu changed",
-		  commitnum, get_feerate(fee_states, channel->funder, LOCAL),
+		  commitnum, get_feerate(fee_states, channel->opener, LOCAL),
 		  tal_count(added), tal_count(fulfilled),
 		  tal_count(failed), tal_count(changed));
 
@@ -1934,7 +1935,7 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 	channel->channel_info.fee_states = tal_steal(channel, fee_states);
 	adjust_channel_feerate_bounds(channel,
 				      get_feerate(fee_states,
-						  channel->funder,
+						  channel->opener,
 						  LOCAL));
 
 	/* Since we're about to send revoke, bump state again. */
@@ -1982,7 +1983,7 @@ void peer_got_revoke(struct channel *channel, const u8 *msg)
 					 &next_per_commitment_point,
 					 &fee_states,
 					 &changed)
-	    || !fee_states_valid(fee_states, channel->funder)) {
+	    || !fee_states_valid(fee_states, channel->opener)) {
 		channel_internal_error(channel, "bad fromwire_channel_got_revoke %s",
 				    tal_hex(channel, msg));
 		return;

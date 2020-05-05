@@ -194,9 +194,10 @@ def test_plugin_dir(node_factory):
 
 def test_plugin_slowinit(node_factory):
     """Tests that the 'plugin' RPC command times out if plugin doesnt respond"""
+    os.environ['SLOWINIT_TIME'] = '61'
     n = node_factory.get_node()
 
-    with pytest.raises(RpcError, match="Timed out while waiting for plugin response"):
+    with pytest.raises(RpcError, match='failed to respond to \'init\' in time, terminating.'):
         n.rpc.plugin_start(os.path.join(os.getcwd(), "tests/plugins/slow_init.py"))
 
     # It's not actually configured yet, see what happens;
@@ -228,7 +229,7 @@ def test_plugin_command(node_factory):
     # Make sure the plugin behaves normally after stop and restart
     assert("Successfully stopped helloworld.py."
            == n.rpc.plugin_stop(plugin="helloworld.py")["result"])
-    n.daemon.wait_for_log(r"Killing plugin: helloworld.py")
+    n.daemon.wait_for_log(r"Killing plugin: stopped by lightningd via RPC")
     n.rpc.plugin_start(plugin=os.path.join(os.getcwd(), "contrib/plugins/helloworld.py"))
     n.daemon.wait_for_log(r"Plugin helloworld.py initialized")
     assert("Hello world" == n.rpc.call(method="hello"))
@@ -236,7 +237,7 @@ def test_plugin_command(node_factory):
     # Now stop the helloworld plugin
     assert("Successfully stopped helloworld.py."
            == n.rpc.plugin_stop(plugin="helloworld.py")["result"])
-    n.daemon.wait_for_log(r"Killing plugin: helloworld.py")
+    n.daemon.wait_for_log(r"Killing plugin: stopped by lightningd via RPC")
     # Make sure that the 'hello' command from the helloworld.py plugin
     # is not available anymore.
     cmd = [hlp for hlp in n.rpc.help()["help"] if "hello" in hlp["command"]]
@@ -259,17 +260,27 @@ def test_plugin_command(node_factory):
     with pytest.raises(RpcError, match=r"Plugin exited before completing handshake."):
         n2.rpc.plugin_start(plugin=os.path.join(os.getcwd(), "tests/plugins/broken.py"))
 
+    # Test that we can add a directory with more than one new plugin in it.
+    try:
+        n.rpc.plugin_startdir(os.path.join(os.getcwd(), "tests/plugins"))
+    except RpcError:
+        pass
+
+    # Usually, it crashes after the above return.
+    n.rpc.stop()
+
 
 def test_plugin_disable(node_factory):
     """--disable-plugin works"""
     plugin_dir = os.path.join(os.getcwd(), 'contrib/plugins')
-    # We need plugin-dir before disable-plugin!
+    # We used to need plugin-dir before disable-plugin!
     n = node_factory.get_node(options=OrderedDict([('plugin-dir', plugin_dir),
                                                    ('disable-plugin',
                                                     '{}/helloworld.py'
                                                     .format(plugin_dir))]))
     with pytest.raises(RpcError):
         n.rpc.hello(name='Sun')
+    assert n.daemon.is_in_log('helloworld.py: disabled via disable-plugin')
 
     # Also works by basename.
     n = node_factory.get_node(options=OrderedDict([('plugin-dir', plugin_dir),
@@ -277,6 +288,45 @@ def test_plugin_disable(node_factory):
                                                     'helloworld.py')]))
     with pytest.raises(RpcError):
         n.rpc.hello(name='Sun')
+    assert n.daemon.is_in_log('helloworld.py: disabled via disable-plugin')
+
+    # Other order also works!
+    n = node_factory.get_node(options=OrderedDict([('disable-plugin',
+                                                    'helloworld.py'),
+                                                   ('plugin-dir', plugin_dir)]))
+    with pytest.raises(RpcError):
+        n.rpc.hello(name='Sun')
+    assert n.daemon.is_in_log('helloworld.py: disabled via disable-plugin')
+
+    # Both orders of explicit specification work.
+    n = node_factory.get_node(options=OrderedDict([('disable-plugin',
+                                                    'helloworld.py'),
+                                                   ('plugin',
+                                                    '{}/helloworld.py'
+                                                    .format(plugin_dir))]))
+    with pytest.raises(RpcError):
+        n.rpc.hello(name='Sun')
+    assert n.daemon.is_in_log('helloworld.py: disabled via disable-plugin')
+
+    # Both orders of explicit specification work.
+    n = node_factory.get_node(options=OrderedDict([('plugin',
+                                                    '{}/helloworld.py'
+                                                    .format(plugin_dir)),
+                                                   ('disable-plugin',
+                                                    'helloworld.py')]))
+    with pytest.raises(RpcError):
+        n.rpc.hello(name='Sun')
+    assert n.daemon.is_in_log('helloworld.py: disabled via disable-plugin')
+
+    # Still disabled if we load directory.
+    n.rpc.plugin_startdir(directory=os.path.join(os.getcwd(), "contrib/plugins"))
+    n.daemon.wait_for_log('helloworld.py: disabled via disable-plugin')
+
+    # Check that list works
+    n = node_factory.get_node(options={'disable-plugin':
+                                       ['something-else.py', 'helloworld.py']})
+
+    assert n.rpc.listconfigs()['disable-plugin'] == ['something-else.py', 'helloworld.py']
 
 
 def test_plugin_hook(node_factory, executor):
@@ -690,6 +740,24 @@ def test_invoice_payment_notification(node_factory):
     l1.rpc.dev_pay(inv1['bolt11'], use_shadow=False)
 
     l2.daemon.wait_for_log(r"Received invoice_payment event for label {},"
+                           " preimage {}, and amount of {}msat"
+                           .format(label, preimage, msats))
+
+
+@unittest.skipIf(not DEVELOPER, "needs to deactivate shadow routing")
+def test_invoice_creation_notification(node_factory):
+    """
+    Test the 'invoice_creation' notification
+    """
+    opts = [{}, {"plugin": os.path.join(os.getcwd(), "contrib/plugins/helloworld.py")}]
+    l1, l2 = node_factory.line_graph(2, opts=opts)
+
+    msats = 12345
+    preimage = '1' * 64
+    label = "a_descriptive_label"
+    l2.rpc.invoice(msats, label, 'description', preimage=preimage)
+
+    l2.daemon.wait_for_log(r"Received invoice_creation event for label {},"
                            " preimage {}, and amount of {}msat"
                            .format(label, preimage, msats))
 
@@ -1200,3 +1268,18 @@ def test_replacement_payload(node_factory):
         l1.rpc.pay(inv)
 
     assert l2.daemon.wait_for_log("Attept to pay.*with wrong secret")
+
+
+def test_plugin_fail(node_factory):
+    """Test that a plugin which fails (not during a command)"""
+    plugin = os.path.join(os.path.dirname(__file__), 'plugins/fail_by_itself.py')
+    l1 = node_factory.get_node(options={"plugin": plugin})
+
+    time.sleep(2)
+    # It should clean up!
+    assert 'failcmd' not in [h['command'] for h in l1.rpc.help()['help']]
+
+    l1.rpc.plugin_start(plugin)
+    time.sleep(2)
+    # It should clean up!
+    assert 'failcmd' not in [h['command'] for h in l1.rpc.help()['help']]

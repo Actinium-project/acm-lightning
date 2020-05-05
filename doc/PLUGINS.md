@@ -324,11 +324,25 @@ to a peer was lost.
 
 ### `invoice_payment`
 
-A notification for topic `invoice_payment` is sent every time an invoie is paid.
+A notification for topic `invoice_payment` is sent every time an invoice is paid.
 
 ```json
 {
   "invoice_payment": {
+    "label": "unique-label-for-invoice",
+    "preimage": "0000000000000000000000000000000000000000000000000000000000000000",
+    "msat": "10000msat"
+  }
+}
+
+```
+### `invoice_creation`
+
+A notification for topic `invoice_creation` is sent every time an invoice is created.
+
+```json
+{
+  "invoice_creation": {
     "label": "unique-label-for-invoice",
     "preimage": "0000000000000000000000000000000000000000000000000000000000000000",
     "msat": "10000msat"

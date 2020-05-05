@@ -133,7 +133,7 @@ u32 get_block_height(const struct chain_topology *topo UNNEEDED)
 { fprintf(stderr, "get_block_height called!\n"); abort(); }
 /* Generated stub for get_feerate */
 u32 get_feerate(const struct fee_states *fee_states UNNEEDED,
-		enum side funder UNNEEDED,
+		enum side opener UNNEEDED,
 		enum side side UNNEEDED)
 { fprintf(stderr, "get_feerate called!\n"); abort(); }
 /* Generated stub for htlc_is_trimmed */
@@ -246,6 +246,10 @@ void notify_connect(struct lightningd *ld UNNEEDED, struct node_id *nodeid UNNEE
 /* Generated stub for notify_disconnect */
 void notify_disconnect(struct lightningd *ld UNNEEDED, struct node_id *nodeid UNNEEDED)
 { fprintf(stderr, "notify_disconnect called!\n"); abort(); }
+/* Generated stub for notify_invoice_creation */
+void notify_invoice_creation(struct lightningd *ld UNNEEDED, struct amount_msat *amount UNNEEDED,
+			    struct preimage preimage UNNEEDED, const struct json_escape *label UNNEEDED)
+{ fprintf(stderr, "notify_invoice_creation called!\n"); abort(); }
 /* Generated stub for notify_invoice_payment */
 void notify_invoice_payment(struct lightningd *ld UNNEEDED, struct amount_msat amount UNNEEDED,
 			    struct preimage preimage UNNEEDED, const struct json_escape *label UNNEEDED)
@@ -374,12 +378,9 @@ void per_peer_state_set_fds(struct per_peer_state *pps UNNEEDED,
 			    int peer_fd UNNEEDED, int gossip_fd UNNEEDED, int gossip_store_fd UNNEEDED)
 { fprintf(stderr, "per_peer_state_set_fds called!\n"); abort(); }
 /* Generated stub for plugin_hook_call_ */
-void plugin_hook_call_(struct lightningd *ld UNNEEDED, const struct plugin_hook *hook UNNEEDED,
-		       tal_t *cb_arg UNNEEDED)
+bool plugin_hook_call_(struct lightningd *ld UNNEEDED, const struct plugin_hook *hook UNNEEDED,
+		       tal_t *cb_arg STEALS UNNEEDED)
 { fprintf(stderr, "plugin_hook_call_ called!\n"); abort(); }
-/* Generated stub for plugin_hook_continue */
-bool plugin_hook_continue(void *arg UNNEEDED, const char *buffer UNNEEDED, const jsmntok_t *toks UNNEEDED)
-{ fprintf(stderr, "plugin_hook_continue called!\n"); abort(); }
 /* Generated stub for subd_release_channel */
 void subd_release_channel(struct subd *owner UNNEEDED, void *channel UNNEEDED)
 { fprintf(stderr, "subd_release_channel called!\n"); abort(); }

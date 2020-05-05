@@ -509,7 +509,7 @@ enum onion_type parse_onionpacket(const u8 *src UNNEEDED,
 { fprintf(stderr, "parse_onionpacket called!\n"); abort(); }
 /* Generated stub for payment_failed */
 void payment_failed(struct lightningd *ld UNNEEDED, const struct htlc_out *hout UNNEEDED,
-		    const char *localfail UNNEEDED)
+		    const char *localfail UNNEEDED, const u8 *failmsg_needs_update UNNEEDED)
 { fprintf(stderr, "payment_failed called!\n"); abort(); }
 /* Generated stub for payment_store */
 void payment_store(struct lightningd *ld UNNEEDED, struct wallet_payment *payment UNNEEDED)
@@ -546,12 +546,9 @@ void per_peer_state_set_fds(struct per_peer_state *pps UNNEEDED,
 			    int peer_fd UNNEEDED, int gossip_fd UNNEEDED, int gossip_store_fd UNNEEDED)
 { fprintf(stderr, "per_peer_state_set_fds called!\n"); abort(); }
 /* Generated stub for plugin_hook_call_ */
-void plugin_hook_call_(struct lightningd *ld UNNEEDED, const struct plugin_hook *hook UNNEEDED,
-		       tal_t *cb_arg UNNEEDED)
+bool plugin_hook_call_(struct lightningd *ld UNNEEDED, const struct plugin_hook *hook UNNEEDED,
+		       tal_t *cb_arg STEALS UNNEEDED)
 { fprintf(stderr, "plugin_hook_call_ called!\n"); abort(); }
-/* Generated stub for plugin_hook_continue */
-bool plugin_hook_continue(void *arg UNNEEDED, const char *buffer UNNEEDED, const jsmntok_t *toks UNNEEDED)
-{ fprintf(stderr, "plugin_hook_continue called!\n"); abort(); }
 /* Generated stub for process_onionpacket */
 struct route_step *process_onionpacket(
 	const tal_t * ctx UNNEEDED,
@@ -1039,8 +1036,8 @@ static bool channelseq(struct channel *c1, struct channel *c2)
 	CHECK(pubkey_eq(&ci1->remote_per_commit, &ci2->remote_per_commit));
 	CHECK(pubkey_eq(&ci1->old_remote_per_commit, &ci2->old_remote_per_commit));
 	CHECK(ci1->their_config.id != 0 && ci1->their_config.id == ci2->their_config.id);
-	CHECK(fee_states_valid(ci1->fee_states, c1->funder));
-	CHECK(fee_states_valid(ci2->fee_states, c2->funder));
+	CHECK(fee_states_valid(ci1->fee_states, c1->opener));
+	CHECK(fee_states_valid(ci2->fee_states, c2->opener));
 	for (enum htlc_state i = 0; i < ARRAY_SIZE(ci1->fee_states->feerate);
 	     i++) {
 		if (ci1->fee_states->feerate[i] == NULL) {
@@ -1125,7 +1122,7 @@ static bool test_channel_crud(struct lightningd *ld, const tal_t *ctx)
 	pubkey_from_der(tal_hexdata(w, "02a1633cafcc01ebfb6d78e39f687a1f0995c62fc95f51ead10a02ee0be551b5dc", 66), 33, &pk);
 	node_id_from_pubkey(&id, &pk);
 	feerate = 31337;
-	ci->fee_states = new_fee_states(w, c1.funder, &feerate);
+	ci->fee_states = new_fee_states(w, c1.opener, &feerate);
 	mempat(scriptpubkey, tal_count(scriptpubkey));
 	c1.first_blocknum = 1;
 	parse_wireaddr_internal("localhost:1234", &addr, 0, false, false, false,

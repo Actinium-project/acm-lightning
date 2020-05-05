@@ -343,15 +343,18 @@ static char *opt_add_proxy_addr(const char *arg, struct lightningd *ld)
 
 static char *opt_add_plugin(const char *arg, struct lightningd *ld)
 {
-	plugin_register(ld->plugins, arg);
+	if (plugin_blacklisted(ld->plugins, arg)) {
+		log_info(ld->log, "%s: disabled via disable-plugin", arg);
+		return NULL;
+	}
+	plugin_register(ld->plugins, arg, NULL);
 	return NULL;
 }
 
 static char *opt_disable_plugin(const char *arg, struct lightningd *ld)
 {
-	if (plugin_remove(ld->plugins, arg))
-		return NULL;
-	return tal_fmt(NULL, "Could not find plugin %s", arg);
+	plugin_blacklist(ld->plugins, arg);
+	return NULL;
 }
 
 static char *opt_add_plugin_dir(const char *arg, struct lightningd *ld)
@@ -1275,8 +1278,9 @@ static void add_config(struct lightningd *ld,
 			json_add_opt_plugins(response, ld->plugins);
 		} else if (opt->cb_arg == (void *)opt_log_level) {
 			json_add_opt_log_levels(response, ld->log);
+		} else if (opt->cb_arg == (void *)opt_disable_plugin) {
+			json_add_opt_disable_plugins(response, ld->plugins);
 		} else if (opt->cb_arg == (void *)opt_add_plugin_dir
-			   || opt->cb_arg == (void *)opt_disable_plugin
 			   || opt->cb_arg == (void *)plugin_opt_set
 			   || opt->cb_arg == (void *)plugin_opt_flag_set) {
 			/* FIXME: We actually treat it as if they specified
