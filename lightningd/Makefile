@@ -42,6 +42,7 @@ LIGHTNINGD_COMMON_OBJS :=			\
 	common/htlc_trim.o			\
 	common/htlc_wire.o			\
 	common/key_derive.o			\
+	common/keyset.o				\
 	common/io_lock.o			\
 	common/json.o				\
 	common/json_helpers.o			\
@@ -53,6 +54,7 @@ LIGHTNINGD_COMMON_OBJS :=			\
 	common/onion.o				\
 	common/onionreply.o			\
 	common/param.o				\
+	common/penalty_base.o			\
 	common/per_peer_state.o			\
 	common/permute_tx.o			\
 	common/pseudorand.o			\

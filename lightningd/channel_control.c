@@ -38,7 +38,8 @@ static void update_feerates(struct lightningd *ld, struct channel *channel)
 
 	msg = towire_channel_feerates(NULL, feerate,
 				      feerate_min(ld, NULL),
-				      feerate_max(ld, NULL));
+				      feerate_max(ld, NULL),
+				      try_get_feerate(ld->topology, FEERATE_PENALTY));
 	subd_send_msg(channel->owner, take(msg));
 }
 
@@ -385,13 +386,15 @@ void peer_start_channeld(struct channel *channel,
 	bool reached_announce_depth;
 	struct secret last_remote_per_commit_secret;
 	secp256k1_ecdsa_signature *remote_ann_node_sig, *remote_ann_bitcoin_sig;
+	struct penalty_base *pbases;
 
 	hsmfd = hsm_get_client_fd(ld, &channel->peer->id,
 				  channel->dbid,
 				  HSM_CAP_SIGN_GOSSIP
 				  | HSM_CAP_ECDH
 				  | HSM_CAP_COMMITMENT_POINT
-				  | HSM_CAP_SIGN_REMOTE_TX);
+				  | HSM_CAP_SIGN_REMOTE_TX
+				  | HSM_CAP_SIGN_ONCHAIN_TX);
 
 	channel_set_owner(channel,
 			  new_channel_subd(ld,
@@ -463,6 +466,9 @@ void peer_start_channeld(struct channel *channel,
 		return;
 	}
 
+	pbases = wallet_penalty_base_load_for_channel(
+	    tmpctx, channel->peer->ld->wallet, channel->dbid);
+
 	initmsg = towire_channel_init(tmpctx,
 				      chainparams,
  				      ld->our_features,
@@ -475,6 +481,7 @@ void peer_start_channeld(struct channel *channel,
 				      channel->channel_info.fee_states,
 				      feerate_min(ld, NULL),
 				      feerate_max(ld, NULL),
+				      try_get_feerate(ld->topology, FEERATE_PENALTY),
 				      &channel->last_sig,
 				      pps,
 				      &channel->channel_info.remote_fundingkey,
@@ -517,7 +524,8 @@ void peer_start_channeld(struct channel *channel,
 				       * negotiated now! */
 				      channel->option_static_remotekey,
 				      IFDEV(ld->dev_fast_gossip, false),
-				      IFDEV(dev_fail_process_onionpacket, false));
+				      IFDEV(dev_fail_process_onionpacket, false),
+				      pbases);
 
 	/* We don't expect a response: we are triggered by funding_depth_cb. */
 	subd_send_msg(channel->owner, take(initmsg));
@@ -813,7 +821,8 @@ static struct command_result *json_dev_feerate(struct command *cmd,
 
 	msg = towire_channel_feerates(NULL, *feerate,
 				      feerate_min(cmd->ld, NULL),
-				      feerate_max(cmd->ld, NULL));
+				      feerate_max(cmd->ld, NULL),
+				      try_get_feerate(cmd->ld->topology, FEERATE_PENALTY));
 	subd_send_msg(channel->owner, take(msg));
 
 	response = json_stream_success(cmd);
