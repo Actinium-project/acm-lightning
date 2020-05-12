@@ -384,6 +384,14 @@ struct utxo **wallet_get_utxos(const tal_t *ctx, struct wallet *w,
 struct utxo **wallet_get_unconfirmed_closeinfo_utxos(const tal_t *ctx,
 						     struct wallet *w);
 
+/** wallet_utxo_get - Retrive a utxo.
+ *
+ * Returns a utxo, or NULL if not found.
+ */
+struct utxo *wallet_utxo_get(const tal_t *ctx, struct wallet *w,
+			     const struct bitcoin_txid *txid,
+			     u32 outnum);
+
 const struct utxo **wallet_select_coins(const tal_t *ctx, struct wallet *w,
 					bool with_change,
 					struct amount_sat value,
@@ -596,6 +604,7 @@ void wallet_htlc_save_out(struct wallet *wallet,
  * @badonion: the current BADONION failure code, or 0.
  * @failonion: the current failure onion message (from peer), or NULL.
  * @failmsg: the current local failure message, or NULL.
+ * @we_filled: for htlc-ins, true if we originated the preimage.
  *
  * Used to update the state of an HTLC, either a `struct htlc_in` or a
  * `struct htlc_out` and optionally set the `payment_key` should the
@@ -606,7 +615,8 @@ void wallet_htlc_update(struct wallet *wallet, const u64 htlc_dbid,
 			const struct preimage *payment_key,
 			enum onion_type badonion,
 			const struct onionreply *failonion,
-			const u8 *failmsg);
+			const u8 *failmsg,
+			bool *we_filled);
 
 /**
  * wallet_htlcs_load_in_for_channel - Load incoming HTLCs associated with chan from DB.
@@ -1089,12 +1099,14 @@ bool wallet_have_block(struct wallet *w, u32 blockheight);
  * Given the outpoint (txid, outnum), and the blockheight, mark the
  * corresponding DB entries as spent at the blockheight.
  *
+ * @our_spend - set to true if found in our wallet's output set, false otherwise
  * @return scid The short_channel_id corresponding to the spent outpoint, if
  *         any.
  */
 const struct short_channel_id *
 wallet_outpoint_spend(struct wallet *w, const tal_t *ctx, const u32 blockheight,
-		      const struct bitcoin_txid *txid, const u32 outnum);
+		      const struct bitcoin_txid *txid, const u32 outnum,
+		      bool *our_spend);
 
 struct outpoint *wallet_outpoint_for_scid(struct wallet *w, tal_t *ctx,
 					  const struct short_channel_id *scid);

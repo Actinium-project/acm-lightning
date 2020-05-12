@@ -384,6 +384,40 @@ bool json_tok_streq(const char *buffer UNNEEDED, const jsmntok_t *tok UNNEEDED, 
 void kill_uncommitted_channel(struct uncommitted_channel *uc UNNEEDED,
 			      const char *why UNNEEDED)
 { fprintf(stderr, "kill_uncommitted_channel called!\n"); abort(); }
+/* Generated stub for new_channel_mvt_invoice_hin */
+struct channel_coin_mvt *new_channel_mvt_invoice_hin(const tal_t *ctx UNNEEDED,
+						     struct htlc_in *hin UNNEEDED,
+						     struct channel *channel UNNEEDED)
+{ fprintf(stderr, "new_channel_mvt_invoice_hin called!\n"); abort(); }
+/* Generated stub for new_channel_mvt_invoice_hout */
+struct channel_coin_mvt *new_channel_mvt_invoice_hout(const tal_t *ctx UNNEEDED,
+						      struct htlc_out *hout UNNEEDED,
+						      struct channel *channel UNNEEDED)
+{ fprintf(stderr, "new_channel_mvt_invoice_hout called!\n"); abort(); }
+/* Generated stub for new_channel_mvt_routed_hin */
+struct channel_coin_mvt *new_channel_mvt_routed_hin(const tal_t *ctx UNNEEDED,
+						    struct htlc_in *hin UNNEEDED,
+						    struct channel *channel UNNEEDED)
+{ fprintf(stderr, "new_channel_mvt_routed_hin called!\n"); abort(); }
+/* Generated stub for new_channel_mvt_routed_hout */
+struct channel_coin_mvt *new_channel_mvt_routed_hout(const tal_t *ctx UNNEEDED,
+						     struct htlc_out *hout UNNEEDED,
+						     struct channel *channel UNNEEDED)
+{ fprintf(stderr, "new_channel_mvt_routed_hout called!\n"); abort(); }
+/* Generated stub for new_coin_deposit_sat */
+struct chain_coin_mvt *new_coin_deposit_sat(const tal_t *ctx UNNEEDED,
+					    const char *account_name UNNEEDED,
+					    const struct bitcoin_txid *txid UNNEEDED,
+					    u32 vout UNNEEDED,
+					    u32 blockheight UNNEEDED,
+					    struct amount_sat amount UNNEEDED)
+{ fprintf(stderr, "new_coin_deposit_sat called!\n"); abort(); }
+/* Generated stub for notify_chain_mvt */
+void notify_chain_mvt(struct lightningd *ld UNNEEDED, const struct chain_coin_mvt *mvt UNNEEDED)
+{ fprintf(stderr, "notify_chain_mvt called!\n"); abort(); }
+/* Generated stub for notify_channel_mvt */
+void notify_channel_mvt(struct lightningd *ld UNNEEDED, const struct channel_coin_mvt *mvt UNNEEDED)
+{ fprintf(stderr, "notify_channel_mvt called!\n"); abort(); }
 /* Generated stub for notify_connect */
 void notify_connect(struct lightningd *ld UNNEEDED, struct node_id *nodeid UNNEEDED,
 		    struct wireaddr_internal *addr UNNEEDED)
@@ -405,7 +439,8 @@ void notify_forward_event(struct lightningd *ld UNNEEDED,
 /* Generated stub for onchaind_funding_spent */
 enum watch_result onchaind_funding_spent(struct channel *channel UNNEEDED,
 					 const struct bitcoin_tx *tx UNNEEDED,
-					 u32 blockheight UNNEEDED)
+					 u32 blockheight UNNEEDED,
+					 bool is_replay UNNEEDED)
 { fprintf(stderr, "onchaind_funding_spent called!\n"); abort(); }
 /* Generated stub for onion_decode */
 struct onion_payload *onion_decode(const tal_t *ctx UNNEEDED,
@@ -674,7 +709,7 @@ u8 *towire_invalid_realm(const tal_t *ctx UNNEEDED)
 u8 *towire_onchain_dev_memleak(const tal_t *ctx UNNEEDED)
 { fprintf(stderr, "towire_onchain_dev_memleak called!\n"); abort(); }
 /* Generated stub for towire_onchain_known_preimage */
-u8 *towire_onchain_known_preimage(const tal_t *ctx UNNEEDED, const struct preimage *preimage UNNEEDED)
+u8 *towire_onchain_known_preimage(const tal_t *ctx UNNEEDED, const struct preimage *preimage UNNEEDED, bool is_replay UNNEEDED)
 { fprintf(stderr, "towire_onchain_known_preimage called!\n"); abort(); }
 /* Generated stub for towire_permanent_channel_failure */
 u8 *towire_permanent_channel_failure(const tal_t *ctx UNNEEDED)
@@ -1311,17 +1346,17 @@ static bool test_htlc_crud(struct lightningd *ld, const tal_t *ctx)
 	wallet_err = tal_free(wallet_err);
 
 	/* Update */
-	CHECK_MSG(transaction_wrap(w->db, wallet_htlc_update(w, in.dbid, RCVD_ADD_HTLC, NULL, 0, NULL, NULL)),
+	CHECK_MSG(transaction_wrap(w->db, wallet_htlc_update(w, in.dbid, RCVD_ADD_HTLC, NULL, 0, NULL, NULL, false)),
 		  "Update HTLC with null payment_key failed");
 	CHECK_MSG(
-		transaction_wrap(w->db, wallet_htlc_update(w, in.dbid, SENT_REMOVE_HTLC, &payment_key, 0, NULL, NULL)),
+		transaction_wrap(w->db, wallet_htlc_update(w, in.dbid, SENT_REMOVE_HTLC, &payment_key, 0, NULL, NULL, false)),
 	    "Update HTLC with payment_key failed");
 	onionreply = new_onionreply(tmpctx, tal_arrz(tmpctx, u8, 100));
 	CHECK_MSG(
-		transaction_wrap(w->db, wallet_htlc_update(w, in.dbid, SENT_REMOVE_HTLC, NULL, 0, onionreply, NULL)),
+		transaction_wrap(w->db, wallet_htlc_update(w, in.dbid, SENT_REMOVE_HTLC, NULL, 0, onionreply, NULL, false)),
 	    "Update HTLC with failonion failed");
 	CHECK_MSG(
-		transaction_wrap(w->db, wallet_htlc_update(w, in.dbid, SENT_REMOVE_HTLC, NULL, WIRE_INVALID_ONION_VERSION, NULL, NULL)),
+		transaction_wrap(w->db, wallet_htlc_update(w, in.dbid, SENT_REMOVE_HTLC, NULL, WIRE_INVALID_ONION_VERSION, NULL, NULL, false)),
 	    "Update HTLC with failcode failed");
 
 	CHECK_MSG(transaction_wrap(w->db, wallet_htlc_save_out(w, chan, &out)),
@@ -1333,7 +1368,7 @@ static bool test_htlc_crud(struct lightningd *ld, const tal_t *ctx)
 	CHECK(wallet_err);
 	wallet_err = tal_free(wallet_err);
 	CHECK_MSG(
-		transaction_wrap(w->db, wallet_htlc_update(w, out.dbid, SENT_ADD_ACK_REVOCATION, NULL, 0, NULL, tal_arrz(tmpctx, u8, 100))),
+		transaction_wrap(w->db, wallet_htlc_update(w, out.dbid, SENT_ADD_ACK_REVOCATION, NULL, 0, NULL, tal_arrz(tmpctx, u8, 100), false)),
 	    "Update outgoing HTLC with failmsg failed");
 
 	/* Attempt to load them from the DB again */

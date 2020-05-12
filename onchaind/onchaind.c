@@ -4,6 +4,7 @@
 #include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
 #include <common/amount.h>
+#include <common/coin_mvt.h>
 #include <common/derive_basepoints.h>
 #include <common/htlc_tx.h>
 #include <common/initial_commit_tx.h>
@@ -74,6 +75,9 @@ static u32 reasonable_depth;
 /* The messages to send at that depth. */
 static u8 **missing_htlc_msgs;
 
+/* Our recorded channel balance at 'chain time' */
+static struct amount_msat our_msat;
+
 /* Does option_static_remotekey apply to this commitment tx? */
 bool option_static_remotekey;
 
@@ -117,7 +121,272 @@ struct tracked_output {
 	struct resolution *resolved;
 
 	const struct chainparams *chainparams;
+
+	/* stashed so we can pass it along to the coin ledger */
+	struct sha256 payment_hash;
 };
+
+static void send_coin_mvt(struct chain_coin_mvt *mvt TAKES)
+{
+	wire_sync_write(REQ_FD,
+			take(towire_onchain_notify_coin_mvt(NULL, mvt)));
+
+	if (taken(mvt))
+		tal_free(mvt);
+}
+
+static void record_their_successful_cheat(const struct bitcoin_txid *txid,
+					  u32 blockheight,
+					  struct tracked_output *out)
+{
+	struct chain_coin_mvt *mvt;
+	/* They successfully spent a delayed_to_them output
+	 * that we were expecting to revoke */
+	mvt = new_coin_penalty_sat(NULL, NULL,
+				   txid, &out->txid, out->outnum,
+				   blockheight, out->sat);
+
+	send_coin_mvt(take(mvt));
+}
+
+static void record_htlc_fulfilled(const struct bitcoin_txid *txid,
+				  struct tracked_output *out,
+				  u32 blockheight,
+				  bool we_fulfilled)
+{
+	struct chain_coin_mvt *mvt;
+
+	/* we're recording the *deposit* of a utxo which contained channel
+	 * funds (htlc).
+	 *
+	 * since we really don't know if this was a 'routed' or 'destination'
+	 * htlc here, we record it as a 'deposit/withdrawal' type */
+	mvt = new_coin_onchain_htlc_sat(NULL, NULL, txid, &out->txid,
+					out->outnum, out->payment_hash,
+					blockheight, out->sat, we_fulfilled);
+
+	send_coin_mvt(take(mvt));
+}
+
+static void update_ledger_chain_fees_msat(const struct bitcoin_txid *txid,
+					  u32 blockheight,
+					  struct amount_msat fees)
+{
+	send_coin_mvt(take(new_coin_chain_fees(NULL, NULL, txid,
+					       blockheight, fees)));
+}
+
+static void update_ledger_chain_fees(const struct bitcoin_txid *txid,
+				     u32 blockheight,
+				     struct amount_sat fees)
+{
+	struct chain_coin_mvt *mvt;
+	mvt = new_coin_chain_fees_sat(NULL, NULL, txid, blockheight, fees);
+
+	send_coin_mvt(take(mvt));
+}
+
+/* Log the fees paid on this transaction as 'chain fees'. note that
+ * you *cannot* pass a chaintopology-originated tx to this method,
+ * as they don't have the input_amounts populated */
+static struct amount_sat record_chain_fees_tx(const struct bitcoin_txid *txid,
+					      const struct bitcoin_tx *tx,
+					      u32 blockheight)
+{
+	struct amount_sat fees;
+	fees = bitcoin_tx_compute_fee(tx);
+	status_debug("recording chain fees for tx %s",
+		     type_to_string(tmpctx, struct bitcoin_txid, txid));
+	update_ledger_chain_fees(txid, blockheight, fees);
+	return fees;
+}
+
+static void add_amt(struct amount_sat *sum, struct amount_sat amt)
+{
+	if (!amount_sat_add(sum, *sum, amt))
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "unable to add %s to %s",
+			      type_to_string(tmpctx, struct amount_sat,
+					     &amt),
+			      type_to_string(tmpctx, struct amount_sat,
+					     sum));
+}
+
+static void record_mutual_closure(const struct bitcoin_txid *txid,
+				  u32 blockheight,
+				  struct amount_sat our_out,
+				  int output_num)
+{
+	struct amount_msat chain_fees, output_msat;
+
+	/* First figure out 'fees' we paid on this will include
+	 *   - 'residue' that can't fit onchain (< 1 sat)
+	 *   - trimmed output, if our balance is < dust_limit
+	 *   - fees paid for getting this tx mined
+	 */
+	if (!amount_sat_to_msat(&output_msat, our_out))
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "unable to convert %s to msat",
+			      type_to_string(tmpctx, struct amount_sat,
+					     &our_out));
+
+	if (!amount_msat_sub(&chain_fees, our_msat, output_msat))
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "unable to subtract %s from %s",
+			      type_to_string(tmpctx, struct amount_msat,
+					     &output_msat),
+			      type_to_string(tmpctx, struct amount_msat,
+					     &our_msat));
+
+	if (!amount_msat_eq(AMOUNT_MSAT(0), chain_fees))
+		update_ledger_chain_fees_msat(txid, blockheight, chain_fees);
+
+	/* If we have no output, we exit early */
+	if (amount_msat_eq(AMOUNT_MSAT(0), output_msat))
+		return;
+
+	assert(output_num > -1);
+	/* Otherwise, we record the channel withdrawal */
+	send_coin_mvt(take(new_coin_withdrawal(NULL, NULL, txid, txid, output_num,
+					       blockheight, output_msat)));
+}
+
+static void record_chain_fees_unilateral(const struct bitcoin_txid *txid,
+					 u32 blockheight,
+					 struct amount_sat funding,
+					 struct amount_sat their_outs,
+					 struct amount_sat our_outs)
+{
+	struct amount_msat trimmed;
+	status_debug("chain_movements...recording chain fees for unilateral."
+		     " our msat balance %s, funding %s,"
+		     " their_outs %s, our outs %s",
+		     type_to_string(tmpctx, struct amount_msat, &our_msat),
+		     type_to_string(tmpctx, struct amount_sat, &funding),
+		     type_to_string(tmpctx, struct amount_sat, &their_outs),
+		     type_to_string(tmpctx, struct amount_sat, &our_outs));
+
+	/* It's possible they published a commitment tx that
+	 * paid us an htlc before we updated our balance. It's also
+	 * possible that they fulfilled an htlc, but we'll just write
+	 * that down in the chain fees :/ */
+	if (!amount_msat_greater_eq_sat(our_msat, our_outs)) {
+		struct amount_msat missing;
+
+		if (!amount_sat_sub_msat(&missing, our_outs, our_msat))
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				      "unable to subtract %s from %s",
+				      type_to_string(tmpctx, struct amount_msat,
+						     &our_msat),
+				      type_to_string(tmpctx, struct amount_sat,
+						     &our_outs));
+
+		/* Log the difference and update our_msat */
+		send_coin_mvt(take(new_coin_journal_entry(NULL, NULL, txid,
+							  NULL, 0, blockheight,
+							  missing, true)));
+		if (!amount_msat_add(&our_msat, our_msat, missing))
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				      "unable to add %s to %s",
+				      type_to_string(tmpctx, struct amount_msat,
+						     &missing),
+				      type_to_string(tmpctx, struct amount_msat,
+						     &our_msat));
+	}
+
+	/* we need to figure out what we paid in fees, total.
+	 * this encompasses the actual chain fees + any trimmed outputs */
+	if (!amount_msat_sub_sat(&trimmed, our_msat, our_outs))
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "unable to subtract %s from %s",
+			      type_to_string(tmpctx, struct amount_sat,
+					     &our_outs),
+			      type_to_string(tmpctx, struct amount_msat,
+					     &our_msat));
+
+	status_debug("logging 'chain fees' for unilateral (trimmed) %s",
+		     type_to_string(tmpctx, struct amount_msat, &trimmed));
+	update_ledger_chain_fees_msat(txid, blockheight, trimmed);
+}
+
+static void record_coin_loss(const struct bitcoin_txid *txid,
+			     u32 blockheight,
+			     struct tracked_output *out)
+{
+	struct chain_coin_mvt *mvt;
+	/* We don't for sure know that it's a 'penalty'
+	 * but we write it as that anyway... */
+	mvt = new_coin_penalty_sat(NULL, NULL, txid, &out->txid,
+				   out->outnum, blockheight, out->sat);
+
+	send_coin_mvt(take(mvt));
+}
+
+static void record_channel_withdrawal_minus_fees(const struct bitcoin_txid *tx_txid,
+				      		 struct tracked_output *out,
+						 u32 blockheight,
+						 struct amount_sat fees)
+{
+	struct amount_sat emitted_amt;
+
+	if (!amount_sat_sub(&emitted_amt, out->sat, fees))
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "unable to subtract %s from %s",
+			      type_to_string(tmpctx, struct amount_sat,
+					     &fees),
+			      type_to_string(tmpctx, struct amount_sat,
+					     &out->sat));
+
+	send_coin_mvt(take(new_coin_withdrawal_sat(
+					NULL, NULL, tx_txid, &out->txid,
+					out->outnum, blockheight, emitted_amt)));
+}
+
+
+static void record_channel_withdrawal(const struct bitcoin_txid *tx_txid,
+				      u32 blockheight,
+				      struct tracked_output *out)
+{
+	record_channel_withdrawal_minus_fees(tx_txid, out, blockheight, AMOUNT_SAT(0));
+}
+
+static bool is_our_htlc_tx(struct tracked_output *out)
+{
+	return out->resolved &&
+		(out->resolved->tx_type == OUR_HTLC_TIMEOUT_TX
+		 || out->resolved->tx_type == OUR_HTLC_SUCCESS_TX);
+}
+
+static bool is_channel_deposit(struct tracked_output *out)
+{
+	return out->resolved &&
+		(out->resolved->tx_type == THEIR_HTLC_FULFILL_TO_US
+		 || out->resolved->tx_type == OUR_HTLC_SUCCESS_TX);
+}
+
+static void record_coin_movements(struct tracked_output *out,
+				  u32 blockheight,
+				  const struct bitcoin_tx *tx,
+				  const struct bitcoin_txid *txid)
+{
+	struct amount_sat fees;
+	/* there is a case where we've fulfilled an htlc onchain,
+	 * in which case we log a deposit to the channel */
+	if (is_channel_deposit(out))
+		record_htlc_fulfilled(txid, out, blockheight, true);
+
+
+	/* record fees paid for the tx here */
+	/* FIXME: for now, every resolution generates its own tx,
+	 * this will need to be updated if we switch to batching */
+	fees = record_chain_fees_tx(txid, tx, blockheight);
+
+	/* we don't record a channel withdrawal until we get to
+	 * the 'exit' utxo, which for local commitment htlc txs
+	 * is the child htlc_tx's output */
+	if (!is_our_htlc_tx(out))
+		record_channel_withdrawal_minus_fees(txid, out, blockheight, fees);
+}
 
 /* We vary feerate until signature they offered matches. */
 static bool grind_htlc_tx_fee(struct amount_sat *fee,
@@ -513,6 +782,8 @@ static enum wallet_tx_type onchain_txtype_to_wallet_txtype(enum tx_type t)
 		return TX_CHANNEL_SWEEP;
 	case OUR_PENALTY_TX:
 		return TX_CHANNEL_PENALTY;
+	case THEIR_DELAYED_CHEAT:
+		return TX_CHANNEL_CHEAT | TX_THEIRS;
 	case THEIR_UNILATERAL:
 	case UNKNOWN_UNILATERAL:
 	case THEIR_REVOKED_UNILATERAL:
@@ -528,7 +799,7 @@ static enum wallet_tx_type onchain_txtype_to_wallet_txtype(enum tx_type t)
 	abort();
 }
 
-static void proposal_meets_depth(struct tracked_output *out)
+static void proposal_meets_depth(struct tracked_output *out, bool is_replay)
 {
 	/* If we simply wanted to ignore it after some depth */
 	if (!out->proposal->tx) {
@@ -545,12 +816,24 @@ static void proposal_meets_depth(struct tracked_output *out)
 	wire_sync_write(
 	    REQ_FD,
 	    take(towire_onchain_broadcast_tx(
-		NULL, out->proposal->tx,
-		onchain_txtype_to_wallet_txtype(out->proposal->tx_type))));
+		 NULL, out->proposal->tx,
+		 onchain_txtype_to_wallet_txtype(out->proposal->tx_type))));
 
 	/* Don't wait for this if we're ignoring the tiny payment. */
-	if (out->proposal->tx_type == IGNORING_TINY_PAYMENT)
+	if (out->proposal->tx_type == IGNORING_TINY_PAYMENT) {
+		struct bitcoin_txid txid;
+		struct amount_sat fees;
+
 		ignore_output(out);
+
+		if (!is_replay) {
+			/* log the coin movements here, since we're not
+			 * going to wait til we hear about it */
+			bitcoin_txid(out->proposal->tx, &txid);
+			fees = record_chain_fees_tx(&txid, out->proposal->tx, 0);
+			record_channel_withdrawal_minus_fees(&txid, out, 0, fees);
+		}
+	}
 
 	/* Otherwise we will get a callback when it's in a block. */
 }
@@ -558,7 +841,8 @@ static void proposal_meets_depth(struct tracked_output *out)
 static void propose_resolution(struct tracked_output *out,
 			       const struct bitcoin_tx *tx,
 			       unsigned int depth_required,
-			       enum tx_type tx_type)
+			       enum tx_type tx_type,
+			       bool is_replay)
 {
 	status_debug("Propose handling %s/%s by %s (%s) after %u blocks",
 		     tx_type_name(out->tx_type),
@@ -573,13 +857,14 @@ static void propose_resolution(struct tracked_output *out,
 	out->proposal->tx_type = tx_type;
 
 	if (depth_required == 0)
-		proposal_meets_depth(out);
+		proposal_meets_depth(out, is_replay);
 }
 
 static void propose_resolution_at_block(struct tracked_output *out,
 					const struct bitcoin_tx *tx,
 					unsigned int block_required,
-					enum tx_type tx_type)
+					enum tx_type tx_type,
+					bool is_replay)
 {
 	u32 depth;
 
@@ -588,7 +873,7 @@ static void propose_resolution_at_block(struct tracked_output *out,
 		depth = 0;
 	else /* Note that out->tx_blockheight is already at depth 1 */
 		depth = block_required - out->tx_blockheight + 1;
-	propose_resolution(out, tx, depth, tx_type);
+	propose_resolution(out, tx, depth, tx_type, is_replay);
 }
 
 static bool is_valid_sig(const u8 *e)
@@ -733,10 +1018,12 @@ static u64 unmask_commit_number(const struct bitcoin_tx *tx,
 
 static bool is_mutual_close(const struct bitcoin_tx *tx,
 			    const u8 *local_scriptpubkey,
-			    const u8 *remote_scriptpubkey)
+			    const u8 *remote_scriptpubkey,
+			    int *local_outnum)
 {
 	size_t i;
 	bool local_matched = false, remote_matched = false;
+	*local_outnum = -1;
 
 	for (i = 0; i < tx->wtx->num_outputs; i++) {
 		const u8 *script = bitcoin_tx_output_get_script(tmpctx, tx, i);
@@ -746,9 +1033,10 @@ static bool is_mutual_close(const struct bitcoin_tx *tx,
 			/* This is a fee output, ignore please */
 			continue;
 		} else if (scripteq(script, local_scriptpubkey)
-		    && !local_matched)
+		    && !local_matched) {
+			*local_outnum = i;
 			local_matched = true;
-		else if (scripteq(script, remote_scriptpubkey)
+		} else if (scripteq(script, remote_scriptpubkey)
 			 && !remote_matched)
 			remote_matched = true;
 		else
@@ -870,7 +1158,8 @@ static void handle_htlc_onchain_fulfill(struct tracked_output *out,
 	struct ripemd160 ripemd;
 
 	/* Our HTLC, they filled (must be an HTLC-success tx). */
-	if (out->tx_type == THEIR_UNILATERAL) {
+	if (out->tx_type == THEIR_UNILATERAL
+		|| out->tx_type == THEIR_REVOKED_UNILATERAL) {
 		/* BOLT #3:
 		 *
 		 * ## HTLC-Timeout and HTLC-Success Transactions
@@ -909,12 +1198,26 @@ static void handle_htlc_onchain_fulfill(struct tracked_output *out,
 			      tx_type_name(out->tx_type),
 			      output_type_name(out->output_type));
 
-	if (tal_count(witness_preimage) != sizeof(preimage))
+	if (tal_count(witness_preimage) != sizeof(preimage)) {
+		/* It's possible something terrible happened and we broadcast
+		 * an old commitment state, which they're now cleaning up.
+		 *
+		 * We stumble along.
+		 */
+		if (out->tx_type == OUR_UNILATERAL
+				&& tal_count(witness_preimage) == PUBKEY_CMPR_LEN) {
+			status_unusual("Our cheat attempt failed, they're "
+				       "taking our htlc out (%s)",
+				       type_to_string(tmpctx, struct amount_sat,
+						      &out->sat));
+			return;
+		}
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "%s/%s spent with bad witness length %zu",
 			      tx_type_name(out->tx_type),
 			      output_type_name(out->output_type),
 			      tal_count(witness_preimage));
+	}
 	memcpy(&preimage, witness_preimage, sizeof(preimage));
 	sha256(&sha, &preimage, sizeof(preimage));
 	ripemd160(&ripemd, &sha, sizeof(sha));
@@ -927,6 +1230,10 @@ static void handle_htlc_onchain_fulfill(struct tracked_output *out,
 			      type_to_string(tmpctx, struct preimage, &preimage),
 			      type_to_string(tmpctx, struct ripemd160,
 					     &out->htlc.ripemd));
+
+	/* we stash the payment_hash into the tracking_output so we
+	 * can pass it along, if needbe, to the coin movement tracker */
+	out->payment_hash = sha;
 
 	/* Tell master we found a preimage. */
 	status_debug("%s/%s gave us preimage %s",
@@ -943,7 +1250,8 @@ static void resolve_htlc_tx(const struct chainparams *chainparams,
 			    size_t out_index,
 			    const struct bitcoin_tx *htlc_tx,
 			    const struct bitcoin_txid *htlc_txid,
-			    u32 tx_blockheight)
+			    u32 tx_blockheight,
+			    bool is_replay)
 {
 	struct tracked_output *out;
 	struct bitcoin_tx *tx;
@@ -987,7 +1295,8 @@ static void resolve_htlc_tx(const struct chainparams *chainparams,
 	tx = tx_to_us(*outs, delayed_payment_to_us, out, to_self_delay[LOCAL],
 		      0, NULL, 0, wscript, &tx_type, htlc_feerate);
 
-	propose_resolution(out, tx, to_self_delay[LOCAL], tx_type);
+	propose_resolution(out, tx, to_self_delay[LOCAL], tx_type,
+			   is_replay);
 }
 
 /* BOLT #5:
@@ -997,19 +1306,70 @@ static void resolve_htlc_tx(const struct chainparams *chainparams,
  *   - MUST *resolve* the _remote node's HTLC-success transaction_ by spending it
  *     using the revocation private key.
  */
-static void steal_htlc_tx(struct tracked_output *out)
+static void steal_htlc_tx(const struct chainparams *chainparams,
+			  struct tracked_output *out,
+			  struct tracked_output ***outs,
+			  const struct bitcoin_tx *htlc_tx,
+			  struct bitcoin_txid *htlc_txid,
+			  u32 htlc_tx_blockheight,
+			  enum tx_type htlc_tx_type,
+			  bool is_replay)
 {
 	struct bitcoin_tx *tx;
 	enum tx_type tx_type = OUR_PENALTY_TX;
+	struct tracked_output *htlc_out;
+	struct amount_asset asset;
+	struct amount_sat htlc_out_amt, fees;
 
+	u8 *wscript = bitcoin_wscript_htlc_tx(htlc_tx, to_self_delay[LOCAL],
+					      &keyset->self_revocation_key,
+					      &keyset->self_delayed_payment_key);
+
+	asset = bitcoin_tx_output_get_amount(htlc_tx, 0);
+	assert(amount_asset_is_main(&asset));
+	htlc_out_amt = amount_asset_to_sat(&asset);
+
+	htlc_out = new_tracked_output(chainparams, outs,
+				      htlc_txid, htlc_tx_blockheight,
+				      htlc_tx_type,
+				      /* htlc tx's only have 1 output */
+				      0, htlc_out_amt,
+				      DELAYED_CHEAT_OUTPUT_TO_THEM,
+				      &out->htlc, wscript, NULL);
 	/* BOLT #3:
 	 *
 	 * To spend this via penalty, the remote node uses a witness stack
 	 * `<revocationsig> 1`
 	 */
-	tx = tx_to_us(out, penalty_to_us, out, 0xFFFFFFFF, 0, &ONE,
-		      sizeof(ONE), out->wscript, &tx_type, penalty_feerate);
-	propose_resolution(out, tx, 0, tx_type);
+	tx = tx_to_us(htlc_out, penalty_to_us, htlc_out,
+		      0xFFFFFFFF, 0,
+		      &ONE, sizeof(ONE),
+		      htlc_out->wscript,
+		      &tx_type, penalty_feerate);
+
+	/* mark commitment tx htlc output as 'resolved by them' */
+	resolved_by_other(out, htlc_txid, htlc_tx_type);
+
+	/* for penalties, we record *any* chain fees
+	 * paid as coming from our channel balance, so
+	 * that our balance ends up at zero */
+	if (!amount_sat_sub(&fees, out->sat, htlc_out->sat))
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "unable to subtract %s from %s",
+			      type_to_string(tmpctx, struct amount_sat,
+					     &htlc_out->sat),
+			      type_to_string(tmpctx, struct amount_sat,
+					     &out->sat));
+
+	status_debug("recording chain fees for peer's htlc tx, that we're about to steal"
+		     " the output of. fees: %s",
+		     type_to_string(tmpctx, struct amount_sat, &fees));
+
+	if (!is_replay)
+		update_ledger_chain_fees(htlc_txid, htlc_tx_blockheight, fees);
+
+	/* annnd done! */
+	propose_resolution(htlc_out, tx, 0, tx_type, is_replay);
 }
 
 static void onchain_annotate_txout(const struct bitcoin_txid *txid, u32 outnum,
@@ -1031,7 +1391,8 @@ static void output_spent(const struct chainparams *chainparams,
 			 struct tracked_output ***outs,
 			 const struct bitcoin_tx *tx,
 			 u32 input_num,
-			 u32 tx_blockheight)
+			 u32 tx_blockheight,
+			 bool is_replay)
 {
 	struct bitcoin_txid txid, tmptxid, spendertxid;
 
@@ -1056,7 +1417,11 @@ static void output_spent(const struct chainparams *chainparams,
 			if (out->resolved->tx_type == OUR_HTLC_SUCCESS_TX
 			    || out->resolved->tx_type == OUR_HTLC_TIMEOUT_TX)
 				resolve_htlc_tx(chainparams, outs, i, tx, &txid,
-						tx_blockheight);
+						tx_blockheight, is_replay);
+
+			if (!is_replay)
+				record_coin_movements(out, tx_blockheight,
+						      out->proposal->tx, &txid);
 			return;
 		}
 
@@ -1064,11 +1429,16 @@ static void output_spent(const struct chainparams *chainparams,
 		case OUTPUT_TO_US:
 		case DELAYED_OUTPUT_TO_US:
 			unknown_spend(out, tx);
+			if (!is_replay)
+				record_coin_loss(&txid, tx_blockheight, out);
 			break;
 
 		case THEIR_HTLC:
 			if (out->tx_type == THEIR_REVOKED_UNILATERAL) {
-				steal_htlc_tx(out);
+				/* we've actually got a 'new' output here */
+				steal_htlc_tx(chainparams, out, outs, tx, &txid,
+					      tx_blockheight, THEIR_HTLC_TIMEOUT_TO_THEM,
+					      is_replay);
 			} else {
 				/* We ignore this timeout tx, since we should
 				 * resolve by ignoring once we reach depth. */
@@ -1094,9 +1464,11 @@ static void output_spent(const struct chainparams *chainparams,
 			 *       HTLC-success transaction input witness.
 			 */
 			handle_htlc_onchain_fulfill(out, tx);
-			if (out->tx_type == THEIR_REVOKED_UNILATERAL)
-				steal_htlc_tx(out);
-			else {
+			if (out->tx_type == THEIR_REVOKED_UNILATERAL) {
+				steal_htlc_tx(chainparams, out, outs, tx, &txid,
+					      tx_blockheight, OUR_HTLC_FULFILL_TO_THEM,
+					      is_replay);
+			} else {
 				/* BOLT #5:
 				 *
 				 * ## HTLC Output Handling: Local Commitment,
@@ -1107,6 +1479,11 @@ static void output_spent(const struct chainparams *chainparams,
 				 *    output is considered *irrevocably resolved*
 				 */
 				ignore_output(out);
+
+				if (!is_replay)
+					record_htlc_fulfilled(&txid, out,
+							      tx_blockheight,
+							      false);
 				onchain_annotate_txout(
 				    &spendertxid, out->outnum,
 				    TX_CHANNEL_HTLC_SUCCESS | TX_THEIRS);
@@ -1119,6 +1496,13 @@ static void output_spent(const struct chainparams *chainparams,
 			status_failed(STATUS_FAIL_INTERNAL_ERROR,
 				      "Funding output spent again!");
 
+		case DELAYED_CHEAT_OUTPUT_TO_THEM:
+			/* They successfully spent a delayed revoked output */
+			resolved_by_other(out, &txid, THEIR_DELAYED_CHEAT);
+			if (!is_replay)
+				record_their_successful_cheat(&txid,
+							      tx_blockheight, out);
+			break;
 		/* Um, we don't track these! */
 		case OUTPUT_TO_THEM:
 		case DELAYED_OUTPUT_TO_THEM:
@@ -1178,7 +1562,8 @@ static void update_resolution_depth(struct tracked_output *out, u32 depth)
 }
 
 static void tx_new_depth(struct tracked_output **outs,
-			 const struct bitcoin_txid *txid, u32 depth)
+			 const struct bitcoin_txid *txid, u32 depth,
+			 bool is_replay)
 {
 	size_t i;
 
@@ -1212,7 +1597,7 @@ static void tx_new_depth(struct tracked_output **outs,
 		if (outs[i]->proposal
 		    && bitcoin_txid_eq(&outs[i]->txid, txid)
 		    && depth >= outs[i]->proposal->depth_required) {
-			proposal_meets_depth(outs[i]);
+			proposal_meets_depth(outs[i], is_replay);
 		}
 	}
 }
@@ -1244,7 +1629,8 @@ static void tx_new_depth(struct tracked_output **outs,
 /* Master makes sure we only get told preimages once other node is committed. */
 static void handle_preimage(const struct chainparams *chainparams,
 			    struct tracked_output **outs,
-			    const struct preimage *preimage)
+			    const struct preimage *preimage,
+			    bool is_replay)
 {
 	size_t i;
 	struct sha256 sha;
@@ -1271,6 +1657,9 @@ static void handle_preimage(const struct chainparams *chainparams,
 				     tx_type_name(outs[i]->resolved->tx_type));
 			return;
 		}
+
+		/* stash the payment_hash so we can track this coin movement */
+		outs[i]->payment_hash = sha;
 
 		/* Discard any previous resolution.  Could be a timeout,
 		 * could be due to multiple identical rhashes in tx. */
@@ -1312,7 +1701,8 @@ static void handle_preimage(const struct chainparams *chainparams,
 			    tx, &sig, outs[i]->remote_htlc_sig, preimage,
 			    outs[i]->wscript);
 			bitcoin_tx_input_set_witness(tx, 0, take(witness));
-			propose_resolution(outs[i], tx, 0, OUR_HTLC_SUCCESS_TX);
+			propose_resolution(outs[i], tx, 0, OUR_HTLC_SUCCESS_TX,
+					   is_replay);
 		} else {
 			enum tx_type tx_type = THEIR_HTLC_FULFILL_TO_US;
 
@@ -1333,7 +1723,14 @@ static void handle_preimage(const struct chainparams *chainparams,
 				      0, preimage, sizeof(*preimage),
 				      outs[i]->wscript, &tx_type,
 				      htlc_feerate);
-			propose_resolution(outs[i], tx, 0, tx_type);
+			propose_resolution(outs[i], tx, 0, tx_type,
+					   is_replay);
+			if (!is_replay && tx_type == IGNORING_TINY_PAYMENT) {
+				struct bitcoin_txid txid;
+				bitcoin_txid(tx, &txid);
+				record_htlc_fulfilled(&txid, outs[i], 0, true);
+			}
+
 		}
 	}
 }
@@ -1407,18 +1804,19 @@ static void wait_for_resolved(const struct chainparams *chainparams,
 		struct bitcoin_tx *tx;
 		u32 input_num, depth, tx_blockheight;
 		struct preimage preimage;
+		bool is_replay;
 
 		status_debug("Got new message %s",
 			     onchain_wire_type_name(fromwire_peektype(msg)));
 
-		if (fromwire_onchain_depth(msg, &txid, &depth))
-			tx_new_depth(outs, &txid, depth);
+		if (fromwire_onchain_depth(msg, &txid, &depth, &is_replay))
+			tx_new_depth(outs, &txid, depth, is_replay);
 		else if (fromwire_onchain_spent(msg, msg, &tx, &input_num,
-						&tx_blockheight)) {
+						&tx_blockheight, &is_replay)) {
 			tx->chainparams = chainparams;
-			output_spent(chainparams, &outs, tx, input_num, tx_blockheight);
-		} else if (fromwire_onchain_known_preimage(msg, &preimage))
-			handle_preimage(chainparams, outs, &preimage);
+			output_spent(chainparams, &outs, tx, input_num, tx_blockheight, is_replay);
+		} else if (fromwire_onchain_known_preimage(msg, &preimage, &is_replay))
+			handle_preimage(chainparams, outs, &preimage, is_replay);
 		else if (!handle_dev_memleak(outs, msg))
 			master_badmsg(-1, msg);
 
@@ -1440,8 +1838,13 @@ static void init_reply(const char *what)
 
 static void handle_mutual_close(const struct chainparams *chainparams,
 				const struct bitcoin_txid *txid,
-				struct tracked_output **outs)
+				struct tracked_output **outs,
+				const struct bitcoin_tx *tx,
+				u32 tx_blockheight,
+				int our_outnum,
+				bool is_replay)
 {
+	struct amount_sat our_out;
 	init_reply("Tracking mutual close transaction");
 
 	/* Annotate the first input as close. We can currently only have a
@@ -1456,6 +1859,20 @@ static void handle_mutual_close(const struct chainparams *chainparams,
 	 * already agreed to the output, which is sent to its specified `scriptpubkey`
 	 */
 	resolved_by_other(outs[0], txid, MUTUAL_CLOSE);
+
+	if (!is_replay) {
+		/* It's possible there's no to_us output */
+		if (our_outnum > -1) {
+			struct amount_asset asset;
+			asset = bitcoin_tx_output_get_amount(tx, our_outnum);
+			assert(amount_asset_is_main(&asset));
+			our_out = amount_asset_to_sat(&asset);
+		} else
+			our_out = AMOUNT_SAT(0);
+
+		record_mutual_closure(txid, tx_blockheight,
+				      our_out, our_outnum);
+	}
 
 	wait_for_resolved(chainparams, outs);
 }
@@ -1491,7 +1908,8 @@ static size_t resolve_our_htlc_ourcommit(const struct chainparams *chainparams,
 					 struct tracked_output *out,
 					 const size_t *matches,
 					 const struct htlc_stub *htlcs,
-					 u8 **htlc_scripts)
+					 u8 **htlc_scripts,
+					 bool is_replay)
 {
 	struct bitcoin_tx *tx = NULL;
 	struct bitcoin_signature localsig;
@@ -1570,7 +1988,7 @@ static size_t resolve_our_htlc_ourcommit(const struct chainparams *chainparams,
 
 	/* Steals tx onto out */
 	propose_resolution_at_block(out, tx, htlcs[matches[i]].cltv_expiry,
-				    OUR_HTLC_TIMEOUT_TX);
+				    OUR_HTLC_TIMEOUT_TX, is_replay);
 
 	return matches[i];
 }
@@ -1592,7 +2010,8 @@ static u32 matches_cltv(const size_t *matches,
 static size_t resolve_our_htlc_theircommit(struct tracked_output *out,
 					   const size_t *matches,
 					   const struct htlc_stub *htlcs,
-					   u8 **htlc_scripts)
+					   u8 **htlc_scripts,
+					   bool is_replay)
 {
 	struct bitcoin_tx *tx;
 	enum tx_type tx_type = OUR_HTLC_TIMEOUT_TO_US;
@@ -1611,7 +2030,7 @@ static size_t resolve_our_htlc_theircommit(struct tracked_output *out,
 	tx = tx_to_us(out, remote_htlc_to_us, out, 0, cltv_expiry, NULL, 0,
 		      htlc_scripts[matches[0]], &tx_type, htlc_feerate);
 
-	propose_resolution_at_block(out, tx, cltv_expiry, tx_type);
+	propose_resolution_at_block(out, tx, cltv_expiry, tx_type, is_replay);
 
 	/* They're all equivalent: might as well use first one. */
 	return matches[0];
@@ -1621,7 +2040,8 @@ static size_t resolve_our_htlc_theircommit(struct tracked_output *out,
 static size_t resolve_their_htlc(struct tracked_output *out,
 				 const size_t *matches,
 				 const struct htlc_stub *htlcs,
-				 u8 **htlc_scripts)
+				 u8 **htlc_scripts,
+				 bool is_replay)
 {
 	size_t which_htlc;
 
@@ -1658,7 +2078,7 @@ static size_t resolve_their_htlc(struct tracked_output *out,
 
 	/* If we hit timeout depth, resolve by ignoring. */
 	propose_resolution_at_block(out, NULL, htlcs[which_htlc].cltv_expiry,
-				    THEIR_HTLC_TIMEOUT_TO_THEM);
+				    THEIR_HTLC_TIMEOUT_TO_THEM, is_replay);
 	return which_htlc;
 }
 
@@ -1733,13 +2153,15 @@ static void handle_our_unilateral(const struct bitcoin_tx *tx,
 				  const bool *tell_if_missing,
 				  const bool *tell_immediately,
 				  const secp256k1_ecdsa_signature *remote_htlc_sigs,
-				  struct tracked_output **outs)
+				  struct tracked_output **outs,
+				  bool is_replay)
 {
 	u8 **htlc_scripts;
 	u8 *local_wscript, *script[NUM_SIDES];
 	struct pubkey local_per_commitment_point;
 	struct keyset *ks;
 	size_t i;
+	struct amount_sat their_outs = AMOUNT_SAT(0), our_outs = AMOUNT_SAT(0);
 
 	init_reply("Tracking our own unilateral close");
 	onchain_annotate_txin(txid, 0, TX_CHANNEL_UNILATERAL);
@@ -1879,9 +2301,10 @@ static void handle_our_unilateral(const struct bitcoin_tx *tx,
 			 * output is *resolved* by the spending transaction
 			 */
 			propose_resolution(out, to_us, to_self_delay[LOCAL],
-					   tx_type);
+					   tx_type, is_replay);
 
 			script[LOCAL] = NULL;
+			add_amt(&our_outs, amt);
 			continue;
 		}
 		if (script[REMOTE]
@@ -1901,6 +2324,7 @@ static void handle_our_unilateral(const struct bitcoin_tx *tx,
 						 NULL, NULL, NULL);
 			ignore_output(out);
 			script[REMOTE] = NULL;
+			add_amt(&their_outs, amt);
 			continue;
 		}
 
@@ -1932,7 +2356,9 @@ static void handle_our_unilateral(const struct bitcoin_tx *tx,
 			which_htlc = resolve_our_htlc_ourcommit(tx->chainparams,
 								out, matches,
 								htlcs,
-								htlc_scripts);
+								htlc_scripts,
+								is_replay);
+			add_amt(&our_outs, amt);
 		} else {
 			out = new_tracked_output(tx->chainparams,
 						 &outs, txid,
@@ -1950,7 +2376,9 @@ static void handle_our_unilateral(const struct bitcoin_tx *tx,
 			 */
 			/* Tells us which htlc to use */
 			which_htlc = resolve_their_htlc(out, matches, htlcs,
-							htlc_scripts);
+							htlc_scripts,
+							is_replay);
+			add_amt(&their_outs, amt);
 		}
 		out->htlc = htlcs[which_htlc];
 		out->wscript = tal_steal(out, htlc_scripts[which_htlc]);
@@ -1964,13 +2392,18 @@ static void handle_our_unilateral(const struct bitcoin_tx *tx,
 
 	note_missing_htlcs(htlc_scripts, htlcs,
 			   tell_if_missing, tell_immediately);
+	if (!is_replay)
+		record_chain_fees_unilateral(txid, tx_blockheight,
+					     outs[0]->sat,
+					     their_outs, our_outs);
+
 	wait_for_resolved(tx->chainparams, outs);
 }
 
 /* We produce individual penalty txs.  It's less efficient, but avoids them
  * using HTLC txs to block our penalties for long enough to pass the CSV
  * delay */
-static void steal_to_them_output(struct tracked_output *out)
+static void steal_to_them_output(struct tracked_output *out, bool is_replay)
 {
 	u8 *wscript;
 	struct bitcoin_tx *tx;
@@ -1990,10 +2423,10 @@ static void steal_to_them_output(struct tracked_output *out)
 	tx = tx_to_us(tmpctx, penalty_to_us, out, 0xFFFFFFFF, 0, &ONE,
 		      sizeof(ONE), wscript, &tx_type, penalty_feerate);
 
-	propose_resolution(out, tx, 0, tx_type);
+	propose_resolution(out, tx, 0, tx_type, is_replay);
 }
 
-static void steal_htlc(struct tracked_output *out)
+static void steal_htlc(struct tracked_output *out, bool is_replay)
 {
 	struct bitcoin_tx *tx;
 	enum tx_type tx_type = OUR_PENALTY_TX;
@@ -2010,7 +2443,7 @@ static void steal_htlc(struct tracked_output *out)
 	tx = tx_to_us(out, penalty_to_us, out, 0xFFFFFFFF, 0, der, sizeof(der),
 		      out->wscript, &tx_type, penalty_feerate);
 
-	propose_resolution(out, tx, 0, tx_type);
+	propose_resolution(out, tx, 0, tx_type, is_replay);
 }
 
 /* Tell wallet that we have discovered a UTXO from a to-remote output,
@@ -2042,6 +2475,37 @@ static void tell_wallet_to_remote(const struct bitcoin_tx *tx,
 						     scriptpubkey)));
 }
 
+/* When a 'cheat' transaction comes through, our accounting is
+ * going to be off, as it's publishing/finalizing old state.
+ * To compensate for this, we count *all* of the channel funds
+ * as ours; any subsequent handling of utxos on this tx
+ * will correctly mark the funds as a 'channel withdrawal'
+ */
+static void update_ledger_cheat(const struct bitcoin_txid *txid,
+				u32 blockheight,
+				struct tracked_output *out)
+{
+	/* how much of a difference should we update the
+	 * channel account ledger by? */
+	struct amount_msat amt;
+
+	if (amount_msat_eq_sat(our_msat, out->sat))
+		return;
+
+	if (!amount_sat_sub_msat(&amt, out->sat, our_msat))
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "unable to subtract our balance %s from channel total %s",
+			      type_to_string(tmpctx, struct amount_msat,
+					     &our_msat),
+			      type_to_string(tmpctx, struct amount_sat,
+					     &out->sat));
+
+	/* add the difference to our ledger balance */
+	send_coin_mvt(take(new_coin_journal_entry(NULL, NULL, txid,
+						  &out->txid, out->outnum,
+						  blockheight, amt, true)));
+}
+
 /* BOLT #5:
  *
  * If any node tries to cheat by broadcasting an outdated commitment
@@ -2057,17 +2521,25 @@ static void handle_their_cheat(const struct bitcoin_tx *tx,
 			       const struct htlc_stub *htlcs,
 			       const bool *tell_if_missing,
 			       const bool *tell_immediately,
-			       struct tracked_output **outs)
+			       struct tracked_output **outs,
+			       bool is_replay)
 {
 	u8 **htlc_scripts;
 	u8 *remote_wscript, *script[NUM_SIDES];
 	struct keyset *ks;
 	struct pubkey *k;
 	size_t i;
+	/* We need to figure out what the 'chain fees'
+	 * for this unilateral tx are */
+	struct amount_sat total_outs = AMOUNT_SAT(0), fee_cost;
+	bool amt_ok;
 
 	init_reply("Tracking their illegal close: taking all funds");
 	onchain_annotate_txin(
 	    txid, 0, TX_CHANNEL_UNILATERAL | TX_CHANNEL_CHEAT | TX_THEIRS);
+
+	if (!is_replay)
+		update_ledger_cheat(txid, tx_blockheight, outs[0]);
 
 	/* BOLT #5:
 	 *
@@ -2189,7 +2661,7 @@ static void handle_their_cheat(const struct bitcoin_tx *tx,
 			 * fee output. */
 			out = new_tracked_output(tx->chainparams,
 						 &outs, txid, tx_blockheight,
-						 OUR_UNILATERAL, i,
+						 THEIR_REVOKED_UNILATERAL, i,
 						 amt,
 						 ELEMENTS_FEE,
 						 NULL, NULL, NULL);
@@ -2214,12 +2686,16 @@ static void handle_their_cheat(const struct bitcoin_tx *tx,
 						 OUTPUT_TO_US, NULL, NULL, NULL);
 			ignore_output(out);
 
+			if (!is_replay)
+				record_channel_withdrawal(txid, tx_blockheight, out);
+
 			tell_wallet_to_remote(tx, i, txid,
 					      tx_blockheight,
 					      script[LOCAL],
 					      remote_per_commitment_point,
 					      option_static_remotekey);
 			script[LOCAL] = NULL;
+			add_amt(&total_outs, amt);
 			continue;
 		}
 		if (script[REMOTE]
@@ -2233,10 +2709,11 @@ static void handle_their_cheat(const struct bitcoin_tx *tx,
 						 &outs, txid, tx_blockheight,
 						 THEIR_REVOKED_UNILATERAL, i,
 						 amt,
-						 DELAYED_OUTPUT_TO_THEM,
+						 DELAYED_CHEAT_OUTPUT_TO_THEM,
 						 NULL, NULL, NULL);
-			steal_to_them_output(out);
+			steal_to_them_output(out, is_replay);
 			script[REMOTE] = NULL;
+			add_amt(&total_outs, amt);
 			continue;
 		}
 
@@ -2266,7 +2743,8 @@ static void handle_their_cheat(const struct bitcoin_tx *tx,
 						 &htlcs[which_htlc],
 						 htlc_scripts[which_htlc],
 						 NULL);
-			steal_htlc(out);
+			steal_htlc(out, is_replay);
+			add_amt(&total_outs, amt);
 		} else {
 			out = new_tracked_output(tx->chainparams,
 						 &outs, txid,
@@ -2284,13 +2762,24 @@ static void handle_their_cheat(const struct bitcoin_tx *tx,
 			 *     * spend the *commitment tx* using the payment preimage (if known).
 			 *     * spend the *HTLC-timeout tx*, if the remote node has published it.
 			 */
-			steal_htlc(out);
+			steal_htlc(out, is_replay);
+			add_amt(&total_outs, amt);
 		}
 		htlc_scripts[which_htlc] = NULL;
 	}
 
 	note_missing_htlcs(htlc_scripts, htlcs,
 			   tell_if_missing, tell_immediately);
+
+	/* Record the fee cost for this tx, deducting it from channel balance */
+	amt_ok = amount_sat_sub(&fee_cost, outs[0]->sat, total_outs);
+	assert(amt_ok);
+	status_debug("recording chain fees for their cheat %s",
+		     type_to_string(tmpctx, struct amount_sat, &fee_cost));
+
+	if (!is_replay)
+		update_ledger_chain_fees(txid, tx_blockheight, fee_cost);
+
 	wait_for_resolved(tx->chainparams, outs);
 }
 
@@ -2302,12 +2791,14 @@ static void handle_their_unilateral(const struct bitcoin_tx *tx,
 				    const struct htlc_stub *htlcs,
 				    const bool *tell_if_missing,
 				    const bool *tell_immediately,
-				    struct tracked_output **outs)
+				    struct tracked_output **outs,
+				    bool is_replay)
 {
 	u8 **htlc_scripts;
 	u8 *remote_wscript, *script[NUM_SIDES];
 	struct keyset *ks;
 	size_t i;
+	struct amount_sat their_outs = AMOUNT_SAT(0), our_outs = AMOUNT_SAT(0);
 
 	init_reply("Tracking their unilateral close");
 	onchain_annotate_txin(txid, 0, TX_CHANNEL_UNILATERAL | TX_THEIRS);
@@ -2426,7 +2917,7 @@ static void handle_their_unilateral(const struct bitcoin_tx *tx,
 			 * fee output. */
 			out = new_tracked_output(tx->chainparams,
 						 &outs, txid, tx_blockheight,
-						 OUR_UNILATERAL, i,
+						 THEIR_UNILATERAL, i,
 						 amt,
 						 ELEMENTS_FEE,
 						 NULL, NULL, NULL);
@@ -2448,12 +2939,16 @@ static void handle_their_unilateral(const struct bitcoin_tx *tx,
 						 OUTPUT_TO_US, NULL, NULL, NULL);
 			ignore_output(out);
 
+			if (!is_replay)
+				record_channel_withdrawal(txid, tx_blockheight, out);
+
 			tell_wallet_to_remote(tx, i, txid,
 					      tx_blockheight,
 					      script[LOCAL],
 					      remote_per_commitment_point,
 					      option_static_remotekey);
 			script[LOCAL] = NULL;
+			add_amt(&our_outs, amt);
 			continue;
 		}
 		if (script[REMOTE]
@@ -2473,6 +2968,7 @@ static void handle_their_unilateral(const struct bitcoin_tx *tx,
 						 DELAYED_OUTPUT_TO_THEM,
 						 NULL, NULL, NULL);
 			ignore_output(out);
+			add_amt(&their_outs, amt);
 			continue;
 		}
 
@@ -2500,7 +2996,9 @@ static void handle_their_unilateral(const struct bitcoin_tx *tx,
 			which_htlc = resolve_our_htlc_theircommit(out,
 								  matches,
 								  htlcs,
-								  htlc_scripts);
+								  htlc_scripts,
+								  is_replay);
+			add_amt(&our_outs, amt);
 		} else {
 			out = new_tracked_output(tx->chainparams,
 						 &outs, txid,
@@ -2517,7 +3015,8 @@ static void handle_their_unilateral(const struct bitcoin_tx *tx,
 			 *   Commitment, Remote Offers]
 			 */
 			which_htlc = resolve_their_htlc(out, matches, htlcs,
-							htlc_scripts);
+							htlc_scripts, is_replay);
+			add_amt(&their_outs, amt);
 		}
 		out->htlc = htlcs[which_htlc];
 		out->wscript = tal_steal(out, htlc_scripts[which_htlc]);
@@ -2526,7 +3025,49 @@ static void handle_their_unilateral(const struct bitcoin_tx *tx,
 
 	note_missing_htlcs(htlc_scripts, htlcs,
 			   tell_if_missing, tell_immediately);
+
+	if (!is_replay)
+		record_chain_fees_unilateral(txid, tx_blockheight,
+					     outs[0]->sat,
+					     their_outs, our_outs);
+
 	wait_for_resolved(tx->chainparams, outs);
+}
+
+static void update_ledger_unknown(const struct bitcoin_txid *txid,
+				  u32 blockheight,
+				  struct amount_sat amt_salvaged)
+{
+	/* ideally, we'd be able to capture the loss to fees (if we funded
+	 * the channel) here separately, but given that we don't know the htlc
+	 * set (and thus which outputs are trimmed), this is difficult.
+	 *
+	 * instead, we count the difference between any recoverable output
+	 * and our current channel balance as a loss (or gain) */
+	bool is_credit;
+	struct amount_msat diff;
+
+	/* we do nothing if the amount withdrawn via 'salvage' is
+	 * the same as our channel balance */
+	if (amount_msat_eq_sat(our_msat, amt_salvaged))
+		return;
+
+	/* if we've withdrawn *less* in salvage than we have on the books
+	 * as being ours, we record the difference as a debit */
+	if (!amount_msat_sub_sat(&diff, our_msat, amt_salvaged)) {
+		is_credit = false;
+		if (!amount_sat_sub_msat(&diff, amt_salvaged, our_msat))
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				      "overflow subtracting %s from %s",
+				      type_to_string(tmpctx, struct amount_msat,
+						     &our_msat),
+				      type_to_string(tmpctx, struct amount_sat,
+						     &amt_salvaged));
+	} else
+		is_credit = true;
+
+	send_coin_mvt(take(new_coin_journal_entry(NULL, NULL, txid, NULL, 0,
+						  blockheight, diff, is_credit)));
 }
 
 static void handle_unknown_commitment(const struct bitcoin_tx *tx,
@@ -2537,10 +3078,12 @@ static void handle_unknown_commitment(const struct bitcoin_tx *tx,
 				      const struct basepoints basepoints[NUM_SIDES],
 				      const struct htlc_stub *htlcs,
 				      const bool *tell_if_missing,
-				      struct tracked_output **outs)
+				      struct tracked_output **outs,
+				      bool is_replay)
 {
 	int to_us_output = -1;
 	u8 *local_script;
+	struct amount_sat amt_salvaged = AMOUNT_SAT(0);
 
 	onchain_annotate_txin(txid, 0, TX_CHANNEL_UNILATERAL | TX_THEIRS);
 
@@ -2549,8 +3092,9 @@ static void handle_unknown_commitment(const struct bitcoin_tx *tx,
 	/* If they don't give us a per-commitment point and we rotate keys,
 	 * we're out of luck. */
 	if (!possible_remote_per_commitment_point
-	    && !option_static_remotekey)
+	    && !option_static_remotekey) {
 		goto search_done;
+	}
 
 	if (!option_static_remotekey) {
 		struct keyset *ks = tal(tmpctx, struct keyset);
@@ -2605,6 +3149,11 @@ static void handle_unknown_commitment(const struct bitcoin_tx *tx,
 						 OUTPUT_TO_US, NULL, NULL, NULL);
 			ignore_output(out);
 
+			if (!is_replay)
+				record_channel_withdrawal(txid, tx_blockheight, out);
+
+			add_amt(&amt_salvaged, amt);
+
 			tell_wallet_to_remote(tx, i, txid,
 					      tx_blockheight,
 					      local_script,
@@ -2626,6 +3175,11 @@ search_done:
 			      commit_num);
 		init_reply("ERROR: Unknown commitment, recovering our funds!");
 	}
+
+	/* update our accounting notions for this channel.
+	 * should result in a channel balance of zero */
+	if (!is_replay)
+		update_ledger_unknown(txid, tx_blockheight, amt_salvaged);
 
 	/* Tell master to give up on HTLCs immediately. */
 	for (size_t i = 0; i < tal_count(htlcs); i++) {
@@ -2662,6 +3216,8 @@ int main(int argc, char *argv[])
 	bool *tell_if_missing, *tell_immediately;
 	u32 tx_blockheight;
 	struct pubkey *possible_remote_per_commitment_point;
+	int mutual_outnum;
+	bool open_is_replay;
 
 	subdaemon_setup(argc, argv);
 
@@ -2674,6 +3230,7 @@ int main(int argc, char *argv[])
 				   &shachain,
 				   &chainparams,
 				   &funding,
+				   &our_msat,
 				   &old_remote_per_commit_point,
 				   &remote_per_commit_point,
 				   &to_self_delay[LOCAL],
@@ -2697,7 +3254,8 @@ int main(int argc, char *argv[])
 				   &min_possible_feerate,
 				   &max_possible_feerate,
 				   &possible_remote_per_commitment_point,
-				   &option_static_remotekey)) {
+				   &option_static_remotekey,
+				   &open_is_replay)) {
 		master_badmsg(WIRE_ONCHAIN_INIT, msg);
 	}
 
@@ -2752,8 +3310,9 @@ int main(int argc, char *argv[])
 	 * without any pending payments) and publish it on the blockchain (see
 	 * [BOLT #2: Channel Close](02-peer-protocol.md#channel-close)).
 	 */
-	if (is_mutual_close(tx, scriptpubkey[LOCAL], scriptpubkey[REMOTE]))
-		handle_mutual_close(tx->chainparams, &txid, outs);
+	if (is_mutual_close(tx, scriptpubkey[LOCAL], scriptpubkey[REMOTE], &mutual_outnum))
+		handle_mutual_close(tx->chainparams, &txid, outs, tx,
+				    tx_blockheight, mutual_outnum, open_is_replay);
 	else {
 		/* BOLT #5:
 		 *
@@ -2777,7 +3336,8 @@ int main(int argc, char *argv[])
 					      htlcs,
 					      tell_if_missing, tell_immediately,
 					      remote_htlc_sigs,
-					      outs);
+					      outs,
+					      open_is_replay);
 		/* BOLT #5:
 		 *
 		 * 3. The ugly way (*revoked transaction close*): one of the
@@ -2793,7 +3353,8 @@ int main(int argc, char *argv[])
 					   basepoints,
 					   htlcs,
 					   tell_if_missing, tell_immediately,
-					   outs);
+					   outs,
+					   open_is_replay);
 		/* BOLT #5:
 		 *
 		 * There may be more than one valid, *unrevoked* commitment
@@ -2812,7 +3373,8 @@ int main(int argc, char *argv[])
 						htlcs,
 						tell_if_missing,
 						tell_immediately,
-						outs);
+						outs,
+						open_is_replay);
 		} else if (commit_num == revocations_received(&shachain) + 1) {
 			status_debug("Their unilateral tx, new commit point");
 			handle_their_unilateral(tx, tx_blockheight,
@@ -2822,7 +3384,8 @@ int main(int argc, char *argv[])
 						htlcs,
 						tell_if_missing,
 						tell_immediately,
-						outs);
+						outs,
+						open_is_replay);
 		} else {
 			handle_unknown_commitment(tx, tx_blockheight,
 						  commit_num,
@@ -2831,7 +3394,8 @@ int main(int argc, char *argv[])
 						  basepoints,
 						  htlcs,
 						  tell_if_missing,
-						  outs);
+						  outs,
+						  open_is_replay);
 		}
 	}
 

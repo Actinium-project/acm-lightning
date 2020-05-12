@@ -11,6 +11,7 @@
 #include <common/onionreply.h>
 #include <common/wireaddr.h>
 #include <inttypes.h>
+#include <lightningd/coin_mvts.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/notification.h>
 #include <lightningd/peer_control.h>
@@ -311,6 +312,46 @@ struct utxo **wallet_get_unconfirmed_closeinfo_utxos(const tal_t *ctx,
 	tal_free(stmt);
 
 	return results;
+}
+
+struct utxo *wallet_utxo_get(const tal_t *ctx, struct wallet *w,
+			     const struct bitcoin_txid *txid,
+			     u32 outnum)
+{
+	struct db_stmt *stmt;
+	struct utxo *utxo;
+
+	stmt = db_prepare_v2(w->db, SQL("SELECT"
+					"  prev_out_tx"
+					", prev_out_index"
+					", value"
+					", type"
+					", status"
+					", keyindex"
+					", channel_id"
+					", peer_id"
+					", commitment_point"
+					", confirmation_height"
+					", spend_height"
+					", scriptpubkey"
+					" FROM outputs"
+					" WHERE prev_out_tx = ?"
+					" AND prev_out_index = ?"));
+
+	db_bind_sha256d(stmt, 0, &txid->shad);
+	db_bind_int(stmt, 1, outnum);
+
+	db_query_prepared(stmt);
+
+	if (!db_step(stmt)) {
+		tal_free(stmt);
+		return NULL;
+	}
+
+	utxo = wallet_stmt2output(ctx, stmt);
+	tal_free(stmt);
+
+	return utxo;
 }
 
 /**
@@ -1620,6 +1661,7 @@ int wallet_extract_owned_outputs(struct wallet *w, const struct bitcoin_tx *tx,
 		bool is_p2sh;
 		const u8 *script;
 		struct amount_asset asset = bitcoin_tx_output_get_amount(tx, output);
+		struct chain_coin_mvt *mvt;
 
 		if (!amount_asset_is_main(&asset))
 			continue;
@@ -1651,6 +1693,14 @@ int wallet_extract_owned_outputs(struct wallet *w, const struct bitcoin_tx *tx,
 			  is_p2sh ? "P2SH" : "SEGWIT",
 			  type_to_string(tmpctx, struct bitcoin_txid,
 					 &utxo->txid), blockheight ? " CONFIRMED" : "");
+
+		/* We only record final ledger movements */
+		if (blockheight) {
+			mvt = new_coin_deposit_sat(utxo, "wallet", &utxo->txid, utxo->outnum,
+						   blockheight ? *blockheight : 0,
+						   utxo->amount);
+			notify_chain_mvt(w->ld, mvt);
+		}
 
 		if (!wallet_add_utxo(w, utxo, is_p2sh ? p2sh_wpkh : our_change)) {
 			/* In case we already know the output, make
@@ -1785,13 +1835,14 @@ void wallet_htlc_save_out(struct wallet *wallet,
 	tal_free(stmt);
 }
 
-/* input htlcs use failcode & failonion, output htlcs use failmsg & failonion */
+/* input htlcs use failcode & failonion & we_filled, output htlcs use failmsg & failonion */
 void wallet_htlc_update(struct wallet *wallet, const u64 htlc_dbid,
 			const enum htlc_state new_state,
 			const struct preimage *payment_key,
 			enum onion_type badonion,
 			const struct onionreply *failonion,
-			const u8 *failmsg)
+			const u8 *failmsg,
+			bool *we_filled)
 {
 	struct db_stmt *stmt;
 
@@ -1803,12 +1854,13 @@ void wallet_htlc_update(struct wallet *wallet, const u64 htlc_dbid,
 	assert(htlc_dbid);
 	stmt = db_prepare_v2(
 	    wallet->db, SQL("UPDATE channel_htlcs SET hstate=?, payment_key=?, "
-			    "malformed_onion=?, failuremsg=?, localfailmsg=?"
+			    "malformed_onion=?, failuremsg=?, localfailmsg=?, "
+			    "we_filled=?"
 			    " WHERE id=?"));
 
 	/* FIXME: htlc_state_in_db */
 	db_bind_int(stmt, 0, new_state);
-	db_bind_u64(stmt, 5, htlc_dbid);
+	db_bind_u64(stmt, 6, htlc_dbid);
 
 	if (payment_key)
 		db_bind_preimage(stmt, 1, payment_key);
@@ -1826,6 +1878,11 @@ void wallet_htlc_update(struct wallet *wallet, const u64 htlc_dbid,
 		db_bind_blob(stmt, 4, failmsg, tal_bytelen(failmsg));
 	else
 		db_bind_null(stmt, 4);
+
+	if (we_filled)
+		db_bind_int(stmt, 5, *we_filled);
+	else
+		db_bind_null(stmt, 5);
 
 	db_exec_prepared_v2(take(stmt));
 }
@@ -1896,6 +1953,12 @@ static bool wallet_stmt2htlc_in(struct channel *channel,
 						  towire_temporary_node_failure(tmpctx));
 	}
 #endif
+
+	if (!db_column_is_null(stmt, 13)) {
+		in->we_filled = tal(in, bool);
+		*in->we_filled = db_column_int(stmt, 13);
+	} else
+		in->we_filled = NULL;
 
 	return ok;
 }
@@ -2023,6 +2086,7 @@ bool wallet_htlcs_load_in_for_channel(struct wallet *wallet,
 					     ", origin_htlc"
 					     ", shared_secret"
 					     ", received_time"
+					     ", we_filled"
 					     " FROM channel_htlcs"
 					     " WHERE direction= ?"
 					     " AND channel_id= ?"
@@ -2882,7 +2946,8 @@ void wallet_blocks_rollback(struct wallet *w, u32 height)
 
 const struct short_channel_id *
 wallet_outpoint_spend(struct wallet *w, const tal_t *ctx, const u32 blockheight,
-		      const struct bitcoin_txid *txid, const u32 outnum)
+		      const struct bitcoin_txid *txid, const u32 outnum,
+		      bool *our_spend)
 {
 	struct short_channel_id *scid;
 	struct db_stmt *stmt;
@@ -2899,7 +2964,10 @@ wallet_outpoint_spend(struct wallet *w, const tal_t *ctx, const u32 blockheight,
 		db_bind_int(stmt, 2, outnum);
 
 		db_exec_prepared_v2(take(stmt));
-	}
+
+		*our_spend = true;
+	} else
+		*our_spend = false;
 
 	if (outpointfilter_matches(w->utxoset_outpoints, txid, outnum)) {
 		stmt = db_prepare_v2(w->db, SQL("UPDATE utxoset "

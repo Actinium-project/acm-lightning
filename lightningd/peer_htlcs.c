@@ -7,6 +7,7 @@
 #include <ccan/tal/str/str.h>
 #include <channeld/gen_channel_wire.h>
 #include <common/blinding.h>
+#include <common/coin_mvt.h>
 #include <common/ecdh.h>
 #include <common/json_command.h>
 #include <common/jsonrpc_errors.h>
@@ -20,6 +21,7 @@
 #include <gossipd/gen_gossip_wire.h>
 #include <hsmd/gen_hsm_wire.h>
 #include <lightningd/chaintopology.h>
+#include <lightningd/coin_mvts.h>
 #include <lightningd/htlc_end.h>
 #include <lightningd/htlc_set.h>
 #include <lightningd/json.h>
@@ -78,7 +80,8 @@ static bool htlc_in_update_state(struct channel *channel,
 
 	wallet_htlc_update(channel->peer->ld->wallet,
 			   hin->dbid, newstate, hin->preimage,
-			   hin->badonion, hin->failonion, NULL);
+			   hin->badonion, hin->failonion, NULL,
+			   hin->we_filled);
 
 	hin->hstate = newstate;
 	return true;
@@ -92,9 +95,10 @@ static bool htlc_out_update_state(struct channel *channel,
 			     "out"))
 		return false;
 
+	bool we_filled = false;
 	wallet_htlc_update(channel->peer->ld->wallet, hout->dbid, newstate,
 			   hout->preimage, 0, hout->failonion,
-			   hout->failmsg);
+			   hout->failmsg, &we_filled);
 
 	hout->hstate = newstate;
 	return true;
@@ -183,11 +187,12 @@ static void failmsg_update_reply(struct subd *gossipd,
 				    cbdata->hin->shared_secret,
 				    failmsg);
 
+	bool we_filled = false;
 	wallet_htlc_update(gossipd->ld->wallet,
 			   cbdata->hin->dbid, cbdata->hin->hstate,
 			   cbdata->hin->preimage,
 			   cbdata->hin->badonion,
-			   cbdata->hin->failonion, NULL);
+			   cbdata->hin->failonion, NULL, &we_filled);
 
 	failed_htlc = mk_failed_htlc(tmpctx,
 				     cbdata->hin, cbdata->hin->failonion);
@@ -420,7 +425,7 @@ void fulfill_htlc(struct htlc_in *hin, const struct preimage *preimage)
 	}
 
 	if (channel_on_chain(channel)) {
-		msg = towire_onchain_known_preimage(hin, preimage);
+		msg = towire_onchain_known_preimage(hin, preimage, false);
 	} else {
 		struct fulfilled_htlc fulfilled_htlc;
 		fulfilled_htlc.id = hin->key.id;
@@ -850,6 +855,8 @@ htlc_accepted_hook_try_resolve(struct htlc_accepted_hook_payload *request,
 		towire_u16(&unknown_details, 0x400f);
 		local_fail_in_htlc(hin, take(unknown_details));
 	} else {
+		hin->we_filled = tal(hin, bool);
+		*hin->we_filled = true;
 		fulfill_htlc(hin, payment_preimage);
 	}
 }
@@ -1240,6 +1247,7 @@ static void fulfill_our_htlc_out(struct channel *channel, struct htlc_out *hout,
 				 const struct preimage *preimage)
 {
 	struct lightningd *ld = channel->peer->ld;
+	bool we_filled = false;
 
 	assert(!hout->preimage);
 	hout->preimage = tal_dup(hout, struct preimage, preimage);
@@ -1247,7 +1255,7 @@ static void fulfill_our_htlc_out(struct channel *channel, struct htlc_out *hout,
 
 	wallet_htlc_update(ld->wallet, hout->dbid, hout->hstate,
 			   hout->preimage, 0, hout->failonion,
-			   hout->failmsg);
+			   hout->failmsg, &we_filled);
 	/* Update channel stats */
 	wallet_channel_stats_incr_out_fulfilled(ld->wallet,
 						channel->dbid,
@@ -1414,9 +1422,11 @@ void onchain_failed_our_htlc(const struct channel *channel,
 	/* Force state to something which expects a failure, and save to db */
 	hout->hstate = RCVD_REMOVE_HTLC;
 	htlc_out_check(hout, __func__);
+
+	bool we_filled = false;
 	wallet_htlc_update(ld->wallet, hout->dbid, hout->hstate,
 			   hout->preimage, 0, hout->failonion,
-			   hout->failmsg);
+			   hout->failmsg, &we_filled);
 
 	if (hout->am_origin) {
 		assert(why != NULL);
@@ -1451,6 +1461,8 @@ static void remove_htlc_in(struct channel *channel, struct htlc_in *hin)
 	/* If we fulfilled their HTLC, credit us. */
 	if (hin->preimage) {
 		struct amount_msat oldamt = channel->our_msat;
+		const struct channel_coin_mvt *mvt;
+
 		if (!amount_msat_add(&channel->our_msat, channel->our_msat,
 				     hin->msat)) {
 			channel_internal_error(channel,
@@ -1469,6 +1481,14 @@ static void remove_htlc_in(struct channel *channel, struct htlc_in *hin)
 		if (amount_msat_greater(channel->our_msat,
 					channel->msat_to_us_max))
 			channel->msat_to_us_max = channel->our_msat;
+
+		/* Coins have definitively moved, log a movement */
+		if (hin->we_filled)
+			mvt = new_channel_mvt_invoice_hin(hin, hin, channel);
+		else
+			mvt = new_channel_mvt_routed_hin(hin, hin, channel);
+
+		notify_channel_mvt(channel->peer->ld, mvt);
 	}
 
 	tal_free(hin);
@@ -1488,6 +1508,7 @@ static void remove_htlc_out(struct channel *channel, struct htlc_out *hout)
 	if (!hout->preimage) {
 		fail_out_htlc(hout, NULL, NULL);
 	} else {
+		const struct channel_coin_mvt *mvt;
 		struct amount_msat oldamt = channel->our_msat;
 		/* We paid for this HTLC, so deduct balance. */
 		if (!amount_msat_sub(&channel->our_msat, channel->our_msat,
@@ -1508,6 +1529,14 @@ static void remove_htlc_out(struct channel *channel, struct htlc_out *hout)
 					 &channel->our_msat));
 		if (amount_msat_less(channel->our_msat, channel->msat_to_us_min))
 			channel->msat_to_us_min = channel->our_msat;
+
+		/* Coins have definitively moved, log a movement */
+		if (hout->am_origin)
+			mvt = new_channel_mvt_invoice_hout(hout, hout, channel);
+		else
+			mvt = new_channel_mvt_routed_hout(hout, hout, channel);
+
+		notify_channel_mvt(channel->peer->ld, mvt);
 	}
 
 	tal_free(hout);
@@ -2583,4 +2612,5 @@ static const struct json_command listforwards_command = {
 	"List all forwarded payments and their information", false,
 	"List all forwarded payments and their information"
 };
+
 AUTODATA(json_command, &listforwards_command);
