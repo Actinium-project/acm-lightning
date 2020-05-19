@@ -40,6 +40,7 @@ OPENINGD_COMMON_OBJS :=				\
 	common/bigsize.o			\
 	common/bip32.o				\
 	common/channel_config.o			\
+	common/channel_id.o			\
 	common/crypto_state.o			\
 	common/crypto_sync.o			\
 	common/cryptomsg.o			\
@@ -62,6 +63,7 @@ OPENINGD_COMMON_OBJS :=				\
 	common/keyset.o				\
 	common/memleak.o			\
 	common/msg_queue.o			\
+	common/node_id.o			\
 	common/onionreply.o			\
 	common/penalty_base.o			\
 	common/per_peer_state.o			\
@@ -70,6 +72,7 @@ OPENINGD_COMMON_OBJS :=				\
 	common/permute_tx.o			\
 	common/pseudorand.o			\
 	common/read_peer_msg.o			\
+	common/setup.o				\
 	common/status.o				\
 	common/status_wire.o			\
 	common/subdaemon.o			\

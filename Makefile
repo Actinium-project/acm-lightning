@@ -7,6 +7,15 @@ ifeq ($(VERSION),)
 $(error "ERROR: git is required for generating version information")
 endif
 
+# --quiet / -s means quiet, dammit!
+ifeq ($(findstring s,$(word 1, $(MAKEFLAGS))),s)
+ECHO := :
+SUPPRESS_OUTPUT := > /dev/null
+else
+ECHO := echo
+SUPPRESS_OUTPUT :=
+endif
+
 DISTRO=$(shell lsb_release -is 2>/dev/null || echo unknown)-$(shell lsb_release -rs 2>/dev/null || echo unknown)
 PKGNAME = c-lightning
 
@@ -21,10 +30,11 @@ BOLTVERSION := 4107c69e315b4f33d5b00459bef919bcfaa64bf2
 
 SORT=LC_ALL=C sort
 
+
 ifeq ($V,1)
-VERBOSE = echo $(2); $(2)
+VERBOSE = $(ECHO) $(2); $(2)
 else
-VERBOSE = echo $(1); $(2)
+VERBOSE = $(ECHO) $(1); $(2)
 endif
 
 ifneq ($(VALGRIND),0)
@@ -226,8 +236,8 @@ endif
 default: show-flags all-programs all-test-programs doc-all
 
 show-flags:
-	@echo "CC: $(CC) $(CFLAGS) -c -o"
-	@echo "LD: $(LINK.o) $(filter-out %.a,$^) $(LOADLIBES) $(EXTERNAL_LDLIBS) $(LDLIBS) -o"
+	@$(ECHO) "CC: $(CC) $(CFLAGS) -c -o"
+	@$(ECHO) "LD: $(LINK.o) $(filter-out %.a,$^) $(LOADLIBES) $(EXTERNAL_LDLIBS) $(LDLIBS) -o"
 
 ccan/config.h: config.vars configure ccan/tools/configurator/configurator.c
 	./configure --reconfigure
@@ -358,7 +368,7 @@ check-setup_locale:
 	@tools/check-setup_locale.sh
 
 check-tmpctx:
-	@if git grep -n 'tal_free[(]tmpctx)' | grep -Ev '^ccan/|/test/|^common/daemon.c:|^common/utils.c:'; then echo "Don't free tmpctx!">&2; exit 1; fi
+	@if git grep -n 'tal_free[(]tmpctx)' | grep -Ev '^ccan/|/test/|^common/setup.c:|^common/utils.c:'; then echo "Don't free tmpctx!">&2; exit 1; fi
 
 check-discouraged-functions:
 	@if git grep -E "[^a-z_/](fgets|fputs|gets|scanf|sprintf)\(" -- "*.c" "*.h" ":(exclude)ccan/"; then exit 1; fi
@@ -398,7 +408,7 @@ ccan/ccan/cdump/tools/cdump-enumstr.o: $(CCAN_HEADERS) Makefile
 
 gen_version.h: FORCE
 	@(echo "#define VERSION \"$(VERSION)\"" && echo "#define BUILD_FEATURES \"$(FEATURES)\"") > $@.new
-	@if cmp $@.new $@ >/dev/null 2>&1; then rm -f $@.new; else mv $@.new $@; echo Version updated; fi
+	@if cmp $@.new $@ >/dev/null 2>&1; then rm -f $@.new; else mv $@.new $@; $(ECHO) Version updated; fi
 
 # That forces this rule to be run every time, too.
 gen_header_versions.h: tools/headerversions
@@ -463,7 +473,7 @@ clean:
 
 update-mocks: $(ALL_GEN_HEADERS)
 update-mocks/%: %
-	@MAKE=$(MAKE) tools/update-mocks.sh "$*"
+	@MAKE=$(MAKE) tools/update-mocks.sh "$*" $(SUPPRESS_OUTPUT)
 
 unittest/%: %
 	$(VG) $(VG_TEST_ARGS) $* > /dev/null
@@ -549,35 +559,35 @@ install: install-program install-data
 uninstall:
 	@$(NORMAL_UNINSTALL)
 	@for f in $(BIN_PROGRAMS); do \
-	  echo rm -f $(DESTDIR)$(bindir)/`basename $$f`; \
+	  $(ECHO) rm -f $(DESTDIR)$(bindir)/`basename $$f`; \
 	  rm -f $(DESTDIR)$(bindir)/`basename $$f`; \
 	done
 	@for f in $(PLUGINS); do \
-	  echo rm -f $(DESTDIR)$(plugindir)/`basename $$f`; \
+	  $(ECHO) rm -f $(DESTDIR)$(plugindir)/`basename $$f`; \
 	  rm -f $(DESTDIR)$(plugindir)/`basename $$f`; \
 	done
 	@for f in $(PKGLIBEXEC_PROGRAMS); do \
-	  echo rm -f $(DESTDIR)$(pkglibexecdir)/`basename $$f`; \
+	  $(ECHO) rm -f $(DESTDIR)$(pkglibexecdir)/`basename $$f`; \
 	  rm -f $(DESTDIR)$(pkglibexecdir)/`basename $$f`; \
 	done
 	@for f in $(MAN1PAGES); do \
-	  echo rm -f $(DESTDIR)$(man1dir)/`basename $$f`; \
+	  $(ECHO) rm -f $(DESTDIR)$(man1dir)/`basename $$f`; \
 	  rm -f $(DESTDIR)$(man1dir)/`basename $$f`; \
 	done
 	@for f in $(MAN5PAGES); do \
-	  echo rm -f $(DESTDIR)$(man5dir)/`basename $$f`; \
+	  $(ECHO) rm -f $(DESTDIR)$(man5dir)/`basename $$f`; \
 	  rm -f $(DESTDIR)$(man5dir)/`basename $$f`; \
 	done
 	@for f in $(MAN7PAGES); do \
-	  echo rm -f $(DESTDIR)$(man7dir)/`basename $$f`; \
+	  $(ECHO) rm -f $(DESTDIR)$(man7dir)/`basename $$f`; \
 	  rm -f $(DESTDIR)$(man7dir)/`basename $$f`; \
 	done
 	@for f in $(MAN8PAGES); do \
-	  echo rm -f $(DESTDIR)$(man8dir)/`basename $$f`; \
+	  $(ECHO) rm -f $(DESTDIR)$(man8dir)/`basename $$f`; \
 	  rm -f $(DESTDIR)$(man8dir)/`basename $$f`; \
 	done
 	@for f in $(DOC_DATA); do \
-	  echo rm -f $(DESTDIR)$(docdir)/`basename $$f`; \
+	  $(ECHO) rm -f $(DESTDIR)$(docdir)/`basename $$f`; \
 	  rm -f $(DESTDIR)$(docdir)/`basename $$f`; \
 	done
 

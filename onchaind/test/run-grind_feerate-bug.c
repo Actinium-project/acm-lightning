@@ -3,6 +3,7 @@
  No valid signature found for 3 htlc_timeout_txs feerate 10992-15370, last tx 0200000001a02a38c6ec5541963704a2a035b3094b18d69cc25cc7419d75e02894618329720000000000000000000191ea3000000000002200208bfadb3554f41cc06f00de0ec2e2f91e36ee45b5006a1f606146784755356ba532f10800, input 3215967sat, signature 3045022100917efdc8577e8578aef5e513fad25edbb55921466e8ffccb05ce8bb05a54ae6902205c2fded9d7bfc290920821bfc828720bc24287f3dad9a62fb4f806e2404ed0f401, cltvs 585998/585998/586034 wscripts 76a914f454b1fe5b95428d6beec58ed3131a6ea611b2fa8763ac672103f83ca95b22920e71487736a7284696dd52443fd8f7ce683153ac31d1d1db7da67c820120876475527c21026ebaa1d08757b86110e40e3f4a081803eec694e23ec75ee0bfd753589df896e752ae67a9148dbcec4a5d782dd87588801607ea7dfc8874ffee88ac6868/76a914f454b1fe5b95428d6beec58ed3131a6ea611b2fa8763ac672103f83ca95b22920e71487736a7284696dd52443fd8f7ce683153ac31d1d1db7da67c820120876475527c21026ebaa1d08757b86110e40e3f4a081803eec694e23ec75ee0bfd753589df896e752ae67a9148dbcec4a5d782dd87588801607ea7dfc8874ffee88ac6868/76a914f454b1fe5b95428d6beec58ed3131a6ea611b2fa8763ac672103f83ca95b22920e71487736a7284696dd52443fd8f7ce683153ac31d1d1db7da67c820120876475527c21026ebaa1d08757b86110e40e3f4a081803eec694e23ec75ee0bfd753589df896e752ae67a9148dbcec4a5d782dd87588801607ea7dfc8874ffee88ac6868 (version v0.7.1-57-gb3215a8)"
 */
 #include <ccan/str/hex/hex.h>
+#include <common/setup.h>
 
 #define main test_main
 int test_main(int argc, char *argv[]);
@@ -27,6 +28,12 @@ bool derive_keyset(const struct pubkey *per_commitment_point UNNEEDED,
 /* Generated stub for dump_memleak */
 bool dump_memleak(struct htable *memtable UNNEEDED)
 { fprintf(stderr, "dump_memleak called!\n"); abort(); }
+/* Generated stub for fromwire */
+const u8 *fromwire(const u8 **cursor UNNEEDED, size_t *max UNNEEDED, void *copy UNNEEDED, size_t n UNNEEDED)
+{ fprintf(stderr, "fromwire called!\n"); abort(); }
+/* Generated stub for fromwire_bool */
+bool fromwire_bool(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
+{ fprintf(stderr, "fromwire_bool called!\n"); abort(); }
 /* Generated stub for fromwire_fail */
 const void *fromwire_fail(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
 { fprintf(stderr, "fromwire_fail called!\n"); abort(); }
@@ -54,6 +61,13 @@ bool fromwire_onchain_spent(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, s
 /* Generated stub for fromwire_peektype */
 int fromwire_peektype(const u8 *cursor UNNEEDED)
 { fprintf(stderr, "fromwire_peektype called!\n"); abort(); }
+/* Generated stub for fromwire_secp256k1_ecdsa_signature */
+void fromwire_secp256k1_ecdsa_signature(const u8 **cursor UNNEEDED, size_t *max UNNEEDED,
+					secp256k1_ecdsa_signature *signature UNNEEDED)
+{ fprintf(stderr, "fromwire_secp256k1_ecdsa_signature called!\n"); abort(); }
+/* Generated stub for fromwire_sha256 */
+void fromwire_sha256(const u8 **cursor UNNEEDED, size_t *max UNNEEDED, struct sha256 *sha256 UNNEEDED)
+{ fprintf(stderr, "fromwire_sha256 called!\n"); abort(); }
 /* Generated stub for fromwire_tal_arrn */
 u8 *fromwire_tal_arrn(const tal_t *ctx UNNEEDED,
 		       const u8 **cursor UNNEEDED, size_t *max UNNEEDED, size_t num UNNEEDED)
@@ -61,6 +75,12 @@ u8 *fromwire_tal_arrn(const tal_t *ctx UNNEEDED,
 /* Generated stub for fromwire_u16 */
 u16 fromwire_u16(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
 { fprintf(stderr, "fromwire_u16 called!\n"); abort(); }
+/* Generated stub for fromwire_u64 */
+u64 fromwire_u64(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
+{ fprintf(stderr, "fromwire_u64 called!\n"); abort(); }
+/* Generated stub for fromwire_u8 */
+u8 fromwire_u8(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
+{ fprintf(stderr, "fromwire_u8 called!\n"); abort(); }
 /* Generated stub for htlc_offered_wscript */
 u8 *htlc_offered_wscript(const tal_t *ctx UNNEEDED,
 			 const struct ripemd160 *ripemd UNNEEDED,
@@ -188,6 +208,12 @@ u8 *to_self_wscript(const tal_t *ctx UNNEEDED,
 		    u16 to_self_delay UNNEEDED,
 		    const struct keyset *keyset UNNEEDED)
 { fprintf(stderr, "to_self_wscript called!\n"); abort(); }
+/* Generated stub for towire */
+void towire(u8 **pptr UNNEEDED, const void *data UNNEEDED, size_t len UNNEEDED)
+{ fprintf(stderr, "towire called!\n"); abort(); }
+/* Generated stub for towire_bool */
+void towire_bool(u8 **pptr UNNEEDED, bool v UNNEEDED)
+{ fprintf(stderr, "towire_bool called!\n"); abort(); }
 /* Generated stub for towire_hsm_get_per_commitment_point */
 u8 *towire_hsm_get_per_commitment_point(const tal_t *ctx UNNEEDED, u64 n UNNEEDED)
 { fprintf(stderr, "towire_hsm_get_per_commitment_point called!\n"); abort(); }
@@ -236,9 +262,22 @@ u8 *towire_onchain_notify_coin_mvt(const tal_t *ctx UNNEEDED, const struct chain
 /* Generated stub for towire_onchain_unwatch_tx */
 u8 *towire_onchain_unwatch_tx(const tal_t *ctx UNNEEDED, const struct bitcoin_txid *txid UNNEEDED)
 { fprintf(stderr, "towire_onchain_unwatch_tx called!\n"); abort(); }
+/* Generated stub for towire_secp256k1_ecdsa_signature */
+void towire_secp256k1_ecdsa_signature(u8 **pptr UNNEEDED,
+			      const secp256k1_ecdsa_signature *signature UNNEEDED)
+{ fprintf(stderr, "towire_secp256k1_ecdsa_signature called!\n"); abort(); }
+/* Generated stub for towire_sha256 */
+void towire_sha256(u8 **pptr UNNEEDED, const struct sha256 *sha256 UNNEEDED)
+{ fprintf(stderr, "towire_sha256 called!\n"); abort(); }
 /* Generated stub for towire_u16 */
 void towire_u16(u8 **pptr UNNEEDED, u16 v UNNEEDED)
 { fprintf(stderr, "towire_u16 called!\n"); abort(); }
+/* Generated stub for towire_u64 */
+void towire_u64(u8 **pptr UNNEEDED, u64 v UNNEEDED)
+{ fprintf(stderr, "towire_u64 called!\n"); abort(); }
+/* Generated stub for towire_u8 */
+void towire_u8(u8 **pptr UNNEEDED, u8 v UNNEEDED)
+{ fprintf(stderr, "towire_u8 called!\n"); abort(); }
 /* Generated stub for towire_u8_array */
 void towire_u8_array(u8 **pptr UNNEEDED, const u8 *arr UNNEEDED, size_t num UNNEEDED)
 { fprintf(stderr, "towire_u8_array called!\n"); abort(); }
@@ -314,7 +353,7 @@ struct bitcoin_tx *htlc_timeout_tx(const tal_t *ctx,
 	return tx;
 }
 
-int main(void)
+int main(int argc, char *argv[])
 {
 	struct bitcoin_signature remotesig;
 	struct tracked_output *out;
@@ -323,10 +362,7 @@ int main(void)
 	struct htlc_stub htlcs[3];
 	u8 *htlc_scripts[3];
 
-	setup_locale();
-	secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY
-						 | SECP256K1_CONTEXT_SIGN);
-	setup_tmpctx();
+	common_setup(argv[0]);
 	chainparams = chainparams_for_network("bitcoin");
 
 	htlcs[0].cltv_expiry = 585998;
@@ -371,6 +407,5 @@ int main(void)
 						false);
 	assert(ret == 2);
 	take_cleanup();
-	tal_free(tmpctx);
-	secp256k1_context_destroy(secp256k1_ctx);
+	common_shutdown();
 }

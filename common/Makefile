@@ -10,6 +10,7 @@ COMMON_SRC_NOGEN :=				\
 	common/blinding.c			\
 	common/bolt11.c				\
 	common/channel_config.c			\
+	common/channel_id.c			\
 	common/coin_mvt.c			\
 	common/close_tx.c			\
 	common/configdir.c			\
@@ -56,6 +57,7 @@ COMMON_SRC_NOGEN :=				\
 	common/ping.c				\
 	common/pseudorand.c			\
 	common/read_peer_msg.c			\
+	common/setup.c				\
 	common/socket_close.c			\
 	common/sphinx.c				\
 	common/status.c				\

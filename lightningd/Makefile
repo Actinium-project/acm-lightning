@@ -24,6 +24,7 @@ LIGHTNINGD_COMMON_OBJS :=			\
 	common/bip32.o				\
 	common/blinding.o			\
 	common/bolt11.o				\
+	common/channel_id.o			\
 	common/channel_config.o			\
 	common/coin_mvt.o			\
 	common/configdir.o			\
@@ -59,6 +60,7 @@ LIGHTNINGD_COMMON_OBJS :=			\
 	common/per_peer_state.o			\
 	common/permute_tx.o			\
 	common/pseudorand.o			\
+	common/setup.o				\
 	common/sphinx.o				\
 	common/status_wire.o			\
 	common/timeout.o			\

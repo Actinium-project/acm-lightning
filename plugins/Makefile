@@ -19,6 +19,7 @@ PLUGIN_LIB_OBJS := $(PLUGIN_LIB_SRC:.c=.o)
 
 PLUGIN_COMMON_OBJS :=				\
 	bitcoin/base58.o			\
+	bitcoin/privkey.o			\
 	bitcoin/pubkey.o			\
 	bitcoin/pullpush.o			\
 	bitcoin/script.o			\
@@ -44,6 +45,7 @@ PLUGIN_COMMON_OBJS :=				\
 	common/node_id.o			\
 	common/param.o				\
 	common/pseudorand.o			\
+	common/setup.o				\
 	common/type_to_string.o			\
 	common/utils.o				\
 	common/version.o			\

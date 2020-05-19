@@ -46,6 +46,7 @@ CLOSINGD_COMMON_OBJS :=				\
 	common/base32.o				\
 	common/bigsize.o			\
 	common/bip32.o				\
+	common/channel_id.o			\
 	common/close_tx.o			\
 	common/crypto_state.o			\
 	common/crypto_sync.o			\
@@ -62,6 +63,7 @@ CLOSINGD_COMMON_OBJS :=				\
 	common/key_derive.o			\
 	common/memleak.o			\
 	common/msg_queue.o			\
+	common/node_id.o			\
 	common/onionreply.o			\
 	common/peer_billboard.o			\
 	common/peer_failed.o			\
@@ -69,6 +71,7 @@ CLOSINGD_COMMON_OBJS :=				\
 	common/permute_tx.o			\
 	common/pseudorand.o			\
 	common/read_peer_msg.o			\
+	common/setup.o				\
 	common/socket_close.o			\
 	common/status.o				\
 	common/status_wire.o			\
