@@ -2375,3 +2375,28 @@ def test_getsharedsecret(node_factory):
     # knowing only the public key of the other.
     assert (l1.rpc.getsharedsecret(l2.info["id"])["shared_secret"]
             == l2.rpc.getsharedsecret(l1.info["id"])["shared_secret"])
+
+
+def test_commitfee_option(node_factory):
+    """Sanity check for the --commit-fee startup option."""
+    l1, l2 = node_factory.get_nodes(2, opts=[{"commit-fee": "200"}, {}])
+
+    mock_wu = 5000
+    for l in [l1, l2]:
+        l.set_feerates((mock_wu, 0, 0, 0), True)
+    l1_commit_fees = l1.rpc.call("estimatefees")["unilateral_close"]
+    l2_commit_fees = l2.rpc.call("estimatefees")["unilateral_close"]
+
+    assert l1_commit_fees == 2 * l2_commit_fees == 2 * 4 * mock_wu  # WU->VB
+
+
+def test_listtransactions(node_factory):
+    """Sanity check for the listtransactions RPC command"""
+    l1, l2 = node_factory.get_nodes(2, opts=[{}, {}])
+
+    wallettxid = l1.openchannel(l2, 10**4)["wallettxid"]
+    txids = [i["txid"] for tx in l1.rpc.listtransactions()["transactions"]
+             for i in tx["inputs"]]
+    # The txid of the transaction funding the channel is present, and
+    # represented as little endian (like bitcoind and explorers).
+    assert wallettxid in txids

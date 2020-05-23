@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <bitcoin/block.h>
 #include <bitcoin/chainparams.h>
+#include <bitcoin/psbt.h>
 #include <bitcoin/pullpush.h>
 #include <bitcoin/tx.h>
 #include <ccan/cast/cast.h>
@@ -16,10 +17,11 @@
 #define SEGREGATED_WITNESS_FLAG 0x1
 
 int bitcoin_tx_add_output(struct bitcoin_tx *tx, const u8 *script,
-			  struct amount_sat amount)
+			  u8 *wscript, struct amount_sat amount)
 {
 	size_t i = tx->wtx->num_outputs;
 	struct wally_tx_output *output;
+	struct wally_psbt_output *psbt_out;
 	int ret;
 	u64 satoshis = amount.satoshis; /* Raw: low-level helper */
 	const struct chainparams *chainparams = tx->chainparams;
@@ -48,6 +50,14 @@ int bitcoin_tx_add_output(struct bitcoin_tx *tx, const u8 *script,
 	ret = wally_tx_add_output(tx->wtx, output);
 	assert(ret == WALLY_OK);
 
+	psbt_out = psbt_add_output(tx->psbt, output, i);
+	if (wscript) {
+		ret = wally_psbt_output_set_witness_script(psbt_out,
+							   wscript,
+							   tal_bytelen(wscript));
+		assert(ret == WALLY_OK);
+	}
+
 	wally_tx_output_free(output);
 	bitcoin_tx_output_set_amount(tx, i, amount);
 
@@ -59,7 +69,7 @@ int bitcoin_tx_add_multi_outputs(struct bitcoin_tx *tx,
 {
 	for (size_t j = 0; j < tal_count(outputs); j++)
 		bitcoin_tx_add_output(tx, outputs[j]->script,
-				      outputs[j]->amount);
+				      NULL, outputs[j]->amount);
 
 	return tx->wtx->num_outputs;
 }
@@ -124,7 +134,6 @@ static int elements_tx_add_fee_output(struct bitcoin_tx *tx)
 {
 	struct amount_sat fee = bitcoin_tx_compute_fee(tx);
 	int pos;
-	struct witscript *w;
 
 	/* If we aren't using elements, we don't add explicit fee outputs */
 	if (!chainparams->is_elements || amount_sat_eq(fee, AMOUNT_SAT(0)))
@@ -136,18 +145,9 @@ static int elements_tx_add_fee_output(struct bitcoin_tx *tx)
 			break;
 	}
 
-	if (pos == tx->wtx->num_outputs) {
-		w = tal(tx->output_witscripts, struct witscript);
-		w->ptr = tal_arr(w, u8, 0);
-
-		/* Make sure we have a place to stash the witness script in. */
-		if (tal_count(tx->output_witscripts) < pos + 1) {
-			tal_resize(&tx->output_witscripts, pos + 1);
-		}
-		tx->output_witscripts[pos] = w;
-
-		return bitcoin_tx_add_output(tx, NULL, fee);
-	} else {
+	if (pos == tx->wtx->num_outputs)
+		return bitcoin_tx_add_output(tx, NULL, NULL, fee);
+	else {
 		bitcoin_tx_output_set_amount(tx, pos, fee);
 		return pos;
 	}
@@ -168,6 +168,7 @@ int bitcoin_tx_add_input(struct bitcoin_tx *tx, const struct bitcoin_txid *txid,
 				  NULL /* Empty witness stack */, &input);
 	input->features = chainparams->is_elements ? WALLY_TX_IS_ELEMENTS : 0;
 	wally_tx_add_input(tx->wtx, input);
+	psbt_add_input(tx->psbt, input, i);
 	wally_tx_input_free(input);
 
 	/* Now store the input amount if we know it, so we can sign later */
@@ -176,6 +177,7 @@ int bitcoin_tx_add_input(struct bitcoin_tx *tx, const struct bitcoin_txid *txid,
 
 	tx->input_amounts[i] = tal_free(tx->input_amounts[i]);
 	tx->input_amounts[i] = tal_dup(tx, struct amount_sat, &amount);
+
 
 	return i;
 }
@@ -187,9 +189,6 @@ bool bitcoin_tx_check(const struct bitcoin_tx *tx)
 	int flags = WALLY_TX_FLAG_USE_WITNESS;
 
 	if (tal_count(tx->input_amounts) != tx->wtx->num_inputs)
-		return false;
-
-	if (tal_count(tx->output_witscripts) != tx->wtx->num_outputs)
 		return false;
 
 	if (wally_tx_get_length(tx->wtx, flags, &written) != WALLY_OK)
@@ -218,6 +217,10 @@ void bitcoin_tx_output_set_amount(struct bitcoin_tx *tx, int outnum,
 		assert(ret == WALLY_OK);
 	} else {
 		output->satoshi = satoshis;
+
+		/* update the global tx for the psbt also */
+		output = &tx->psbt->tx->outputs[outnum];
+		output->satoshi = satoshis;
 	}
 }
 
@@ -235,9 +238,22 @@ const u8 *bitcoin_tx_output_get_script(const tal_t *ctx,
 		return NULL;
 	}
 
-	res = tal_arr(ctx, u8, output->script_len);
-	memcpy(res, output->script, output->script_len);
+	res = tal_dup_arr(ctx, u8, output->script, output->script_len, 0);
 	return res;
+}
+
+u8 *bitcoin_tx_output_get_witscript(const tal_t *ctx, const struct bitcoin_tx *tx,
+				    int outnum)
+{
+	struct wally_psbt_output *out;
+
+	assert(outnum < tx->psbt->num_outputs);
+	out = &tx->psbt->outputs[outnum];
+
+	if (out->witness_script_len == 0)
+		return NULL;
+
+	return tal_dup_arr(ctx, u8, out->witness_script, out->witness_script_len, 0);
 }
 
 /* FIXME(cdecker) Make the caller pass in a reference to amount_asset, and
@@ -284,12 +300,12 @@ void bitcoin_tx_output_get_amount_sat(struct bitcoin_tx *tx, int outnum,
 	*amount = amount_asset_to_sat(&asset_amt);
 }
 
-
 void bitcoin_tx_input_set_witness(struct bitcoin_tx *tx, int innum,
 				  u8 **witness)
 {
 	struct wally_tx_witness_stack *stack = NULL;
 	size_t stack_size = tal_count(witness);
+	struct wally_psbt_input *in;
 
 	/* Free any lingering witness */
 	if (witness) {
@@ -299,15 +315,30 @@ void bitcoin_tx_input_set_witness(struct bitcoin_tx *tx, int innum,
 						   tal_bytelen(witness[i]));
 	}
 	wally_tx_set_input_witness(tx->wtx, innum, stack);
+
+	/* Also add to the psbt */
+	if (stack) {
+		assert(innum < tx->psbt->num_inputs);
+		in = &tx->psbt->inputs[innum];
+		wally_psbt_input_set_final_witness(in, stack);
+	}
+
 	if (stack)
 		wally_tx_witness_stack_free(stack);
 	if (taken(witness))
 	    tal_free(witness);
+
 }
 
 void bitcoin_tx_input_set_script(struct bitcoin_tx *tx, int innum, u8 *script)
 {
+	struct wally_psbt_input *in;
 	wally_tx_set_input_script(tx->wtx, innum, script, tal_bytelen(script));
+
+	/* Also add to the psbt */
+	assert(innum < tx->psbt->num_inputs);
+	in = &tx->psbt->inputs[innum];
+	wally_psbt_input_set_final_script_sig(in, script, tal_bytelen(script));
 }
 
 const u8 *bitcoin_tx_input_get_witness(const tal_t *ctx,
@@ -445,22 +476,33 @@ struct bitcoin_tx *bitcoin_tx(const tal_t *ctx,
 	tx->input_amounts = tal_arrz(tx, struct amount_sat*, input_count);
 	tx->wtx->locktime = nlocktime;
 	tx->wtx->version = 2;
-	tx->output_witscripts = tal_arrz(tx, struct witscript*, output_count);
 	tx->chainparams = chainparams;
+	tx->psbt = new_psbt(tx, tx->wtx);
+
 	return tx;
 }
 
 void bitcoin_tx_finalize(struct bitcoin_tx *tx)
 {
-	size_t num_outputs, num_inputs;
+	size_t num_inputs;
 	elements_tx_add_fee_output(tx);
-
-	num_outputs = tx->wtx->num_outputs;
-	tal_resize(&(tx->output_witscripts), num_outputs);
 
 	num_inputs = tx->wtx->num_inputs;
 	tal_resize(&tx->input_amounts, num_inputs);
 	assert(bitcoin_tx_check(tx));
+}
+
+char *bitcoin_tx_to_psbt_base64(const tal_t *ctx, struct bitcoin_tx *tx)
+{
+	char *serialized_psbt, *ret_val;
+	int ret;
+
+	ret = wally_psbt_to_base64(tx->psbt, &serialized_psbt);
+	assert(ret == WALLY_OK);
+
+	ret_val = tal_strdup(ctx, serialized_psbt);
+	wally_free_string(serialized_psbt);
+	return ret_val;
 }
 
 struct bitcoin_tx *pull_bitcoin_tx(const tal_t *ctx, const u8 **cursor,
@@ -494,6 +536,8 @@ struct bitcoin_tx *pull_bitcoin_tx(const tal_t *ctx, const u8 **cursor,
 	    tal_arrz(tx, struct amount_sat *, tx->wtx->inputs_allocation_len);
 	tx->chainparams = chainparams;
 
+	tx->psbt = new_psbt(tx, tx->wtx);
+
 	*cursor += wsize;
 	*max -= wsize;
 	return tx;
@@ -526,8 +570,6 @@ struct bitcoin_tx *bitcoin_tx_from_hex(const tal_t *ctx, const char *hex,
 
 	tal_free(linear_tx);
 
-	tx->output_witscripts =
-	    tal_arrz(tx, struct witscript *, tx->wtx->num_outputs);
 	tx->input_amounts =
 	    tal_arrz(tx, struct amount_sat *, tx->wtx->num_inputs);
 
@@ -602,10 +644,21 @@ struct bitcoin_tx *fromwire_bitcoin_tx(const tal_t *ctx,
 	size_t i;
 
 	tx = pull_bitcoin_tx(ctx, cursor, max);
+	if (!tx)
+		return fromwire_fail(cursor, max);
+
+	/* pull_bitcoin_tx sets the psbt */
+	tal_free(tx->psbt);
+	tx->psbt = fromwire_psbt(tx, cursor, max);
+
 	input_amts_len = fromwire_u16(cursor, max);
-	/* We don't serialize the amounts if they're not *all* populated */
-	if (input_amts_len != tal_count(tx->input_amounts))
-		return tx;
+
+	/* They must give us none or all */
+	if (input_amts_len != 0
+	    && input_amts_len != tal_count(tx->input_amounts)) {
+		tal_free(tx);
+		return fromwire_fail(cursor, max);
+	}
 
 	for (i = 0; i < input_amts_len; i++) {
 		struct amount_sat sat;
@@ -628,6 +681,7 @@ void towire_bitcoin_tx(u8 **pptr, const struct bitcoin_tx *tx)
 	u8 *lin = linearize_tx(tmpctx, tx);
 	towire_u8_array(pptr, lin, tal_count(lin));
 
+	towire_psbt(pptr, tx->psbt);
 	/* We only want to 'save' the amounts if every amount
 	 * has been populated */
 	for (i = 0; i < tal_count(tx->input_amounts); i++) {
@@ -662,25 +716,4 @@ void towire_bitcoin_tx_output(u8 **pptr, const struct bitcoin_tx_output *output)
 	towire_amount_sat(pptr, output->amount);
 	towire_u16(pptr, tal_count(output->script));
 	towire_u8_array(pptr, output->script, tal_count(output->script));
-}
-
-void towire_witscript(u8 **pptr, const struct witscript *script)
-{
-	if (script == NULL) {
-		towire_u16(pptr, 0);
-	} else {
-		assert(script->ptr != NULL);
-		towire_u16(pptr, tal_count(script->ptr));
-		towire_u8_array(pptr, script->ptr, tal_count(script->ptr));
-	}
-}
-
-struct witscript *fromwire_witscript(const tal_t *ctx, const u8 **cursor, size_t *max)
-{
-	struct witscript *retval = tal(ctx, struct witscript);
-	u16 len = fromwire_u16(cursor, max);
-	retval->ptr = fromwire_tal_arrn(retval, cursor, max, len);
-	if (!*cursor)
-		return tal_free(retval);
-	return retval;
 }

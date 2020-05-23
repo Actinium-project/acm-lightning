@@ -736,7 +736,6 @@ static bool funder_finalize_channel_setup(struct state *state,
 						   *tx,
 						   &state->channel->funding_pubkey[REMOTE],
 						   state->channel->funding,
-						   (const struct witscript **) (*tx)->output_witscripts,
 						   &state->first_per_commitment_point[REMOTE],
 						   state->channel->option_static_remotekey);
 
@@ -1271,7 +1270,6 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 						   remote_commit,
 						   &state->channel->funding_pubkey[REMOTE],
 						   state->channel->funding,
-						   (const struct witscript **) remote_commit->output_witscripts,
 						   &state->first_per_commitment_point[REMOTE],
 						   state->channel->option_static_remotekey);
 

@@ -8,13 +8,11 @@
 #include <ccan/structeq/structeq.h>
 #include <ccan/tal/tal.h>
 #include <common/amount.h>
+#include <wally_psbt.h>
 #include <wally_transaction.h>
 
 #define BITCOIN_TX_DEFAULT_SEQUENCE 0xFFFFFFFF
-
-struct witscript {
-    u8 *ptr;
-};
+struct wally_psbt;
 
 struct bitcoin_txid {
 	struct sha256_double shad;
@@ -28,11 +26,11 @@ struct bitcoin_tx {
 	struct amount_sat **input_amounts;
 	struct wally_tx *wtx;
 
-	/* Need the output wscripts in the HSM to validate transaction */
-	struct witscript **output_witscripts;
-
 	/* Keep a reference to the ruleset we have to abide by */
 	const struct chainparams *chainparams;
+
+	/* psbt struct */
+	struct wally_psbt *psbt;
 };
 
 struct bitcoin_tx_output {
@@ -73,6 +71,7 @@ struct bitcoin_tx *pull_bitcoin_tx(const tal_t *ctx,
 				   const u8 **cursor, size_t *max);
 /* Add one output to tx. */
 int bitcoin_tx_add_output(struct bitcoin_tx *tx, const u8 *script,
+			  u8 *wscript,
 			  struct amount_sat amount);
 
 /* Add mutiple output to tx. */
@@ -103,6 +102,11 @@ void bitcoin_tx_output_set_amount(struct bitcoin_tx *tx, int outnum,
  * return a `tal_arr` clone of the original script.
  */
 const u8 *bitcoin_tx_output_get_script(const tal_t *ctx, const struct bitcoin_tx *tx, int outnum);
+
+/**
+ * Helper to get a witness script for an output.
+ */
+u8 *bitcoin_tx_output_get_witscript(const tal_t *ctx, const struct bitcoin_tx *tx, int outnum);
 
 /** bitcoin_tx_output_get_amount_sat - Helper to get transaction output's amount
  *
@@ -187,12 +191,12 @@ struct bitcoin_tx *fromwire_bitcoin_tx(const tal_t *ctx,
 				       const u8 **cursor, size_t *max);
 struct bitcoin_tx_output *fromwire_bitcoin_tx_output(const tal_t *ctx,
 						     const u8 **cursor, size_t *max);
-struct witscript *fromwire_witscript(const tal_t *ctx,
-				     const u8 **cursor, size_t *max);
-
 void towire_bitcoin_txid(u8 **pptr, const struct bitcoin_txid *txid);
 void towire_bitcoin_tx(u8 **pptr, const struct bitcoin_tx *tx);
 void towire_bitcoin_tx_output(u8 **pptr, const struct bitcoin_tx_output *output);
-void towire_witscript(u8 **pptr, const struct witscript *script);
 
+/*
+ * Get the base64 string encoded PSBT of a bitcoin transaction.
+ */
+char *bitcoin_tx_to_psbt_base64(const tal_t *ctx, struct bitcoin_tx *tx);
 #endif /* LIGHTNING_BITCOIN_TX_H */

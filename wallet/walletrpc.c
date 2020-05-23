@@ -443,6 +443,7 @@ static struct command_result *json_txprepare(struct command *cmd,
 	response = json_stream_success(cmd);
 	json_add_tx(response, "unsigned_tx", utx->tx);
 	json_add_txid(response, "txid", &utx->txid);
+	json_add_psbt(response, "psbt", utx->tx);
 	return command_success(cmd, response);
 }
 static const struct json_command txprepare_command = {
@@ -1034,9 +1035,12 @@ static void json_transaction_details(struct json_stream *response,
 
 		json_array_start(response, "inputs");
 		for (size_t i = 0; i < wtx->num_inputs; i++) {
+			struct bitcoin_txid prevtxid;
 			struct wally_tx_input *in = &wtx->inputs[i];
+			bitcoin_tx_input_get_txid(tx->tx, i, &prevtxid);
+
 			json_object_start(response, NULL);
-			json_add_hex(response, "txid", in->txhash, sizeof(in->txhash));
+			json_add_txid(response, "txid", &prevtxid);
 			json_add_u32(response, "index", in->index);
 			json_add_u32(response, "sequence", in->sequence);
 #if EXPERIMENTAL_FEATURES
