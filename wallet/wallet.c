@@ -2355,19 +2355,19 @@ void wallet_payment_store(struct wallet *wallet,
 	stmt = db_prepare_v2(
 		wallet->db,
 		SQL("INSERT INTO payments ("
-		"  status,"
-		"  payment_hash,"
-		"  destination,"
-		"  msatoshi,"
-		"  timestamp,"
-		"  path_secrets,"
-		"  route_nodes,"
-		"  route_channels,"
-		"  msatoshi_sent,"
-		"  description,"
-		"  bolt11,"
-		"  total_msat,"
-		"  partid"
+		    "  status,"
+		    "  payment_hash,"
+		    "  destination,"
+		    "  msatoshi,"
+		    "  timestamp,"
+		    "  path_secrets,"
+		    "  route_nodes,"
+		    "  route_channels,"
+		    "  msatoshi_sent,"
+		    "  description,"
+		    "  bolt11,"
+		    "  total_msat,"
+		    "  partid"
 		    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"));
 
 	db_bind_int(stmt, 0, payment->status);
@@ -2797,7 +2797,8 @@ wallet_payment_list(const tal_t *ctx,
 						     ", failonionreply"
 						     ", total_msat"
 						     ", partid"
-						     " FROM payments;"));
+						     " FROM payments"
+						     " ORDER BY id;"));
 	}
 	db_query_prepared(stmt);
 
@@ -3152,9 +3153,9 @@ void wallet_transaction_add(struct wallet *w, const struct bitcoin_tx *tx,
 		/* This transaction is still unknown, insert */
 		stmt = db_prepare_v2(w->db,
 				     SQL("INSERT INTO transactions ("
-				  "  id"
-				  ", blockheight"
-				  ", txindex"
+					 "  id"
+					 ", blockheight"
+					 ", txindex"
 					 ", rawtx) VALUES (?, ?, ?, ?);"));
 		db_bind_txid(stmt, 0, &txid);
 		if (blockheight) {
