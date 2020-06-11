@@ -12,6 +12,7 @@
  */
 #include <bitcoin/chainparams.h>
 #include <bitcoin/privkey.h>
+#include <bitcoin/psbt.h>
 #include <bitcoin/script.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/cast/cast.h>
@@ -841,7 +842,6 @@ static secp256k1_ecdsa_signature *calc_commitsigs(const tal_t *ctx,
 
 	msg = towire_hsm_sign_remote_commitment_tx(NULL, txs[0],
 						   &peer->channel->funding_pubkey[REMOTE],
-						   *txs[0]->input_amounts[0],
 						   &peer->remote_per_commit,
 						   peer->channel->option_static_remotekey);
 
@@ -883,7 +883,6 @@ static secp256k1_ecdsa_signature *calc_commitsigs(const tal_t *ctx,
 		wscript = bitcoin_tx_output_get_witscript(tmpctx, txs[0],
 							  txs[i+1]->wtx->inputs[0].index);
 		msg = towire_hsm_sign_remote_htlc_tx(NULL, txs[i + 1], wscript,
-						     *txs[i+1]->input_amounts[0],
 						     &peer->remote_per_commit);
 
 		msg = hsm_req(tmpctx, take(msg));
@@ -1290,6 +1289,10 @@ static void handle_peer_commit_sig(struct peer *peer, const u8 *msg)
 	    channel_txs(tmpctx, &htlc_map, NULL,
 			&funding_wscript, peer->channel, &peer->next_local_per_commit,
 			peer->next_index[LOCAL], LOCAL);
+
+	/* Set the commit_sig on the commitment tx psbt */
+	psbt_input_set_partial_sig(txs[0]->psbt, 0,
+	    &peer->channel->funding_pubkey[REMOTE], &commit_sig);
 
 	if (!derive_simple_key(&peer->channel->basepoints[REMOTE].htlc,
 			       &peer->next_local_per_commit, &remote_htlckey))

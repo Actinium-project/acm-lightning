@@ -21,9 +21,6 @@ struct bitcoin_txid {
 STRUCTEQ_DEF(bitcoin_txid, 0, shad.sha.u);
 
 struct bitcoin_tx {
-	/* Keep track of input amounts, this is needed for signatures (NULL if
-	 * unknown) */
-	struct amount_sat **input_amounts;
 	struct wally_tx *wtx;
 
 	/* Keep a reference to the ruleset we have to abide by */
@@ -68,6 +65,9 @@ bool bitcoin_txid_from_hex(const char *hexstr, size_t hexstr_len,
 bool bitcoin_txid_to_hex(const struct bitcoin_txid *txid,
 			 char *hexstr, size_t hexstr_len);
 
+/* Create a bitcoin_tx from a psbt */
+struct bitcoin_tx *bitcoin_tx_with_psbt(const tal_t *ctx, struct wally_psbt *psbt);
+
 /* Internal de-linearization functions. */
 struct bitcoin_tx *pull_bitcoin_tx(const tal_t *ctx,
 				   const u8 **cursor, size_t *max);
@@ -80,9 +80,19 @@ int bitcoin_tx_add_output(struct bitcoin_tx *tx, const u8 *script,
 int bitcoin_tx_add_multi_outputs(struct bitcoin_tx *tx,
 				 struct bitcoin_tx_output **outputs);
 
+/* Set the locktime for a transaction */
+void bitcoin_tx_set_locktime(struct bitcoin_tx *tx, u32 locktime);
+
+/* Add a new input to a bitcoin tx.
+ *
+ * For P2WSH inputs, we'll also store the wscript and/or scriptPubkey
+ * Passing in just the {input_wscript}, we'll generate the scriptPubkey for you.
+ * In some cases we may not have the wscript, in which case the scriptPubkey
+ * should be provided. We'll check that it's P2WSH before saving it */
 int bitcoin_tx_add_input(struct bitcoin_tx *tx, const struct bitcoin_txid *txid,
-			 u32 outnum, u32 sequence,
-			 struct amount_sat amount, u8 *script);
+			 u32 outnum, u32 sequence, const u8 *scriptSig,
+			 struct amount_sat amount, const u8 *scriptPubkey,
+			 const u8 *input_wscript);
 
 /* This helps is useful because wally uses a raw byte array for txids */
 bool wally_tx_input_spends(const struct wally_tx_input *input,
@@ -189,8 +199,8 @@ struct amount_sat bitcoin_tx_compute_fee(const struct bitcoin_tx *tx);
 /*
  * Calculate the fees for this transaction, given a pre-computed input balance.
  *
- * This is needed for cases where the input_amounts aren't properly initialized,
- * typically due to being passed across the wire.
+ * This is needed for cases where the transaction's psbt metadata isn't properly filled
+ * in typically due to being instantiated from a tx hex (i.e. from a block scan)
  */
 struct amount_sat bitcoin_tx_compute_fee_w_inputs(const struct bitcoin_tx *tx,
 						  struct amount_sat input_val);
@@ -210,4 +220,6 @@ void towire_bitcoin_tx_output(u8 **pptr, const struct bitcoin_tx_output *output)
  * Get the base64 string encoded PSBT of a bitcoin transaction.
  */
 char *bitcoin_tx_to_psbt_base64(const tal_t *ctx, struct bitcoin_tx *tx);
+
+int wally_tx_clone(struct wally_tx *tx, struct wally_tx **output);
 #endif /* LIGHTNING_BITCOIN_TX_H */

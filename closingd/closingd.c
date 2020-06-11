@@ -39,6 +39,7 @@ static struct bitcoin_tx *close_tx(const tal_t *ctx,
 				   const struct bitcoin_txid *funding_txid,
 				   unsigned int funding_txout,
 				   struct amount_sat funding,
+				   const u8 *funding_wscript,
 				   const struct amount_sat out[NUM_SIDES],
 				   enum side opener,
 				   struct amount_sat fee,
@@ -67,6 +68,7 @@ static struct bitcoin_tx *close_tx(const tal_t *ctx,
 	tx = create_close_tx(ctx,
 			     chainparams,
 			     scriptpubkey[LOCAL], scriptpubkey[REMOTE],
+			     funding_wscript,
 			     funding_txid,
 			     funding_txout,
 			     funding,
@@ -238,6 +240,7 @@ static void send_offer(struct per_peer_state *pps,
 		       const struct chainparams *chainparams,
 		       const struct channel_id *channel_id,
 		       const struct pubkey funding_pubkey[NUM_SIDES],
+		       const u8 *funding_wscript,
 		       u8 *scriptpubkey[NUM_SIDES],
 		       const struct bitcoin_txid *funding_txid,
 		       unsigned int funding_txout,
@@ -262,6 +265,7 @@ static void send_offer(struct per_peer_state *pps,
 		      funding_txid,
 		      funding_txout,
 		      funding,
+		      funding_wscript,
 		      out,
 		      opener, fee_to_offer, our_dust_limit);
 
@@ -276,8 +280,7 @@ static void send_offer(struct per_peer_state *pps,
 	wire_sync_write(HSM_FD,
 			take(towire_hsm_sign_mutual_close_tx(NULL,
 							     tx,
-							     &funding_pubkey[REMOTE],
-							     funding)));
+							     &funding_pubkey[REMOTE])));
 	msg = wire_sync_read(tmpctx, HSM_FD);
 	if (!fromwire_hsm_sign_tx_reply(msg, &our_sig))
 		status_failed(STATUS_FAIL_HSM_IO,
@@ -372,6 +375,7 @@ receive_offer(struct per_peer_state *pps,
 		      funding_txid,
 		      funding_txout,
 		      funding,
+		      funding_wscript,
 		      out, opener, received_fee, our_dust_limit);
 
 	if (!check_tx_sig(tx, 0, NULL, funding_wscript,
@@ -401,6 +405,7 @@ receive_offer(struct per_peer_state *pps,
 				   funding_txid,
 				   funding_txout,
 				   funding,
+				   funding_wscript,
 				   trimming_out,
 				   opener, received_fee, our_dust_limit);
 		if (!trimmed
@@ -696,7 +701,7 @@ int main(int argc, char *argv[])
 	for (size_t i = 0; i < 2; i++, whose_turn = !whose_turn) {
 		if (whose_turn == LOCAL) {
 			send_offer(pps, chainparams,
-				   &channel_id, funding_pubkey,
+				   &channel_id, funding_pubkey, funding_wscript,
 				   scriptpubkey, &funding_txid, funding_txout,
 				   funding, out, opener,
 				   our_dust_limit,
@@ -745,7 +750,7 @@ int main(int argc, char *argv[])
 						    fee_negotiation_step,
 						    fee_negotiation_step_unit);
 			send_offer(pps, chainparams, &channel_id,
-				   funding_pubkey,
+				   funding_pubkey, funding_wscript,
 				   scriptpubkey, &funding_txid, funding_txout,
 				   funding, out, opener,
 				   our_dust_limit,
