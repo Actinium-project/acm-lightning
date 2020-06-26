@@ -35,6 +35,10 @@ struct bitcoin_tx_output {
 	u8 *script;
 };
 
+struct bitcoin_tx_output *new_tx_output(const tal_t *ctx,
+					struct amount_sat amount,
+					const u8 *script);
+
 /* SHA256^2 the tx in legacy format. */
 void bitcoin_txid(const struct bitcoin_tx *tx, struct bitcoin_txid *txid);
 void wally_txid(const struct wally_tx *wtx, struct bitcoin_txid *txid);
@@ -215,11 +219,6 @@ struct bitcoin_tx_output *fromwire_bitcoin_tx_output(const tal_t *ctx,
 void towire_bitcoin_txid(u8 **pptr, const struct bitcoin_txid *txid);
 void towire_bitcoin_tx(u8 **pptr, const struct bitcoin_tx *tx);
 void towire_bitcoin_tx_output(u8 **pptr, const struct bitcoin_tx_output *output);
-
-/*
- * Get the base64 string encoded PSBT of a bitcoin transaction.
- */
-char *bitcoin_tx_to_psbt_base64(const tal_t *ctx, struct bitcoin_tx *tx);
 
 int wally_tx_clone(struct wally_tx *tx, struct wally_tx **output);
 #endif /* LIGHTNING_BITCOIN_TX_H */

@@ -32,6 +32,16 @@ int wally_tx_clone(struct wally_tx *tx, struct wally_tx **output)
 	return ret;
 }
 
+struct bitcoin_tx_output *new_tx_output(const tal_t *ctx,
+					struct amount_sat amount,
+					const u8 *script)
+{
+	struct bitcoin_tx_output *output = tal(ctx, struct bitcoin_tx_output);
+	output->amount = amount;
+	output->script = tal_dup_arr(output, u8, script, tal_count(script), 0);
+	return output;
+}
+
 int bitcoin_tx_add_output(struct bitcoin_tx *tx, const u8 *script,
 			  u8 *wscript, struct amount_sat amount)
 {
@@ -484,48 +494,20 @@ void bitcoin_tx_finalize(struct bitcoin_tx *tx)
 	assert(bitcoin_tx_check(tx));
 }
 
-char *bitcoin_tx_to_psbt_base64(const tal_t *ctx, struct bitcoin_tx *tx)
-{
-	char *serialized_psbt, *ret_val;
-	int ret;
-
-	ret = wally_psbt_to_base64(tx->psbt, &serialized_psbt);
-	assert(ret == WALLY_OK);
-
-	ret_val = tal_strdup(ctx, serialized_psbt);
-	wally_free_string(serialized_psbt);
-	return ret_val;
-}
-
 struct bitcoin_tx *bitcoin_tx_with_psbt(const tal_t *ctx, struct wally_psbt *psbt STEALS)
 {
-	struct wally_psbt *tmppsbt;
 	struct bitcoin_tx *tx = bitcoin_tx(ctx, chainparams,
 					   psbt->tx->num_inputs,
 					   psbt->tx->num_outputs,
 					   psbt->tx->locktime);
 	wally_tx_free(tx->wtx);
-
-	/* We want the 'finalized' tx since that includes any signature
-	 * data, not the global tx. But 'finalizing' a tx destroys some fields
-	 * so we 'clone' it first and then finalize it */
-	if (wally_psbt_clone(psbt, &tmppsbt) != WALLY_OK)
-		abort();
-
-	if (wally_finalize_psbt(tmppsbt) != WALLY_OK)
-		abort();
-
-	if (psbt_is_finalized(tmppsbt)) {
-		if (wally_extract_psbt(tmppsbt, &tx->wtx) != WALLY_OK)
-			abort();
-	} else if (wally_tx_clone(psbt->tx, &tx->wtx) != WALLY_OK)
-		abort();
-
-
-	wally_psbt_free(tmppsbt);
+	tx->wtx = psbt_finalize(psbt, false);
+	if (!tx->wtx && wally_tx_clone(psbt->tx, &tx->wtx) != WALLY_OK)
+		return NULL;
 
 	tal_free(tx->psbt);
 	tx->psbt = tal_steal(tx, psbt);
+
 	return tx;
 }
 
@@ -665,7 +647,7 @@ struct bitcoin_tx *fromwire_bitcoin_tx(const tal_t *ctx,
 
 	/* pull_bitcoin_tx sets the psbt */
 	tal_free(tx->psbt);
-	tx->psbt = fromwire_psbt(tx, cursor, max);
+	tx->psbt = fromwire_wally_psbt(tx, cursor, max);
 
 	return tx;
 }
@@ -680,7 +662,7 @@ void towire_bitcoin_tx(u8 **pptr, const struct bitcoin_tx *tx)
 	u8 *lin = linearize_tx(tmpctx, tx);
 	towire_u8_array(pptr, lin, tal_count(lin));
 
-	towire_psbt(pptr, tx->psbt);
+	towire_wally_psbt(pptr, tx->psbt);
 }
 
 struct bitcoin_tx_output *fromwire_bitcoin_tx_output(const tal_t *ctx,

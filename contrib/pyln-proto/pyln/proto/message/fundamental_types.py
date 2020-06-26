@@ -59,6 +59,15 @@ These are further specialized.
     def val_to_str(self, v: Any, otherfields: Dict[str, Any]) -> str:
         raise NotImplementedError()
 
+    def val_from_str(self, s: str) -> Tuple[Any, str]:
+        raise NotImplementedError()
+
+    def write(self, io_out: BufferedIOBase, v: Any, otherfields: Dict[str, Any]) -> None:
+        raise NotImplementedError()
+
+    def read(self, io_in: BufferedIOBase, otherfields: Dict[str, Any]) -> Any:
+        raise NotImplementedError()
+
     def val_to_py(self, v: Any, otherfields: Dict[str, Any]) -> Any:
         """Convert to a python object: for simple fields, this means a string"""
         return self.val_to_str(v, otherfields)
@@ -83,7 +92,7 @@ class IntegerType(FieldType):
         a, b = split_field(s)
         return int(a), b
 
-    def val_to_py(self, v: Any, otherfields: Dict[str, Any]) -> int:
+    def val_to_py(self, v: Any, otherfields: Dict[str, Any]) -> Any:
         """Convert to a python object: for integer fields, this means an int"""
         return int(v)
 
@@ -240,8 +249,37 @@ class BigSizeType(FieldType):
         return int(v)
 
 
-def fundamental_types():
-    # From 01-messaging.md#fundamental-types:
+def fundamental_types() -> List[FieldType]:
+    # BOLT #1:
+    # Various fundamental types are referred to in the message specifications:
+    #
+    # * `byte`: an 8-bit byte
+    # * `u16`: a 2 byte unsigned integer
+    # * `u32`: a 4 byte unsigned integer
+    # * `u64`: an 8 byte unsigned integer
+    #
+    # Inside TLV records which contain a single value, leading zeros in
+    # integers can be omitted:
+    #
+    # * `tu16`: a 0 to 2 byte unsigned integer
+    # * `tu32`: a 0 to 4 byte unsigned integer
+    # * `tu64`: a 0 to 8 byte unsigned integer
+    #
+    # The following convenience types are also defined:
+    #
+    # * `chain_hash`: a 32-byte chain identifier (see [BOLT
+    #   #0](00-introduction.md#glossary-and-terminology-guide))
+    # * `channel_id`: a 32-byte channel_id (see [BOLT
+    #   #2](02-peer-protocol.md#definition-of-channel-id))
+    # * `sha256`: a 32-byte SHA2-256 hash
+    # * `signature`: a 64-byte bitcoin Elliptic Curve signature
+    # * `point`: a 33-byte Elliptic Curve point (compressed encoding as per
+    #   [SEC 1 standard](http://www.secg.org/sec1-v2.pdf#subsubsection.2.3.3))
+    # * `short_channel_id`: an 8 byte value identifying a channel (see [BOLT
+    #   #7](07-routing-gossip.md#definition-of-short-channel-id))
+    # * `bigsize`: a variable-length, unsigned integer similar to Bitcoin's
+    #   CompactSize encoding, but big-endian.  Described in
+    #   [BigSize](#appendix-a-bigsize-test-vectors).
     return [IntegerType('byte', 1, 'B'),
             IntegerType('u16', 2, '>H'),
             IntegerType('u32', 4, '>I'),
@@ -256,10 +294,6 @@ def fundamental_types():
             ShortChannelIDType('short_channel_id'),
             FundamentalHexType('signature', 64),
             BigSizeType('bigsize'),
-            # FIXME: See https://github.com/lightningnetwork/lightning-rfc/pull/778
-            BigSizeType('varint'),
-            # FIXME
-            IntegerType('u8', 1, 'B'),
             ]
 
 
