@@ -1107,6 +1107,46 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("txsend", payload)
 
+    def reserveinputs(self, outputs, feerate=None, minconf=None, utxos=None):
+        """
+        Reserve UTXOs and return a psbt for a 'stub' transaction that
+        spends the reserved UTXOs.
+        """
+        payload = {
+            "outputs": outputs,
+            "feerate": feerate,
+            "minconf": minconf,
+            "utxos": utxos,
+        }
+        return self.call("reserveinputs", payload)
+
+    def unreserveinputs(self, psbt):
+        """
+        Unreserve UTXOs that were previously reserved.
+        """
+        payload = {
+            "psbt": psbt,
+        }
+        return self.call("unreserveinputs", payload)
+
+    def signpsbt(self, psbt):
+        """
+        Add internal wallet's signatures to PSBT
+        """
+        payload = {
+            "psbt": psbt,
+        }
+        return self.call("signpsbt", payload)
+
+    def sendpsbt(self, psbt):
+        """
+        Finalize extract and broadcast a PSBT
+        """
+        payload = {
+            "psbt": psbt,
+        }
+        return self.call("sendpsbt", payload)
+
     def signmessage(self, message):
         """
         Sign a message with this node's secret key.

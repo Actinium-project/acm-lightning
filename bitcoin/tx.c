@@ -2,7 +2,6 @@
 #include <bitcoin/block.h>
 #include <bitcoin/chainparams.h>
 #include <bitcoin/psbt.h>
-#include <bitcoin/pullpush.h>
 #include <bitcoin/script.h>
 #include <bitcoin/tx.h>
 #include <ccan/cast/cast.h>
@@ -30,6 +29,16 @@ int wally_tx_clone(struct wally_tx *tx, struct wally_tx **output)
 	ret = wally_tx_from_bytes(txlin, tal_bytelen(txlin), flags, output);
 	tal_free(txlin);
 	return ret;
+}
+
+struct bitcoin_tx_output *new_tx_output(const tal_t *ctx,
+					struct amount_sat amount,
+					const u8 *script)
+{
+	struct bitcoin_tx_output *output = tal(ctx, struct bitcoin_tx_output);
+	output->amount = amount;
+	output->script = tal_dup_arr(output, u8, script, tal_count(script), 0);
+	return output;
 }
 
 int bitcoin_tx_add_output(struct bitcoin_tx *tx, const u8 *script,
@@ -111,7 +120,9 @@ struct amount_sat bitcoin_tx_compute_fee_w_inputs(const struct bitcoin_tx *tx,
 
 		ok = amount_sat_sub(&input_val, input_val,
 				    amount_asset_to_sat(&asset));
-		assert(ok);
+		if (!ok)
+			return AMOUNT_SAT(0);
+
 	}
 	return input_val;
 }
@@ -255,22 +266,26 @@ void bitcoin_tx_output_set_amount(struct bitcoin_tx *tx, int outnum,
 	}
 }
 
-const u8 *bitcoin_tx_output_get_script(const tal_t *ctx,
-				       const struct bitcoin_tx *tx, int outnum)
+const u8 *wally_tx_output_get_script(const tal_t *ctx,
+				     const struct wally_tx_output *output)
 {
-	const struct wally_tx_output *output;
-	u8 *res;
-	assert(outnum < tx->wtx->num_outputs);
-	output = &tx->wtx->outputs[outnum];
-
 	if (output->script == NULL) {
 		/* This can happen for coinbase transactions and pegin
 		 * transactions */
 		return NULL;
 	}
 
-	res = tal_dup_arr(ctx, u8, output->script, output->script_len, 0);
-	return res;
+	return tal_dup_arr(ctx, u8, output->script, output->script_len, 0);
+}
+
+const u8 *bitcoin_tx_output_get_script(const tal_t *ctx,
+				       const struct bitcoin_tx *tx, int outnum)
+{
+	const struct wally_tx_output *output;
+	assert(outnum < tx->wtx->num_outputs);
+	output = &tx->wtx->outputs[outnum];
+
+	return wally_tx_output_get_script(ctx, output);
 }
 
 u8 *bitcoin_tx_output_get_witscript(const tal_t *ctx, const struct bitcoin_tx *tx,
@@ -484,48 +499,20 @@ void bitcoin_tx_finalize(struct bitcoin_tx *tx)
 	assert(bitcoin_tx_check(tx));
 }
 
-char *bitcoin_tx_to_psbt_base64(const tal_t *ctx, struct bitcoin_tx *tx)
-{
-	char *serialized_psbt, *ret_val;
-	int ret;
-
-	ret = wally_psbt_to_base64(tx->psbt, &serialized_psbt);
-	assert(ret == WALLY_OK);
-
-	ret_val = tal_strdup(ctx, serialized_psbt);
-	wally_free_string(serialized_psbt);
-	return ret_val;
-}
-
 struct bitcoin_tx *bitcoin_tx_with_psbt(const tal_t *ctx, struct wally_psbt *psbt STEALS)
 {
-	struct wally_psbt *tmppsbt;
 	struct bitcoin_tx *tx = bitcoin_tx(ctx, chainparams,
 					   psbt->tx->num_inputs,
 					   psbt->tx->num_outputs,
 					   psbt->tx->locktime);
 	wally_tx_free(tx->wtx);
-
-	/* We want the 'finalized' tx since that includes any signature
-	 * data, not the global tx. But 'finalizing' a tx destroys some fields
-	 * so we 'clone' it first and then finalize it */
-	if (wally_psbt_clone(psbt, &tmppsbt) != WALLY_OK)
-		abort();
-
-	if (wally_finalize_psbt(tmppsbt) != WALLY_OK)
-		abort();
-
-	if (psbt_is_finalized(tmppsbt)) {
-		if (wally_extract_psbt(tmppsbt, &tx->wtx) != WALLY_OK)
-			abort();
-	} else if (wally_tx_clone(psbt->tx, &tx->wtx) != WALLY_OK)
-		abort();
-
-
-	wally_psbt_free(tmppsbt);
+	tx->wtx = psbt_finalize(psbt, false);
+	if (!tx->wtx && wally_tx_clone(psbt->tx, &tx->wtx) != WALLY_OK)
+		return NULL;
 
 	tal_free(tx->psbt);
 	tx->psbt = tal_steal(tx, psbt);
+
 	return tx;
 }
 
@@ -665,7 +652,7 @@ struct bitcoin_tx *fromwire_bitcoin_tx(const tal_t *ctx,
 
 	/* pull_bitcoin_tx sets the psbt */
 	tal_free(tx->psbt);
-	tx->psbt = fromwire_psbt(tx, cursor, max);
+	tx->psbt = fromwire_wally_psbt(tx, cursor, max);
 
 	return tx;
 }
@@ -680,7 +667,7 @@ void towire_bitcoin_tx(u8 **pptr, const struct bitcoin_tx *tx)
 	u8 *lin = linearize_tx(tmpctx, tx);
 	towire_u8_array(pptr, lin, tal_count(lin));
 
-	towire_psbt(pptr, tx->psbt);
+	towire_wally_psbt(pptr, tx->psbt);
 }
 
 struct bitcoin_tx_output *fromwire_bitcoin_tx_output(const tal_t *ctx,
@@ -743,4 +730,93 @@ wally_tx_output_get_amount(const struct wally_tx_output *output)
 	}
 
 	return amount;
+}
+
+/* Various weights of transaction parts. */
+size_t bitcoin_tx_core_weight(size_t num_inputs, size_t num_outputs)
+{
+	size_t weight;
+
+	/* version, input count, output count, locktime */
+	weight = (4 + varint_size(num_inputs) + varint_size(num_outputs) + 4)
+		* 4;
+
+	/* Add segwit fields: marker + flag */
+	weight += 1 + 1;
+
+	/* A couple of things need to change for elements: */
+	if (chainparams->is_elements) {
+                /* Each transaction has surjection and rangeproof (both empty
+		 * for us as long as we use unblinded L-BTC transactions). */
+		weight += 2 * 4;
+
+		/* An elements transaction has 1 additional output for fees */
+		weight += bitcoin_tx_output_weight(0);
+	}
+	return weight;
+}
+
+size_t bitcoin_tx_output_weight(size_t outscript_len)
+{
+	size_t weight;
+
+	/* amount, len, scriptpubkey */
+	weight = (8 + varint_size(outscript_len) + outscript_len) * 4;
+
+	if (chainparams->is_elements) {
+		/* Each output additionally has an asset_tag (1 + 32), value
+		 * is prefixed by a version (1 byte), an empty nonce (1
+		 * byte), two empty proofs (2 bytes). */
+		weight += (32 + 1 + 1 + 1) * 4;
+	}
+
+	return weight;
+}
+
+/* We grind signatures to get them down to 71 bytes (+1 for sighash flags) */
+size_t bitcoin_tx_input_sig_weight(void)
+{
+	return 1 + 71 + 1;
+}
+
+/* We only do segwit inputs, and we assume witness is sig + key  */
+size_t bitcoin_tx_simple_input_weight(bool p2sh)
+{
+	size_t weight;
+
+	/* Input weight: txid + index + sequence */
+	weight = (32 + 4 + 4) * 4;
+
+	/* We always encode the length of the script, even if empty */
+	weight += 1 * 4;
+
+	/* P2SH variants include push of <0 <20-byte-key-hash>> */
+	if (p2sh)
+		weight += 23 * 4;
+
+	/* Account for witness (1 byte count + sig + key) */
+	weight += 1 + (bitcoin_tx_input_sig_weight() + 1 + 33);
+
+	/* Elements inputs have 6 bytes of blank proofs attached. */
+	if (chainparams->is_elements)
+		weight += 6;
+
+	return weight;
+}
+
+struct amount_sat change_amount(struct amount_sat excess, u32 feerate_perkw)
+{
+	size_t outweight;
+
+	/* Must be able to pay for its own additional weight */
+	outweight = bitcoin_tx_output_weight(BITCOIN_SCRIPTPUBKEY_P2WPKH_LEN);
+	if (!amount_sat_sub(&excess,
+			    excess, amount_tx_fee(feerate_perkw, outweight)))
+		return AMOUNT_SAT(0);
+
+	/* Must be non-dust */
+	if (!amount_sat_greater_eq(excess, chainparams->dust_limit))
+		return AMOUNT_SAT(0);
+
+	return excess;
 }

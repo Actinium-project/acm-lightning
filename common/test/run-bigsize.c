@@ -27,11 +27,17 @@ struct amount_sat amount_asset_to_sat(struct amount_asset *asset UNNEEDED)
 /* Generated stub for amount_sat_eq */
 bool amount_sat_eq(struct amount_sat a UNNEEDED, struct amount_sat b UNNEEDED)
 { fprintf(stderr, "amount_sat_eq called!\n"); abort(); }
+/* Generated stub for amount_sat_greater_eq */
+bool amount_sat_greater_eq(struct amount_sat a UNNEEDED, struct amount_sat b UNNEEDED)
+{ fprintf(stderr, "amount_sat_greater_eq called!\n"); abort(); }
 /* Generated stub for amount_sat_sub */
  bool amount_sat_sub(struct amount_sat *val UNNEEDED,
 				       struct amount_sat a UNNEEDED,
 				       struct amount_sat b UNNEEDED)
 { fprintf(stderr, "amount_sat_sub called!\n"); abort(); }
+/* Generated stub for amount_tx_fee */
+struct amount_sat amount_tx_fee(u32 fee_per_kw UNNEEDED, size_t weight UNNEEDED)
+{ fprintf(stderr, "amount_tx_fee called!\n"); abort(); }
 /* Generated stub for fromwire */
 const u8 *fromwire(const u8 **cursor UNNEEDED, size_t *max UNNEEDED, void *copy UNNEEDED, size_t n UNNEEDED)
 { fprintf(stderr, "fromwire called!\n"); abort(); }
@@ -171,19 +177,19 @@ void towire_u8_array(u8 **pptr UNNEEDED, const u8 *arr UNNEEDED, size_t num UNNE
  *         "name": "two byte not canonical",
  *         "value": 0,
  *         "bytes": "fd00fc",
- *         "exp_error": "decoded varint is not canonical"
+ *         "exp_error": "decoded bigsize is not canonical"
  *     },
  *     {
  *         "name": "four byte not canonical",
  *         "value": 0,
  *         "bytes": "fe0000ffff",
- *         "exp_error": "decoded varint is not canonical"
+ *         "exp_error": "decoded bigsize is not canonical"
  *     },
  *     {
  *         "name": "eight byte not canonical",
  *         "value": 0,
  *         "bytes": "ff00000000ffffffff",
- *         "exp_error": "decoded varint is not canonical"
+ *         "exp_error": "decoded bigsize is not canonical"
  *     },
  *     {
  *         "name": "two byte short read",

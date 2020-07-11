@@ -35,6 +35,10 @@ struct bitcoin_tx_output {
 	u8 *script;
 };
 
+struct bitcoin_tx_output *new_tx_output(const tal_t *ctx,
+					struct amount_sat amount,
+					const u8 *script);
+
 /* SHA256^2 the tx in legacy format. */
 void bitcoin_txid(const struct bitcoin_tx *tx, struct bitcoin_txid *txid);
 void wally_txid(const struct wally_tx *wtx, struct bitcoin_txid *txid);
@@ -122,6 +126,15 @@ void bitcoin_tx_output_set_amount(struct bitcoin_tx *tx, int outnum,
  */
 const u8 *bitcoin_tx_output_get_script(const tal_t *ctx, const struct bitcoin_tx *tx, int outnum);
 
+/**
+ * Helper to get the script of a script's output as a tal_arr
+ *
+ * The script attached to a `wally_tx_output` is not a `tal_arr`, so in order to keep the
+ * comfort of being able to call `tal_bytelen` and similar on a script we just
+ * return a `tal_arr` clone of the original script.
+ */
+const u8 *wally_tx_output_get_script(const tal_t *ctx,
+				     const struct wally_tx_output *output);
 /**
  * Helper to get a witness script for an output.
  */
@@ -216,10 +229,27 @@ void towire_bitcoin_txid(u8 **pptr, const struct bitcoin_txid *txid);
 void towire_bitcoin_tx(u8 **pptr, const struct bitcoin_tx *tx);
 void towire_bitcoin_tx_output(u8 **pptr, const struct bitcoin_tx_output *output);
 
-/*
- * Get the base64 string encoded PSBT of a bitcoin transaction.
- */
-char *bitcoin_tx_to_psbt_base64(const tal_t *ctx, struct bitcoin_tx *tx);
-
 int wally_tx_clone(struct wally_tx *tx, struct wally_tx **output);
+
+/* Various weights of transaction parts. */
+size_t bitcoin_tx_core_weight(size_t num_inputs, size_t num_outputs);
+size_t bitcoin_tx_output_weight(size_t outscript_len);
+
+/* Weight to push sig on stack. */
+size_t bitcoin_tx_input_sig_weight(void);
+
+/* We only do segwit inputs, and we assume witness is sig + key  */
+size_t bitcoin_tx_simple_input_weight(bool p2sh);
+
+/**
+ * change_amount - Is it worth making a P2WPKH change output at this feerate?
+ * @excess: input amount we have above the tx fee and other outputs.
+ * @feerate_perkw: feerate.
+ *
+ * If it's not worth (or possible) to make change, returns AMOUNT_SAT(0).
+ * Otherwise returns the amount of the change output to add (@excess minus
+ * the additional fee for the change output itself).
+ */
+struct amount_sat change_amount(struct amount_sat excess, u32 feerate_perkw);
+
 #endif /* LIGHTNING_BITCOIN_TX_H */

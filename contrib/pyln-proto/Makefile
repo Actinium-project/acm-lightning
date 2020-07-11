@@ -17,13 +17,13 @@ check-flake8:
 
 # mypy . does not recurse.  I have no idea why...
 check-mypy:
-	mypy --ignore-missing-imports `find * -name '*.py'`
+	mypy --ignore-missing-imports `find pyln/proto/message/ -name '*.py'`
 
 $(SDIST_FILE):
 	python3 setup.py sdist
 
 $(BDIST_FILE):
-	python3 setup.py bdist
+	python3 setup.py bdist_wheel
 
 test-release: check $(ARTEFACTS)
 	python3 -m twine upload --repository testpypi --skip-existing $(ARTEFACTS)
@@ -31,7 +31,7 @@ test-release: check $(ARTEFACTS)
 	# Create a test virtualenv, install from the testpypi and run the
 	# tests against it (make sure not to use any virtualenv that may have
 	# pyln-proto already installed).
-	virtualenv --no-site-packages testpypi --python=/usr/bin/python3 --download --always-copy --clear
+	virtualenv testpypi --python=/usr/bin/python3 --download --always-copy --clear
 	# Install the requirements from the prod repo, they are not being kept up to date on the test repo
 	testpypi/bin/python3 -m pip install -r requirements.txt pytest flaky pytest-timeout
 	testpypi/bin/python3 -m pip install -I --index-url https://test.pypi.org/simple/ --no-deps pyln-proto
@@ -39,7 +39,7 @@ test-release: check $(ARTEFACTS)
 	testpypi/bin/pytest tests
 	rm -rf testpypi
 
-prod-release: test $(ARTEFACTS)
+prod-release: test-release $(ARTEFACTS)
 	python3 -m twine upload $(ARTEFACTS)
 
 clean:

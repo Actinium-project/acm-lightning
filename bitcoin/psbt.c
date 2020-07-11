@@ -5,7 +5,9 @@
 #include <bitcoin/signature.h>
 #include <ccan/cast/cast.h>
 #include <ccan/ccan/array_size/array_size.h>
+#include <ccan/tal/str/str.h>
 #include <common/amount.h>
+#include <common/type_to_string.h>
 #include <common/utils.h>
 #include <string.h>
 #include <wally_psbt.h>
@@ -114,10 +116,32 @@ struct wally_psbt_input *psbt_add_input(struct wally_psbt *psbt,
 {
 	struct wally_tx *tx;
 	struct wally_tx_input tmp_in;
+	u8 *script;
+	size_t scriptlen = 0;
+	struct wally_tx_witness_stack *witness = NULL;
 
 	tx = psbt->tx;
 	assert(insert_at <= tx->num_inputs);
+
+	/* Remove any script sig or witness info before adding it ! */
+	if (input->script_len > 0) {
+		scriptlen = input->script_len;
+		input->script_len = 0;
+		script = (u8 *)input->script;
+		input->script = NULL;
+	}
+	if (input->witness) {
+		witness = input->witness;
+		input->witness = NULL;
+	}
 	wally_tx_add_input(tx, input);
+	/* Put the script + witness info back */
+	if (scriptlen > 0) {
+		input->script_len = scriptlen;
+		input->script = script;
+	}
+	if (witness)
+		input->witness = witness;
 
 	tmp_in = tx->inputs[tx->num_inputs - 1];
 	MAKE_ROOM(tx->inputs, insert_at, tx->num_inputs);
@@ -219,29 +243,24 @@ void psbt_input_add_pubkey(struct wally_psbt *psbt, size_t in,
 	assert(wally_err == WALLY_OK);
 }
 
-void psbt_input_set_partial_sig(struct wally_psbt *psbt, size_t in,
+bool psbt_input_set_partial_sig(struct wally_psbt *psbt, size_t in,
 				const struct pubkey *pubkey,
 				const struct bitcoin_signature *sig)
 {
-	int wally_err;
 	u8 pk_der[PUBKEY_CMPR_LEN];
 
 	assert(in < psbt->num_inputs);
 	if (!psbt->inputs[in].partial_sigs)
 		if (wally_partial_sigs_map_init_alloc(1, &psbt->inputs[in].partial_sigs) != WALLY_OK)
-			abort();
+			return false;
 
 	/* we serialize the compressed version of the key, wally likes this */
 	pubkey_to_der(pk_der, pubkey);
-	wally_err = wally_add_new_partial_sig(psbt->inputs[in].partial_sigs,
-					      pk_der, sizeof(pk_der),
-					      cast_const(unsigned char *, sig->s.data),
-					      sizeof(sig->s.data));
-	assert(wally_err == WALLY_OK);
-
-	wally_err = wally_psbt_input_set_sighash_type(&psbt->inputs[in],
-						      sig->sighash_type);
-	assert(wally_err == WALLY_OK);
+	wally_psbt_input_set_sighash_type(&psbt->inputs[in], sig->sighash_type);
+	return wally_add_new_partial_sig(psbt->inputs[in].partial_sigs,
+					 pk_der, sizeof(pk_der),
+					 cast_const(unsigned char *, sig->s.data),
+					 sizeof(sig->s.data)) == WALLY_OK;
 }
 
 void psbt_input_set_prev_utxo(struct wally_psbt *psbt, size_t in,
@@ -293,6 +312,17 @@ void psbt_input_set_prev_utxo_wscript(struct wally_psbt *psbt, size_t in,
 	psbt_input_set_prev_utxo(psbt, in, scriptPubkey, amt);
 }
 
+bool psbt_input_set_redeemscript(struct wally_psbt *psbt, size_t in,
+				 const u8 *redeemscript)
+{
+	int wally_err;
+	assert(psbt->num_inputs > in);
+	wally_err = wally_psbt_input_set_redeem_script(&psbt->inputs[in],
+						       cast_const(u8 *, redeemscript),
+						       tal_bytelen(redeemscript));
+	return wally_err == WALLY_OK;
+}
+
 struct amount_sat psbt_input_get_amount(struct wally_psbt *psbt,
 					size_t in)
 {
@@ -309,6 +339,60 @@ struct amount_sat psbt_input_get_amount(struct wally_psbt *psbt,
 
 	return val;
 }
+
+struct wally_tx *psbt_finalize(struct wally_psbt *psbt, bool finalize_in_place)
+{
+	struct wally_psbt *tmppsbt;
+	struct wally_tx *wtx;
+
+	/* We want the 'finalized' tx since that includes any signature
+	 * data, not the global tx. But 'finalizing' a tx destroys some fields
+	 * so we 'clone' it first and then finalize it */
+	if (!finalize_in_place) {
+		if (wally_psbt_clone(psbt, &tmppsbt) != WALLY_OK)
+			return NULL;
+	} else
+		tmppsbt = cast_const(struct wally_psbt *, psbt);
+
+	if (wally_finalize_psbt(tmppsbt) != WALLY_OK) {
+		if (!finalize_in_place)
+			wally_psbt_free(tmppsbt);
+		return NULL;
+	}
+
+	if (psbt_is_finalized(tmppsbt)
+		&& wally_extract_psbt(tmppsbt, &wtx) == WALLY_OK) {
+		if (!finalize_in_place)
+			wally_psbt_free(tmppsbt);
+		return wtx;
+	}
+
+	if (!finalize_in_place)
+		wally_psbt_free(tmppsbt);
+	return NULL;
+}
+
+bool psbt_from_b64(const char *b64str, struct wally_psbt **psbt)
+{
+	int wally_err;
+	wally_err = wally_psbt_from_base64(b64str, psbt);
+	return wally_err == WALLY_OK;
+}
+
+char *psbt_to_b64(const tal_t *ctx, const struct wally_psbt *psbt)
+{
+	char *serialized_psbt, *ret_val;
+	int ret;
+
+	ret = wally_psbt_to_base64(cast_const(struct wally_psbt *, psbt),
+				   &serialized_psbt);
+	assert(ret == WALLY_OK);
+
+	ret_val = tal_strdup(ctx, serialized_psbt);
+	wally_free_string(serialized_psbt);
+	return ret_val;
+}
+REGISTER_TYPE_TO_STRING(wally_psbt, psbt_to_b64);
 
 const u8 *psbt_get_bytes(const tal_t *ctx, const struct wally_psbt *psbt,
 			 size_t *bytes_written)
@@ -340,7 +424,7 @@ struct wally_psbt *psbt_from_bytes(const tal_t *ctx, const u8 *bytes,
 	return psbt;
 }
 
-void towire_psbt(u8 **pptr, const struct wally_psbt *psbt)
+void towire_wally_psbt(u8 **pptr, const struct wally_psbt *psbt)
 {
 	/* Let's include the PSBT bytes */
 	size_t bytes_written;
@@ -350,8 +434,8 @@ void towire_psbt(u8 **pptr, const struct wally_psbt *psbt)
 	tal_free(pbt_bytes);
 }
 
-struct wally_psbt *fromwire_psbt(const tal_t *ctx,
-				 const u8 **cursor, size_t *max)
+struct wally_psbt *fromwire_wally_psbt(const tal_t *ctx,
+				       const u8 **cursor, size_t *max)
 {
 	struct wally_psbt *psbt;
 	u32 psbt_byte_len;

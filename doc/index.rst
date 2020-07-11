@@ -46,6 +46,7 @@ c-lightning Documentation
    lightning-fundchannel_start <lightning-fundchannel_start.7.md>
    lightning-getroute <lightning-getroute.7.md>
    lightning-getsharedsecret <lightning-getsharedsecret.7.md>
+   lightning-hsmtool <lightning-hsmtool.8.md>
    lightning-invoice <lightning-invoice.7.md>
    lightning-listchannels <lightning-listchannels.7.md>
    lightning-listforwards <lightning-listforwards.7.md>
@@ -57,6 +58,7 @@ c-lightning Documentation
    lightning-newaddr <lightning-newaddr.7.md>
    lightning-pay <lightning-pay.7.md>
    lightning-plugin <lightning-plugin.7.md>
+   lightning-reserveinputs <lightning-reserveinputs.7.md>
    lightning-sendonion <lightning-sendonion.7.md>
    lightning-sendpay <lightning-sendpay.7.md>
    lightning-setchannelfee <lightning-setchannelfee.7.md>
@@ -64,6 +66,7 @@ c-lightning Documentation
    lightning-txdiscard <lightning-txdiscard.7.md>
    lightning-txprepare <lightning-txprepare.7.md>
    lightning-txsend <lightning-txsend.7.md>
+   lightning-unreserveinputs <lightning-unreserveinputs.7.md>
    lightning-waitanyinvoice <lightning-waitanyinvoice.7.md>
    lightning-waitblockheight <lightning-waitblockheight.7.md>
    lightning-waitinvoice <lightning-waitinvoice.7.md>

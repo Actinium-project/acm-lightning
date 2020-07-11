@@ -15,6 +15,7 @@
 #include <common/pseudorand.h>
 #include <common/type_to_string.h>
 #include <inttypes.h>
+#include <plugins/libplugin-pay.h>
 #include <plugins/libplugin.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -25,6 +26,8 @@
 static struct node_id my_id;
 static unsigned int maxdelay_default;
 static LIST_HEAD(pay_status);
+
+static LIST_HEAD(payments);
 
 struct pay_attempt {
 	/* What we changed when starting this attempt. */
@@ -1266,6 +1269,9 @@ static struct pay_status *add_pay_status(struct pay_command *pc,
 	return ps;
 }
 
+#ifndef COMPAT_V090
+UNUSED
+#endif
 static struct command_result *json_pay(struct command *cmd,
 				       const char *buf,
 				       const jsmntok_t *params)
@@ -1447,6 +1453,84 @@ static void add_attempt(struct json_stream *ret,
 	json_object_end(ret);
 }
 
+static void json_add_sendpay_result(struct json_stream *s, const struct payment_result *r)
+{
+	if (r->code != 0) {
+		/* This is a failure */
+		json_add_string(s, "message", r->message);
+		json_add_u32(s, "code", r->code);
+
+		json_object_start(s, "data");
+		json_add_u32(s, "id", r->id);
+		json_add_hex(s, "raw_message", r->raw_message, tal_bytelen(r->raw_message));
+		json_add_num(s, "failcode", r->failcode);
+		json_add_string(s, "failcodename", r->failcodename);
+
+		if (r->erring_index)
+			json_add_num(s, "erring_index", *r->erring_index);
+
+		if (r->erring_node)
+			json_add_node_id(s, "erring_node", r->erring_node);
+
+		if (r->erring_channel)
+			json_add_short_channel_id(s, "erring_channel",
+						  r->erring_channel);
+
+		if (r->erring_direction)
+			json_add_num(s, "erring_direction",
+				     *r->erring_direction);
+		if (r->erring_node)
+			json_add_node_id(s, "erring_node", r->erring_node);
+		json_object_end(s);
+	} else {
+		/* This is a success */
+		json_add_u32(s, "id", r->id);
+		json_add_preimage(s, "payment_preimage", r->payment_preimage);
+	}
+
+}
+
+static void paystatus_add_payment(struct json_stream *s, const struct payment *p)
+{
+	char timestr[UTC_TIMELEN];
+
+	utc_timestring(&p->start_time, timestr);
+
+	json_object_start(s, NULL);
+	if (p->why != NULL)
+		json_add_string(s, "strategy", p->why);
+	json_add_string(s, "start_time", timestr);
+	json_add_u64(s, "age_in_seconds",
+		     time_to_sec(time_between(time_now(), p->start_time)));
+
+	/* Any final state will have an end time. */
+	if (p->step >= PAYMENT_STEP_SPLIT) {
+		utc_timestring(&p->end_time, timestr);
+		json_add_string(s, "end_time", timestr);
+	}
+
+	/* TODO Add routehint. */
+	/* TODO Add route details */
+
+	if (p->result != NULL) {
+		if (p->step == PAYMENT_STEP_SUCCESS)
+			json_object_start(s, "success");
+		else
+			json_object_start(s, "failure");
+		json_add_sendpay_result(s, p->result);
+		json_object_end(s);
+	} else {
+		json_object_start(s, "failure");
+		json_add_num(s, "code", PAY_ROUTE_NOT_FOUND);
+		json_add_string(s, "message", "Call to getroute: Could not find a route");
+		json_object_end(s);
+	}
+
+	json_object_end(s);
+	for (size_t i = 0; i < tal_count(p->children); i++)
+		paystatus_add_payment(s, p->children[i]);
+}
+
 static struct command_result *json_paystatus(struct command *cmd,
 					     const char *buf,
 					     const jsmntok_t *params)
@@ -1454,6 +1538,7 @@ static struct command_result *json_paystatus(struct command *cmd,
 	struct pay_status *ps;
 	const char *b11str;
 	struct json_stream *ret;
+	struct payment *p;
 
 	if (!param(cmd, buf, params,
 		   p_opt("bolt11", param_string, &b11str),
@@ -1464,6 +1549,7 @@ static struct command_result *json_paystatus(struct command *cmd,
 	json_array_start(ret, "pay");
 
 	/* FIXME: Index by bolt11 string! */
+	/* TODO(cdecker) Remove once we migrated to `pay` with modifiers. */
 	list_for_each(&pay_status, ps, list) {
 		if (b11str && !streq(b11str, ps->bolt11))
 			continue;
@@ -1493,6 +1579,36 @@ static struct command_result *json_paystatus(struct command *cmd,
 		json_array_end(ret);
 		json_object_end(ret);
 	}
+
+	list_for_each(&payments, p, list) {
+		assert(p->parent == NULL);
+		if (b11str && !streq(b11str, p->bolt11))
+			continue;
+
+		json_object_start(ret, NULL);
+		if (p->label != NULL)
+			json_add_string(ret, "label", p->label);
+
+		if (p->bolt11)
+			json_add_string(ret, "bolt11", p->bolt11);
+		json_add_amount_msat_only(ret, "amount_msat", p->amount);
+		json_add_string(
+		    ret, "amount_msat",
+		    type_to_string(tmpctx, struct amount_msat, &p->amount));
+
+		json_add_node_id(ret, "destination", p->destination);
+
+		/* TODO(cdecker) Add label in once we track labels. */
+		/* TODO(cdecker) Add routehint_modifications in once we track
+		 * them. */
+		/* TODO(cdecker) Add shadow route once we support it. */
+
+		/* If it's in listpeers right now, this can be 0 */
+		json_array_start(ret, "attempts");
+		paystatus_add_payment(ret, p);
+		json_array_end(ret);
+		json_object_end(ret);
+	}
 	json_array_end(ret);
 
 	return command_finished(cmd, ret);
@@ -1501,7 +1617,11 @@ static struct command_result *json_paystatus(struct command *cmd,
 static bool attempt_ongoing(const char *b11)
 {
 	struct pay_status *ps;
+	struct payment *root;
 	struct pay_attempt *attempt;
+	struct payment_tree_result res;
+	enum payment_step diff,
+	    final_states = PAYMENT_STEP_FAILED | PAYMENT_STEP_SUCCESS;
 
 	list_for_each(&pay_status, ps, list) {
 		if (!streq(b11, ps->bolt11))
@@ -1509,12 +1629,23 @@ static bool attempt_ongoing(const char *b11)
 		attempt = &ps->attempts[tal_count(ps->attempts)-1];
 		return attempt->result == NULL && attempt->failure == NULL;
 	}
+
+	list_for_each(&payments, root, list) {
+		if (root->bolt11 == NULL || !streq(b11, root->bolt11))
+			continue;
+		res = payment_collect_result(root);
+		diff = res.leafstates & ~final_states;
+		return diff != 0;
+	}
 	return false;
 }
 
 /* We consolidate multi-part payments into a single entry. */
 struct pay_mpp {
-	/* This is the bolt11 string, and lookup key */
+	/* payment_hash from the invoice and lookup key */
+	const struct sha256 *payment_hash;
+
+	/* This is the bolt11 string */
 	const char *b11;
 	/* Status of combined payment */
 	const char *status;
@@ -1528,22 +1659,22 @@ struct pay_mpp {
 	struct amount_msat amount_sent;
 };
 
-static const char *pay_mpp_key(const struct pay_mpp *pm)
+static const struct sha256 *pay_mpp_key(const struct pay_mpp *pm)
 {
-	return pm->b11;
+	return pm->payment_hash;
 }
 
-static size_t b11str_hash(const char *b11)
+static size_t pay_mpp_hash(const struct sha256 *payment_hash)
 {
-	return siphash24(siphash_seed(), b11, strlen(b11));
+	return siphash24(siphash_seed(), payment_hash, sizeof(struct sha256));
 }
 
-static bool pay_mpp_eq(const struct pay_mpp *pm, const char *b11)
+static bool pay_mpp_eq(const struct pay_mpp *pm, const struct sha256 *payment_hash)
 {
-	return streq(pm->b11, b11);
+	return memcmp(pm->payment_hash, payment_hash, sizeof(struct sha256)) == 0;
 }
 
-HTABLE_DEFINE_TYPE(struct pay_mpp, pay_mpp_key, b11str_hash, pay_mpp_eq,
+HTABLE_DEFINE_TYPE(struct pay_mpp, pay_mpp_key, pay_mpp_hash, pay_mpp_eq,
 		   pay_map);
 
 static void add_amount_sent(struct plugin *p,
@@ -1604,19 +1735,22 @@ static struct command_result *listsendpays_done(struct command *cmd,
 	ret = jsonrpc_stream_success(cmd);
 	json_array_start(ret, "pays");
 	json_for_each_arr(i, t, arr) {
-		const jsmntok_t *status, *b11tok;
-		const char *b11;
+		const jsmntok_t *status, *b11tok, *hashtok;
+		const char *b11 = b11str;
+		struct sha256 payment_hash;
 
 		b11tok = json_get_member(buf, t, "bolt11");
-		/* Old (or manual) payments didn't have bolt11 field */
-		if (!b11tok)
-			continue;
+		hashtok = json_get_member(buf, t, "payment_hash");
+		assert(hashtok != NULL);
 
-		b11 = json_strdup(cmd, buf, b11tok);
+		json_to_sha256(buf, hashtok, &payment_hash);
+		if (b11tok)
+			b11 = json_strdup(cmd, buf, b11tok);
 
-		pm = pay_map_get(&pay_map, b11);
+		pm = pay_map_get(&pay_map, &payment_hash);
 		if (!pm) {
 			pm = tal(cmd, struct pay_mpp);
+			pm->payment_hash = tal_dup(pm, struct sha256, &payment_hash);
 			pm->b11 = tal_steal(pm, b11);
 			pm->label = json_get_member(buf, t, "label");
 			pm->preimage = NULL;
@@ -1702,12 +1836,142 @@ static void init(struct plugin *p,
 	maxdelay_default = atoi(field);
 }
 
+struct payment_modifier *paymod_mods[] = {
+	&local_channel_hints_pay_mod,
+	&directpay_pay_mod,
+	&shadowroute_pay_mod,
+	&exemptfee_pay_mod,
+	&routehints_pay_mod,
+	&waitblockheight_pay_mod,
+	&retry_pay_mod,
+	NULL,
+};
+
+#if !DEVELOPER
+UNUSED
+#endif
+static struct command_result *json_paymod(struct command *cmd,
+					  const char *buf,
+					  const jsmntok_t *params)
+{
+	struct payment *p;
+	const char *b11str;
+	struct bolt11 *b11;
+	char *fail;
+	u64 *maxfee_pct_millionths;
+	u32 *maxdelay;
+	struct amount_msat *exemptfee, *msat;
+	const char *label;
+	unsigned int *retryfor;
+	u64 *riskfactor_millionths;
+#if DEVELOPER
+	bool *use_shadow;
+#endif
+
+	p = payment_new(NULL, cmd, NULL /* No parent */, paymod_mods);
+
+	/* If any of the modifiers need to add params to the JSON-RPC call we
+	 * would add them to the `param()` call below, and have them be
+	 * initialized directly that way. */
+	if (!param(cmd, buf, params, p_req("bolt11", param_string, &b11str),
+		   p_opt("msatoshi", param_msat, &msat),
+		   p_opt("label", param_string, &label),
+		   p_opt_def("riskfactor", param_millionths,
+			     &riskfactor_millionths, 10000000),
+		   p_opt_def("maxfeepercent", param_millionths,
+			     &maxfee_pct_millionths, 500000),
+		   p_opt_def("retry_for", param_number, &retryfor, 60),
+		   p_opt_def("maxdelay", param_number, &maxdelay,
+			     maxdelay_default),
+		   p_opt_def("exemptfee", param_msat, &exemptfee, AMOUNT_MSAT(5000)),
+#if DEVELOPER
+		   p_opt_def("use_shadow", param_bool, &use_shadow, true),
+#endif
+		      NULL))
+		return command_param_failed();
+
+	b11 = bolt11_decode(cmd, b11str, plugin_feature_set(cmd->plugin),
+			    NULL, &fail);
+	if (!b11)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Invalid bolt11: %s", fail);
+
+	if (!b11->chain)
+		return command_fail(cmd, PAY_ROUTE_NOT_FOUND, "Invoice is for an unknown network");
+
+	if (b11->chain != chainparams)
+		return command_fail(cmd, PAY_ROUTE_NOT_FOUND, "Invoice is for another network %s", b11->chain->network_name);
+
+	if (time_now().ts.tv_sec > b11->timestamp + b11->expiry)
+		return command_fail(cmd, PAY_INVOICE_EXPIRED, "Invoice expired");
+
+	if (b11->msat) {
+		if (msat) {
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "msatoshi parameter unnecessary");
+		}
+		p->amount = *b11->msat;
+
+	} else {
+		if (!msat) {
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "msatoshi parameter required");
+		}
+		p->amount = *msat;
+	}
+
+	/* Sanity check */
+	if (feature_offered(b11->features, OPT_VAR_ONION)
+	    && !b11->payment_secret)
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Invalid bolt11:"
+				    " sets feature var_onion with no secret");
+
+	p->local_id = &my_id;
+	p->json_buffer = tal_steal(p, buf);
+	p->json_toks = params;
+	p->destination = &b11->receiver_id;
+	p->payment_hash = tal_dup(p, struct sha256, &b11->payment_hash);
+	p->payment_secret = b11->payment_secret
+				? tal_dup(p, struct secret, b11->payment_secret)
+				: NULL;
+	p->invoice = tal_steal(p, b11);
+	p->bolt11 = tal_steal(p, b11str);
+	p->why = "Initial attempt";
+	p->constraints.cltv_budget = *maxdelay;
+	p->deadline = timeabs_add(time_now(), time_from_sec(*retryfor));
+	p->getroute->riskfactorppm = *riskfactor_millionths;
+
+	if (!amount_msat_fee(&p->constraints.fee_budget, p->amount, 0,
+			     *maxfee_pct_millionths / 100)) {
+		tal_free(p);
+		return command_fail(
+		    cmd, JSONRPC2_INVALID_PARAMS,
+		    "Overflow when computing fee budget, fee rate too high.");
+	}
+	p->constraints.cltv_budget = *maxdelay;
+
+	payment_mod_exemptfee_get_data(p)->amount = *exemptfee;
+#if DEVELOPER
+	payment_mod_shadowroute_get_data(p)->use_shadow = *use_shadow;
+#endif
+	p->label = tal_steal(p, label);
+	payment_start(p);
+	list_add_tail(&payments, &p->list);
+
+	return command_still_pending(cmd);
+}
+
 static const struct plugin_command commands[] = { {
 		"pay",
 		"payment",
 		"Send payment specified by {bolt11} with {amount}",
 		"Try to send a payment, retrying {retry_for} seconds before giving up",
+#ifdef COMPAT_V090
 		json_pay
+#else
+		json_paymod
+#endif
 	}, {
 		"paystatus",
 		"payment",
@@ -1720,7 +1984,16 @@ static const struct plugin_command commands[] = { {
 		"List result of payment {bolt11}, or all",
 		"Covers old payments (failed and succeeded) and current ones.",
 		json_listpays
-	}
+	},
+#if DEVELOPER
+	{
+		"paymod",
+		"payment",
+		"Send payment specified by {bolt11}",
+		"Experimental implementation of pay using modifiers",
+		json_paymod
+	},
+#endif
 };
 
 int main(int argc, char *argv[])
