@@ -2,7 +2,6 @@
 #include <bitcoin/block.h>
 #include <bitcoin/chainparams.h>
 #include <bitcoin/psbt.h>
-#include <bitcoin/pullpush.h>
 #include <bitcoin/script.h>
 #include <bitcoin/tx.h>
 #include <ccan/cast/cast.h>
@@ -121,7 +120,9 @@ struct amount_sat bitcoin_tx_compute_fee_w_inputs(const struct bitcoin_tx *tx,
 
 		ok = amount_sat_sub(&input_val, input_val,
 				    amount_asset_to_sat(&asset));
-		assert(ok);
+		if (!ok)
+			return AMOUNT_SAT(0);
+
 	}
 	return input_val;
 }
@@ -206,18 +207,51 @@ int bitcoin_tx_add_input(struct bitcoin_tx *tx, const struct bitcoin_txid *txid,
 
 	if (input_wscript) {
 		/* Add the prev output's data into the PSBT struct */
-		psbt_input_set_prev_utxo_wscript(tx->psbt, i, input_wscript, amount);
+		if (is_elements(chainparams)) {
+			struct amount_asset asset;
+			/*FIXME: persist asset tags */
+			asset = amount_sat_to_asset(
+					&amount,
+					chainparams->fee_asset_tag);
+			psbt_elements_input_init_witness(tx->psbt, i,
+							 input_wscript,
+							 &asset, NULL);
+		} else
+			psbt_input_set_prev_utxo_wscript(tx->psbt, i,
+							 input_wscript,
+							 amount);
 	} else if (scriptPubkey) {
-		if (is_p2wsh(scriptPubkey, NULL) || is_p2wpkh(scriptPubkey, NULL) ||
-			/* FIXME: assert that p2sh inputs are witness/are accompanied by a redeemscript+witnessscript */
+		if (is_p2wsh(scriptPubkey, NULL) ||
+			is_p2wpkh(scriptPubkey, NULL) ||
+			/* FIXME: assert that p2sh inputs are
+			 * witness/are accompanied by a
+			 * redeemscript+witnessscript */
 			is_p2sh(scriptPubkey, NULL)) {
-			/* the only way to get here currently with a p2sh script is via a p2sh-p2wpkh script
+			/* the only way to get here currently with
+			 * a p2sh script is via a p2sh-p2wpkh script
 			 * that we've created ...*/
-			/* Relevant section from bip-0174, emphasis mine:
-			 * ** Value: The entire transaction output in network serialization which the current input spends from.
-			 * This should only be present for inputs which spend segwit outputs, _including P2SH embedded ones._
+			/* BIP0174:
+			 * ** Value: The entire transaction output in
+			 * network serialization which the
+			 * current input spends from.
+			 * This should only be present for
+			 * inputs which spend segwit outputs,
+			 * including P2SH embedded ones.
 			 */
-			psbt_input_set_prev_utxo(tx->psbt, i, scriptPubkey, amount);
+			if (is_elements(chainparams)) {
+				struct amount_asset asset;
+				/*FIXME: persist asset tags */
+				asset = amount_sat_to_asset(
+						&amount,
+						chainparams->fee_asset_tag);
+				/* FIXME: persist nonces */
+				psbt_elements_input_init(tx->psbt, i,
+							 scriptPubkey,
+							 &asset, NULL);
+			} else
+				psbt_input_set_prev_utxo(tx->psbt, i,
+							 scriptPubkey,
+							 amount);
 		}
 	}
 
@@ -265,22 +299,26 @@ void bitcoin_tx_output_set_amount(struct bitcoin_tx *tx, int outnum,
 	}
 }
 
-const u8 *bitcoin_tx_output_get_script(const tal_t *ctx,
-				       const struct bitcoin_tx *tx, int outnum)
+const u8 *wally_tx_output_get_script(const tal_t *ctx,
+				     const struct wally_tx_output *output)
 {
-	const struct wally_tx_output *output;
-	u8 *res;
-	assert(outnum < tx->wtx->num_outputs);
-	output = &tx->wtx->outputs[outnum];
-
 	if (output->script == NULL) {
 		/* This can happen for coinbase transactions and pegin
 		 * transactions */
 		return NULL;
 	}
 
-	res = tal_dup_arr(ctx, u8, output->script, output->script_len, 0);
-	return res;
+	return tal_dup_arr(ctx, u8, output->script, output->script_len, 0);
+}
+
+const u8 *bitcoin_tx_output_get_script(const tal_t *ctx,
+				       const struct bitcoin_tx *tx, int outnum)
+{
+	const struct wally_tx_output *output;
+	assert(outnum < tx->wtx->num_outputs);
+	output = &tx->wtx->outputs[outnum];
+
+	return wally_tx_output_get_script(ctx, output);
 }
 
 u8 *bitcoin_tx_output_get_witscript(const tal_t *ctx, const struct bitcoin_tx *tx,
@@ -627,8 +665,17 @@ static char *fmt_bitcoin_txid(const tal_t *ctx, const struct bitcoin_txid *txid)
 	return hexstr;
 }
 
+static char *fmt_wally_tx(const tal_t *ctx, const struct wally_tx *tx)
+{
+	u8 *lin = linearize_wtx(ctx, tx);
+	char *s = tal_hex(ctx, lin);
+	tal_free(lin);
+	return s;
+}
+
 REGISTER_TYPE_TO_STRING(bitcoin_tx, fmt_bitcoin_tx);
 REGISTER_TYPE_TO_STRING(bitcoin_txid, fmt_bitcoin_txid);
+REGISTER_TYPE_TO_STRING(wally_tx, fmt_wally_tx);
 
 void fromwire_bitcoin_txid(const u8 **cursor, size_t *max,
 			   struct bitcoin_txid *txid)
@@ -708,10 +755,9 @@ wally_tx_output_get_amount(const struct wally_tx_output *output)
 	if (chainparams->is_elements) {
 		assert(output->asset_len == sizeof(amount.asset));
 		memcpy(&amount.asset, output->asset, sizeof(amount.asset));
-
-		/* We currently only support explicit value asset tags, others
-		 * are confidential, so don't even try to assign a value to
-		 * it. */
+		/* We currently only support explicit value
+		 * asset tags, others are confidential, so
+		 * don't even try to assign a value to it. */
 		if (output->asset[0] == 0x01) {
 			memcpy(&raw, output->value + 1, sizeof(raw));
 			amount.value = be64_to_cpu(raw);
@@ -725,4 +771,93 @@ wally_tx_output_get_amount(const struct wally_tx_output *output)
 	}
 
 	return amount;
+}
+
+/* Various weights of transaction parts. */
+size_t bitcoin_tx_core_weight(size_t num_inputs, size_t num_outputs)
+{
+	size_t weight;
+
+	/* version, input count, output count, locktime */
+	weight = (4 + varint_size(num_inputs) + varint_size(num_outputs) + 4)
+		* 4;
+
+	/* Add segwit fields: marker + flag */
+	weight += 1 + 1;
+
+	/* A couple of things need to change for elements: */
+	if (chainparams->is_elements) {
+                /* Each transaction has surjection and rangeproof (both empty
+		 * for us as long as we use unblinded L-BTC transactions). */
+		weight += 2 * 4;
+
+		/* An elements transaction has 1 additional output for fees */
+		weight += bitcoin_tx_output_weight(0);
+	}
+	return weight;
+}
+
+size_t bitcoin_tx_output_weight(size_t outscript_len)
+{
+	size_t weight;
+
+	/* amount, len, scriptpubkey */
+	weight = (8 + varint_size(outscript_len) + outscript_len) * 4;
+
+	if (chainparams->is_elements) {
+		/* Each output additionally has an asset_tag (1 + 32), value
+		 * is prefixed by a version (1 byte), an empty nonce (1
+		 * byte), two empty proofs (2 bytes). */
+		weight += (32 + 1 + 1 + 1) * 4;
+	}
+
+	return weight;
+}
+
+/* We grind signatures to get them down to 71 bytes (+1 for sighash flags) */
+size_t bitcoin_tx_input_sig_weight(void)
+{
+	return 1 + 71 + 1;
+}
+
+/* We only do segwit inputs, and we assume witness is sig + key  */
+size_t bitcoin_tx_simple_input_weight(bool p2sh)
+{
+	size_t weight;
+
+	/* Input weight: txid + index + sequence */
+	weight = (32 + 4 + 4) * 4;
+
+	/* We always encode the length of the script, even if empty */
+	weight += 1 * 4;
+
+	/* P2SH variants include push of <0 <20-byte-key-hash>> */
+	if (p2sh)
+		weight += 23 * 4;
+
+	/* Account for witness (1 byte count + sig + key) */
+	weight += 1 + (bitcoin_tx_input_sig_weight() + 1 + 33);
+
+	/* Elements inputs have 6 bytes of blank proofs attached. */
+	if (chainparams->is_elements)
+		weight += 6;
+
+	return weight;
+}
+
+struct amount_sat change_amount(struct amount_sat excess, u32 feerate_perkw)
+{
+	size_t outweight;
+
+	/* Must be able to pay for its own additional weight */
+	outweight = bitcoin_tx_output_weight(BITCOIN_SCRIPTPUBKEY_P2WPKH_LEN);
+	if (!amount_sat_sub(&excess,
+			    excess, amount_tx_fee(feerate_perkw, outweight)))
+		return AMOUNT_SAT(0);
+
+	/* Must be non-dust */
+	if (!amount_sat_greater_eq(excess, chainparams->dust_limit))
+		return AMOUNT_SAT(0);
+
+	return excess;
 }

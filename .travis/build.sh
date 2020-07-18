@@ -10,10 +10,10 @@ export SOURCE_CHECK_ONLY=${SOURCE_CHECK_ONLY:-"false"}
 export COMPAT=${COMPAT:-1}
 export PATH=$CWD/dependencies/bin:"$HOME"/.local/bin:"$PATH"
 export PYTEST_PAR=2
+export PYTEST_SENTRY_ALWAYS_REPORT=1
 
-# If we're not in developer mode, tests spend a lot of time waiting for gossip!
-# But if we're under valgrind, we can run out of memory!
-if [ "$DEVELOPER" = 0 ] && [ "$VALGRIND" = 0 ]; then
+# Allow up to 4 concurrent tests when not under valgrind, which might run out of memory.
+if [ "$VALGRIND" = 0 ]; then
     PYTEST_PAR=4
 fi
 
@@ -40,6 +40,10 @@ pip3 install --user -U --quiet --progress-bar off \
      -r contrib/pyln-proto/requirements.txt \
      -r contrib/pyln-testing/requirements.txt
 
+pip3 install --user -U --quiet --progress-bar off \
+     pytest-sentry \
+     pytest-rerunfailures
+
 echo "Configuration which is going to be built:"
 echo -en 'travis_fold:start:script.1\\r'
 ./configure CC="$CC"
@@ -48,7 +52,7 @@ echo -en 'travis_fold:end:script.1\\r'
 
 cat > pytest.ini << EOF
 [pytest]
-addopts=-p no:logging --color=no --force-flaky
+addopts=-p no:logging --color=no --reruns=5
 EOF
 
 if [ "$TARGET_HOST" == "arm-linux-gnueabihf" ] || [ "$TARGET_HOST" == "aarch64-linux-gnu" ]

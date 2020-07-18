@@ -12,6 +12,10 @@
 #include <wally_transaction.h>
 
 #define BITCOIN_TX_DEFAULT_SEQUENCE 0xFFFFFFFF
+
+/* BIP 125: Any nsequence < 0xFFFFFFFE is replacable.
+ * And bitcoind uses this value. */
+#define BITCOIN_TX_RBF_SEQUENCE 0xFFFFFFFD
 struct wally_psbt;
 
 struct bitcoin_txid {
@@ -127,6 +131,15 @@ void bitcoin_tx_output_set_amount(struct bitcoin_tx *tx, int outnum,
 const u8 *bitcoin_tx_output_get_script(const tal_t *ctx, const struct bitcoin_tx *tx, int outnum);
 
 /**
+ * Helper to get the script of a script's output as a tal_arr
+ *
+ * The script attached to a `wally_tx_output` is not a `tal_arr`, so in order to keep the
+ * comfort of being able to call `tal_bytelen` and similar on a script we just
+ * return a `tal_arr` clone of the original script.
+ */
+const u8 *wally_tx_output_get_script(const tal_t *ctx,
+				     const struct wally_tx_output *output);
+/**
  * Helper to get a witness script for an output.
  */
 u8 *bitcoin_tx_output_get_witscript(const tal_t *ctx, const struct bitcoin_tx *tx, int outnum);
@@ -221,4 +234,26 @@ void towire_bitcoin_tx(u8 **pptr, const struct bitcoin_tx *tx);
 void towire_bitcoin_tx_output(u8 **pptr, const struct bitcoin_tx_output *output);
 
 int wally_tx_clone(struct wally_tx *tx, struct wally_tx **output);
+
+/* Various weights of transaction parts. */
+size_t bitcoin_tx_core_weight(size_t num_inputs, size_t num_outputs);
+size_t bitcoin_tx_output_weight(size_t outscript_len);
+
+/* Weight to push sig on stack. */
+size_t bitcoin_tx_input_sig_weight(void);
+
+/* We only do segwit inputs, and we assume witness is sig + key  */
+size_t bitcoin_tx_simple_input_weight(bool p2sh);
+
+/**
+ * change_amount - Is it worth making a P2WPKH change output at this feerate?
+ * @excess: input amount we have above the tx fee and other outputs.
+ * @feerate_perkw: feerate.
+ *
+ * If it's not worth (or possible) to make change, returns AMOUNT_SAT(0).
+ * Otherwise returns the amount of the change output to add (@excess minus
+ * the additional fee for the change output itself).
+ */
+struct amount_sat change_amount(struct amount_sat excess, u32 feerate_perkw);
+
 #endif /* LIGHTNING_BITCOIN_TX_H */

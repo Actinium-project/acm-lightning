@@ -76,7 +76,6 @@ struct bitcoin_tx *tx_spending_utxos(const tal_t *ctx,
 	struct pubkey key;
 	u8 *scriptSig, *scriptPubkey, *redeemscript;
 
-	assert(num_output);
 	size_t outcount = add_change_output ? 1 + num_output : num_output;
 	struct bitcoin_tx *tx = bitcoin_tx(ctx, chainparams, tal_count(utxos),
 					   outcount, nlocktime);
@@ -112,4 +111,9 @@ struct bitcoin_tx *tx_spending_utxos(const tal_t *ctx,
 	}
 
 	return tx;
+}
+
+size_t utxo_spend_weight(const struct utxo *utxo)
+{
+	return bitcoin_tx_simple_input_weight(utxo->is_p2sh);
 }
