@@ -47,6 +47,10 @@ struct amount_asset {
 #define AMOUNT_SAT(constant)						\
 	((struct amount_sat){(constant) + AMOUNT_MUST_BE_CONST(constant)})
 
+/* We do sometimes need to import from raw types, eg. wally or wire fmt */
+struct amount_msat amount_msat(u64 millisatoshis);
+struct amount_sat amount_sat(u64 satoshis);
+
 /* You may not always be able to convert satoshis->millisatoshis. */
 WARN_UNUSED_RESULT bool amount_sat_to_msat(struct amount_msat *msat,
 					   struct amount_sat sat);
@@ -76,6 +80,12 @@ WARN_UNUSED_RESULT bool amount_msat_add_sat(struct amount_msat *val,
 WARN_UNUSED_RESULT bool amount_sat_sub_msat(struct amount_msat *val,
 					    struct amount_sat a,
 					    struct amount_msat b);
+WARN_UNUSED_RESULT bool amount_msat_scale(struct amount_msat *val,
+					  struct amount_msat msat,
+					  double scale);
+
+struct amount_msat amount_msat_div(struct amount_msat msat, u64 div);
+struct amount_sat amount_sat_div(struct amount_sat sat, u64 div);
 
 /* Is a == b? */
 bool amount_sat_eq(struct amount_sat a, struct amount_sat b);
@@ -108,9 +118,21 @@ bool amount_msat_less_eq_sat(struct amount_msat msat, struct amount_sat sat);
 /* Is msat == sat? */
 bool amount_msat_eq_sat(struct amount_msat msat, struct amount_sat sat);
 
+/* a / b */
+double amount_msat_ratio(struct amount_msat a, struct amount_msat b);
+
 /* Check whether this asset is actually the main / fee-paying asset of the
  * current chain. */
 bool amount_asset_is_main(struct amount_asset *asset);
+
+/* Convert an amount_sat to an amount_asset */
+struct amount_asset amount_sat_to_asset(struct amount_sat *sat, const u8 *asset);
+
+/* amount_asset_extract_value -Prefix the amount_asset's value
+ * to have the 'explicit' marker. Returns NULL if the
+ * asset was originally blinded.
+ * FIXME: pass through blinded amounts */
+u8 *amount_asset_extract_value(const tal_t *ctx, struct amount_asset *asset);
 
 /* Convert from a generic asset to the fee-paying asset if possible. */
 struct amount_sat amount_asset_to_sat(struct amount_asset *asset);
@@ -118,10 +140,6 @@ struct amount_sat amount_asset_to_sat(struct amount_asset *asset);
 /* Returns true if msat fits in a u32 value. */
 WARN_UNUSED_RESULT bool amount_msat_to_u32(struct amount_msat msat,
 					   u32 *millisatoshis);
-
-/* Programatically initialize from various types */
-void amount_msat_from_u64(struct amount_msat *msat, u64 millisatoshis);
-WARN_UNUSED_RESULT bool amount_msat_from_sat_u64(struct amount_msat *msat, u64 satoshis);
 
 /* Common operation: what is the HTLC fee for given feerate?  Can overflow! */
 WARN_UNUSED_RESULT bool amount_msat_fee(struct amount_msat *fee,

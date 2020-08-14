@@ -331,7 +331,8 @@ struct wallet_transaction {
  * This is guaranteed to either return a valid wallet, or abort with
  * `fatal` if it cannot be initialized.
  */
-struct wallet *wallet_new(struct lightningd *ld, struct timers *timers);
+struct wallet *wallet_new(struct lightningd *ld, struct timers *timers,
+			  struct ext_key *bip32_base);
 
 /**
  * wallet_confirm_tx - Confirm a tx which contains a UTXO.
@@ -375,6 +376,29 @@ struct utxo **wallet_get_unconfirmed_closeinfo_utxos(const tal_t *ctx,
 						     struct wallet *w);
 
 /**
+ * wallet_find_utxo - Select an available UTXO (does not reserve it!).
+ * @ctx: tal context
+ * @w: wallet
+ * @current_blockheight: current chain length.
+ * @amount_we_are_short: optional amount.
+ * @feerate_per_kw: feerate we are using.
+ * @maxheight: zero (if caller doesn't care) or maximum blockheight to accept.
+ * @excludes: UTXOs not to consider.
+ *
+ * If @amount_we_are_short is not NULL, we try to get something very close
+ * (i.e. when we add this input, we will add => @amount_we_are_short, but
+ * less than @amount_we_are_short + dustlimit).
+ *
+ * Otherwise we give a random UTXO.
+ */
+struct utxo *wallet_find_utxo(const tal_t *ctx, struct wallet *w,
+			      unsigned current_blockheight,
+			      struct amount_sat *amount_we_are_short,
+			      unsigned feerate_per_kw,
+			      u32 maxheight,
+			      const struct utxo **excludes);
+
+/**
  * wallet_add_onchaind_utxo - Add a UTXO with spending info from onchaind.
  *
  * Usually we add UTXOs by looking at transactions, but onchaind tells
@@ -391,6 +415,23 @@ bool wallet_add_onchaind_utxo(struct wallet *w,
 			      const struct channel *chan,
 			      /* NULL if option_static_remotekey */
 			      const struct pubkey *commitment_point);
+
+/**
+ * wallet_reserve_utxo - set a reservation on a UTXO.
+ *
+ * If the reservation is already reserved, refreshes the reservation,
+ * otherwise if it's not available, returns false.
+ */
+bool wallet_reserve_utxo(struct wallet *w,
+			 struct utxo *utxo,
+			 u32 reservation_blocknum);
+
+/* wallet_unreserve_utxo - make a reserved UTXO available again.
+ *
+ * Must be reserved.
+ */
+void wallet_unreserve_utxo(struct wallet *w, struct utxo *utxo,
+			   u32 current_height);
 
 /** wallet_utxo_get - Retrive a utxo.
  *
@@ -1070,7 +1111,7 @@ const struct wallet_payment **wallet_payment_list(const tal_t *ctx,
  * wallet_htlc_sigs_save - Store the latest HTLC sigs for the channel
  */
 void wallet_htlc_sigs_save(struct wallet *w, u64 channel_id,
-			   secp256k1_ecdsa_signature *htlc_sigs);
+			   const struct bitcoin_signature *htlc_sigs);
 
 /**
  * wallet_network_check - Check that the wallet is setup for this chain
@@ -1124,7 +1165,7 @@ void wallet_utxoset_add(struct wallet *w, const struct bitcoin_tx *tx,
 			const u32 txindex, const u8 *scriptpubkey,
 			struct amount_sat sat);
 
-void wallet_transaction_add(struct wallet *w, const struct bitcoin_tx *tx,
+void wallet_transaction_add(struct wallet *w, const struct wally_tx *tx,
 			    const u32 blockheight, const u32 txindex);
 
 void wallet_annotate_txout(struct wallet *w, const struct bitcoin_txid *txid,

@@ -356,7 +356,7 @@ void drop_to_chain(struct lightningd *ld, struct channel *channel,
 	} else {
 		sign_last_tx(channel);
 		bitcoin_txid(channel->last_tx, &txid);
-		wallet_transaction_add(ld->wallet, channel->last_tx, 0, 0);
+		wallet_transaction_add(ld->wallet, channel->last_tx->wtx, 0, 0);
 		wallet_transaction_annotate(ld->wallet, &txid, channel->last_tx_type, channel->dbid);
 
 		/* Keep broadcasting until we say stop (can fail due to dup,
@@ -471,7 +471,8 @@ static void json_add_htlcs(struct lightningd *ld,
 		json_add_string(response, "state",
 				htlc_state_name(hin->hstate));
 		if (htlc_is_trimmed(REMOTE, hin->msat, local_feerate,
-				    channel->our_config.dust_limit, LOCAL))
+				    channel->our_config.dust_limit, LOCAL,
+				    channel->option_anchor_outputs))
 			json_add_bool(response, "local_trimmed", true);
 		json_object_end(response);
 	}
@@ -492,7 +493,8 @@ static void json_add_htlcs(struct lightningd *ld,
 		json_add_string(response, "state",
 				htlc_state_name(hout->hstate));
 		if (htlc_is_trimmed(LOCAL, hout->msat, local_feerate,
-				    channel->our_config.dust_limit, LOCAL))
+				    channel->our_config.dust_limit, LOCAL,
+				    channel->option_anchor_outputs))
 			json_add_bool(response, "local_trimmed", true);
 		json_object_end(response);
 	}
@@ -526,13 +528,16 @@ static struct amount_sat commit_txfee(const struct channel *channel,
 	u32 feerate = get_feerate(channel->channel_info.fee_states,
 				  channel->opener, side);
 	struct amount_sat dust_limit;
+	struct amount_sat fee;
+
 	if (side == LOCAL)
 		dust_limit = channel->our_config.dust_limit;
 	if (side == REMOTE)
 		dust_limit = channel->channel_info.their_config.dust_limit;
 
 	/* Assume we tried to add "amount" */
-	if (!htlc_is_trimmed(side, amount, feerate, dust_limit, side))
+	if (!htlc_is_trimmed(side, amount, feerate, dust_limit, side,
+			     channel->option_anchor_outputs))
 		num_untrimmed_htlcs++;
 
 	for (hin = htlc_in_map_first(&ld->htlcs_in, &ini);
@@ -541,7 +546,8 @@ static struct amount_sat commit_txfee(const struct channel *channel,
 		if (hin->key.channel != channel)
 			continue;
 		if (!htlc_is_trimmed(!side, hin->msat, feerate, dust_limit,
-				     side))
+				     side,
+				     channel->option_anchor_outputs))
 			num_untrimmed_htlcs++;
 	}
 	for (hout = htlc_out_map_first(&ld->htlcs_out, &outi);
@@ -550,7 +556,8 @@ static struct amount_sat commit_txfee(const struct channel *channel,
 		if (hout->key.channel != channel)
 			continue;
 		if (!htlc_is_trimmed(side, hout->msat, feerate, dust_limit,
-				     side))
+				     side,
+				     channel->option_anchor_outputs))
 			num_untrimmed_htlcs++;
 	}
 
@@ -567,7 +574,21 @@ static struct amount_sat commit_txfee(const struct channel *channel,
 	 *       ("fee spike buffer"). A buffer of 2*feerate_per_kw is
 	 *       recommended to ensure predictability.
 	 */
-	return commit_tx_base_fee(2 * feerate, num_untrimmed_htlcs + 1);
+	fee = commit_tx_base_fee(2 * feerate, num_untrimmed_htlcs + 1,
+				 channel->option_anchor_outputs);
+
+	if (channel->option_anchor_outputs) {
+		/* BOLT-a12da24dd0102c170365124782b46d9710950ac1:
+		 * If `option_anchor_outputs` applies to the commitment
+		 * transaction, also subtract two times the fixed anchor size
+		 * of 330 sats from the funder (either `to_local` or
+		 * `to_remote`).
+		 */
+		if (!amount_sat_add(&fee, fee, AMOUNT_SAT(660)))
+			; /* fee is somehow astronomical already.... */
+	}
+
+	return fee;
 }
 
 static void subtract_offered_htlcs(const struct channel *channel,

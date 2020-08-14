@@ -5,10 +5,11 @@ from fixtures import TEST_NETWORK
 from flaky import flaky  # noqa: F401
 from pyln.client import RpcError, Millisatoshi
 from utils import (
-    DEVELOPER, only_one, wait_for, sync_blockheight, VALGRIND, TIMEOUT,
-    SLOW_MACHINE, expected_peer_features, expected_node_features,
+    DEVELOPER, only_one, wait_for, sync_blockheight, TIMEOUT,
+    expected_peer_features, expected_node_features,
     expected_channel_features,
-    check_coin_moves, first_channel_id, account_balance
+    check_coin_moves, first_channel_id, account_balance, basic_fee,
+    EXPERIMENTAL_FEATURES
 )
 from bitcoin.core import CMutableTransaction, CMutableTxOut
 
@@ -138,8 +139,10 @@ def test_bad_opening(node_factory):
     l2.daemon.wait_for_log('to_self_delay 100 larger than 99')
 
 
+@unittest.skipIf(EXPERIMENTAL_FEATURES, "FIXME: anchor_outputs changes numbers")
 @unittest.skipIf(not DEVELOPER, "gossip without DEVELOPER=1 is slow")
 @unittest.skipIf(TEST_NETWORK != 'regtest', "Fee computation and limits are network specific")
+@pytest.mark.slow_test
 def test_opening_tiny_channel(node_factory):
     # Test custom min-capacity-sat parameters
     #
@@ -162,7 +165,7 @@ def test_opening_tiny_channel(node_factory):
     #
     dustlimit = 546
     reserves = 2 * dustlimit
-    min_commit_tx_fees = 5430
+    min_commit_tx_fees = basic_fee(7500)
     min_for_opener = min_commit_tx_fees + dustlimit + 1
 
     l1_min_capacity = 1000            # 1k old default, too small but used at l1 to allow small incoming channels
@@ -171,12 +174,11 @@ def test_opening_tiny_channel(node_factory):
     l4_min_capacity = 10000           # the current default
     l5_min_capacity = 20000           # a server with more than default minimum
 
-    l1 = node_factory.get_node(options={'min-capacity-sat': l1_min_capacity})
-    l2 = node_factory.get_node(options={'min-capacity-sat': l2_min_capacity})
-    l3 = node_factory.get_node(options={'min-capacity-sat': l3_min_capacity})
-    l4 = node_factory.get_node(options={'min-capacity-sat': l4_min_capacity})
-    l5 = node_factory.get_node(options={'min-capacity-sat': l5_min_capacity})
-
+    l1, l2, l3, l4, l5 = node_factory.get_nodes(5, opts=[{'min-capacity-sat': l1_min_capacity},
+                                                         {'min-capacity-sat': l2_min_capacity},
+                                                         {'min-capacity-sat': l3_min_capacity},
+                                                         {'min-capacity-sat': l4_min_capacity},
+                                                         {'min-capacity-sat': l5_min_capacity}])
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     l1.rpc.connect(l3.info['id'], 'localhost', l3.port)
     l1.rpc.connect(l4.info['id'], 'localhost', l4.port)
@@ -212,9 +214,7 @@ def test_opening_tiny_channel(node_factory):
 
 
 def test_second_channel(node_factory):
-    l1 = node_factory.get_node()
-    l2 = node_factory.get_node()
-    l3 = node_factory.get_node()
+    l1, l2, l3 = node_factory.get_nodes(3)
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     l1.rpc.connect(l3.info['id'], 'localhost', l3.port)
@@ -428,9 +428,7 @@ def test_reconnect_no_update(node_factory, executor):
 
 def test_connect_stresstest(node_factory, executor):
     # This test is unreliable, but it's better than nothing.
-    l1 = node_factory.get_node(may_reconnect=True)
-    l2 = node_factory.get_node(may_reconnect=True)
-    l3 = node_factory.get_node(may_reconnect=True)
+    l1, l2, l3 = node_factory.get_nodes(3, opts={'may_reconnect': True})
 
     # Hack l3 into a clone of l2, to stress reconnect code.
     l3.stop()
@@ -995,7 +993,7 @@ def test_funding_external_wallet_corners(node_factory, bitcoind):
 def test_funding_cancel_race(node_factory, bitcoind, executor):
     l1 = node_factory.get_node()
 
-    if VALGRIND or SLOW_MACHINE:
+    if node_factory.valgrind:
         num = 5
     else:
         num = 100
@@ -1056,7 +1054,7 @@ def test_funding_cancel_race(node_factory, bitcoind, executor):
     assert num_cancel == len(nodes)
 
     # We should have raced at least once!
-    if not VALGRIND:
+    if not node_factory.valgrind:
         assert num_cancel > 0
         assert num_complete > 0
 
@@ -1162,9 +1160,8 @@ def test_funding_close_upfront(node_factory, bitcoind):
 
 @unittest.skipIf(TEST_NETWORK != 'regtest', "External wallet support doesn't work with elements yet.")
 def test_funding_external_wallet(node_factory, bitcoind):
-    l1 = node_factory.get_node(options={'funding-confirms': 2})
-    l2 = node_factory.get_node(options={'funding-confirms': 2})
-    l3 = node_factory.get_node()
+    l1, l2, l3 = node_factory.get_nodes(3, opts=[{'funding-confirms': 2},
+                                                 {'funding-confirms': 2}, {}])
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     assert(l1.rpc.listpeers()['peers'][0]['id'] == l2.info['id'])
@@ -1422,7 +1419,12 @@ def test_update_fee(node_factory, bitcoind):
 
 @unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1")
 def test_fee_limits(node_factory, bitcoind):
-    l1, l2 = node_factory.line_graph(2, opts={'dev-max-fee-multiplier': 5, 'may_reconnect': True}, fundchannel=True)
+    l1, l2, l3, l4 = node_factory.get_nodes(4, opts=[{'dev-max-fee-multiplier': 5, 'may_reconnect': True},
+                                                     {'dev-max-fee-multiplier': 5, 'may_reconnect': True},
+                                                     {'ignore-fee-limits': True, 'may_reconnect': True},
+                                                     {}])
+
+    node_factory.join_nodes([l1, l2], fundchannel=True)
 
     # Kick off fee adjustment using HTLC.
     l1.pay(l2, 1000)
@@ -1441,7 +1443,6 @@ def test_fee_limits(node_factory, bitcoind):
     sync_blockheight(bitcoind, [l1, l2])
 
     # Trying to open a channel with too low a fee-rate is denied
-    l4 = node_factory.get_node()
     l1.rpc.connect(l4.info['id'], 'localhost', l4.port)
     with pytest.raises(RpcError, match='They sent error .* feerate_per_kw 253 below minimum'):
         l1.fund_channel(l4, 10**6)
@@ -1452,7 +1453,6 @@ def test_fee_limits(node_factory, bitcoind):
     l1.start()
 
     # Try with node which sets --ignore-fee-limits
-    l3 = node_factory.get_node(options={'ignore-fee-limits': 'true'}, may_reconnect=True)
     l1.rpc.connect(l3.info['id'], 'localhost', l3.port)
     chan = l1.fund_channel(l3, 10**6)
 
@@ -1963,7 +1963,7 @@ def test_fulfill_incoming_first(node_factory, bitcoind):
     # We manually reconnect l2 & l3, after 100 blocks; hence allowing manual
     # reconnect, but disabling auto connect, and massive cltv so 2/3 doesn't
     # time out.
-    l1, l2, l3 = node_factory.line_graph(3, opts=[{},
+    l1, l2, l3 = node_factory.line_graph(3, opts=[{'disable-mpp': None},
                                                   {'may_reconnect': True,
                                                    'dev-no-reconnect': None},
                                                   {'may_reconnect': True,
@@ -1997,43 +1997,56 @@ def test_fulfill_incoming_first(node_factory, bitcoind):
 
 
 @unittest.skipIf(not DEVELOPER, "gossip without DEVELOPER=1 is slow")
+@pytest.mark.slow_test
 def test_restart_many_payments(node_factory, bitcoind):
     l1 = node_factory.get_node(may_reconnect=True)
 
-    # On my laptop, these take 74 seconds and 44 seconds (with restart commented out)
-    if VALGRIND:
+    # On my laptop, these take 89 seconds and 12 seconds
+    if node_factory.valgrind:
         num = 2
     else:
         num = 5
 
+    nodes = node_factory.get_nodes(num * 2, opts={'may_reconnect': True})
+    innodes = nodes[:num]
+    outnodes = nodes[num:]
+
+    # Fund up-front to save some time.
+    dests = {l1.rpc.newaddr()['bech32']: (10**6 + 1000000) / 10**8 * num}
+    for n in innodes:
+        dests[n.rpc.newaddr()['bech32']] = (10**6 + 1000000) / 10**8
+    bitcoind.rpc.sendmany("", dests)
+    bitcoind.generate_block(1)
+    sync_blockheight(bitcoind, [l1] + innodes)
+
     # Nodes with channels into the main node
-    innodes = node_factory.get_nodes(num, opts={'may_reconnect': True})
-    inchans = []
     for n in innodes:
         n.rpc.connect(l1.info['id'], 'localhost', l1.port)
-        inchans.append(n.fund_channel(l1, 10**6, False))
+        n.rpc.fundchannel(l1.info['id'], 10**6)
 
     # Nodes with channels out of the main node
-    outnodes = node_factory.get_nodes(len(innodes), opts={'may_reconnect': True})
+    for n in outnodes:
+        l1.rpc.connect(n.info['id'], 'localhost', n.port)
+        # OK to use change from previous fundings
+        l1.rpc.fundchannel(n.info['id'], 10**6, minconf=0)
+
+    # Now mine them, get scids.
+    bitcoind.generate_block(6, wait_for_mempool=num * 2)
+    sync_blockheight(bitcoind, [l1] + nodes)
+
+    wait_for(lambda: [only_one(n.rpc.listpeers()['peers'])['channels'][0]['state'] for n in nodes] == ['CHANNELD_NORMAL'] * len(nodes))
+
+    inchans = []
+    for n in innodes:
+        inchans.append(only_one(n.rpc.listpeers()['peers'])['channels'][0]['short_channel_id'])
+
     outchans = []
     for n in outnodes:
-        n.rpc.connect(l1.info['id'], 'localhost', l1.port)
-        outchans.append(l1.fund_channel(n, 10**6, False))
+        outchans.append(only_one(n.rpc.listpeers()['peers'])['channels'][0]['short_channel_id'])
 
-    # Make sure they're all announced.
-    bitcoind.generate_block(5)
-
-    # We wait for each node to see each dir active, and its own
-    # channel CHANNELD_NORMAL
-    logs = ([r'update for channel {}/0 now ACTIVE'.format(scid)
-             for scid in inchans + outchans]
-            + [r'update for channel {}/1 now ACTIVE'.format(scid)
-               for scid in inchans + outchans]
-            + ['to CHANNELD_NORMAL'])
-
-    # Now do all the waiting at once: if !DEVELOPER, this can be *very* slow!
-    for n in innodes + outnodes:
-        n.daemon.wait_for_logs(logs)
+    # Now make sure every node sees every channel.
+    for n in nodes + [l1]:
+        wait_for(lambda: [c['public'] for c in n.rpc.listchannels()['channels']] == [True] * len(nodes) * 2)
 
     # Manually create routes, get invoices
     Payment = namedtuple('Payment', ['innode', 'route', 'payment_hash'])
@@ -2165,8 +2178,9 @@ def test_feerate_spam(node_factory, chainparams):
     # Now change feerates to something l1 can't afford.
     l1.set_feerates((100000, 100000, 100000, 100000))
 
-    # It will raise as far as it can (48000)
-    l1.daemon.wait_for_log('Setting REMOTE feerate to 48000')
+    # It will raise as far as it can (48000) (30000 for option_anchor_outputs)
+    maxfeerate = 30000 if EXPERIMENTAL_FEATURES else 48000
+    l1.daemon.wait_for_log('Setting REMOTE feerate to {}'.format(maxfeerate))
     l1.daemon.wait_for_log('peer_out WIRE_UPDATE_FEE')
 
     # But it won't do it again once it's at max.
@@ -2226,9 +2240,10 @@ def test_feerate_stress(node_factory, executor):
 
 
 @unittest.skipIf(not DEVELOPER, "need dev_disconnect")
+@pytest.mark.slow_test
 def test_pay_disconnect_stress(node_factory, executor):
     """Expose race in htlc restoration in channeld: 50% chance of failure"""
-    if SLOW_MACHINE and VALGRIND:
+    if node_factory.valgrind:
         NUM_RUNS = 2
     else:
         NUM_RUNS = 5

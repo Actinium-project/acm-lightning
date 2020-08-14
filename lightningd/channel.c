@@ -170,7 +170,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    struct bitcoin_tx *last_tx,
 			    const struct bitcoin_signature *last_sig,
 			    /* NULL or stolen */
-			    secp256k1_ecdsa_signature *last_htlc_sigs,
+			    const struct bitcoin_signature *last_htlc_sigs,
 			    const struct channel_info *channel_info,
 			    /* NULL or stolen */
 			    u8 *remote_shutdown_scriptpubkey,
@@ -189,7 +189,8 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    u32 feerate_base,
 			    u32 feerate_ppm,
 			    const u8 *remote_upfront_shutdown_script,
-			    bool option_static_remotekey)
+			    bool option_static_remotekey,
+			    bool option_anchor_outputs)
 {
 	struct channel *channel = tal(peer->ld, struct channel);
 
@@ -270,6 +271,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 	channel->remote_upfront_shutdown_script
 		= tal_steal(channel, remote_upfront_shutdown_script);
 	channel->option_static_remotekey = option_static_remotekey;
+	channel->option_anchor_outputs = option_anchor_outputs;
 	channel->forgets = tal_arr(channel, struct command *, 0);
 
 	list_add_tail(&peer->channels, &channel->list);

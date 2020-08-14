@@ -115,7 +115,7 @@ void   fatal(const char *fmt UNNEEDED, ...)
 bool fromwire_channel_dev_memleak_reply(const void *p UNNEEDED, bool *leak UNNEEDED)
 { fprintf(stderr, "fromwire_channel_dev_memleak_reply called!\n"); abort(); }
 /* Generated stub for fromwire_channel_got_commitsig */
-bool fromwire_channel_got_commitsig(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u64 *commitnum UNNEEDED, struct fee_states **fee_states UNNEEDED, struct bitcoin_signature *signature UNNEEDED, secp256k1_ecdsa_signature **htlc_signature UNNEEDED, struct added_htlc **added UNNEEDED, struct fulfilled_htlc **fulfilled UNNEEDED, struct failed_htlc ***failed UNNEEDED, struct changed_htlc **changed UNNEEDED, struct bitcoin_tx **tx UNNEEDED)
+bool fromwire_channel_got_commitsig(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u64 *commitnum UNNEEDED, struct fee_states **fee_states UNNEEDED, struct bitcoin_signature *signature UNNEEDED, struct bitcoin_signature **htlc_signature UNNEEDED, struct added_htlc **added UNNEEDED, struct fulfilled_htlc **fulfilled UNNEEDED, struct failed_htlc ***failed UNNEEDED, struct changed_htlc **changed UNNEEDED, struct bitcoin_tx **tx UNNEEDED)
 { fprintf(stderr, "fromwire_channel_got_commitsig called!\n"); abort(); }
 /* Generated stub for fromwire_channel_got_revoke */
 bool fromwire_channel_got_revoke(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u64 *revokenum UNNEEDED, struct secret *per_commitment_secret UNNEEDED, struct pubkey *next_per_commit_point UNNEEDED, struct fee_states **fee_states UNNEEDED, struct changed_htlc **changed UNNEEDED, struct penalty_base **pbase UNNEEDED, struct bitcoin_tx **penalty_tx UNNEEDED)
@@ -124,7 +124,7 @@ bool fromwire_channel_got_revoke(const tal_t *ctx UNNEEDED, const void *p UNNEED
 bool fromwire_channel_offer_htlc_reply(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u64 *id UNNEEDED, u8 **failuremsg UNNEEDED, wirestring **failurestr UNNEEDED)
 { fprintf(stderr, "fromwire_channel_offer_htlc_reply called!\n"); abort(); }
 /* Generated stub for fromwire_channel_sending_commitsig */
-bool fromwire_channel_sending_commitsig(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u64 *commitnum UNNEEDED, struct penalty_base **pbase UNNEEDED, struct fee_states **fee_states UNNEEDED, struct changed_htlc **changed UNNEEDED, struct bitcoin_signature *commit_sig UNNEEDED, secp256k1_ecdsa_signature **htlc_sigs UNNEEDED)
+bool fromwire_channel_sending_commitsig(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u64 *commitnum UNNEEDED, struct penalty_base **pbase UNNEEDED, struct fee_states **fee_states UNNEEDED, struct changed_htlc **changed UNNEEDED, struct bitcoin_signature *commit_sig UNNEEDED, struct bitcoin_signature **htlc_sigs UNNEEDED)
 { fprintf(stderr, "fromwire_channel_sending_commitsig called!\n"); abort(); }
 /* Generated stub for fromwire_connect_peer_connected */
 bool fromwire_connect_peer_connected(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, struct node_id *id UNNEEDED, struct wireaddr_internal *addr UNNEEDED, struct per_peer_state **pps UNNEEDED, u8 **features UNNEEDED)
@@ -135,6 +135,9 @@ bool fromwire_custommsg_in(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u8
 /* Generated stub for fromwire_gossip_get_stripped_cupdate_reply */
 bool fromwire_gossip_get_stripped_cupdate_reply(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u8 **stripped_update UNNEEDED)
 { fprintf(stderr, "fromwire_gossip_get_stripped_cupdate_reply called!\n"); abort(); }
+/* Generated stub for fromwire_hsm_get_output_scriptpubkey_reply */
+bool fromwire_hsm_get_output_scriptpubkey_reply(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u8 **script UNNEEDED)
+{ fprintf(stderr, "fromwire_hsm_get_output_scriptpubkey_reply called!\n"); abort(); }
 /* Generated stub for fromwire_hsm_sign_commitment_tx_reply */
 bool fromwire_hsm_sign_commitment_tx_reply(const void *p UNNEEDED, struct bitcoin_signature *sig UNNEEDED)
 { fprintf(stderr, "fromwire_hsm_sign_commitment_tx_reply called!\n"); abort(); }
@@ -149,7 +152,8 @@ bool htlc_is_trimmed(enum side htlc_owner UNNEEDED,
 		     struct amount_msat htlc_amount UNNEEDED,
 		     u32 feerate_per_kw UNNEEDED,
 		     struct amount_sat dust_limit UNNEEDED,
-		     enum side side UNNEEDED)
+		     enum side side UNNEEDED,
+		     bool option_anchor_outputs UNNEEDED)
 { fprintf(stderr, "htlc_is_trimmed called!\n"); abort(); }
 /* Generated stub for htlc_set_add */
 void htlc_set_add(struct lightningd *ld UNNEEDED,
@@ -692,6 +696,9 @@ u8 *towire_final_incorrect_htlc_amount(const tal_t *ctx UNNEEDED, struct amount_
 /* Generated stub for towire_gossip_get_stripped_cupdate */
 u8 *towire_gossip_get_stripped_cupdate(const tal_t *ctx UNNEEDED, const struct short_channel_id *channel_id UNNEEDED)
 { fprintf(stderr, "towire_gossip_get_stripped_cupdate called!\n"); abort(); }
+/* Generated stub for towire_hsm_get_output_scriptpubkey */
+u8 *towire_hsm_get_output_scriptpubkey(const tal_t *ctx UNNEEDED, u64 channel_id UNNEEDED, const struct node_id *peer_id UNNEEDED, const struct pubkey *commitment_point UNNEEDED)
+{ fprintf(stderr, "towire_hsm_get_output_scriptpubkey called!\n"); abort(); }
 /* Generated stub for towire_hsm_sign_commitment_tx */
 u8 *towire_hsm_sign_commitment_tx(const tal_t *ctx UNNEEDED, const struct node_id *peer_id UNNEEDED, u64 channel_dbid UNNEEDED, const struct bitcoin_tx *tx UNNEEDED, const struct pubkey *remote_funding_key UNNEEDED)
 { fprintf(stderr, "towire_hsm_sign_commitment_tx called!\n"); abort(); }
@@ -866,6 +873,7 @@ static struct wallet *create_test_wallet(struct lightningd *ld, const tal_t *ctx
 	int fd = mkstemp(filename);
 	struct wallet *w = tal(ctx, struct wallet);
 	static unsigned char badseed[BIP32_ENTROPY_LEN_128];
+	const struct ext_key *bip32_base = NULL;
 	CHECK_MSG(fd != -1, "Unable to generate temp filename");
 	close(fd);
 
@@ -885,7 +893,7 @@ static struct wallet *create_test_wallet(struct lightningd *ld, const tal_t *ctx
 
 	CHECK_MSG(w->db, "Failed opening the db");
 	db_begin_transaction(w->db);
-	db_migrate(ld, w->db);
+	db_migrate(ld, w->db, bip32_base);
 	w->db->data_version = 0;
 	db_commit_transaction(w->db);
 	CHECK_MSG(!wallet_err, "DB migration failed");
@@ -925,6 +933,10 @@ static bool test_wallet_outputs(struct lightningd *ld, const tal_t *ctx)
 	u.close_info->channel_id = 42;
 	u.close_info->peer_id = id;
 	u.close_info->commitment_point = &pk;
+	u.close_info->option_anchor_outputs = false;
+	/* Arbitrarily set scriptpubkey len to 20 */
+	u.scriptPubkey = tal_arr(w, u8, 20);
+	memset(u.scriptPubkey, 1, 20);
 	CHECK_MSG(wallet_add_utxo(w, &u, p2sh_wpkh),
 		  "wallet_add_utxo with close_info");
 
@@ -937,7 +949,8 @@ static bool test_wallet_outputs(struct lightningd *ld, const tal_t *ctx)
 	u = *utxos[1];
 	CHECK(u.close_info->channel_id == 42 &&
 	      pubkey_eq(u.close_info->commitment_point, &pk) &&
-	      node_id_eq(&u.close_info->peer_id, &id));
+	      node_id_eq(&u.close_info->peer_id, &id) &&
+	      u.close_info->option_anchor_outputs == false);
 	/* Now un-reserve them for the tests below */
 	tal_free(utxos);
 
@@ -973,6 +986,9 @@ static bool test_wallet_outputs(struct lightningd *ld, const tal_t *ctx)
 	u.close_info->channel_id = 42;
 	u.close_info->peer_id = id;
 	u.close_info->commitment_point = NULL;
+	u.close_info->option_anchor_outputs = true;
+	u.scriptPubkey = tal_arr(w, u8, 20);
+	memset(u.scriptPubkey, 1, 20);
 	CHECK_MSG(wallet_add_utxo(w, &u, p2sh_wpkh),
 		  "wallet_add_utxo with close_info no commitment_point");
 
@@ -985,7 +1001,8 @@ static bool test_wallet_outputs(struct lightningd *ld, const tal_t *ctx)
 	u = *utxos[1];
 	CHECK(u.close_info->channel_id == 42 &&
 	      u.close_info->commitment_point == NULL &&
-	      node_id_eq(&u.close_info->peer_id, &id));
+	      node_id_eq(&u.close_info->peer_id, &id) &&
+	      u.close_info->option_anchor_outputs == true);
 	/* Now un-reserve them */
 	tal_free(utxos);
 

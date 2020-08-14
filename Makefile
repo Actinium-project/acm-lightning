@@ -196,8 +196,6 @@ CCAN_HEADERS :=						\
 	$(CCANDIR)/ccan/typesafe_cb/typesafe_cb.h	\
 	$(CCANDIR)/ccan/utf8/utf8.h
 
-ALL_GEN_HEADERS += gen_version.h
-
 CDUMP_OBJS := ccan-cdump.o ccan-strmap.o
 
 BOLT_GEN := tools/generate-wire.py
@@ -267,6 +265,15 @@ include devtools/Makefile
 include tools/Makefile
 include plugins/Makefile
 include tests/plugins/Makefile
+
+# Generated from PLUGINS definition in plugins/Makefile
+gen_list_of_builtin_plugins.h : plugins/Makefile Makefile
+	@echo GEN $@
+	@rm -f $@ || true
+	@echo 'static const char *list_of_builtin_plugins[] = {' >> $@
+	@echo '$(PLUGINS)' | sed 's@plugins/\([^ 	]*\)@"\1",@g'>> $@
+	@echo 'NULL' >> $@
+	@echo '};' >> $@
 
 # Git doesn't maintain timestamps, so we only regen if git says we should.
 CHANGED_FROM_GIT = [ x"`git log $@ | head -n1`" != x"`git log $< | head -n1`" -o x"`git diff $<`" != x"" ]

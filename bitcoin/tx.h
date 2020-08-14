@@ -12,6 +12,10 @@
 #include <wally_transaction.h>
 
 #define BITCOIN_TX_DEFAULT_SEQUENCE 0xFFFFFFFF
+
+/* BIP 125: Any nsequence < 0xFFFFFFFE is replacable.
+ * And bitcoind uses this value. */
+#define BITCOIN_TX_RBF_SEQUENCE 0xFFFFFFFD
 struct wally_psbt;
 
 struct bitcoin_txid {
@@ -75,6 +79,13 @@ struct bitcoin_tx *bitcoin_tx_with_psbt(const tal_t *ctx, struct wally_psbt *psb
 /* Internal de-linearization functions. */
 struct bitcoin_tx *pull_bitcoin_tx(const tal_t *ctx,
 				   const u8 **cursor, size_t *max);
+
+/* Helper to create a wally_tx_output: make sure to wally_tx_output_free!
+ * Returns NULL if amount is extreme (wally doesn't like).
+ */
+struct wally_tx_output *wally_tx_output(const u8 *script,
+					struct amount_sat amount);
+
 /* Add one output to tx. */
 int bitcoin_tx_add_output(struct bitcoin_tx *tx, const u8 *script,
 			  u8 *wscript,
@@ -228,8 +239,6 @@ struct bitcoin_tx_output *fromwire_bitcoin_tx_output(const tal_t *ctx,
 void towire_bitcoin_txid(u8 **pptr, const struct bitcoin_txid *txid);
 void towire_bitcoin_tx(u8 **pptr, const struct bitcoin_tx *tx);
 void towire_bitcoin_tx_output(u8 **pptr, const struct bitcoin_tx_output *output);
-
-int wally_tx_clone(struct wally_tx *tx, struct wally_tx **output);
 
 /* Various weights of transaction parts. */
 size_t bitcoin_tx_core_weight(size_t num_inputs, size_t num_outputs);

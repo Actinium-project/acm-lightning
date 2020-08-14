@@ -229,7 +229,7 @@ static void handle_onchain_broadcast_tx(struct channel *channel, const u8 *msg)
 	tx->chainparams = chainparams;
 
 	bitcoin_txid(tx, &txid);
-	wallet_transaction_add(w, tx, 0, 0);
+	wallet_transaction_add(w, tx->wtx, 0, 0);
 	wallet_transaction_annotate(w, &txid, type, channel->dbid);
 
 	/* We don't really care if it fails, we'll respond via watch. */
@@ -624,7 +624,10 @@ enum watch_result onchaind_funding_spent(struct channel *channel,
 				  channel->min_possible_feerate,
 				  channel->max_possible_feerate,
 				  channel->future_per_commitment_point,
+				  &channel->local_funding_pubkey,
+				  &channel->channel_info.remote_fundingkey,
 				  channel->option_static_remotekey,
+				  channel->option_anchor_outputs,
 				  is_replay);
 	subd_send_msg(channel->owner, take(msg));
 

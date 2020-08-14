@@ -650,14 +650,13 @@ static WARN_UNUSED_RESULT bool risk_add_fee(struct amount_msat *risk,
 					    u32 delay, double riskfactor,
 					    u64 riskbias)
 {
-	double r;
+	struct amount_msat riskfee;
 
-	/* Won't overflow on add, just lose precision */
-	r = (double)riskbias + riskfactor * delay * msat.millisatoshis + risk->millisatoshis; /* Raw: to double */
-	if (r > (double)UINT64_MAX)
+	if (!amount_msat_scale(&riskfee, msat, riskfactor * delay))
 		return false;
-	risk->millisatoshis = r; /* Raw: from double */
-	return true;
+	if (!amount_msat_add(&riskfee, riskfee, amount_msat(riskbias)))
+		return false;
+	return amount_msat_add(risk, *risk, riskfee);
 }
 
 /* Check that we can fit through this channel's indicated
@@ -1209,7 +1208,7 @@ find_shorter_route(const tal_t *ctx, struct routing_state *rstate,
 	 * per block delay, which is close enough to zero to not break
 	 * this algorithm, but still provide some bias towards
 	 * low-delay routes. */
-	riskfactor = (double)1.0 / msat.millisatoshis; /* Raw: inversion */
+	riskfactor = amount_msat_ratio(AMOUNT_MSAT(1), msat);
 
 	/* First, figure out if a short route is even possible.
 	 * We set the cost function to ignore total, riskbias 1 and riskfactor
@@ -2762,96 +2761,6 @@ struct route_hop **get_route(const tal_t *ctx, struct routing_state *rstate,
 	return hops;
 }
 
-void routing_failure(struct routing_state *rstate,
-		     const struct node_id *erring_node_id,
-		     const struct short_channel_id *scid,
-		     int erring_direction,
-		     enum onion_type failcode,
-		     const u8 *channel_update)
-{
-	struct chan **pruned = tal_arr(tmpctx, struct chan *, 0);
-
-	status_debug("Received routing failure 0x%04x (%s), "
-		     "erring node %s, "
-		     "channel %s/%u",
-		     (int) failcode, onion_type_name(failcode),
-		     type_to_string(tmpctx, struct node_id, erring_node_id),
-		     type_to_string(tmpctx, struct short_channel_id, scid),
-		     erring_direction);
-
-	/* lightningd will only extract this if UPDATE is set. */
-	if (channel_update) {
-		u8 *err = handle_channel_update(rstate, channel_update,
-						NULL, NULL);
-		if (err) {
-			status_unusual("routing_failure: "
-				       "bad channel_update %s",
-				       sanitize_error(err, err, NULL));
-			tal_free(err);
-		}
-	} else if (failcode & UPDATE) {
-		status_unusual("routing_failure: "
-			       "UPDATE bit set, no channel_update. "
-			       "failcode: 0x%04x",
-			       (int) failcode);
-	}
-
-	/* We respond to permanent errors, ignore the rest: they're
-	 * for the pay command to worry about.  */
-	if (!(failcode & PERM))
-		return;
-
-	if (failcode & NODE) {
-		struct node *node = get_node(rstate, erring_node_id);
-		if (!node) {
-			status_unusual("routing_failure: Erring node %s not in map",
-				       type_to_string(tmpctx, struct node_id,
-						      erring_node_id));
-		} else {
-			struct chan_map_iter i;
-			struct chan *c;
-
-			status_debug("Deleting node %s",
-				     type_to_string(tmpctx,
-						    struct node_id,
-						    &node->id));
-			for (c = first_chan(node, &i); c; c = next_chan(node, &i)) {
-				/* Set it up to be pruned. */
-				tal_arr_expand(&pruned, c);
-			}
-		}
-	} else {
-		struct chan *chan = get_channel(rstate, scid);
-
-		if (!chan)
-			status_unusual("routing_failure: "
-				       "Channel %s unknown",
-				       type_to_string(tmpctx,
-						      struct short_channel_id,
-						      scid));
-		else {
-			/* This error can be triggered by sendpay if caller
-			 * uses the wrong key for dest. */
-			if (failcode == WIRE_INVALID_ONION_HMAC
-			    && !node_id_eq(&chan->nodes[!erring_direction]->id,
-					   erring_node_id))
-				return;
-
-			status_debug("Deleting channel %s",
-				     type_to_string(tmpctx,
-						    struct short_channel_id,
-						    scid));
-			/* Set it up to be deleted. */
-			tal_arr_expand(&pruned, chan);
-		}
-	}
-
-	/* Now free all the chans and maybe even nodes. */
-	for (size_t i = 0; i < tal_count(pruned); i++)
-		free_chan(rstate, pruned[i]);
-}
-
-
 void route_prune(struct routing_state *rstate)
 {
 	u64 now = gossip_time_now(rstate).ts.tv_sec;
@@ -2996,7 +2905,7 @@ void remove_all_gossip(struct routing_state *rstate)
 	while ((c = uintmap_first(&rstate->chanmap, &index)) != NULL) {
 		uintmap_del(&rstate->chanmap, index);
 #if DEVELOPER
-		c->sat.satoshis = (unsigned long)c; /* Raw: dev-hack */
+		c->sat = amount_sat((unsigned long)c);
 #endif
 		tal_free(c);
 	}

@@ -35,8 +35,7 @@ def test_stop_pending_fundchannel(node_factory, executor):
     freeing the daemon, but that needs a DB transaction to be open.
 
     """
-    l1 = node_factory.get_node()
-    l2 = node_factory.get_node()
+    l1, l2 = node_factory.get_nodes(2)
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
 
@@ -69,8 +68,8 @@ def test_names(node_factory):
         ('0265b6ab5ec860cd257865d61ef0bbf5b3339c36cbda8b26b74e7f1dca490b6518', 'LOUDPHOTO', '0265b6')
     ]
 
-    for key, alias, color in configs:
-        n = node_factory.get_node()
+    nodes = node_factory.get_nodes(len(configs))
+    for n, (key, alias, color) in zip(nodes, configs):
         assert n.daemon.is_in_log(r'public key {}, alias {}.* \(color #{}\)'
                                   .format(key, alias, color))
 
@@ -128,6 +127,18 @@ def test_bitcoin_failure(node_factory, bitcoind):
     bitcoind.generate_block(5)
     sync_blockheight(bitcoind, [l1])
 
+    # We refuse to start if bitcoind is in `blocksonly`
+    l1.stop()
+    bitcoind.stop()
+    bitcoind.cmd_line += ["-blocksonly"]
+    bitcoind.start()
+
+    l2 = node_factory.get_node(start=False, expect_fail=True)
+    with pytest.raises(ValueError):
+        l2.start(stderr=subprocess.PIPE)
+    assert l2.daemon.is_in_stderr(r".*deactivating transaction relay is not"
+                                  " supported.") is not None
+
 
 def test_bitcoin_ibd(node_factory, bitcoind):
     """Test that we recognize bitcoin in initial download mode"""
@@ -168,17 +179,19 @@ def test_lightningd_still_loading(node_factory, bitcoind, executor):
         }
 
     # Start it, establish channel, get extra funds.
-    l1, l2 = node_factory.line_graph(2, opts={'may_reconnect': True, 'wait_for_bitcoind_sync': False})
+    l1, l2, l3 = node_factory.get_nodes(3, opts=[{'may_reconnect': True,
+                                                  'wait_for_bitcoind_sync': False},
+                                                 {'may_reconnect': True,
+                                                  'wait_for_bitcoind_sync': False},
+                                                 {}])
+    node_factory.join_nodes([l1, l2])
 
     # Balance l1<->l2 channel
     l1.pay(l2, 10**9 // 2)
 
     l1.stop()
 
-    # Start extra node.
-    l3 = node_factory.get_node()
-
-    # Now make sure it's behind.
+    # Now make sure l2 is behind.
     bitcoind.generate_block(2)
     # Make sure l2/l3 are synced
     sync_blockheight(bitcoind, [l2, l3])
@@ -451,11 +464,7 @@ def test_htlc_in_timeout(node_factory, bitcoind, executor):
 @unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1")
 def test_bech32_funding(node_factory, chainparams):
     # Don't get any funds from previous runs.
-    l1 = node_factory.get_node(random_hsm=True)
-    l2 = node_factory.get_node(random_hsm=True)
-
-    # connect
-    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    l1, l2 = node_factory.line_graph(2, opts={'random_hsm': True}, fundchannel=False)
 
     # fund a bech32 address and then open a channel with it
     res = l1.openchannel(l2, 20000, 'bech32')
@@ -821,7 +830,7 @@ def test_listconfigs(node_factory, bitcoind, chainparams):
 
     # Test one at a time.
     for c in configs.keys():
-        if c.startswith('#') or c.startswith('plugins'):
+        if c.startswith('#') or c.startswith('plugins') or c == 'important-plugins':
             continue
         oneconfig = l1.rpc.listconfigs(config=c)
         assert(oneconfig[c] == configs[c])
@@ -832,9 +841,9 @@ def test_listconfigs_plugins(node_factory, bitcoind, chainparams):
 
     # assert that we have pay plugin and that plugins have a name and path
     configs = l1.rpc.listconfigs()
-    assert configs['plugins']
-    assert len([p for p in configs['plugins'] if p['name'] == "pay"]) == 1
-    for p in configs['plugins']:
+    assert configs['important-plugins']
+    assert len([p for p in configs['important-plugins'] if p['name'] == "pay"]) == 1
+    for p in configs['important-plugins']:
         assert p['name'] and len(p['name']) > 0
         assert p['path'] and len(p['path']) > 0
         assert os.path.isfile(p['path']) and os.access(p['path'], os.X_OK)
@@ -1368,22 +1377,16 @@ def test_reserve_enforcement(node_factory, executor):
 def test_htlc_send_timeout(node_factory, bitcoind, compat):
     """Test that we don't commit an HTLC to an unreachable node."""
     # Feerates identical so we don't get gratuitous commit to update them
-    l1 = node_factory.get_node(options={'log-level': 'io'},
-                               feerates=(7500, 7500, 7500, 7500))
-    # Blackhole it after it sends HTLC_ADD to l3.
-    l2 = node_factory.get_node(disconnect=['0WIRE_UPDATE_ADD_HTLC'],
-                               options={'log-level': 'io'},
-                               feerates=(7500, 7500, 7500, 7500))
-    l3 = node_factory.get_node()
+    l1, l2, l3 = node_factory.line_graph(3, opts=[{'log-level': 'io',
+                                                   'feerates': (7500, 7500, 7500, 7500)},
+                                                  # Blackhole it after it sends HTLC_ADD to l3.
+                                                  {'log-level': 'io',
+                                                   'feerates': (7500, 7500, 7500, 7500),
+                                                   'disconnect': ['0WIRE_UPDATE_ADD_HTLC']},
+                                                  {}],
+                                         wait_for_announce=True)
 
-    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
-    l2.rpc.connect(l3.info['id'], 'localhost', l3.port)
-
-    l1.fund_channel(l2, 10**6)
-    chanid2 = l2.fund_channel(l3, 10**6)
-
-    # Make sure channels get announced.
-    bitcoind.generate_block(5)
+    chanid2 = l2.get_channel_scid(l3)
 
     # Make sure we have 30 seconds without any incoming traffic from l3 to l2
     # so it tries to ping before sending WIRE_COMMITMENT_SIGNED.
@@ -1395,13 +1398,13 @@ def test_htlc_send_timeout(node_factory, bitcoind, compat):
             timedout = True
 
     inv = l3.rpc.invoice(123000, 'test_htlc_send_timeout', 'description')
-    with pytest.raises(RpcError, match=r'Ran out of routes to try after 1 attempt') as excinfo:
+    with pytest.raises(RpcError, match=r'Ran out of routes to try after [0-9]+ attempt[s]?') as excinfo:
         l1.rpc.pay(inv['bolt11'])
 
     err = excinfo.value
     # Complains it stopped after several attempts.
     # FIXME: include in pylightning
-    PAY_STOPPED_RETRYING = 210 if compat('090') else 205
+    PAY_STOPPED_RETRYING = 210
     assert err.error['code'] == PAY_STOPPED_RETRYING
 
     status = only_one(l1.rpc.call('paystatus')['pay'])
@@ -1458,7 +1461,7 @@ def test_feerates(node_factory):
     # Query feerates (shouldn't give any!)
     wait_for(lambda: len(l1.rpc.feerates('perkw')['perkw']) == 2)
     feerates = l1.rpc.feerates('perkw')
-    assert feerates['warning'] == 'Some fee estimates unavailable: bitcoind startup?'
+    assert feerates['warning_missing_feerates'] == 'Some fee estimates unavailable: bitcoind startup?'
     assert 'perkb' not in feerates
     assert feerates['perkw']['max_acceptable'] == 2**32 - 1
     assert feerates['perkw']['min_acceptable'] == 253
@@ -1467,7 +1470,7 @@ def test_feerates(node_factory):
 
     wait_for(lambda: len(l1.rpc.feerates('perkb')['perkb']) == 2)
     feerates = l1.rpc.feerates('perkb')
-    assert feerates['warning'] == 'Some fee estimates unavailable: bitcoind startup?'
+    assert feerates['warning_missing_feerates'] == 'Some fee estimates unavailable: bitcoind startup?'
     assert 'perkw' not in feerates
     assert feerates['perkb']['max_acceptable'] == (2**32 - 1)
     assert feerates['perkb']['min_acceptable'] == 253 * 4
@@ -1480,7 +1483,7 @@ def test_feerates(node_factory):
     wait_for(lambda: len(l1.rpc.feerates('perkw')['perkw']) == 3)
     feerates = l1.rpc.feerates('perkw')
     assert feerates['perkw']['unilateral_close'] == 15000
-    assert feerates['warning'] == 'Some fee estimates unavailable: bitcoind startup?'
+    assert feerates['warning_missing_feerates'] == 'Some fee estimates unavailable: bitcoind startup?'
     assert 'perkb' not in feerates
     assert feerates['perkw']['max_acceptable'] == 15000 * 10
     assert feerates['perkw']['min_acceptable'] == 253
@@ -1492,7 +1495,7 @@ def test_feerates(node_factory):
     assert feerates['perkw']['unilateral_close'] == 15000
     assert feerates['perkw']['htlc_resolution'] == 11000
     assert feerates['perkw']['penalty'] == 11000
-    assert feerates['warning'] == 'Some fee estimates unavailable: bitcoind startup?'
+    assert feerates['warning_missing_feerates'] == 'Some fee estimates unavailable: bitcoind startup?'
     assert 'perkb' not in feerates
     assert feerates['perkw']['max_acceptable'] == 15000 * 10
     assert feerates['perkw']['min_acceptable'] == 253
@@ -1507,7 +1510,7 @@ def test_feerates(node_factory):
     for t in types:
         if t not in ("unilateral_close", "htlc_resolution", "penalty"):
             assert feerates['perkb'][t] == 25000
-    assert feerates['warning'] == 'Some fee estimates unavailable: bitcoind startup?'
+    assert feerates['warning_missing_feerates'] == 'Some fee estimates unavailable: bitcoind startup?'
     assert 'perkw' not in feerates
     assert feerates['perkb']['max_acceptable'] == 15000 * 4 * 10
     assert feerates['perkb']['min_acceptable'] == 253 * 4
@@ -1534,8 +1537,13 @@ def test_feerates(node_factory):
     htlc_feerate = feerates["perkw"]["htlc_resolution"]
     htlc_timeout_cost = feerates["onchain_fee_estimates"]["htlc_timeout_satoshis"]
     htlc_success_cost = feerates["onchain_fee_estimates"]["htlc_success_satoshis"]
-    assert htlc_timeout_cost == htlc_feerate * 663 // 1000
-    assert htlc_success_cost == htlc_feerate * 703 // 1000
+    if EXPERIMENTAL_FEATURES:
+        # option_anchor_outputs
+        assert htlc_timeout_cost == htlc_feerate * 666 // 1000
+        assert htlc_success_cost == htlc_feerate * 706 // 1000
+    else:
+        assert htlc_timeout_cost == htlc_feerate * 663 // 1000
+        assert htlc_success_cost == htlc_feerate * 703 // 1000
 
 
 def test_logging(node_factory):
@@ -1884,6 +1892,7 @@ def test_list_features_only(node_factory):
                 'option_basic_mpp/odd',
                 ]
     if EXPERIMENTAL_FEATURES:
+        expected += ['option_anchor_outputs/odd']
         expected += ['option_unknown_102/odd']
     assert features == expected
 
@@ -2171,7 +2180,7 @@ def test_unix_socket_path_length(node_factory, bitcoind, directory, executor, db
     os.makedirs(lightning_dir)
     db = db_provider.get_db(lightning_dir, "test_unix_socket_path_length", 1)
 
-    l1 = LightningNode(1, lightning_dir, bitcoind, executor, db=db, port=node_factory.get_next_port())
+    l1 = LightningNode(1, lightning_dir, bitcoind, executor, VALGRIND, db=db, port=node_factory.get_next_port())
 
     # `LightningNode.start()` internally calls `LightningRpc.getinfo()` which
     # exercises the socket logic, and raises an issue if it fails.
@@ -2232,8 +2241,8 @@ def test_sendcustommsg(node_factory):
     """
     plugin = os.path.join(os.path.dirname(__file__), "plugins", "custommsg.py")
     opts = {'log-level': 'io', 'plugin': plugin}
-    l1, l2, l3 = node_factory.line_graph(3, opts=opts)
-    l4 = node_factory.get_node(options=opts)
+    l1, l2, l3, l4 = node_factory.get_nodes(4, opts=opts)
+    node_factory.join_nodes([l1, l2, l3])
     l2.connect(l4)
     l3.stop()
     msg = r'ff' * 32
@@ -2399,7 +2408,7 @@ def test_listtransactions(node_factory):
     """Sanity check for the listtransactions RPC command"""
     l1, l2 = node_factory.get_nodes(2, opts=[{}, {}])
 
-    wallettxid = l1.openchannel(l2, 10**4)["wallettxid"]
+    wallettxid = l1.openchannel(l2, 10**5)["wallettxid"]
     txids = [i["txid"] for tx in l1.rpc.listtransactions()["transactions"]
              for i in tx["inputs"]]
     # The txid of the transaction funding the channel is present, and

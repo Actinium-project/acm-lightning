@@ -115,6 +115,7 @@ struct state {
 	struct channel *channel;
 
 	bool option_static_remotekey;
+	bool option_anchor_outputs;
 
 	struct feature_set *our_features;
 };
@@ -243,6 +244,23 @@ static bool check_config_bounds(struct state *state,
 		return false;
 	}
 
+	/* BOLT-a12da24dd0102c170365124782b46d9710950ac1 #2:
+	 *  - if `option_anchor_outputs` applies to this commitment
+	 *    transaction and the sending node is the funder:
+	 *   - MUST be able to additionally pay for `to_local_anchor` and
+	 *    `to_remote_anchor` above its reserve.
+	 */
+	/* (We simply include in "reserve" here if they opened). */
+	if (state->option_anchor_outputs
+	    && !am_opener
+	    && !amount_sat_add(&reserve, reserve, AMOUNT_SAT(660))) {
+		negotiation_failed(state, am_opener,
+				   "cannot add anchors to reserve %s",
+				   type_to_string(tmpctx, struct amount_sat,
+						  &reserve));
+		return false;
+	}
+
 	/* If reserves are larger than total sat, we fail. */
 	if (!amount_sat_sub(&capacity, state->funding, reserve)) {
 		negotiation_failed(state, am_opener,
@@ -348,8 +366,7 @@ static bool check_config_bounds(struct state *state,
 /* We always set channel_reserve_satoshis to 1%, rounded down. */
 static void set_reserve(struct state *state)
 {
-	state->localconf.channel_reserve.satoshis  /* Raw: rounding. */
-		= state->funding.satoshis / 100;   /* Raw: rounding. */
+	state->localconf.channel_reserve = amount_sat_div(state->funding, 100);
 
 	/* BOLT #2:
 	 *
@@ -687,6 +704,7 @@ static bool funder_finalize_channel_setup(struct state *state,
 					     &state->our_funding_pubkey,
 					     &state->their_funding_pubkey,
 					     state->option_static_remotekey,
+					     state->option_anchor_outputs,
 					     /* Opener is local */
 					     LOCAL);
 	/* We were supposed to do enough checks above, but just in case,
@@ -840,9 +858,9 @@ static bool funder_finalize_channel_setup(struct state *state,
 	}
 
 	/* We save their sig to our first commitment tx */
-	if (!psbt_input_set_partial_sig((*tx)->psbt, 0,
-					&state->their_funding_pubkey,
-					sig))
+	if (!psbt_input_set_signature((*tx)->psbt, 0,
+				      &state->their_funding_pubkey,
+				      sig))
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Unable to set signature internally");
 
@@ -1168,6 +1186,7 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 					     &state->our_funding_pubkey,
 					     &their_funding_pubkey,
 					     state->option_static_remotekey,
+					     state->option_anchor_outputs,
 					     REMOTE);
 	/* We don't expect this to fail, but it does do some additional
 	 * internal sanity checks. */
@@ -1520,6 +1539,7 @@ int main(int argc, char *argv[])
 				   &state->min_feerate, &state->max_feerate,
 				   &state->their_features,
 				   &state->option_static_remotekey,
+				   &state->option_anchor_outputs,
 				   &inner,
 				   &force_tmp_channel_id,
 				   &dev_fast_gossip))

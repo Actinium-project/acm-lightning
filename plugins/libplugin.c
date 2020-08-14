@@ -83,6 +83,10 @@ struct plugin {
 
 	/* Feature set for lightningd */
 	struct feature_set *our_features;
+
+	/* Location of the RPC filename in case we need to defer RPC
+	 * initialization or need to recover from a disconnect. */
+	const char *rpc_location;
 };
 
 /* command_result is mainly used as a compile-time check to encourage you
@@ -564,10 +568,24 @@ send_outreq(struct plugin *plugin, const struct out_req *req)
 }
 
 static struct command_result *
-handle_getmanifest(struct command *getmanifest_cmd)
+handle_getmanifest(struct command *getmanifest_cmd,
+		   const char *buf,
+		   const jsmntok_t *getmanifest_params)
 {
 	struct json_stream *params = jsonrpc_stream_success(getmanifest_cmd);
 	struct plugin *p = getmanifest_cmd->plugin;
+	const jsmntok_t *dep;
+
+	/* This was added post 0.9.0 */
+	dep = json_get_member(buf, getmanifest_params, "allow-deprecated-apis");
+	if (!dep)
+		deprecated_apis = true;
+	else {
+		if (!json_to_bool(buf, dep, &deprecated_apis))
+			plugin_err(p, "Invalid allow-deprecated-apis '%.*s'",
+				   json_tok_full_len(dep),
+				   json_tok_full(buf, dep));
+	}
 
 	json_array_start(params, "options");
 	for (size_t i = 0; i < tal_count(p->opts); i++) {
@@ -575,6 +593,7 @@ handle_getmanifest(struct command *getmanifest_cmd)
 		json_add_string(params, "name", p->opts[i].name);
 		json_add_string(params, "type", p->opts[i].type);
 		json_add_string(params, "description", p->opts[i].description);
+		json_add_bool(params, "deprecated", p->opts[i].deprecated);
 		json_object_end(params);
 	}
 	json_array_end(params);
@@ -589,6 +608,7 @@ handle_getmanifest(struct command *getmanifest_cmd)
 		if (p->commands[i].long_description)
 			json_add_string(params, "long_description",
 					p->commands[i].long_description);
+		json_add_bool(params, "deprecated", p->commands[i].deprecated);
 		json_object_end(params);
 	}
 	json_array_end(params);
@@ -761,9 +781,8 @@ static struct command_result *handle_init(struct command *cmd,
 	struct sockaddr_un addr;
 	size_t i;
 	char *dir, *network;
-	struct json_out *param_obj;
 	struct plugin *p = cmd->plugin;
-	bool with_rpc = true;
+	bool with_rpc = p->rpc_conn != NULL;
 
 	configtok = json_delve(buf, params, ".configuration");
 
@@ -780,27 +799,34 @@ static struct command_result *handle_init(struct command *cmd,
 	fsettok = json_delve(buf, configtok, ".feature_set");
 	p->our_features = json_to_feature_set(p, buf, fsettok);
 
+	/* Only attempt to connect if the plugin has configured the rpc_conn
+	 * already, if that's not the case we were told to run without an RPC
+	 * connection, so don't even log an error. */
 	rpctok = json_delve(buf, configtok, ".rpc-file");
-	p->rpc_conn->fd = socket(AF_UNIX, SOCK_STREAM, 0);
-	if (rpctok->end - rpctok->start + 1 > sizeof(addr.sun_path))
-		plugin_err(p, "rpc filename '%.*s' too long",
-			   rpctok->end - rpctok->start,
-			   buf + rpctok->start);
-	memcpy(addr.sun_path, buf + rpctok->start, rpctok->end - rpctok->start);
-	addr.sun_path[rpctok->end - rpctok->start] = '\0';
-	addr.sun_family = AF_UNIX;
+	p->rpc_location = json_strdup(p, buf, rpctok);
+	/* FIXME: Move this to its own function so we can initialize at a
+	 * later point in time. */
+	if (p->rpc_conn != NULL) {
+		p->rpc_conn->fd = socket(AF_UNIX, SOCK_STREAM, 0);
+		if (strlen(p->rpc_location) + 1 > sizeof(addr.sun_path))
+			plugin_err(p, "rpc filename '%s' too long",
+				   p->rpc_location);
+		memcpy(addr.sun_path, buf + rpctok->start,
+		       rpctok->end - rpctok->start);
+		addr.sun_path[rpctok->end - rpctok->start] = '\0';
+		addr.sun_family = AF_UNIX;
 
-	if (connect(p->rpc_conn->fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-		with_rpc = false;
-		plugin_log(p, LOG_UNUSUAL, "Could not connect to '%.*s': %s",
-			   rpctok->end - rpctok->start, buf + rpctok->start,
-			   strerror(errno));
-	} else {
-		param_obj = json_out_obj(NULL, "config", "allow-deprecated-apis");
-		deprecated_apis = streq(rpc_delve(tmpctx, p, "listconfigs",
-						  take(param_obj),
-						  ".allow-deprecated-apis"),
-					"true");
+		if (connect(p->rpc_conn->fd, (struct sockaddr *)&addr,
+			    sizeof(addr)) != 0) {
+			with_rpc = false;
+			plugin_log(p, LOG_UNUSUAL,
+				   "Could not connect to '%s': %s",
+				   p->rpc_location, strerror(errno));
+		}
+
+		membuf_init(&p->rpc_conn->mb, tal_arr(p, char, READ_CHUNKSIZE),
+			    READ_CHUNKSIZE, membuf_tal_realloc);
+
 	}
 
 	opttok = json_get_member(buf, params, "options");
@@ -859,6 +885,27 @@ char *u32_option(const char *arg, u32 *i)
 	if (*i != n)
 		return tal_fmt(NULL, "'%s' is too large (overflow)", arg);
 
+	return NULL;
+}
+
+char *bool_option(const char *arg, bool *i)
+{
+	if (!streq(arg, "true") && !streq(arg, "false"))
+		return tal_fmt(NULL, "'%s' is not a bool, must be \"true\" or \"false\"", arg);
+
+	*i = streq(arg, "true");
+	return NULL;
+}
+
+char *flag_option(const char *arg, bool *i)
+{
+	/* We only get called if the flag was provided, so *i should be false
+	 * by default */
+	assert(*i == false);
+	if (!streq(arg, "true"))
+		return tal_fmt(NULL, "Invalid argument '%s' passed to a flag", arg);
+
+	*i = true;
 	return NULL;
 }
 
@@ -985,7 +1032,7 @@ static void ld_command_handle(struct plugin *plugin,
 
 	if (!plugin->manifested) {
 		if (streq(cmd->methodname, "getmanifest")) {
-			handle_getmanifest(cmd);
+			handle_getmanifest(cmd, plugin->buffer, paramstok);
 			plugin->manifested = true;
 			return;
 		}
@@ -1161,6 +1208,7 @@ static struct plugin *new_plugin(const tal_t *ctx,
 				 void (*init)(struct plugin *p,
 					      const char *buf, const jsmntok_t *),
 				 const enum plugin_restartability restartability,
+				 bool init_rpc,
 				 struct feature_set *features,
 				 const struct plugin_command *commands,
 				 size_t num_commands,
@@ -1186,11 +1234,12 @@ static struct plugin *new_plugin(const tal_t *ctx,
 	uintmap_init(&p->out_reqs);
 
 	p->our_features = features;
-	/* Sync RPC FIXME: maybe go full async ? */
-	p->rpc_conn = tal(p, struct rpc_conn);
-	membuf_init(&p->rpc_conn->mb,
-		    tal_arr(p, char, READ_CHUNKSIZE), READ_CHUNKSIZE,
-		    membuf_tal_realloc);
+	if (init_rpc) {
+		/* Sync RPC FIXME: maybe go full async ? */
+		p->rpc_conn = tal(p, struct rpc_conn);
+	} else {
+		p->rpc_conn = NULL;
+	}
 
 	p->init = init;
 	p->manifested = p->initialized = false;
@@ -1213,6 +1262,7 @@ static struct plugin *new_plugin(const tal_t *ctx,
 		o.description = va_arg(ap, const char *);
 		o.handle = va_arg(ap, char *(*)(const char *str, void *arg));
 		o.arg = va_arg(ap, void *);
+		o.deprecated = va_arg(ap, int); /* bool gets promoted! */
 		tal_arr_expand(&p->opts, o);
 	}
 
@@ -1223,6 +1273,7 @@ void plugin_main(char *argv[],
 		 void (*init)(struct plugin *p,
 			      const char *buf, const jsmntok_t *),
 		 const enum plugin_restartability restartability,
+		 bool init_rpc,
 		 struct feature_set *features,
 		 const struct plugin_command *commands,
 		 size_t num_commands,
@@ -1243,7 +1294,7 @@ void plugin_main(char *argv[],
 	daemon_setup(argv[0], NULL, NULL);
 
 	va_start(ap, num_hook_subs);
-	plugin = new_plugin(NULL, init, restartability, features, commands,
+	plugin = new_plugin(NULL, init, restartability, init_rpc, features, commands,
 			    num_commands, notif_subs, num_notif_subs, hook_subs,
 			    num_hook_subs, ap);
 	va_end(ap);

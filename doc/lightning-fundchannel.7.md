@@ -64,6 +64,7 @@ RETURN VALUE
 ------------
 
 On success, the *tx* and *txid* of the transaction is returned, as well
+as the *outnum* indicating the output index which creates the channel, as well
 as the *channel\_id* of the newly created channel. On failure, an error
 is reported and the channel is not funded.
 
@@ -80,7 +81,8 @@ channel parameters (funding limits, channel reserves, fees, etc.).
 SEE ALSO
 --------
 
-lightning-connect(7), lightning-listfunds(), lightning-listpeers(7)
+lightning-connect(7), lightning-listfunds(), lightning-listpeers(7),
+lightning-feerates(7)
 
 RESOURCES
 ---------

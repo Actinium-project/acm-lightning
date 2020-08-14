@@ -79,6 +79,10 @@ struct plugin {
 	/* An array of currently pending RPC method calls, to be killed if the
 	 * plugin exits. */
 	struct list_head pending_rpccalls;
+
+	/* If set, the plugin is so important that if it terminates early,
+	 * C-lightning should terminate as well.  */
+	bool important;
 };
 
 /**
@@ -103,6 +107,14 @@ struct plugins {
 
 	/* Blacklist of plugins from --disable-plugin */
 	const char **blacklist;
+
+	/* Whether we are shutting down (`plugins_free` is called) */
+	bool shutdown;
+
+#if DEVELOPER
+	/* Whether builtin plugins should be overridden as unimportant.  */
+	bool dev_builtin_plugins_unimportant;
+#endif /* DEVELOPER */
 };
 
 /* The value of a plugin option, which can have different types.
@@ -125,6 +137,7 @@ struct plugin_opt {
 	const char *type;
 	const char *description;
 	struct plugin_opt_value *value;
+	bool deprecated;
 };
 
 /**
@@ -175,13 +188,15 @@ void plugins_free(struct plugins *plugins);
  * @param plugins: Plugin context
  * @param path: The path of the executable for this plugin
  * @param start_cmd: The optional JSON command which caused this.
+ * @param important: The plugin is important.
  *
  * If @start_cmd, then plugin_cmd_killed or plugin_cmd_succeeded will be called
  * on it eventually.
  */
 struct plugin *plugin_register(struct plugins *plugins,
 			       const char* path TAKES,
-			       struct command *start_cmd);
+			       struct command *start_cmd,
+			       bool important);
 
 /**
  * Returns true if the provided name matches a plugin command
@@ -333,6 +348,12 @@ struct io_plan *plugin_stdout_conn_init(struct io_conn *conn,
  * Needed for I/O logging for plugin messages.
 */
 struct log *plugin_get_log(struct plugin *plugin);
+
+/**
+ * Tells the plugin system the directory for builtin plugins.
+ */
+void plugins_set_builtin_plugins_dir(struct plugins *plugins,
+				     const char *dir);
 
 /* Pair of functions to detect if plugin destroys itself: must always
  * call both! */

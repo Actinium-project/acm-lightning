@@ -58,11 +58,24 @@ u8 *to_self_wscript(const tal_t *ctx,
 					&keyset->self_delayed_payment_key);
 }
 
+void tx_add_anchor_output(struct bitcoin_tx *tx,
+			  const struct pubkey *funding_key)
+{
+	u8 *wscript = bitcoin_wscript_anchor(tmpctx, funding_key);
+	u8 *p2wsh = scriptpubkey_p2wsh(tmpctx, wscript);
+
+	/* BOLT-a12da24dd0102c170365124782b46d9710950ac1 #3:
+	 * The amount of the output is fixed at 330 sats, the default
+	 * dust limit for P2WSH.
+	 */
+	bitcoin_tx_add_output(tx, p2wsh, wscript, AMOUNT_SAT(330));
+}
+
 struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 				     const struct bitcoin_txid *funding_txid,
 				     unsigned int funding_txout,
 				     struct amount_sat funding,
-				     u8 *funding_wscript,
+				     const struct pubkey funding_key[NUM_SIDES],
 				     enum side opener,
 				     u16 to_self_delay,
 				     const struct keyset *keyset,
@@ -74,16 +87,21 @@ struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 				     u64 obscured_commitment_number,
 				     struct wally_tx_output *direct_outputs[NUM_SIDES],
 				     enum side side,
+				     bool option_anchor_outputs,
 				     char** err_reason)
 {
 	struct amount_sat base_fee;
 	struct bitcoin_tx *tx;
 	size_t n, untrimmed;
+	bool to_local, to_remote;
 	struct amount_msat total_pay;
 	struct amount_sat amount;
 	u32 sequence;
 	void *dummy_local = (void *)LOCAL, *dummy_remote = (void *)REMOTE;
 	const void *output_order[NUM_SIDES];
+	const u8 *funding_wscript = bitcoin_redeem_2of2(tmpctx,
+							&funding_key[LOCAL],
+							&funding_key[REMOTE]);
 
 	if (!amount_msat_add(&total_pay, self_pay, other_pay))
 		abort();
@@ -101,7 +119,20 @@ struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 	 * 2. Calculate the base [commitment transaction
 	 * fee](#fee-calculation).
 	 */
-	base_fee = commit_tx_base_fee(feerate_per_kw, untrimmed);
+	base_fee = commit_tx_base_fee(feerate_per_kw, untrimmed,
+				      option_anchor_outputs);
+
+	/* BOLT-a12da24dd0102c170365124782b46d9710950ac1:
+	 * If `option_anchor_outputs` applies to the commitment
+	 * transaction, also subtract two times the fixed anchor size
+	 * of 330 sats from the funder (either `to_local` or
+	 * `to_remote`).
+	 */
+	if (option_anchor_outputs
+	    && !amount_sat_add(&base_fee, base_fee, AMOUNT_SAT(660))) {
+		*err_reason = "Funder cannot afford anchor outputs";
+		return NULL;
+	}
 
 	/* BOLT #3:
 	 *
@@ -148,8 +179,8 @@ struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 	}
 
 
-	/* Worst-case sizing: both to-local and to-remote outputs. */
-	tx = bitcoin_tx(ctx, chainparams, 1, untrimmed + 2, 0);
+	/* Worst-case sizing: both to-local and to-remote outputs + anchors. */
+	tx = bitcoin_tx(ctx, chainparams, 1, untrimmed + 4, 0);
 
 	/* This could be done in a single loop, but we follow the BOLT
 	 * literally to make comments in test vectors clearer. */
@@ -181,7 +212,9 @@ struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 		assert(pos == n);
 		output_order[n] = dummy_local;
 		n++;
-	}
+		to_local = true;
+	} else
+		to_local = false;
 
 	/* BOLT #3:
 	 *
@@ -190,20 +223,53 @@ struct bitcoin_tx *initial_commit_tx(const tal_t *ctx,
 	 *    output](#to_remote-output).
 	 */
 	if (amount_msat_greater_eq_sat(other_pay, dust_limit)) {
-		/* BOLT #3:
+		/* BOLT-a12da24dd0102c170365124782b46d9710950ac1 #3:
 		 *
-		 * #### `to_remote` Output
+		 * If `option_anchor_outputs` applies to the commitment
+		 * transaction, the `to_remote` output is encumbered by a one
+		 * block csv lock.
+		 *    <remote_pubkey> OP_CHECKSIGVERIFY 1 OP_CHECKSEQUENCEVERIFY
 		 *
-		 * This output sends funds to the other peer and thus is a simple
-		 * P2WPKH to `remotepubkey`.
+		 *...
+		 * Otherwise, this output is a simple P2WPKH to `remotepubkey`.
 		 */
+		u8 *scriptpubkey;
+		int pos;
+
 		amount = amount_msat_to_sat_round_down(other_pay);
-		int pos = bitcoin_tx_add_output(
-		    tx, scriptpubkey_p2wpkh(tx, &keyset->other_payment_key),
-		    NULL, amount);
+		if (option_anchor_outputs) {
+			scriptpubkey = scriptpubkey_p2wsh(tmpctx,
+							  anchor_to_remote_redeem(tmpctx, &keyset->other_payment_key));
+		} else {
+			scriptpubkey = scriptpubkey_p2wpkh(tmpctx,
+							   &keyset->other_payment_key);
+		}
+		pos = bitcoin_tx_add_output(tx, scriptpubkey, NULL, amount);
 		assert(pos == n);
 		output_order[n] = dummy_remote;
 		n++;
+		to_remote = true;
+	} else
+		to_remote = false;
+
+	if (option_anchor_outputs) {
+		/* BOLT-a12da24dd0102c170365124782b46d9710950ac1 #3:
+		 * if `to_local` exists or there are untrimmed HTLCs, add a `to_local_anchor` output
+		 */
+		if (to_local || untrimmed != 0) {
+			tx_add_anchor_output(tx, &funding_key[side]);
+			output_order[n] = NULL;
+			n++;
+		}
+
+		/* BOLT-a12da24dd0102c170365124782b46d9710950ac1 #3:
+		 * if `to_remote` exists or there are untrimmed HTLCs, add a `to_remote_anchor` output
+		 */
+		if (to_remote || untrimmed != 0) {
+			tx_add_anchor_output(tx, &funding_key[!side]);
+			output_order[n] = NULL;
+			n++;
+		}
 	}
 
 	assert(n <= tx->wtx->num_outputs);

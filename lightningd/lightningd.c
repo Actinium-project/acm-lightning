@@ -139,6 +139,7 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->dev_force_channel_secrets_shaseed = NULL;
 	ld->dev_force_tmp_channel_id = NULL;
 	ld->dev_no_htlc_timeout = false;
+	ld->dev_no_version_checks = false;
 #endif
 
 	/*~ These are CCAN lists: an embedded double-linked list.  It's not
@@ -279,6 +280,11 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	 * RPC. Can be overridden with `--rpc-file-mode`.
 	 */
 	ld->rpc_filemode = 0600;
+
+	/*~ This is the exit code to use on exit.
+	 * Set to NULL meaning we are not interested in exiting yet.
+	 */
+	ld->exit_code = NULL;
 
 	return ld;
 }
@@ -468,9 +474,9 @@ static const char *find_my_pkglibexec_path(struct lightningd *ld,
 
 	/*~ The plugin dir is in ../libexec/c-lightning/plugins, which (unlike
 	 * those given on the command line) does not need to exist. */
-	add_plugin_dir(ld->plugins,
-		       path_join(tmpctx, pkglibexecdir, "plugins"),
-		       true);
+	plugins_set_builtin_plugins_dir(ld->plugins,
+					path_join(tmpctx,
+						  pkglibexecdir, "plugins"));
 
 	/*~ Sometimes take() can be more efficient, since the routine can
 	 * manipulate the string in place.  This is the case here. */
@@ -483,10 +489,11 @@ static const char *find_daemon_dir(struct lightningd *ld, const char *argv0)
 	const char *my_path = find_my_directory(ld, argv0);
 	/* If we're running in-tree, all the subdaemons are with lightningd. */
 	if (has_all_subdaemons(my_path)) {
-		/* In this case, look in ../plugins */
-		add_plugin_dir(ld->plugins,
-			       path_join(tmpctx, my_path, "../plugins"),
-			       true);
+		/* In this case, look for built-in plugins in ../plugins */
+		plugins_set_builtin_plugins_dir(ld->plugins,
+						path_join(tmpctx,
+							  my_path,
+							  "../plugins"));
 		return my_path;
 	}
 
@@ -726,6 +733,7 @@ static struct feature_set *default_features(const tal_t *ctx)
 		OPTIONAL_FEATURE(OPT_GOSSIP_QUERIES_EX),
 		OPTIONAL_FEATURE(OPT_STATIC_REMOTEKEY),
 #if EXPERIMENTAL_FEATURES
+		OPTIONAL_FEATURE(OPT_ANCHOR_OUTPUTS),
 		OPTIONAL_FEATURE(OPT_ONION_MESSAGES),
 #endif
 	};
@@ -750,6 +758,14 @@ static void hsm_ecdh_failed(enum status_failreason fail,
 	fatal("hsm failure: %s", fmt);
 }
 
+/*~ This signals to the mainloop that some part wants to cleanly exit now.  */
+void lightningd_exit(struct lightningd *ld, int exit_code)
+{
+	ld->exit_code = tal(ld, int);
+	*ld->exit_code = exit_code;
+	io_break(ld);
+}
+
 int main(int argc, char *argv[])
 {
 	struct lightningd *ld;
@@ -761,6 +777,8 @@ int main(int argc, char *argv[])
 	struct htlc_in_map *unconnected_htlcs_in;
 	struct ext_key *bip32_base;
 	struct rlimit nofile = {1024, 1024};
+
+	int exit_code = 0;
 
 	/*~ Make sure that we limit ourselves to something reasonable. Modesty
 	 *  is a virtue. */
@@ -820,8 +838,13 @@ int main(int argc, char *argv[])
 	 * daemon running, so we call before doing almost anything else. */
 	pidfile_create(ld);
 
-	/*~ Make sure we can reach the subdaemons, and versions match. */
-	test_subdaemons(ld);
+	/*~ Make sure we can reach the subdaemons, and versions match.
+	 * This can be turned off in DEVELOPER builds with --dev-skip-version-checks,
+	 * but the `dev_no_version_checks` field of `ld` doesn't even exist
+	 * if DEVELOPER isn't defined, so we use IFDEV(devoption,non-devoption):
+	 */
+	if (IFDEV(!ld->dev_no_version_checks, 1))
+		test_subdaemons(ld);
 
 	/*~ Set up the HSM daemon, which knows our node secret key, so tells
 	 *  us who we are.
@@ -835,8 +858,7 @@ int main(int argc, char *argv[])
 	/*~ Our "wallet" code really wraps the db, which is more than a simple
 	 * bitcoin wallet (though it's that too).  It also stores channel
 	 * states, invoices, payments, blocks and bitcoin transactions. */
-	ld->wallet = wallet_new(ld, ld->timers);
-	ld->wallet->bip32_base = tal_steal(ld->wallet, bip32_base);
+	ld->wallet = wallet_new(ld, ld->timers, bip32_base);
 
 	/*~ We keep track of how many 'coin moves' we've ever made.
 	 * Initialize the starting value from the database here. */
@@ -997,10 +1019,17 @@ int main(int argc, char *argv[])
 	assert(io_loop_ret == ld);
 	ld->state = LD_STATE_SHUTDOWN;
 
-	/* Keep this fd around, to write final response at the end. */
-	stop_fd = io_conn_fd(ld->stop_conn);
-	io_close_taken_fd(ld->stop_conn);
-	stop_response = tal_steal(NULL, ld->stop_response);
+	/* Were we exited via `lightningd_exit`?  */
+	if (ld->exit_code) {
+		exit_code = *ld->exit_code;
+		stop_fd = -1;
+		stop_response = NULL;
+	} else {
+		/* Keep this fd around, to write final response at the end. */
+		stop_fd = io_conn_fd(ld->stop_conn);
+		io_close_taken_fd(ld->stop_conn);
+		stop_response = tal_steal(NULL, ld->stop_response);
+	}
 
 	shutdown_subdaemons(ld);
 
@@ -1035,11 +1064,13 @@ int main(int argc, char *argv[])
 
 	daemon_shutdown();
 
-	/* Finally, send response to shutdown command */
-	write_all(stop_fd, stop_response, strlen(stop_response));
-	close(stop_fd);
-	tal_free(stop_response);
+	/* Finally, send response to shutdown command if appropriate.  */
+	if (stop_fd >= 0) {
+		write_all(stop_fd, stop_response, strlen(stop_response));
+		close(stop_fd);
+		tal_free(stop_response);
+	}
 
 	/*~ Farewell.  Next stop: hsmd/hsmd.c. */
-	return 0;
+	return exit_code;
 }

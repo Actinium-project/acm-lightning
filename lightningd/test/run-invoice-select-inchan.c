@@ -88,11 +88,12 @@ char *encode_scriptpubkey_to_addr(const tal_t *ctx UNNEEDED,
 				  const struct chainparams *chainparams UNNEEDED,
 				  const u8 *scriptPubkey UNNEEDED)
 { fprintf(stderr, "encode_scriptpubkey_to_addr called!\n"); abort(); }
-/* Generated stub for failmsg_incorrect_or_unknown */
-const u8 *failmsg_incorrect_or_unknown(const tal_t *ctx UNNEEDED,
-				       struct lightningd *ld UNNEEDED,
-				       const struct htlc_in *hin UNNEEDED)
-{ fprintf(stderr, "failmsg_incorrect_or_unknown called!\n"); abort(); }
+/* Generated stub for failmsg_incorrect_or_unknown_ */
+const u8 *failmsg_incorrect_or_unknown_(const tal_t *ctx UNNEEDED,
+					struct lightningd *ld UNNEEDED,
+					const struct htlc_in *hin UNNEEDED,
+					const char *file UNNEEDED, int line UNNEEDED)
+{ fprintf(stderr, "failmsg_incorrect_or_unknown_ called!\n"); abort(); }
 /* Generated stub for fatal */
 void   fatal(const char *fmt UNNEEDED, ...)
 { fprintf(stderr, "fatal called!\n"); abort(); }
@@ -146,7 +147,8 @@ bool htlc_is_trimmed(enum side htlc_owner UNNEEDED,
 		     struct amount_msat htlc_amount UNNEEDED,
 		     u32 feerate_per_kw UNNEEDED,
 		     struct amount_sat dust_limit UNNEEDED,
-		     enum side side UNNEEDED)
+		     enum side side UNNEEDED,
+		     bool option_anchor_outputs UNNEEDED)
 { fprintf(stderr, "htlc_is_trimmed called!\n"); abort(); }
 /* Generated stub for htlc_set_fail */
 void htlc_set_fail(struct htlc_set *set UNNEEDED, const u8 *failmsg TAKES UNNEEDED)
@@ -619,7 +621,7 @@ void wallet_peer_delete(struct wallet *w UNNEEDED, u64 peer_dbid UNNEEDED)
 struct amount_msat wallet_total_forward_fees(struct wallet *w UNNEEDED)
 { fprintf(stderr, "wallet_total_forward_fees called!\n"); abort(); }
 /* Generated stub for wallet_transaction_add */
-void wallet_transaction_add(struct wallet *w UNNEEDED, const struct bitcoin_tx *tx UNNEEDED,
+void wallet_transaction_add(struct wallet *w UNNEEDED, const struct wally_tx *tx UNNEEDED,
 			    const u32 blockheight UNNEEDED, const u32 txindex UNNEEDED)
 { fprintf(stderr, "wallet_transaction_add called!\n"); abort(); }
 /* Generated stub for wallet_transaction_annotate */

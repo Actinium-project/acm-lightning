@@ -23,6 +23,7 @@
 #define OP_ENDIF	0x68
 #define OP_RETURN	0x6a
 #define OP_2DROP	0x6d
+#define OP_IFDUP	0x73
 #define OP_DEPTH	0x74
 #define OP_DROP		0x75
 #define OP_DUP		0x76
@@ -33,6 +34,7 @@
 #define OP_1SUB		0x8C
 #define OP_ADD		0x93
 #define OP_CHECKSIG	0xAC
+#define OP_CHECKSIGVERIFY	0xAD
 #define OP_CHECKMULTISIG	0xAE
 #define OP_HASH160	0xA9
 #define OP_CHECKSEQUENCEVERIFY	0xB2
@@ -59,7 +61,7 @@ static void add_op(u8 **scriptp, u8 op)
 	add(scriptp, &op, 1);
 }
 
-static void add_push_bytes(u8 **scriptp, const void *mem, size_t len)
+void script_push_bytes(u8 **scriptp, const void *mem, size_t len)
 {
 	if (len < 76)
 		add_op(scriptp, OP_PUSHBYTES(len));
@@ -91,15 +93,15 @@ static void add_number(u8 **script, u32 num)
 
 		/* Beware: encoding is signed! */
 		if (num <= 0x0000007F)
-			add_push_bytes(script, &n, 1);
+			script_push_bytes(script, &n, 1);
 		else if (num <= 0x00007FFF)
-			add_push_bytes(script, &n, 2);
+			script_push_bytes(script, &n, 2);
 		else if (num <= 0x007FFFFF)
-			add_push_bytes(script, &n, 3);
+			script_push_bytes(script, &n, 3);
 		else if (num <= 0x7FFFFFFF)
-			add_push_bytes(script, &n, 4);
+			script_push_bytes(script, &n, 4);
 		else
-			add_push_bytes(script, &n, 5);
+			script_push_bytes(script, &n, 5);
 	}
 }
 
@@ -108,7 +110,7 @@ static void add_push_key(u8 **scriptp, const struct pubkey *key)
 	u8 der[PUBKEY_CMPR_LEN];
 	pubkey_to_der(der, key);
 
-	add_push_bytes(scriptp, der, sizeof(der));
+	script_push_bytes(scriptp, der, sizeof(der));
 }
 
 static void add_push_sig(u8 **scriptp, const struct bitcoin_signature *sig)
@@ -116,7 +118,7 @@ static void add_push_sig(u8 **scriptp, const struct bitcoin_signature *sig)
 	u8 der[73];
 	size_t len = signature_to_der(der, sig);
 
-	add_push_bytes(scriptp, der, len);
+	script_push_bytes(scriptp, der, len);
 }
 
 static u8 *stack_key(const tal_t *ctx, const struct pubkey *key)
@@ -183,7 +185,7 @@ u8 *scriptpubkey_p2sh_hash(const tal_t *ctx, const struct ripemd160 *redeemhash)
 	u8 *script = tal_arr(ctx, u8, 0);
 
 	add_op(&script, OP_HASH160);
-	add_push_bytes(&script, redeemhash->u.u8, sizeof(redeemhash->u.u8));
+	script_push_bytes(&script, redeemhash->u.u8, sizeof(redeemhash->u.u8));
 	add_op(&script, OP_EQUAL);
 	assert(tal_count(script) == BITCOIN_SCRIPTPUBKEY_P2SH_LEN);
 	return script;
@@ -205,7 +207,7 @@ u8 *scriptpubkey_p2pkh(const tal_t *ctx, const struct bitcoin_address *addr)
 
 	add_op(&script, OP_DUP);
 	add_op(&script, OP_HASH160);
-	add_push_bytes(&script, &addr->addr, sizeof(addr->addr));
+	script_push_bytes(&script, &addr->addr, sizeof(addr->addr));
 	add_op(&script, OP_EQUALVERIFY);
 	add_op(&script, OP_CHECKSIG);
 	assert(tal_count(script) == BITCOIN_SCRIPTPUBKEY_P2PKH_LEN);
@@ -242,7 +244,7 @@ u8 *bitcoin_redeem_p2sh_p2wpkh(const tal_t *ctx, const struct pubkey *key)
 	 * push of a version byte plus a push of a witness program. */
 	add_number(&script, 0);
 	pubkey_to_hash160(key, &keyhash);
-	add_push_bytes(&script, &keyhash, sizeof(keyhash));
+	script_push_bytes(&script, &keyhash, sizeof(keyhash));
 
 	assert(tal_count(script) == BITCOIN_SCRIPTPUBKEY_P2WPKH_LEN);
 	return script;
@@ -255,7 +257,7 @@ u8 *bitcoin_scriptsig_p2sh_p2wpkh(const tal_t *ctx, const struct pubkey *key)
 	/* BIP141: The scriptSig must be exactly a push of the BIP16
 	 * redeemScript or validation fails. */
 	script = tal_arr(ctx, u8, 0);
-	add_push_bytes(&script, redeemscript, tal_count(redeemscript));
+	script_push_bytes(&script, redeemscript, tal_count(redeemscript));
 	tal_free(redeemscript);
 	return script;
 }
@@ -283,7 +285,7 @@ u8 *scriptpubkey_p2wsh(const tal_t *ctx, const u8 *witnessscript)
 
 	add_op(&script, OP_0);
 	sha256(&h, witnessscript, tal_count(witnessscript));
-	add_push_bytes(&script, h.u.u8, sizeof(h.u.u8));
+	script_push_bytes(&script, h.u.u8, sizeof(h.u.u8));
 	assert(tal_count(script) == BITCOIN_SCRIPTPUBKEY_P2WSH_LEN);
 	return script;
 }
@@ -296,7 +298,7 @@ u8 *scriptpubkey_p2wpkh(const tal_t *ctx, const struct pubkey *key)
 
 	add_op(&script, OP_0);
 	pubkey_to_hash160(key, &h);
-	add_push_bytes(&script, &h, sizeof(h));
+	script_push_bytes(&script, &h, sizeof(h));
 	return script;
 }
 
@@ -307,7 +309,7 @@ u8 *scriptpubkey_p2wpkh_derkey(const tal_t *ctx, const u8 der[33])
 
 	add_op(&script, OP_0);
 	hash160(&h, der, PUBKEY_CMPR_LEN);
-	add_push_bytes(&script, &h, sizeof(h));
+	script_push_bytes(&script, &h, sizeof(h));
 	return script;
 }
 
@@ -316,8 +318,45 @@ u8 *scriptpubkey_witness_raw(const tal_t *ctx, u8 version,
 {
 	u8 *script = tal_arr(ctx, u8, 0);
 	add_number(&script, version);
-	add_push_bytes(&script, wprog, wprog_size);
+	script_push_bytes(&script, wprog, wprog_size);
 	return script;
+}
+
+/* BOLT-a12da24dd0102c170365124782b46d9710950ac1 #3:
+ *
+ * #### `to_remote` Output
+ *
+ * If `option_anchor_outputs` applies to the commitment
+ * transaction, the `to_remote` output is encumbered by a one
+ * block csv lock.
+ *    <remote_pubkey> OP_CHECKSIGVERIFY 1 OP_CHECKSEQUENCEVERIFY
+ */
+u8 *anchor_to_remote_redeem(const tal_t *ctx,
+			    const struct pubkey *remote_key)
+{
+	u8 *script = tal_arr(ctx, u8, 0);
+	add_push_key(&script, remote_key);
+	add_op(&script, OP_CHECKSIGVERIFY);
+	add_number(&script, 1);
+	add_op(&script, OP_CHECKSEQUENCEVERIFY);
+
+	assert(is_anchor_witness_script(script, tal_bytelen(script)));
+	return script;
+}
+
+bool is_anchor_witness_script(const u8 *script, size_t script_len)
+{
+	if (script_len != 34 + 1 + 1 + 1)
+		return false;
+	if (script[0] != OP_PUSHBYTES(33))
+		return false;
+	if (script[34] != OP_CHECKSIGVERIFY)
+		return false;
+	if (script[35] != 0x51)
+		return false;
+	if (script[36] != OP_CHECKSEQUENCEVERIFY)
+		return false;
+	return true;
 }
 
 /* Create a witness which spends the 2of2. */
@@ -362,7 +401,7 @@ u8 *p2wpkh_scriptcode(const tal_t *ctx, const struct pubkey *key)
 	 * OP_EQUALVERIFY OP_CHECKSIG */
 	add_op(&script, OP_DUP);
 	add_op(&script, OP_HASH160);
-	add_push_bytes(&script, &pkhash, sizeof(pkhash));
+	script_push_bytes(&script, &pkhash, sizeof(pkhash));
 	add_op(&script, OP_EQUALVERIFY);
 	add_op(&script, OP_CHECKSIG);
 
@@ -516,11 +555,32 @@ u8 *bitcoin_wscript_to_local(const tal_t *ctx, u16 to_self_delay,
  *         OP_ENDIF
  *     OP_ENDIF
  */
+/* BOLT-a12da24dd0102c170365124782b46d9710950ac1 #3:
+ * Or, with `option_anchor_outputs`:
+ *
+ *  # To remote node with revocation key
+ *  OP_DUP OP_HASH160 <RIPEMD160(SHA256(revocationpubkey))> OP_EQUAL
+ *  OP_IF
+ *      OP_CHECKSIG
+ *  OP_ELSE
+ *      <remote_htlcpubkey> OP_SWAP OP_SIZE 32 OP_EQUAL
+ *      OP_NOTIF
+ *          # To local node via HTLC-timeout transaction (timelocked).
+ *          OP_DROP 2 OP_SWAP <local_htlcpubkey> 2 OP_CHECKMULTISIG
+ *      OP_ELSE
+ *          # To remote node with preimage.
+ *          OP_HASH160 <RIPEMD160(payment_hash)> OP_EQUALVERIFY
+ *          OP_CHECKSIG
+ *      OP_ENDIF
+ *      1 OP_CHECKSEQUENCEVERIFY OP_DROP
+ *  OP_ENDIF
+ */
 u8 *bitcoin_wscript_htlc_offer_ripemd160(const tal_t *ctx,
 					 const struct pubkey *localhtlckey,
 					 const struct pubkey *remotehtlckey,
 					 const struct ripemd160 *payment_ripemd,
-					 const struct pubkey *revocationkey)
+					 const struct pubkey *revocationkey,
+					 bool option_anchor_outputs)
 {
 	u8 *script = tal_arr(ctx, u8, 0);
 	struct ripemd160 ripemd;
@@ -528,7 +588,7 @@ u8 *bitcoin_wscript_htlc_offer_ripemd160(const tal_t *ctx,
 	add_op(&script, OP_DUP);
 	add_op(&script, OP_HASH160);
 	pubkey_to_hash160(revocationkey, &ripemd);
-	add_push_bytes(&script, &ripemd, sizeof(ripemd));
+	script_push_bytes(&script, &ripemd, sizeof(ripemd));
 	add_op(&script, OP_EQUAL);
 	add_op(&script, OP_IF);
 	add_op(&script, OP_CHECKSIG);
@@ -547,11 +607,16 @@ u8 *bitcoin_wscript_htlc_offer_ripemd160(const tal_t *ctx,
 	add_op(&script, OP_CHECKMULTISIG);
 	add_op(&script, OP_ELSE);
 	add_op(&script, OP_HASH160);
-	add_push_bytes(&script,
-		       payment_ripemd->u.u8, sizeof(payment_ripemd->u.u8));
+	script_push_bytes(&script,
+			  payment_ripemd->u.u8, sizeof(payment_ripemd->u.u8));
 	add_op(&script, OP_EQUALVERIFY);
 	add_op(&script, OP_CHECKSIG);
 	add_op(&script, OP_ENDIF);
+	if (option_anchor_outputs) {
+		add_number(&script, 1);
+		add_op(&script, OP_CHECKSEQUENCEVERIFY);
+		add_op(&script, OP_DROP);
+	}
 	add_op(&script, OP_ENDIF);
 
 	return script;
@@ -561,14 +626,16 @@ u8 *bitcoin_wscript_htlc_offer(const tal_t *ctx,
 			       const struct pubkey *localhtlckey,
 			       const struct pubkey *remotehtlckey,
 			       const struct sha256 *payment_hash,
-			       const struct pubkey *revocationkey)
+			       const struct pubkey *revocationkey,
+			       bool option_anchor_outputs)
 {
 	struct ripemd160 ripemd;
 
 	ripemd160(&ripemd, payment_hash->u.u8, sizeof(payment_hash->u));
 	return bitcoin_wscript_htlc_offer_ripemd160(ctx, localhtlckey,
 						    remotehtlckey,
-						    &ripemd, revocationkey);
+						    &ripemd, revocationkey,
+						    option_anchor_outputs);
 }
 
 /* BOLT #3:
@@ -597,12 +664,34 @@ u8 *bitcoin_wscript_htlc_offer(const tal_t *ctx,
  *         OP_ENDIF
  *     OP_ENDIF
  */
+/* BOLT-a12da24dd0102c170365124782b46d9710950ac1 #3:
+ * Or, with `option_anchor_outputs`:
+ *
+ *  # To remote node with revocation key
+ *  OP_DUP OP_HASH160 <RIPEMD160(SHA256(revocationpubkey))> OP_EQUAL
+ *  OP_IF
+ *      OP_CHECKSIG
+ *  OP_ELSE
+ *      <remote_htlcpubkey> OP_SWAP OP_SIZE 32 OP_EQUAL
+ *      OP_IF
+ *          # To local node via HTLC-success transaction.
+ *          OP_HASH160 <RIPEMD160(payment_hash)> OP_EQUALVERIFY
+ *          2 OP_SWAP <local_htlcpubkey> 2 OP_CHECKMULTISIG
+ *      OP_ELSE
+ *          # To remote node after timeout.
+ *          OP_DROP <cltv_expiry> OP_CHECKLOCKTIMEVERIFY OP_DROP
+ *          OP_CHECKSIG
+ *      OP_ENDIF
+ *      1 OP_CHECKSEQUENCEVERIFY OP_DROP
+ *  OP_ENDIF
+ */
 u8 *bitcoin_wscript_htlc_receive_ripemd(const tal_t *ctx,
 					const struct abs_locktime *htlc_abstimeout,
 					const struct pubkey *localhtlckey,
 					const struct pubkey *remotehtlckey,
 					const struct ripemd160 *payment_ripemd,
-					const struct pubkey *revocationkey)
+					const struct pubkey *revocationkey,
+					bool option_anchor_outputs)
 {
 	u8 *script = tal_arr(ctx, u8, 0);
 	struct ripemd160 ripemd;
@@ -610,7 +699,7 @@ u8 *bitcoin_wscript_htlc_receive_ripemd(const tal_t *ctx,
 	add_op(&script, OP_DUP);
 	add_op(&script, OP_HASH160);
 	pubkey_to_hash160(revocationkey, &ripemd);
-	add_push_bytes(&script, &ripemd, sizeof(ripemd));
+	script_push_bytes(&script, &ripemd, sizeof(ripemd));
 	add_op(&script, OP_EQUAL);
 	add_op(&script, OP_IF);
 	add_op(&script, OP_CHECKSIG);
@@ -622,8 +711,8 @@ u8 *bitcoin_wscript_htlc_receive_ripemd(const tal_t *ctx,
 	add_op(&script, OP_EQUAL);
 	add_op(&script, OP_IF);
 	add_op(&script, OP_HASH160);
-	add_push_bytes(&script,
-		       payment_ripemd->u.u8, sizeof(payment_ripemd->u.u8));
+	script_push_bytes(&script,
+			  payment_ripemd->u.u8, sizeof(payment_ripemd->u.u8));
 	add_op(&script, OP_EQUALVERIFY);
 	add_number(&script, 2);
 	add_op(&script, OP_SWAP);
@@ -637,6 +726,11 @@ u8 *bitcoin_wscript_htlc_receive_ripemd(const tal_t *ctx,
 	add_op(&script, OP_DROP);
 	add_op(&script, OP_CHECKSIG);
 	add_op(&script, OP_ENDIF);
+	if (option_anchor_outputs) {
+		add_number(&script, 1);
+		add_op(&script, OP_CHECKSEQUENCEVERIFY);
+		add_op(&script, OP_DROP);
+	}
 	add_op(&script, OP_ENDIF);
 
 	return script;
@@ -647,14 +741,16 @@ u8 *bitcoin_wscript_htlc_receive(const tal_t *ctx,
 				 const struct pubkey *localhtlckey,
 				 const struct pubkey *remotehtlckey,
 				 const struct sha256 *payment_hash,
-				 const struct pubkey *revocationkey)
+				 const struct pubkey *revocationkey,
+				 bool option_anchor_outputs)
 {
 	struct ripemd160 ripemd;
 
 	ripemd160(&ripemd, payment_hash->u.u8, sizeof(payment_hash->u));
 	return bitcoin_wscript_htlc_receive_ripemd(ctx, htlc_abstimeout,
 						   localhtlckey, remotehtlckey,
-						   &ripemd, revocationkey);
+						   &ripemd, revocationkey,
+						   option_anchor_outputs);
 }
 
 /* BOLT #3:
@@ -727,6 +823,30 @@ u8 *bitcoin_wscript_htlc_tx(const tal_t *ctx,
 	add_push_key(&script, local_delayedkey);
 	add_op(&script, OP_ENDIF);
 	add_op(&script, OP_CHECKSIG);
+
+	return script;
+}
+
+u8 *bitcoin_wscript_anchor(const tal_t *ctx,
+			   const struct pubkey *funding_pubkey)
+{
+	u8 *script = tal_arr(ctx, u8, 0);
+
+	/* BOLT-a12da24dd0102c170365124782b46d9710950ac1 #3:
+	 * #### `to_local_anchor` and `to_remote_anchor` Output (option_anchor_outputs)
+	 *...
+	 *  <local_funding_pubkey/remote_funding_pubkey> OP_CHECKSIG OP_IFDUP
+	 *  OP_NOTIF
+	 *      OP_16 OP_CHECKSEQUENCEVERIFY
+	 *  OP_ENDIF
+	 */
+	add_push_key(&script, funding_pubkey);
+	add_op(&script, OP_CHECKSIG);
+	add_op(&script, OP_IFDUP);
+	add_op(&script, OP_NOTIF);
+	add_number(&script, 16);
+	add_op(&script, OP_CHECKSEQUENCEVERIFY);
+	add_op(&script, OP_ENDIF);
 
 	return script;
 }

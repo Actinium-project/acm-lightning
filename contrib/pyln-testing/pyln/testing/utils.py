@@ -550,9 +550,10 @@ class LightningD(TailableProc):
 
 
 class LightningNode(object):
-    def __init__(self, node_id, lightning_dir, bitcoind, executor, may_fail=False,
+    def __init__(self, node_id, lightning_dir, bitcoind, executor, valgrind, may_fail=False,
                  may_reconnect=False, allow_broken_log=False,
-                 allow_bad_gossip=False, db=None, port=None, disconnect=None, random_hsm=None, options=None, **kwargs):
+                 allow_bad_gossip=False, db=None, port=None, disconnect=None, random_hsm=None, options=None,
+                 **kwargs):
         self.bitcoin = bitcoind
         self.executor = executor
         self.may_fail = may_fail
@@ -579,10 +580,13 @@ class LightningNode(object):
             self.daemon.opts["dev-disconnect"] = "dev_disconnect"
         if DEVELOPER:
             self.daemon.opts["dev-fail-on-subdaemon-fail"] = None
+            # Don't run --version on every subdaemon if we're valgrinding and slow.
+            if SLOW_MACHINE and VALGRIND:
+                self.daemon.opts["dev-no-version-checks"] = None
             self.daemon.env["LIGHTNINGD_DEV_MEMLEAK"] = "1"
             if os.getenv("DEBUG_SUBD"):
                 self.daemon.opts["dev-debugger"] = os.getenv("DEBUG_SUBD")
-            if VALGRIND:
+            if valgrind:
                 self.daemon.env["LIGHTNINGD_DEV_NO_BACKTRACE"] = "1"
             if not may_reconnect:
                 self.daemon.opts["dev-no-reconnect"] = None
@@ -592,7 +596,7 @@ class LightningNode(object):
         dsn = db.get_dsn()
         if dsn is not None:
             self.daemon.opts['wallet'] = dsn
-        if VALGRIND:
+        if valgrind:
             self.daemon.cmd_prefix = [
                 'valgrind',
                 '-q',
@@ -601,6 +605,9 @@ class LightningNode(object):
                 '--error-exitcode=7',
                 '--log-file={}/valgrind-errors.%p'.format(self.daemon.lightning_dir)
             ]
+            # Reduce precision of errors, speeding startup and reducing memory greatly:
+            if SLOW_MACHINE:
+                self.daemon.cmd_prefix += ['--read-inline-info=no']
 
     def connect(self, remote_node):
         self.rpc.connect(remote_node.info['id'], '127.0.0.1', remote_node.daemon.port)
@@ -952,7 +959,11 @@ class LightningNode(object):
 class NodeFactory(object):
     """A factory to setup and start `lightningd` daemons.
     """
-    def __init__(self, testname, bitcoind, executor, directory, db_provider, node_cls):
+    def __init__(self, request, testname, bitcoind, executor, directory, db_provider, node_cls):
+        if request.node.get_closest_marker("slow_test") and SLOW_MACHINE:
+            self.valgrind = False
+        else:
+            self.valgrind = VALGRIND
         self.testname = testname
         self.next_id = 1
         self.nodes = []
@@ -1020,8 +1031,8 @@ class NodeFactory(object):
 
     def get_node(self, node_id=None, options=None, dbfile=None,
                  feerates=(15000, 11000, 7500, 3750), start=True,
-                 wait_for_bitcoind_sync=True, expect_fail=False,
-                 cleandir=True, **kwargs):
+                 wait_for_bitcoind_sync=True, may_fail=False,
+                 expect_fail=False, cleandir=True, **kwargs):
 
         node_id = self.get_node_id() if not node_id else node_id
         port = self.get_next_port()
@@ -1036,8 +1047,9 @@ class NodeFactory(object):
         # node.
         db = self.db_provider.get_db(os.path.join(lightning_dir, TEST_NETWORK), self.testname, node_id)
         node = self.node_cls(
-            node_id, lightning_dir, self.bitcoind, self.executor, db=db,
-            port=port, options=options, **kwargs
+            node_id, lightning_dir, self.bitcoind, self.executor, self.valgrind, db=db,
+            port=port, options=options, may_fail=may_fail or expect_fail,
+            **kwargs
         )
 
         # Regtest estimatefee are unusable, so override.
@@ -1065,13 +1077,10 @@ class NodeFactory(object):
                 raise
         return node
 
-    def line_graph(self, num_nodes, fundchannel=True, fundamount=10**6, wait_for_announce=False, opts=None, announce_channels=True):
-        """ Create nodes, connect them and optionally fund channels.
-        """
+    def join_nodes(self, nodes, fundchannel=True, fundamount=10**6, wait_for_announce=False, announce_channels=True) -> None:
+        """Given nodes, connect them in a line, optionally funding a channel"""
         assert not (wait_for_announce and not announce_channels), "You've asked to wait for an announcement that's not coming. (wait_for_announce=True,announce_channels=False)"
-        nodes = self.get_nodes(num_nodes, opts=opts)
-        bitcoin = nodes[0].bitcoin
-        connections = [(nodes[i], nodes[i + 1]) for i in range(0, num_nodes - 1)]
+        connections = [(nodes[i], nodes[i + 1]) for i in range(len(nodes) - 1)]
 
         for src, dst in connections:
             src.rpc.connect(dst.info['id'], 'localhost', dst.port)
@@ -1081,32 +1090,55 @@ class NodeFactory(object):
         if not fundchannel:
             for src, dst in connections:
                 dst.daemon.wait_for_log(r'{}-.*openingd-chan#[0-9]*: Handed peer, entering loop'.format(src.info['id']))
-            return nodes
+            return
 
+        bitcoind = nodes[0].bitcoin
         # If we got here, we want to fund channels
         for src, dst in connections:
             addr = src.rpc.newaddr()['bech32']
-            src.bitcoin.rpc.sendtoaddress(addr, (fundamount + 1000000) / 10**8)
+            bitcoind.rpc.sendtoaddress(addr, (fundamount + 1000000) / 10**8)
 
-        bitcoin.generate_block(1)
+        bitcoind.generate_block(1)
+        sync_blockheight(bitcoind, nodes)
+        txids = []
         for src, dst in connections:
-            wait_for(lambda: len(src.rpc.listfunds()['outputs']) > 0)
-            tx = src.rpc.fundchannel(dst.info['id'], fundamount, announce=announce_channels)
-            wait_for(lambda: tx['txid'] in bitcoin.rpc.getrawmempool())
+            txids.append(src.rpc.fundchannel(dst.info['id'], fundamount, announce=announce_channels)['txid'])
+
+        wait_for(lambda: set(txids).issubset(set(bitcoind.rpc.getrawmempool())))
 
         # Confirm all channels and wait for them to become usable
-        bitcoin.generate_block(1)
+        bitcoind.generate_block(1)
         scids = []
         for src, dst in connections:
             wait_for(lambda: src.channel_state(dst) == 'CHANNELD_NORMAL')
             scid = src.get_channel_scid(dst)
-            src.daemon.wait_for_log(r'Received channel_update for channel {scid}/. now ACTIVE'.format(scid=scid))
             scids.append(scid)
 
-        if not wait_for_announce:
-            return nodes
+        # We don't want to assume message order here.
+        # Wait for ends:
+        nodes[0].daemon.wait_for_logs([r'update for channel {}/0 now ACTIVE'
+                                       .format(scids[0]),
+                                       r'update for channel {}/1 now ACTIVE'
+                                       .format(scids[0])])
+        nodes[-1].daemon.wait_for_logs([r'update for channel {}/0 now ACTIVE'
+                                        .format(scids[-1]),
+                                        r'update for channel {}/1 now ACTIVE'
+                                        .format(scids[-1])])
+        # Now wait for intermediate nodes:
+        for i, n in enumerate(nodes[1:-1]):
+            n.daemon.wait_for_logs([r'update for channel {}/0 now ACTIVE'
+                                    .format(scids[i]),
+                                    r'update for channel {}/1 now ACTIVE'
+                                    .format(scids[i]),
+                                    r'update for channel {}/0 now ACTIVE'
+                                    .format(scids[i + 1]),
+                                    r'update for channel {}/1 now ACTIVE'
+                                    .format(scids[i + 1])])
 
-        bitcoin.generate_block(5)
+        if not wait_for_announce:
+            return
+
+        bitcoind.generate_block(5)
 
         def both_dirs_ready(n, scid):
             resp = n.rpc.listchannels(scid)
@@ -1122,6 +1154,12 @@ class NodeFactory(object):
             for end in (nodes[0], nodes[-1]):
                 wait_for(lambda: 'alias' in only_one(end.rpc.listnodes(n.info['id'])['nodes']))
 
+    def line_graph(self, num_nodes, fundchannel=True, fundamount=10**6, wait_for_announce=False, opts=None, announce_channels=True):
+        """ Create nodes, connect them and optionally fund channels.
+        """
+        nodes = self.get_nodes(num_nodes, opts=opts)
+
+        self.join_nodes(nodes, fundchannel, fundamount, wait_for_announce, announce_channels)
         return nodes
 
     def killall(self, expected_successes):
@@ -1132,7 +1170,7 @@ class NodeFactory(object):
             leaks = None
             # leak detection upsets VALGRIND by reading uninitialized mem.
             # If it's dead, we'll catch it below.
-            if not VALGRIND and DEVELOPER:
+            if not self.valgrind and DEVELOPER:
                 try:
                     # This also puts leaks in log.
                     leaks = self.nodes[i].rpc.dev_memleak()['leaks']

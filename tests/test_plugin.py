@@ -8,13 +8,15 @@ from utils import (
     DEVELOPER, only_one, sync_blockheight, TIMEOUT, wait_for, TEST_NETWORK,
     DEPRECATED_APIS, expected_peer_features, expected_node_features,
     expected_channel_features, account_balance,
-    check_coin_moves, first_channel_id, check_coin_moves_idx
+    check_coin_moves, first_channel_id, check_coin_moves_idx, EXPERIMENTAL_FEATURES
 )
+from pyln.testing.utils import TailableProc
 
 import json
 import os
 import pytest
 import re
+import signal
 import sqlite3
 import subprocess
 import time
@@ -501,7 +503,7 @@ def test_invoice_payment_hook(node_factory):
     l1, l2 = node_factory.line_graph(2, opts=opts)
 
     # This one works
-    inv1 = l2.rpc.invoice(123000, 'label', 'description', preimage='1' * 64)
+    inv1 = l2.rpc.invoice(1230, 'label', 'description', preimage='1' * 64)
     l1.rpc.pay(inv1['bolt11'])
 
     l2.daemon.wait_for_log('label=label')
@@ -509,12 +511,12 @@ def test_invoice_payment_hook(node_factory):
     l2.daemon.wait_for_log('preimage=' + '1' * 64)
 
     # This one will be rejected.
-    inv2 = l2.rpc.invoice(123000, 'label2', 'description', preimage='0' * 64)
+    inv2 = l2.rpc.invoice(1230, 'label2', 'description', preimage='0' * 64)
     with pytest.raises(RpcError):
         l1.rpc.pay(inv2['bolt11'])
 
     pstatus = l1.rpc.call('paystatus', [inv2['bolt11']])['pay'][0]
-    assert pstatus['attempts'][0]['failure']['data']['failcodename'] == 'WIRE_TEMPORARY_NODE_FAILURE'
+    assert pstatus['attempts'][-1]['failure']['data']['failcodename'] == 'WIRE_TEMPORARY_NODE_FAILURE'
 
     l2.daemon.wait_for_log('label=label2')
     l2.daemon.wait_for_log('msat=')
@@ -527,7 +529,7 @@ def test_invoice_payment_hook_hold(node_factory):
     opts = [{}, {'plugin': os.path.join(os.getcwd(), 'tests/plugins/hold_invoice.py'), 'holdtime': TIMEOUT / 2}]
     l1, l2 = node_factory.line_graph(2, opts=opts)
 
-    inv1 = l2.rpc.invoice(123000, 'label', 'description', preimage='1' * 64)
+    inv1 = l2.rpc.invoice(1230, 'label', 'description', preimage='1' * 64)
     l1.rpc.pay(inv1['bolt11'])
 
 
@@ -772,6 +774,9 @@ def test_channel_opened_notification(node_factory):
     amount = 10**6
     l1, l2 = node_factory.line_graph(2, fundchannel=True, fundamount=amount,
                                      opts=opts)
+
+    # Might have already passed, so reset start.
+    l2.daemon.logsearch_start = 0
     l2.daemon.wait_for_log(r"A channel was opened to us by {}, "
                            "with an amount of {}*"
                            .format(l1.info["id"], amount))
@@ -784,13 +789,14 @@ def test_forward_event_notification(node_factory, bitcoind, executor):
     amount = 10**8
     disconnects = ['-WIRE_UPDATE_FAIL_HTLC', 'permfail']
 
-    l1, l2, l3 = node_factory.line_graph(3, opts=[
+    l1, l2, l3, l4, l5 = node_factory.get_nodes(5, opts=[
         {},
         {'plugin': os.path.join(os.getcwd(), 'tests/plugins/forward_payment_status.py')},
-        {}
-    ], wait_for_announce=True)
-    l4 = node_factory.get_node()
-    l5 = node_factory.get_node(disconnect=disconnects)
+        {},
+        {},
+        {'disconnect': disconnects}])
+
+    node_factory.join_nodes([l1, l2, l3], wait_for_announce=True)
     l2.openchannel(l4, 10**6, wait_for_announce=False)
     l2.openchannel(l5, 10**6, wait_for_announce=True)
 
@@ -961,7 +967,8 @@ def test_rpc_command_hook(node_factory):
 def test_libplugin(node_factory):
     """Sanity checks for plugins made with libplugin"""
     plugin = os.path.join(os.getcwd(), "tests/plugins/test_libplugin")
-    l1 = node_factory.get_node(options={"plugin": plugin})
+    l1 = node_factory.get_node(options={"plugin": plugin,
+                                        'allow-deprecated-apis': False})
 
     # Test startup
     assert l1.daemon.is_in_log("test_libplugin initialised!")
@@ -989,6 +996,39 @@ def test_libplugin(node_factory):
 
     # Test RPC calls FIXME: test concurrent ones ?
     assert l1.rpc.call("testrpc") == l1.rpc.getinfo()
+
+    # Make sure deprecated options nor commands are mentioned.
+    with pytest.raises(RpcError, match=r'Command "testrpc-deprecated" is deprecated'):
+        l1.rpc.call('testrpc-deprecated')
+
+    assert not any([h['command'] == 'testrpc-deprecated'
+                    for h in l1.rpc.help()['help']])
+    with pytest.raises(RpcError, match=r"Deprecated command.*testrpc-deprecated"):
+        l1.rpc.help('testrpc-deprecated')
+
+    assert 'name-deprecated' not in str(l1.rpc.listconfigs())
+
+    l1.stop()
+    l1.daemon.opts["name-deprecated"] = "test_opt"
+
+    # This actually dies while waiting for the logs.
+    with pytest.raises(ValueError):
+        l1.start()
+
+    del l1.daemon.opts["name-deprecated"]
+    l1.start()
+
+
+def test_libplugin_deprecated(node_factory):
+    """Sanity checks for plugins made with libplugin using deprecated args"""
+    plugin = os.path.join(os.getcwd(), "tests/plugins/test_libplugin")
+    l1 = node_factory.get_node(options={"plugin": plugin,
+                                        'name-deprecated': 'test_opt depr',
+                                        'allow-deprecated-apis': True})
+
+    assert l1.rpc.call("helloworld") == "hello test_opt depr"
+    l1.rpc.help('testrpc-deprecated')
+    assert l1.rpc.call("testrpc-deprecated") == l1.rpc.getinfo()
 
 
 @unittest.skipIf(
@@ -1171,14 +1211,16 @@ def test_bcli(node_factory, bitcoind, chainparams):
 
     l1.fundwallet(10**5)
     l1.connect(l2)
-    txid = l1.rpc.fundchannel(l2.info["id"], 10**4)["txid"]
-    txo = l1.rpc.call("getutxout", {"txid": txid, "vout": 0})
-    assert (Millisatoshi(txo["amount"]) == Millisatoshi(10**4 * 10**3)
+    fc = l1.rpc.fundchannel(l2.info["id"], 10**4 * 2)
+    txo = l1.rpc.call("getutxout", {"txid": fc['txid'], "vout": fc['outnum']})
+    assert (Millisatoshi(txo["amount"]) == Millisatoshi(10**4 * 2 * 10**3)
             and txo["script"].startswith("0020"))
     l1.rpc.close(l2.info["id"])
     # When output is spent, it should give us null !
-    txo = l1.rpc.call("getutxout", {"txid": txid, "vout": 0})
-    assert txo["amount"] is txo["script"] is None
+    wait_for(lambda: l1.rpc.call("getutxout", {
+        "txid": fc['txid'],
+        "vout": fc['outnum']
+    })['amount'] is None)
 
     resp = l1.rpc.call("sendrawtransaction", {"tx": "dummy"})
     assert not resp["success"] and "decode failed" in resp["errmsg"]
@@ -1389,12 +1431,32 @@ def test_coin_movement_notices(node_factory, bitcoind, chainparams):
         l2_wallet_mvts = [
             {'type': 'chain_mvt', 'credit': 2000000000, 'debit': 0, 'tag': 'deposit'},
             {'type': 'chain_mvt', 'credit': 0, 'debit': 0, 'tag': 'spend_track'},
-            {'type': 'chain_mvt', 'credit': 0, 'debit': 991893000, 'tag': 'withdrawal'},
+            {'type': 'chain_mvt', 'credit': 0, 'debit': 991900000, 'tag': 'withdrawal'},
             {'type': 'chain_mvt', 'credit': 0, 'debit': 1000000000, 'tag': 'withdrawal'},
-            {'type': 'chain_mvt', 'credit': 0, 'debit': 8107000, 'tag': 'chain_fees'},
-            {'type': 'chain_mvt', 'credit': 991893000, 'debit': 0, 'tag': 'deposit'},
+            {'type': 'chain_mvt', 'credit': 0, 'debit': 8100000, 'tag': 'chain_fees'},
+            {'type': 'chain_mvt', 'credit': 991900000, 'debit': 0, 'tag': 'deposit'},
             {'type': 'chain_mvt', 'credit': 100001000, 'debit': 0, 'tag': 'deposit'},
             {'type': 'chain_mvt', 'credit': 941045000, 'debit': 0, 'tag': 'deposit'},
+        ]
+    elif EXPERIMENTAL_FEATURES:
+        # option_anchor_outputs
+        l2_l3_mvts = [
+            {'type': 'chain_mvt', 'credit': 1000000000, 'debit': 0, 'tag': 'deposit'},
+            {'type': 'channel_mvt', 'credit': 0, 'debit': 100000000, 'tag': 'routed'},
+            {'type': 'channel_mvt', 'credit': 50000501, 'debit': 0, 'tag': 'routed'},
+            {'type': 'chain_mvt', 'credit': 0, 'debit': 8430501, 'tag': 'chain_fees'},
+            {'type': 'chain_mvt', 'credit': 0, 'debit': 941570000, 'tag': 'withdrawal'},
+        ]
+
+        l2_wallet_mvts = [
+            {'type': 'chain_mvt', 'credit': 2000000000, 'debit': 0, 'tag': 'deposit'},
+            {'type': 'chain_mvt', 'credit': 0, 'debit': 0, 'tag': 'spend_track'},
+            {'type': 'chain_mvt', 'credit': 0, 'debit': 995425000, 'tag': 'withdrawal'},
+            {'type': 'chain_mvt', 'credit': 0, 'debit': 1000000000, 'tag': 'withdrawal'},
+            {'type': 'chain_mvt', 'credit': 0, 'debit': 4575000, 'tag': 'chain_fees'},
+            {'type': 'chain_mvt', 'credit': 995425000, 'debit': 0, 'tag': 'deposit'},
+            {'type': 'chain_mvt', 'credit': 100001000, 'debit': 0, 'tag': 'deposit'},
+            {'type': 'chain_mvt', 'credit': 941570000, 'debit': 0, 'tag': 'deposit'},
         ]
     else:
         l2_l3_mvts = [
@@ -1497,3 +1559,106 @@ def test_coin_movement_notices(node_factory, bitcoind, chainparams):
     check_coin_moves(l2, chanid_3, l2_l3_mvts, chainparams)
     check_coin_moves(l2, 'wallet', l2_wallet_mvts, chainparams)
     check_coin_moves_idx(l2)
+
+
+def test_3847_repro(node_factory, bitcoind):
+    """Reproduces the issue in #3847: duplicate response from plugin
+
+    l2 holds on to HTLCs until the deadline expires. Then we allow them
+    through and either should terminate the payment attempt, and the second
+    would return a redundant result.
+
+    """
+    l1, l2, l3 = node_factory.line_graph(3, opts=[
+        {},
+        {},
+        {
+            'plugin': os.path.join(os.getcwd(), 'tests/plugins/hold_htlcs.py'),
+            'hold-time': 11,
+            'hold-result': 'fail',
+        },
+    ], wait_for_announce=True)
+    wait_for(lambda: len(l1.rpc.listchannels()['channels']) == 4)
+
+    # Amount sufficient to trigger the presplit modifier
+    amt = 20 * 1000 * 1000
+
+    i1 = l3.rpc.invoice(
+        msatoshi=amt, label="direct", description="desc"
+    )['bolt11']
+    with pytest.raises(RpcError):
+        l1.rpc.pay(i1, retry_for=10)
+
+    # We wait for at least two parts, and the bug would cause the `pay` plugin
+    # to crash
+    l1.daemon.wait_for_logs([r'Payment deadline expired, not retrying'] * 2)
+
+    # This call to paystatus would fail if the pay plugin crashed (it's
+    # provided by the plugin)
+    l1.rpc.paystatus(i1)
+
+
+def test_important_plugin(node_factory):
+    # Cache it here.
+    pluginsdir = os.path.join(os.path.dirname(__file__), "plugins")
+
+    # Check we fail if we cannot find the important plugin.
+    n = node_factory.get_node(options={"important-plugin": os.path.join(pluginsdir, "nonexistent")},
+                              may_fail=True, expect_fail=True,
+                              allow_broken_log=True)
+    assert not n.daemon.running
+    assert n.daemon.is_in_stderr(r"error starting plugin '.*nonexistent'")
+
+    # Check we exit if the important plugin dies.
+    n = node_factory.get_node(options={"important-plugin": os.path.join(pluginsdir, "fail_by_itself.py")},
+                              may_fail=True, expect_fail=True,
+                              allow_broken_log=True)
+
+    n.daemon.wait_for_log('fail_by_itself.py: Plugin marked as important, shutting down lightningd')
+    wait_for(lambda: not n.daemon.running)
+
+    # Check if the important plugin is disabled, we run as normal.
+    n = node_factory.get_node(options=OrderedDict([("important-plugin", os.path.join(pluginsdir, "fail_by_itself.py")),
+                                                   ("disable-plugin", "fail_by_itself.py")]))
+    # Make sure we can call into a plugin RPC (this is from `bcli`) even
+    # if fail_by_itself.py is disabled.
+    n.rpc.call("estimatefees", {})
+    # Make sure we are still running.
+    assert n.daemon.running
+    n.stop()
+
+    # Check if an important plugin dies later, we fail.
+    n = node_factory.get_node(options={"important-plugin": os.path.join(pluginsdir, "suicidal_plugin.py")},
+                              may_fail=True, allow_broken_log=True)
+    with pytest.raises(RpcError):
+        n.rpc.call("die", {})
+    n.daemon.wait_for_log('suicidal_plugin.py: Plugin marked as important, shutting down lightningd')
+    wait_for(lambda: not n.daemon.running)
+
+    # Check that if a builtin plugin dies, we fail.
+    n = node_factory.get_node(may_fail=True, allow_broken_log=True,
+                              # The log message with the pay PID is printed
+                              # very early in the logs.
+                              start=False)
+    # Start the daemon directly, not via the node object n.start,
+    # because the normal n.daemon.start and n.start methods will
+    # wait for "Starting server with public key" and will execute
+    # getinfo, both of which are very much after plugins are
+    # started.
+    # And the PIDs of plugins are only seen at plugin startup.
+    TailableProc.start(n.daemon)
+    assert n.daemon.running
+    # Extract the pid of pay.
+    r = n.daemon.wait_for_log(r'started([0-9]*).*plugins/pay')
+    pidstr = re.search(r'.*started\(([0-9]*)\)', r).group(1)
+    # Kill pay.
+    os.kill(int(pidstr), signal.SIGKILL)
+    # node should die as well.
+    n.daemon.wait_for_log('pay: Plugin marked as important, shutting down lightningd')
+    wait_for(lambda: not n.daemon.running)
+
+
+@unittest.skipIf(not DEVELOPER, "tests developer-only option.")
+def test_dev_builtin_plugins_unimportant(node_factory):
+    n = node_factory.get_node(options={"dev-builtin-plugins-unimportant": None})
+    n.rpc.plugin_stop(plugin="pay")

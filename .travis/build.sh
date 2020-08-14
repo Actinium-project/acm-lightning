@@ -11,19 +11,19 @@ export COMPAT=${COMPAT:-1}
 export PATH=$CWD/dependencies/bin:"$HOME"/.local/bin:"$PATH"
 export PYTEST_PAR=2
 export PYTEST_SENTRY_ALWAYS_REPORT=1
-
-# If we're not in developer mode, tests spend a lot of time waiting for gossip!
-# But if we're under valgrind, we can run out of memory!
-if [ "$DEVELOPER" = 0 ] && [ "$VALGRIND" = 0 ]; then
+export BOLTDIR=lightning-rfc
+# Allow up to 4 concurrent tests when not under valgrind, which might run out of memory.
+if [ "$VALGRIND" = 0 ]; then
     PYTEST_PAR=4
 fi
+export TEST_CMD=${TEST_CMD:-"make -j $PYTEST_PAR pytest"}
 
 mkdir -p dependencies/bin || true
 
 # Download bitcoind and bitcoin-cli 
 if [ ! -f dependencies/bin/bitcoind ]; then
-    wget https://bitcoin.org/bin/bitcoin-core-0.18.1/bitcoin-0.18.1-x86_64-linux-gnu.tar.gz
-    tar -xzf bitcoin-0.18.1-x86_64-linux-gnu.tar.gz
+    wget https://storage.googleapis.com/c-lightning-tests/bitcoin-0.18.1-x86_64-linux-gnu.tar.bz2
+    tar -xjf bitcoin-0.18.1-x86_64-linux-gnu.tar.bz2
     mv bitcoin-0.18.1/bin/* dependencies/bin
     rm -rf bitcoin-0.18.1-x86_64-linux-gnu.tar.gz bitcoin-0.18.1
 fi
@@ -55,6 +55,8 @@ cat > pytest.ini << EOF
 [pytest]
 addopts=-p no:logging --color=no --reruns=5
 EOF
+
+git clone https://github.com/lightningnetwork/lightning-rfc.git
 
 if [ "$TARGET_HOST" == "arm-linux-gnueabihf" ] || [ "$TARGET_HOST" == "aarch64-linux-gnu" ]
 then
@@ -104,18 +106,12 @@ then
     #echo -en 'travis_fold:start:script.3\\r'
     #make -j$PYTEST_PAR check-units
     #echo -en 'travis_fold:end:script.3\\r'
-elif [ "$SOURCE_CHECK_ONLY" == "false" ]; then
+else
     echo -en 'travis_fold:start:script.2\\r'
-    make -j3 > /dev/null
+    make -j8 > /dev/null
     echo -en 'travis_fold:end:script.2\\r'
 
     echo -en 'travis_fold:start:script.3\\r'
-    make -j$PYTEST_PAR check
+    $TEST_CMD
     echo -en 'travis_fold:end:script.3\\r'
-else
-    git clone https://github.com/lightningnetwork/lightning-rfc.git
-    echo -en 'travis_fold:start:script.2\\r'
-    make -j3 > /dev/null
-    echo -en 'travis_fold:end:script.2\\r'
-    make check-source BOLTDIR=lightning-rfc
 fi

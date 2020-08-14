@@ -79,8 +79,14 @@ static u8 **missing_htlc_msgs;
 /* Our recorded channel balance at 'chain time' */
 static struct amount_msat our_msat;
 
+/* Needed for anchor outputs */
+static struct pubkey funding_pubkey[NUM_SIDES];
+
 /* Does option_static_remotekey apply to this commitment tx? */
-bool option_static_remotekey;
+static bool option_static_remotekey;
+
+/* Does option_anchor_outputs apply to this commitment tx? */
+static bool option_anchor_outputs;
 
 /* If we broadcast a tx, or need a delay to resolve the output. */
 struct proposed_resolution {
@@ -448,19 +454,25 @@ static bool set_htlc_timeout_fee(struct bitcoin_tx *tx,
 {
 	static struct amount_sat amount, fee = AMOUNT_SAT_INIT(UINT64_MAX);
 	struct amount_asset asset = bitcoin_tx_output_get_amount(tx, 0);
-	size_t weight = elements_add_overhead(663, tx->wtx->num_inputs,
-					      tx->wtx->num_outputs);
+	size_t weight;
+
+	/* BOLT-a12da24dd0102c170365124782b46d9710950ac1 #3:
+	 *
+	 * The fee for an HTLC-timeout transaction:
+	 *  - MUST BE calculated to match:
+	 *    1. Multiply `feerate_per_kw` by 663 (666 if `option_anchor_outputs`
+	 *       applies) and divide by 1000 (rounding down).
+	 */
+	if (option_anchor_outputs)
+		weight = 666;
+	else
+		weight = 663;
+	weight = elements_add_overhead(weight, tx->wtx->num_inputs,
+				       tx->wtx->num_outputs);
 
 	assert(amount_asset_is_main(&asset));
 	amount = amount_asset_to_sat(&asset);
 
-	/* BOLT #3:
-	 *
-	 * The fee for an HTLC-timeout transaction:
-	 *  - MUST BE calculated to match:
-	 *    1. Multiply `feerate_per_kw` by 663 and divide by 1000 (rounding
-	 *    down).
-	 */
 	if (amount_sat_eq(fee, AMOUNT_SAT(UINT64_MAX))) {
 		struct amount_sat grindfee;
 		if (grind_htlc_tx_fee(&grindfee, tx, remotesig, wscript, weight)) {
@@ -489,15 +501,22 @@ static void set_htlc_success_fee(struct bitcoin_tx *tx,
 {
 	static struct amount_sat amt, fee = AMOUNT_SAT_INIT(UINT64_MAX);
 	struct amount_asset asset;
-	size_t weight = elements_add_overhead(703, tx->wtx->num_inputs,
-					      tx->wtx->num_outputs);
-	/* BOLT #3:
+	size_t weight;
+
+	/* BOLT-a12da24dd0102c170365124782b46d9710950ac1 #3:
 	 *
 	 * The fee for an HTLC-success transaction:
-	 *  - MUST BE calculated to match:
-	 *    1. Multiply `feerate_per_kw` by 703 and divide by 1000
-	 *    (rounding down).
+	 * - MUST BE calculated to match:
+	 *   1. Multiply `feerate_per_kw` by 703 (706 if `option_anchor_outputs`
+	 *      applies) and divide by 1000 (rounding down).
 	 */
+	if (option_anchor_outputs)
+		weight = 706;
+	else
+		weight = 703;
+
+	weight = elements_add_overhead(weight, tx->wtx->num_inputs,
+				       tx->wtx->num_outputs);
 	if (amount_sat_eq(fee, AMOUNT_SAT(UINT64_MAX))) {
 		if (!grind_htlc_tx_fee(&fee, tx, remotesig, wscript, weight))
 			status_failed(STATUS_FAIL_INTERNAL_ERROR,
@@ -571,7 +590,8 @@ static u8 *remote_htlc_to_us(const tal_t *ctx,
 {
 	return towire_hsm_sign_remote_htlc_to_us(ctx,
 						 remote_per_commitment_point,
-						 tx, wscript);
+						 tx, wscript,
+						 option_anchor_outputs);
 }
 
 static u8 *penalty_to_us(const tal_t *ctx,
@@ -675,7 +695,8 @@ static void hsm_sign_local_htlc_tx(struct bitcoin_tx *tx,
 				   struct bitcoin_signature *sig)
 {
 	u8 *msg = towire_hsm_sign_local_htlc_tx(NULL, commit_num,
-						tx, wscript);
+						tx, wscript,
+						option_anchor_outputs);
 
 	if (!wire_sync_write(HSM_FD, take(msg)))
 		status_failed(STATUS_FAIL_HSM_IO,
@@ -714,7 +735,7 @@ new_tracked_output(struct tracked_output ***outs,
 		   enum output_type output_type,
 		   const struct htlc_stub *htlc,
 		   const u8 *wscript,
-		   const secp256k1_ecdsa_signature *remote_htlc_sig)
+		   const struct bitcoin_signature *remote_htlc_sig TAKES)
 {
 	struct tracked_output *out = tal(*outs, struct tracked_output);
 
@@ -736,13 +757,10 @@ new_tracked_output(struct tracked_output ***outs,
 	if (htlc)
 		out->htlc = *htlc;
 	out->wscript = tal_steal(out, wscript);
-	if (remote_htlc_sig) {
-		struct bitcoin_signature *sig;
-		sig = tal(out, struct bitcoin_signature);
-		sig->s = *remote_htlc_sig;
-		sig->sighash_type = SIGHASH_ALL;
-		out->remote_htlc_sig = sig;
-	} else
+	if (remote_htlc_sig)
+		out->remote_htlc_sig = tal_dup(out, struct bitcoin_signature,
+					       remote_htlc_sig);
+	else
 		out->remote_htlc_sig = NULL;
 
 	tal_arr_expand(outs, out);
@@ -1497,6 +1515,8 @@ static void output_spent(struct tracked_output ***outs,
 		case OUTPUT_TO_THEM:
 		case DELAYED_OUTPUT_TO_THEM:
 		case ELEMENTS_FEE:
+		case ANCHOR_TO_US:
+		case ANCHOR_TO_THEM:
 			status_failed(STATUS_FAIL_INTERNAL_ERROR,
 				      "Tracked spend of %s/%s?",
 				      tx_type_name(out->tx_type),
@@ -1683,7 +1703,7 @@ static void handle_preimage(struct tracked_output **outs,
 					     htlc_amount,
 					     to_self_delay[LOCAL],
 					     0,
-					     keyset);
+					     keyset, option_anchor_outputs);
 			set_htlc_success_fee(tx, outs[i]->remote_htlc_sig,
 					     outs[i]->wscript);
 			hsm_sign_local_htlc_tx(tx, outs[i]->wscript, &sig);
@@ -1709,7 +1729,8 @@ static void handle_preimage(struct tracked_output **outs,
 			 *    - MUST *resolve* the output by spending it to a
 			 *      convenient address.
 			 */
-			tx = tx_to_us(outs[i], remote_htlc_to_us, outs[i], 0,
+			tx = tx_to_us(outs[i], remote_htlc_to_us, outs[i],
+				      option_anchor_outputs ? 1 : 0,
 				      0, preimage, sizeof(*preimage),
 				      outs[i]->wscript, &tx_type,
 				      htlc_feerate);
@@ -1872,7 +1893,8 @@ static u8 **derive_htlc_scripts(const struct htlc_stub *htlcs, enum side side)
 		if (htlcs[i].owner == side)
 			htlc_scripts[i] = htlc_offered_wscript(htlc_scripts,
 							       &htlcs[i].ripemd,
-							       keyset);
+							       keyset,
+							       option_anchor_outputs);
 		else {
 			/* FIXME: remove abs_locktime */
 			struct abs_locktime ltime;
@@ -1884,7 +1906,8 @@ static u8 **derive_htlc_scripts(const struct htlc_stub *htlcs, enum side side)
 			htlc_scripts[i] = htlc_received_wscript(htlc_scripts,
 								&htlcs[i].ripemd,
 								&ltime,
-								keyset);
+								keyset,
+								option_anchor_outputs);
 		}
 	}
 	return htlc_scripts;
@@ -1926,7 +1949,8 @@ static size_t resolve_our_htlc_ourcommit(struct tracked_output *out,
 				     &out->txid, out->outnum,
 				     htlc_scripts[matches[i]], htlc_amount,
 				     htlcs[matches[i]].cltv_expiry,
-				     to_self_delay[LOCAL], 0, keyset);
+				     to_self_delay[LOCAL], 0, keyset,
+				     option_anchor_outputs);
 
 		if (set_htlc_timeout_fee(tx, out->remote_htlc_sig,
 					 htlc_scripts[matches[i]]))
@@ -1952,7 +1976,8 @@ static size_t resolve_our_htlc_ourcommit(struct tracked_output *out,
 			      "No valid signature found for %zu htlc_timeout_txs"
 			      " feerate %u-%u,"
 			      " last tx %s, input %s, signature %s,"
-			      " cltvs %s wscripts %s",
+			      " cltvs %s wscripts %s"
+			      " %s",
 			      tal_count(matches),
 			      min_possible_feerate, max_possible_feerate,
 			      type_to_string(tmpctx, struct bitcoin_tx, tx),
@@ -1960,7 +1985,9 @@ static size_t resolve_our_htlc_ourcommit(struct tracked_output *out,
 					     &out->sat),
 			      type_to_string(tmpctx, struct bitcoin_signature,
 					     out->remote_htlc_sig),
-			      cltvs, wscripts);
+			      cltvs, wscripts,
+			      option_anchor_outputs
+			      ? "option_anchor_outputs" : "");
 	}
 
 	hsm_sign_local_htlc_tx(tx, htlc_scripts[matches[i]], &localsig);
@@ -2012,7 +2039,9 @@ static size_t resolve_our_htlc_theircommit(struct tracked_output *out,
 	 *     - MUST *resolve* the output, by spending it to a convenient
 	 *       address.
 	 */
-	tx = tx_to_us(out, remote_htlc_to_us, out, 0, cltv_expiry, NULL, 0,
+	tx = tx_to_us(out, remote_htlc_to_us, out,
+		      option_anchor_outputs ? 1 : 0,
+		      cltv_expiry, NULL, 0,
 		      htlc_scripts[matches[0]], &tx_type, htlc_feerate);
 
 	propose_resolution_at_block(out, tx, cltv_expiry, tx_type, is_replay);
@@ -2129,18 +2158,56 @@ static void note_missing_htlcs(u8 **htlc_scripts,
 	}
 }
 
+static void get_anchor_scriptpubkeys(const tal_t *ctx, u8 **anchor)
+{
+	if (!option_anchor_outputs) {
+		anchor[LOCAL] = anchor[REMOTE] = NULL;
+		return;
+	}
+
+	for (enum side side = 0; side < NUM_SIDES; side++) {
+		u8 *wscript = bitcoin_wscript_anchor(tmpctx,
+						     &funding_pubkey[side]);
+		anchor[side] = scriptpubkey_p2wsh(ctx, wscript);
+	}
+}
+
+static u8 *scriptpubkey_to_remote(const tal_t *ctx,
+				  const struct pubkey *remotekey)
+{
+	/* BOLT-a12da24dd0102c170365124782b46d9710950ac1 #3:
+	 *
+	 * #### `to_remote` Output
+	 *
+	 * If `option_anchor_outputs` applies to the commitment
+	 * transaction, the `to_remote` output is encumbered by a one
+	 * block csv lock.
+	 *    <remote_pubkey> OP_CHECKSIGVERIFY 1 OP_CHECKSEQUENCEVERIFY
+	 *
+	 *...
+	 * Otherwise, this output is a simple P2WPKH to `remotepubkey`.
+	 */
+	if (option_anchor_outputs) {
+		return scriptpubkey_p2wsh(ctx,
+					  anchor_to_remote_redeem(tmpctx,
+								  remotekey));
+	} else {
+		return scriptpubkey_p2wpkh(ctx, remotekey);
+	}
+}
+
 static void handle_our_unilateral(const struct tx_parts *tx,
 				  u32 tx_blockheight,
 				  const struct basepoints basepoints[NUM_SIDES],
 				  const struct htlc_stub *htlcs,
 				  const bool *tell_if_missing,
 				  const bool *tell_immediately,
-				  const secp256k1_ecdsa_signature *remote_htlc_sigs,
+				  const struct bitcoin_signature *remote_htlc_sigs,
 				  struct tracked_output **outs,
 				  bool is_replay)
 {
 	u8 **htlc_scripts;
-	u8 *local_wscript, *script[NUM_SIDES];
+	u8 *local_wscript, *script[NUM_SIDES], *anchor[NUM_SIDES];
 	struct pubkey local_per_commitment_point;
 	struct keyset *ks;
 	size_t i;
@@ -2197,7 +2264,8 @@ static void handle_our_unilateral(const struct tx_parts *tx,
 	script[LOCAL] = scriptpubkey_p2wsh(tmpctx, local_wscript);
 
 	/* Figure out what direct to-them output looks like. */
-	script[REMOTE] = scriptpubkey_p2wpkh(tmpctx, &keyset->other_payment_key);
+	script[REMOTE] = scriptpubkey_to_remote(tmpctx,
+						&keyset->other_payment_key);
 
 	/* Calculate all the HTLC scripts so we can match them */
 	htlc_scripts = derive_htlc_scripts(htlcs, LOCAL);
@@ -2216,6 +2284,8 @@ static void handle_our_unilateral(const struct tx_parts *tx,
 			     tal_hexstr(tmpctx, tx->outputs[i]->script,
 					tx->outputs[i]->script_len));
 	}
+
+	get_anchor_scriptpubkeys(tmpctx, anchor);
 
 	for (i = 0; i < tal_count(tx->outputs); i++) {
 		struct tracked_output *out;
@@ -2307,6 +2377,33 @@ static void handle_our_unilateral(const struct tx_parts *tx,
 			ignore_output(out);
 			script[REMOTE] = NULL;
 			add_amt(&their_outs, amt);
+			continue;
+		}
+		if (anchor[LOCAL]
+		    && wally_tx_output_scripteq(tx->outputs[i],
+						anchor[LOCAL])) {
+			/* FIXME: We should be able to spend this! */
+			out = new_tracked_output(&outs, &tx->txid,
+						 tx_blockheight,
+						 OUR_UNILATERAL, i,
+						 amt,
+						 ANCHOR_TO_US,
+						 NULL, NULL, NULL);
+			ignore_output(out);
+			anchor[LOCAL] = NULL;
+			continue;
+		}
+		if (anchor[REMOTE]
+		    && wally_tx_output_scripteq(tx->outputs[i],
+						anchor[REMOTE])) {
+			out = new_tracked_output(&outs, &tx->txid,
+						 tx_blockheight,
+						 OUR_UNILATERAL, i,
+						 amt,
+						 ANCHOR_TO_THEM,
+						 NULL, NULL, NULL);
+			ignore_output(out);
+			anchor[REMOTE] = NULL;
 			continue;
 		}
 
@@ -2461,7 +2558,7 @@ static void tell_wallet_to_remote(const struct tx_parts *tx,
  */
 static void update_ledger_cheat(const struct bitcoin_txid *txid,
 				u32 blockheight,
-				struct tracked_output *out)
+				const struct tracked_output *out)
 {
 	/* how much of a difference should we update the
 	 * channel account ledger by? */
@@ -2502,7 +2599,7 @@ static void handle_their_cheat(const struct tx_parts *tx,
 			       bool is_replay)
 {
 	u8 **htlc_scripts;
-	u8 *remote_wscript, *script[NUM_SIDES];
+	u8 *remote_wscript, *script[NUM_SIDES], *anchor[NUM_SIDES];
 	struct keyset *ks;
 	struct pubkey *k;
 	size_t i;
@@ -2603,7 +2700,8 @@ static void handle_their_cheat(const struct tx_parts *tx,
 	script[REMOTE] = scriptpubkey_p2wsh(tmpctx, remote_wscript);
 
 	/* Figure out what direct to-us output looks like. */
-	script[LOCAL] = scriptpubkey_p2wpkh(tmpctx, &keyset->other_payment_key);
+	script[LOCAL] = scriptpubkey_to_remote(tmpctx,
+					       &keyset->other_payment_key);
 
 	/* Calculate all the HTLC scripts so we can match them */
 	htlc_scripts = derive_htlc_scripts(htlcs, REMOTE);
@@ -2614,6 +2712,8 @@ static void handle_their_cheat(const struct tx_parts *tx,
 		     tal_hex(tmpctx, remote_wscript));
 	status_debug("Script to-me: %s",
 		     tal_hex(tmpctx, script[LOCAL]));
+
+	get_anchor_scriptpubkeys(tmpctx, anchor);
 
 	for (i = 0; i < tal_count(tx->outputs); i++) {
  		if (tx->outputs[i]->script_len == 0)
@@ -2692,6 +2792,33 @@ static void handle_their_cheat(const struct tx_parts *tx,
 			add_amt(&total_outs, amt);
 			continue;
 		}
+		if (anchor[LOCAL]
+		    && wally_tx_output_scripteq(tx->outputs[i],
+						anchor[LOCAL])) {
+			/* FIXME: We should be able to spend this! */
+			out = new_tracked_output(&outs, &tx->txid,
+						 tx_blockheight,
+						 THEIR_REVOKED_UNILATERAL, i,
+						 amt,
+						 ANCHOR_TO_US,
+						 NULL, NULL, NULL);
+			ignore_output(out);
+			anchor[LOCAL] = NULL;
+			continue;
+		}
+		if (anchor[REMOTE]
+		    && wally_tx_output_scripteq(tx->outputs[i],
+						anchor[REMOTE])) {
+			out = new_tracked_output(&outs, &tx->txid,
+						 tx_blockheight,
+						 THEIR_REVOKED_UNILATERAL, i,
+						 amt,
+						 ANCHOR_TO_THEM,
+						 NULL, NULL, NULL);
+			ignore_output(out);
+			anchor[REMOTE] = NULL;
+			continue;
+		}
 
 		matches = match_htlc_output(tmpctx, tx->outputs[i], htlc_scripts);
 		if (tal_count(matches) == 0)
@@ -2768,7 +2895,7 @@ static void handle_their_unilateral(const struct tx_parts *tx,
 				    bool is_replay)
 {
 	u8 **htlc_scripts;
-	u8 *remote_wscript, *script[NUM_SIDES];
+	u8 *remote_wscript, *script[NUM_SIDES], *anchor[NUM_SIDES];
 	struct keyset *ks;
 	size_t i;
 	struct amount_sat their_outs = AMOUNT_SAT(0), our_outs = AMOUNT_SAT(0);
@@ -2855,7 +2982,8 @@ static void handle_their_unilateral(const struct tx_parts *tx,
 	script[REMOTE] = scriptpubkey_p2wsh(tmpctx, remote_wscript);
 
 	/* Figure out what direct to-us output looks like. */
-	script[LOCAL] = scriptpubkey_p2wpkh(tmpctx, &keyset->other_payment_key);
+	script[LOCAL] = scriptpubkey_to_remote(tmpctx,
+					       &keyset->other_payment_key);
 
 	/* Calculate all the HTLC scripts so we can match them */
 	htlc_scripts = derive_htlc_scripts(htlcs, REMOTE);
@@ -2866,6 +2994,8 @@ static void handle_their_unilateral(const struct tx_parts *tx,
 		     tal_hex(tmpctx, remote_wscript));
 	status_debug("Script to-me: %s",
 		     tal_hex(tmpctx, script[LOCAL]));
+
+	get_anchor_scriptpubkeys(tmpctx, anchor);
 
 	for (i = 0; i < tal_count(tx->outputs); i++) {
  		if (tx->outputs[i]->script_len == 0)
@@ -2942,6 +3072,33 @@ static void handle_their_unilateral(const struct tx_parts *tx,
 						 NULL, NULL, NULL);
 			ignore_output(out);
 			add_amt(&their_outs, amt);
+			continue;
+		}
+		if (anchor[LOCAL]
+		    && wally_tx_output_scripteq(tx->outputs[i],
+						anchor[LOCAL])) {
+			/* FIXME: We should be able to spend this! */
+			out = new_tracked_output(&outs, &tx->txid,
+						 tx_blockheight,
+						 THEIR_UNILATERAL, i,
+						 amt,
+						 ANCHOR_TO_US,
+						 NULL, NULL, NULL);
+			ignore_output(out);
+			anchor[LOCAL] = NULL;
+			continue;
+		}
+		if (anchor[REMOTE]
+		    && wally_tx_output_scripteq(tx->outputs[i],
+						anchor[REMOTE])) {
+			out = new_tracked_output(&outs, &tx->txid,
+						 tx_blockheight,
+						 THEIR_UNILATERAL, i,
+						 amt,
+						 ANCHOR_TO_THEM,
+						 NULL, NULL, NULL);
+			ignore_output(out);
+			anchor[REMOTE] = NULL;
 			continue;
 		}
 
@@ -3081,17 +3238,8 @@ static void handle_unknown_commitment(const struct tx_parts *tx,
 		local_script = scriptpubkey_p2wpkh(tmpctx,
 						   &ks->other_payment_key);
 	} else {
-		/* BOLT #3:
-		 *
-		 * ### `remotepubkey` Derivation
-		 *
-		 * If `option_static_remotekey` is negotiated the
-		 * `remotepubkey` is simply the remote node's
-		 * `payment_basepoint`, otherwise it is calculated as above
-		 * using the remote node's `payment_basepoint`.
-		 */
-		local_script = scriptpubkey_p2wpkh(tmpctx,
-						   &basepoints[LOCAL].payment);
+		local_script = scriptpubkey_to_remote(tmpctx,
+						      &basepoints[LOCAL].payment);
 	}
 
 	for (size_t i = 0; i < tal_count(tx->outputs); i++) {
@@ -3177,7 +3325,7 @@ int main(int argc, char *argv[])
 	struct tx_parts *tx;
 	struct tracked_output **outs;
 	struct bitcoin_txid our_broadcast_txid, tmptxid;
-	secp256k1_ecdsa_signature *remote_htlc_sigs;
+	struct bitcoin_signature *remote_htlc_sigs;
 	struct amount_sat funding;
 	u64 num_htlcs;
 	u8 *scriptpubkey[NUM_SIDES];
@@ -3224,7 +3372,10 @@ int main(int argc, char *argv[])
 				   &min_possible_feerate,
 				   &max_possible_feerate,
 				   &possible_remote_per_commitment_point,
+				   &funding_pubkey[LOCAL],
+				   &funding_pubkey[REMOTE],
 				   &option_static_remotekey,
+				   &option_anchor_outputs,
 				   &open_is_replay)) {
 		master_badmsg(WIRE_ONCHAIN_INIT, msg);
 	}

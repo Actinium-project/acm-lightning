@@ -50,6 +50,12 @@ bool feature_offered(const u8 *features, size_t f);
 bool feature_negotiated(const struct feature_set *our_features,
 			const u8 *their_features, size_t f);
 
+/* Features can depend on other features: both must be set!
+ * Sets @depender, @missing_dependency if returns false.
+ */
+bool feature_check_depends(const u8 *their_features,
+			   size_t *depender, size_t *missing_dependency);
+
 /* Return a list of what (init) features we advertize. */
 const char **list_supported_features(const tal_t *ctx,
 				     const struct feature_set *fset);
@@ -100,6 +106,12 @@ u8 *featurebits_or(const tal_t *ctx, const u8 *f1 TAKES, const u8 *f2 TAKES);
 #define OPT_PAYMENT_SECRET			14
 #define OPT_BASIC_MPP				16
 #define OPT_LARGE_CHANNELS			18
+
+/* BOLT-a12da24dd0102c170365124782b46d9710950ac1 #9:
+ *
+ * | 20/21 | `option_anchor_outputs` |... IN ...
+ */
+#define OPT_ANCHOR_OUTPUTS			20
 
 /* BOLT-9fc25cfd2895578c0b1ab701ebe6c1eb67a19623 #9:
  *

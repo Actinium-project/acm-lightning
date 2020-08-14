@@ -1,4 +1,4 @@
-from pyln.testing.utils import TEST_NETWORK, SLOW_MACHINE, TIMEOUT, VALGRIND, DEVELOPER, DEPRECATED_APIS  # noqa: F401
+from pyln.testing.utils import TEST_NETWORK, TIMEOUT, VALGRIND, DEVELOPER, DEPRECATED_APIS  # noqa: F401
 from pyln.testing.utils import env, only_one, wait_for, write_config, TailableProc, sync_blockheight, wait_channel_quiescent, get_tx_p2wsh_outnum  # noqa: F401
 import bitstring
 from pyln.client import Millisatoshi
@@ -23,6 +23,8 @@ def expected_peer_features(wumbo_channels=False, extra=[]):
     if EXPERIMENTAL_FEATURES:
         # OPT_ONION_MESSAGES
         features += [103]
+        # option_anchor_outputs
+        features += [21]
     if wumbo_channels:
         features += [19]
     return hex_bits(features + extra)
@@ -36,6 +38,8 @@ def expected_node_features(wumbo_channels=False, extra=[]):
     if EXPERIMENTAL_FEATURES:
         # OPT_ONION_MESSAGES
         features += [103]
+        # option_anchor_outputs
+        features += [21]
     if wumbo_channels:
         features += [19]
     return hex_bits(features + extra)
@@ -102,3 +106,12 @@ def account_balance(n, account_id):
 
 def first_channel_id(n1, n2):
     return only_one(only_one(n1.rpc.listpeers(n2.info['id'])['peers'])['channels'])['channel_id']
+
+
+def basic_fee(feerate):
+    if EXPERIMENTAL_FEATURES:
+        # option_anchor_outputs
+        weight = 1124
+    else:
+        weight = 724
+    return (weight * feerate) // 1000

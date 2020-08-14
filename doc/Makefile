@@ -18,14 +18,17 @@ MANPAGES := doc/lightning-cli.1 \
 	doc/lightning-delinvoice.7 \
 	doc/lightning-dev-sendcustommsg.7 \
 	doc/lightning-disconnect.7 \
+	doc/lightning-feerates.7 \
 	doc/lightning-fundchannel.7 \
 	doc/lightning-fundchannel_start.7 \
 	doc/lightning-fundchannel_complete.7 \
 	doc/lightning-fundchannel_cancel.7 \
+	doc/lightning-fundpsbt.7 \
 	doc/lightning-getroute.7 \
 	doc/lightning-getsharedsecret.7 \
 	doc/lightning-hsmtool.8 \
 	doc/lightning-invoice.7 \
+	doc/lightning-keysend.7 \
 	doc/lightning-listchannels.7 \
 	doc/lightning-listforwards.7 \
 	doc/lightning-listfunds.7 \

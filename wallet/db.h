@@ -15,6 +15,7 @@
 #include <secp256k1_ecdh.h>
 #include <stdbool.h>
 
+struct ext_key;
 struct lightningd;
 struct log;
 struct node_id;
@@ -23,7 +24,6 @@ struct db_stmt;
 struct db;
 struct wally_psbt;
 
-void migrate_last_tx_to_psbt(struct lightningd *ld, struct db *db);
 /**
  * Macro to annotate a named SQL query.
  *
@@ -56,8 +56,10 @@ void migrate_last_tx_to_psbt(struct lightningd *ld, struct db *db);
  * Params:
  *  @ctx: the tal_t context to allocate from
  *  @ld: the lightningd context to hand to upgrade functions.
+ *  @bip32_base: the base all of our pubkeys are constructed on
  */
-struct db *db_setup(const tal_t *ctx, struct lightningd *ld);
+struct db *db_setup(const tal_t *ctx, struct lightningd *ld,
+		    const struct ext_key *bip32_base);
 
 /**
  * db_begin_transaction - Begin a transaction
@@ -116,7 +118,7 @@ void db_bind_short_channel_id_arr(struct db_stmt *stmt, int col,
 void db_bind_signature(struct db_stmt *stmt, int col,
 		       const secp256k1_ecdsa_signature *sig);
 void db_bind_timeabs(struct db_stmt *stmt, int col, struct timeabs t);
-void db_bind_tx(struct db_stmt *stmt, int col, const struct bitcoin_tx *tx);
+void db_bind_tx(struct db_stmt *stmt, int col, const struct wally_tx *tx);
 void db_bind_psbt(struct db_stmt *stmt, int col, const struct wally_psbt *psbt);
 void db_bind_amount_msat(struct db_stmt *stmt, int pos,
 			 const struct amount_msat *msat);

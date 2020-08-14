@@ -283,10 +283,13 @@ void local_fail_in_htlc_needs_update(struct htlc_in *hin,
 }
 
 /* Helper to create (common) WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS */
-const u8 *failmsg_incorrect_or_unknown(const tal_t *ctx,
-				       struct lightningd *ld,
-				       const struct htlc_in *hin)
+const u8 *failmsg_incorrect_or_unknown_(const tal_t *ctx,
+					struct lightningd *ld,
+					const struct htlc_in *hin,
+					const char *file, int line)
 {
+	log_debug(ld->log, "WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS: %s:%u",
+		  file, line);
 	return towire_incorrect_or_unknown_payment_details(
 		ctx, hin->msat,
 		get_block_height(ld->topology));
@@ -1697,7 +1700,7 @@ void peer_sending_commitsig(struct channel *channel, const u8 *msg)
 	struct changed_htlc *changed_htlcs;
 	size_t i, maxid = 0, num_local_added = 0;
 	struct bitcoin_signature commit_sig;
-	secp256k1_ecdsa_signature *htlc_sigs;
+	struct bitcoin_signature *htlc_sigs;
 	struct lightningd *ld = channel->peer->ld;
 	struct penalty_base *pbase;
 
@@ -1887,8 +1890,7 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 {
 	u64 commitnum;
 	struct fee_states *fee_states;
-	struct bitcoin_signature commit_sig;
-	secp256k1_ecdsa_signature *htlc_sigs;
+	struct bitcoin_signature commit_sig, *htlc_sigs;
 	struct added_htlc *added;
 	struct fulfilled_htlc *fulfilled;
 	struct failed_htlc **failed;

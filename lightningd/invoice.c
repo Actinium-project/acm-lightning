@@ -302,8 +302,15 @@ invoice_check_payment(const tal_t *ctx,
 	 *    - MUST fail the HTLC.
 	 *    - MUST return an `incorrect_or_unknown_payment_details` error.
 	 */
-	if (!wallet_invoice_find_unpaid(ld->wallet, &invoice, payment_hash))
+	if (!wallet_invoice_find_unpaid(ld->wallet, &invoice, payment_hash)) {
+		log_debug(ld->log, "Unknown paid invoice %s",
+			  type_to_string(tmpctx, struct sha256, payment_hash));
+		if (wallet_invoice_find_by_rhash(ld->wallet, &invoice, payment_hash)) {
+			log_debug(ld->log, "ALREADY paid invoice %s",
+				  type_to_string(tmpctx, struct sha256, payment_hash));
+		}
 		return NULL;
+	}
 
 	details = wallet_invoice_details(ctx, ld->wallet, invoice);
 
@@ -342,11 +349,22 @@ invoice_check_payment(const tal_t *ctx,
 	if (details->msat != NULL) {
 		struct amount_msat twice;
 
-		if (amount_msat_less(msat, *details->msat))
+		if (amount_msat_less(msat, *details->msat)) {
+			log_debug(ld->log, "Attept to pay %s with amount %s < %s",
+				  type_to_string(tmpctx, struct sha256,
+						 &details->rhash),
+				  type_to_string(tmpctx, struct amount_msat, &msat),
+				  type_to_string(tmpctx, struct amount_msat, details->msat));
 			return tal_free(details);
+		}
 
 		if (amount_msat_add(&twice, *details->msat, *details->msat)
 		    && amount_msat_greater(msat, twice)) {
+			log_debug(ld->log, "Attept to pay %s with amount %s > %s",
+				  type_to_string(tmpctx, struct sha256,
+						 &details->rhash),
+				  type_to_string(tmpctx, struct amount_msat, details->msat),
+				  type_to_string(tmpctx, struct amount_msat, &twice));
 			/* BOLT #4:
 			 *
 			 * - if the amount paid is more than twice the amount
@@ -524,7 +542,7 @@ static struct route_info **select_inchan(const tal_t *ctx,
 			continue;
 		}
 
-		excess_frac = (double)excess.millisatoshis / capacity.millisatoshis; /* Raw: double fraction */
+		excess_frac = amount_msat_ratio(excess, capacity);
 
 		sample.route = &inchans[i];
 		sample.weight = excess_frac;
@@ -1127,7 +1145,7 @@ static struct command_result *json_delinvoice(struct command *cmd,
 		return command_param_failed();
 
 	if (!wallet_invoice_find_by_label(wallet, &i, label)) {
-		return command_fail(cmd, LIGHTNINGD, "Unknown invoice");
+		return command_fail(cmd, INVOICE_NOT_FOUND, "Unknown invoice");
 	}
 
 	details = wallet_invoice_details(cmd, cmd->ld->wallet, i);
@@ -1136,15 +1154,22 @@ static struct command_result *json_delinvoice(struct command *cmd,
 	 * might not make sense if it changed! */
 	actual_status = invoice_status_str(details);
 	if (!streq(actual_status, status)) {
-		return command_fail(cmd, LIGHTNINGD,
-				    "Invoice status is %s not %s",
-				    actual_status, status);
+		struct json_stream *js;
+		js = json_stream_fail(cmd, INVOICE_STATUS_UNEXPECTED,
+				      tal_fmt(tmpctx,
+					      "Invoice status is %s not %s",
+					      actual_status, status));
+		json_add_string(js, "current_status", actual_status);
+		json_add_string(js, "expected_status", status);
+		json_object_end(js);
+		return command_failed(cmd, js);
 	}
 
 	if (!wallet_invoice_delete(wallet, i)) {
 		log_broken(cmd->ld->log,
 			   "Error attempting to remove invoice %"PRIu64,
 			   i.id);
+		/* FIXME: allocate a generic DATABASE_ERROR code.  */
 		return command_fail(cmd, LIGHTNINGD, "Database error");
 	}
 

@@ -82,7 +82,7 @@ struct channel {
 	struct bitcoin_tx *last_tx;
 	enum wallet_tx_type last_tx_type;
 	struct bitcoin_signature last_sig;
-	secp256k1_ecdsa_signature *last_htlc_sigs;
+	const struct bitcoin_signature *last_htlc_sigs;
 
 	/* Keys for channel */
 	struct channel_info channel_info;
@@ -131,6 +131,9 @@ struct channel {
 	/* Was this negotiated with `option_static_remotekey? */
 	bool option_static_remotekey;
 
+	/* Was this negotiated with `option_anchor_outputs? */
+	bool option_anchor_outputs;
+
 	/* Any commands trying to forget us. */
 	struct command **forgets;
 };
@@ -163,7 +166,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    struct bitcoin_tx *last_tx STEALS,
 			    const struct bitcoin_signature *last_sig,
 			    /* NULL or stolen */
-			    secp256k1_ecdsa_signature *last_htlc_sigs STEALS,
+			    const struct bitcoin_signature *last_htlc_sigs STEALS,
 			    const struct channel_info *channel_info,
 			    /* NULL or stolen */
 			    u8 *remote_shutdown_scriptpubkey STEALS,
@@ -183,7 +186,8 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    u32 feerate_ppm,
 			    /* NULL or stolen */
 			    const u8 *remote_upfront_shutdown_script STEALS,
-			    bool option_static_remotekey);
+			    bool option_static_remotekey,
+			    bool option_anchor_outputs);
 
 void delete_channel(struct channel *channel STEALS);
 

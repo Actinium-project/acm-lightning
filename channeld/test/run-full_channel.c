@@ -372,6 +372,7 @@ int main(int argc, const char *argv[])
 	struct amount_msat to_local, to_remote;
 	const struct htlc **htlc_map, **htlcs;
 	const u8 *funding_wscript, *funding_wscript_alt;
+	bool option_anchor_outputs = false;
 	size_t i;
 
 	chainparams = chainparams_for_network("bitcoin");
@@ -489,7 +490,7 @@ int main(int argc, const char *argv[])
 				    &localbase, &remotebase,
 				    &local_funding_pubkey,
 				    &remote_funding_pubkey,
-				    false, LOCAL);
+				    false, false, LOCAL);
 	rchannel = new_full_channel(tmpctx,
 				    &funding_txid, funding_output_index, 0,
 				    funding_amount, to_remote,
@@ -500,7 +501,7 @@ int main(int argc, const char *argv[])
 				    &remotebase, &localbase,
 				    &remote_funding_pubkey,
 				    &local_funding_pubkey,
-				    false, REMOTE);
+				    false, false, REMOTE);
 
 	/* BOLT #3:
 	 *
@@ -524,14 +525,17 @@ int main(int argc, const char *argv[])
 
 	raw_tx = commit_tx(tmpctx,
 			   &funding_txid, funding_output_index,
-			   funding_amount, funding_wscript,
+			   funding_amount,
+			   &local_funding_pubkey,
+			   &remote_funding_pubkey,
 			   LOCAL, remote_config->to_self_delay,
 			   &keyset,
 			   feerate_per_kw[LOCAL],
 			   local_config->dust_limit,
 			   to_local,
 			   to_remote,
-			   NULL, &htlc_map, NULL, 0x2bb038521914 ^ 42, LOCAL);
+			   NULL, &htlc_map, NULL, 0x2bb038521914 ^ 42,
+			   option_anchor_outputs, LOCAL);
 
 	txs = channel_txs(tmpctx,
 			  &htlc_map, NULL, &funding_wscript_alt,
@@ -651,10 +655,14 @@ int main(int argc, const char *argv[])
 
 		raw_tx = commit_tx(
 		    tmpctx, &funding_txid, funding_output_index,
-		    funding_amount, funding_wscript, LOCAL, remote_config->to_self_delay,
+		    funding_amount,
+		    &local_funding_pubkey,
+		    &remote_funding_pubkey,
+		    LOCAL, remote_config->to_self_delay,
 		    &keyset, feerate_per_kw[LOCAL], local_config->dust_limit,
 		    to_local, to_remote, htlcs, &htlc_map, NULL,
-		    0x2bb038521914 ^ 42, LOCAL);
+		    0x2bb038521914 ^ 42,
+		    option_anchor_outputs, LOCAL);
 
 		txs = channel_txs(tmpctx, &htlc_map, NULL, &funding_wscript,
 				  lchannel, &local_per_commitment_point, 42,

@@ -19,6 +19,8 @@ struct ripemd160;
  * proofs per input and 35 bytes per output. In addition the explicit fee
  * output will add 9 bytes and the per output overhead as well.
  */
+/* FIXME: This seems to be a generalization of the logic in initial_commit_tx.h
+ * and should be in bitcoin/tx.h */
 static inline size_t elements_add_overhead(size_t weight, size_t incount,
 					   size_t outcount)
 {
@@ -39,28 +41,40 @@ static inline size_t elements_add_overhead(size_t weight, size_t incount,
 	return weight;
 }
 
-static inline struct amount_sat htlc_timeout_fee(u32 feerate_per_kw)
+static inline struct amount_sat htlc_timeout_fee(u32 feerate_per_kw,
+						 bool option_anchor_outputs)
 {
-	/* BOLT #3:
+	/* BOLT-a12da24dd0102c170365124782b46d9710950ac1 #3:
 	 *
 	 * The fee for an HTLC-timeout transaction:
-	 *  - MUST BE calculated to match:
-	 *    1. Multiply `feerate_per_kw` by 663 and divide by 1000 (rounding
-	 *       down).
+	 * - MUST BE calculated to match:
+	 *   1. Multiply `feerate_per_kw` by 663 (666 if `option_anchor_outputs`
+	 *      applies) and divide by 1000 (rounding down).
 	 */
-	return amount_tx_fee(elements_add_overhead(663, 1, 1), feerate_per_kw);
+	u32 base;
+	if (option_anchor_outputs)
+		base = 666;
+	else
+		base = 663;
+	return amount_tx_fee(elements_add_overhead(base, 1, 1), feerate_per_kw);
 }
 
-static inline struct amount_sat htlc_success_fee(u32 feerate_per_kw)
+static inline struct amount_sat htlc_success_fee(u32 feerate_per_kw,
+						 bool option_anchor_outputs)
 {
-	/* BOLT #3:
+	/* BOLT-a12da24dd0102c170365124782b46d9710950ac1 #3:
 	 *
 	 * The fee for an HTLC-success transaction:
-	 *   - MUST BE calculated to match:
-	 *     1. Multiply `feerate_per_kw` by 703 and divide by 1000 (rounding
-	 *     down).
+	 * - MUST BE calculated to match:
+	 *   1. Multiply `feerate_per_kw` by 703 (706 if `option_anchor_outputs`
+	 *      applies) and divide by 1000 (rounding down).
 	 */
-	return amount_tx_fee(elements_add_overhead(703, 1, 1), feerate_per_kw);
+	u32 base;
+	if (option_anchor_outputs)
+		base = 706;
+	else
+		base = 703;
+	return amount_tx_fee(elements_add_overhead(base, 1, 1), feerate_per_kw);
 }
 
 /* Create HTLC-success tx to spend a received HTLC commitment tx
@@ -73,7 +87,8 @@ struct bitcoin_tx *htlc_success_tx(const tal_t *ctx,
 				   struct amount_msat htlc_msatoshi,
 				   u16 to_self_delay,
 				   u32 feerate_per_kw,
-				   const struct keyset *keyset);
+				   const struct keyset *keyset,
+				   bool option_anchor_outputs);
 
 /* Fill in the witness for HTLC-success tx produced above. */
 void htlc_success_tx_add_witness(struct bitcoin_tx *htlc_success,
@@ -83,7 +98,8 @@ void htlc_success_tx_add_witness(struct bitcoin_tx *htlc_success,
 				 const struct bitcoin_signature *localsig,
 				 const struct bitcoin_signature *remotesig,
 				 const struct preimage *payment_preimage,
-				 const struct pubkey *revocationkey);
+				 const struct pubkey *revocationkey,
+				 bool option_anchor_outputs);
 
 /* Create HTLC-timeout tx to spend an offered HTLC commitment tx
  * output; doesn't fill in input witness. */
@@ -96,7 +112,8 @@ struct bitcoin_tx *htlc_timeout_tx(const tal_t *ctx,
 				   u32 cltv_expiry,
 				   u16 to_self_delay,
 				   u32 feerate_per_kw,
-				   const struct keyset *keyset);
+				   const struct keyset *keyset,
+				   bool option_anchor_outputs);
 
 /* Fill in the witness for HTLC-timeout tx produced above. */
 void htlc_timeout_tx_add_witness(struct bitcoin_tx *htlc_timeout,
@@ -105,7 +122,8 @@ void htlc_timeout_tx_add_witness(struct bitcoin_tx *htlc_timeout,
 				 const struct sha256 *payment_hash,
 				 const struct pubkey *revocationkey,
 				 const struct bitcoin_signature *localsig,
-				 const struct bitcoin_signature *remotesig);
+				 const struct bitcoin_signature *remotesig,
+				 bool option_anchor_outputs);
 
 
 /* Generate the witness script for an HTLC the other side offered:
@@ -113,12 +131,14 @@ void htlc_timeout_tx_add_witness(struct bitcoin_tx *htlc_timeout,
 u8 *htlc_received_wscript(const tal_t *ctx,
 			  const struct ripemd160 *ripemd,
 			  const struct abs_locktime *expiry,
-			  const struct keyset *keyset);
+			  const struct keyset *keyset,
+			  bool option_anchor_outputs);
 
 /* Generate the witness script for an HTLC this side offered:
  * scriptpubkey_p2wsh(ctx, wscript) gives the scriptpubkey */
 u8 *htlc_offered_wscript(const tal_t *ctx,
 			 const struct ripemd160 *ripemd,
-			 const struct keyset *keyset);
+			 const struct keyset *keyset,
+			 bool option_anchor_outputs);
 
 #endif /* LIGHTNING_COMMON_HTLC_TX_H */

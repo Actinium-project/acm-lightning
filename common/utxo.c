@@ -21,8 +21,6 @@ void towire_utxo(u8 **pptr, const struct utxo *utxo)
 
 	towire_u16(pptr, tal_count(utxo->scriptPubkey));
 	towire_u8_array(pptr, utxo->scriptPubkey, tal_count(utxo->scriptPubkey));
-	towire_u16(pptr, tal_count(utxo->scriptSig));
-	towire_u8_array(pptr, utxo->scriptSig, tal_count(utxo->scriptSig));
 
 	towire_bool(pptr, is_unilateral_close);
 	if (is_unilateral_close) {
@@ -31,6 +29,7 @@ void towire_utxo(u8 **pptr, const struct utxo *utxo)
 		towire_bool(pptr, utxo->close_info->commitment_point != NULL);
 		if (utxo->close_info->commitment_point)
 			towire_pubkey(pptr, utxo->close_info->commitment_point);
+		towire_bool(pptr, utxo->close_info->option_anchor_outputs);
 	}
 }
 
@@ -45,7 +44,6 @@ struct utxo *fromwire_utxo(const tal_t *ctx, const u8 **ptr, size_t *max)
 	utxo->is_p2sh = fromwire_bool(ptr, max);
 
 	utxo->scriptPubkey = fromwire_tal_arrn(utxo, ptr, max, fromwire_u16(ptr, max));
-	utxo->scriptSig = fromwire_tal_arrn(utxo, ptr, max, fromwire_u16(ptr, max));
 
 	if (fromwire_bool(ptr, max)) {
 		utxo->close_info = tal(utxo, struct unilateral_close_info);
@@ -58,6 +56,8 @@ struct utxo *fromwire_utxo(const tal_t *ctx, const u8 **ptr, size_t *max)
 					utxo->close_info->commitment_point);
 		} else
 			utxo->close_info->commitment_point = NULL;
+		utxo->close_info->option_anchor_outputs
+			= fromwire_bool(ptr, max);
 	} else {
 		utxo->close_info = NULL;
 	}
@@ -74,40 +74,47 @@ struct bitcoin_tx *tx_spending_utxos(const tal_t *ctx,
 				     u32 nsequence)
 {
 	struct pubkey key;
-	u8 *scriptSig, *scriptPubkey, *redeemscript;
+	u8 *scriptSig, *redeemscript;
 
-	assert(num_output);
 	size_t outcount = add_change_output ? 1 + num_output : num_output;
 	struct bitcoin_tx *tx = bitcoin_tx(ctx, chainparams, tal_count(utxos),
 					   outcount, nlocktime);
 
 	for (size_t i = 0; i < tal_count(utxos); i++) {
+		u32 this_nsequence;
 		if (utxos[i]->is_p2sh && bip32_base) {
 			bip32_pubkey(bip32_base, &key, utxos[i]->keyindex);
-			scriptSig = bitcoin_scriptsig_p2sh_p2wpkh(tmpctx, &key);
-			redeemscript = bitcoin_redeem_p2sh_p2wpkh(tmpctx, &key);
-			scriptPubkey = scriptpubkey_p2sh(tmpctx, redeemscript);
+			scriptSig =
+				bitcoin_scriptsig_p2sh_p2wpkh(tmpctx, &key);
+			redeemscript =
+				bitcoin_redeem_p2sh_p2wpkh(tmpctx, &key);
 
-			/* Make sure we've got the right info! */
-			if (utxos[i]->scriptPubkey)
-				assert(memeq(utxos[i]->scriptPubkey,
-					     tal_bytelen(utxos[i]->scriptPubkey),
-					     scriptPubkey, tal_bytelen(scriptPubkey)));
 		} else {
 			scriptSig = NULL;
 			redeemscript = NULL;
-			/* We can't definitively derive the pubkey without
-			 * hitting the HSM, so we don't */
-			scriptPubkey = utxos[i]->scriptPubkey;
 		}
 
-		bitcoin_tx_add_input(tx, &utxos[i]->txid, utxos[i]->outnum,
-				     nsequence, scriptSig, utxos[i]->amount,
-				     scriptPubkey, NULL);
+		/* BOLT-a12da24dd0102c170365124782b46d9710950ac1 #3:
+		 * #### `to_remote` Output
+		 * ...
+		 * The output is spent by a transaction with `nSequence` field
+		 * set to `1` and witness:
+		 */
+		if (utxos[i]->close_info && utxos[i]->close_info->option_anchor_outputs)
+			this_nsequence = 1;
+		else
+			this_nsequence = nsequence;
+
+		bitcoin_tx_add_input(tx, &utxos[i]->txid,
+				     utxos[i]->outnum,
+				     this_nsequence,
+				     scriptSig, utxos[i]->amount,
+				     utxos[i]->scriptPubkey, NULL);
 
 		/* Add redeemscript to the PSBT input */
 		if (redeemscript)
-			psbt_input_set_redeemscript(tx->psbt, i, redeemscript);
+			psbt_input_set_redeemscript(tx->psbt, i,
+						    redeemscript);
 
 	}
 
