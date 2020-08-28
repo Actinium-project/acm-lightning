@@ -3,6 +3,7 @@
 #include <ccan/tal/str/str.h>
 #include <common/json_stream.h>
 #include <common/pseudorand.h>
+#include <common/random_select.h>
 #include <common/type_to_string.h>
 #include <plugins/libplugin-pay.h>
 
@@ -13,6 +14,9 @@ struct payment *payment_new(tal_t *ctx, struct command *cmd,
 			    struct payment_modifier **mods)
 {
 	struct payment *p = tal(ctx, struct payment);
+
+	static u64 next_id = 0;
+
 	p->children = tal_arr(p, struct payment *, 0);
 	p->parent = parent;
 	p->modifiers = mods;
@@ -29,6 +33,7 @@ struct payment *payment_new(tal_t *ctx, struct command *cmd,
 	p->temp_exclusion = NULL;
 	p->failroute_retry = false;
 	p->bolt11 = NULL;
+	p->routetxt = NULL;
 
 	/* Copy over the relevant pieces of information. */
 	if (parent != NULL) {
@@ -46,6 +51,8 @@ struct payment *payment_new(tal_t *ctx, struct command *cmd,
 		p->deadline = parent->deadline;
 
 		p->invoice = parent->invoice;
+		p->id = parent->id;
+		p->local_id = parent->local_id;
 	} else {
 		assert(cmd != NULL);
 		p->partid = 0;
@@ -53,6 +60,9 @@ struct payment *payment_new(tal_t *ctx, struct command *cmd,
 		p->plugin = cmd->plugin;
 		p->channel_hints = tal_arr(p, struct channel_hint, 0);
 		p->excluded_nodes = tal_arr(p, struct node_id, 0);
+		p->id = next_id++;
+		/* Caller must set this.  */
+		p->local_id = NULL;
 	}
 
 	/* Initialize all modifier data so we can point to the fields when
@@ -77,6 +87,59 @@ struct payment *payment_root(struct payment *p)
 		return p;
 	else
 		return payment_root(p->parent);
+}
+
+static void
+paymod_log_header(struct payment *p, const char **type, u64 *id)
+{
+	struct payment *root = payment_root(p);
+	/* We prefer to show the command ID here since it is also known
+	 * by `lightningd`, so in theory it can be used to correlate
+	 * debugging logs between the main `lightningd` and whatever
+	 * plugin is using the paymod system.
+	 * We only fall back to a unique id per root payment if there
+	 * is no command with an id associated with this payment.
+	 */
+	if (root->cmd && root->cmd->id) {
+		*type = "cmd";
+		*id = *root->cmd->id;
+	} else {
+		*type = "id";
+		*id = root->id;
+	}
+}
+
+static void
+paymod_log(struct payment *p, enum log_level l, const char *fmt, ...)
+{
+	const char *type;
+	u64 id;
+	char *txt;
+	va_list ap;
+
+	va_start(ap, fmt);
+	txt = tal_vfmt(tmpctx, fmt, ap);
+	va_end(ap);
+
+	paymod_log_header(p, &type, &id);
+	plugin_log(p->plugin, l, "%s %"PRIu64" partid %"PRIu32": %s",
+		   type, id, p->partid, txt);
+}
+static void
+paymod_err(struct payment *p, const char *fmt, ...)
+{
+	const char *type;
+	u64 id;
+	char *txt;
+	va_list ap;
+
+	va_start(ap, fmt);
+	txt = tal_vfmt(tmpctx, fmt, ap);
+	va_end(ap);
+
+	paymod_log_header(p, &type, &id);
+	plugin_err(p->plugin, "%s %"PRIu64" partid %"PRIu32": %s",
+		   type, id, p->partid, txt);
 }
 
 /* Generic handler for RPC failures that should end up failing the payment. */
@@ -119,8 +182,8 @@ struct payment_tree_result payment_collect_result(struct payment *p)
 		/* Some of our subpayments have succeeded, aggregate how much
 		 * we sent in total. */
 		if (!amount_msat_add(&res.sent, res.sent, cres.sent))
-			plugin_err(
-			    p->plugin,
+			paymod_err(
+			    p,
 			    "Number overflow summing partial payments: %s + %s",
 			    type_to_string(tmpctx, struct amount_msat,
 					   &res.sent),
@@ -161,6 +224,11 @@ static struct command_result *payment_getinfo_success(struct command *cmd,
 void payment_start(struct payment *p)
 {
 	struct payment *root = payment_root(p);
+
+	/* Should have been set in root payment, or propagated from root
+	 * payment to all child payments.  */
+	assert(p->local_id);
+
 	p->step = PAYMENT_STEP_INITIALIZED;
 	p->current_modifier = -1;
 
@@ -201,16 +269,37 @@ static void channel_hints_update(struct payment *p,
 		struct channel_hint *hint = &root->channel_hints[i];
 		if (short_channel_id_eq(&hint->scid.scid, &scid) &&
 		    hint->scid.dir == direction) {
+			bool modified = false;
 			/* Prefer to disable a channel. */
-			hint->enabled = hint->enabled & enabled;
+			if (!enabled && hint->enabled) {
+				hint->enabled = false;
+				modified = true;
+			}
 
 			/* Prefer the more conservative estimate. */
 			if (estimated_capacity != NULL &&
 			    amount_msat_greater(hint->estimated_capacity,
-						*estimated_capacity))
+						*estimated_capacity)) {
 				hint->estimated_capacity = *estimated_capacity;
-			if (htlc_budget != NULL && *htlc_budget < hint->htlc_budget)
+				modified = true;
+			}
+			if (htlc_budget != NULL && *htlc_budget < hint->htlc_budget) {
 				hint->htlc_budget = *htlc_budget;
+				modified = true;
+			}
+
+			if (modified)
+				paymod_log(p, LOG_DBG,
+					   "Updated a channel hint for %s: "
+					   "enabled %s, "
+					   "estimated capacity %s",
+					   type_to_string(tmpctx,
+						struct short_channel_id_dir,
+						&hint->scid),
+					   hint->enabled ? "true" : "false",
+					   type_to_string(tmpctx,
+						struct amount_msat,
+						&hint->estimated_capacity));
 			return;
 		}
 	}
@@ -228,8 +317,8 @@ static void channel_hints_update(struct payment *p,
 
 	tal_arr_expand(&root->channel_hints, hint);
 
-	plugin_log(
-	    root->plugin, LOG_DBG,
+	paymod_log(
+	    p, LOG_DBG,
 	    "Added a channel hint for %s: enabled %s, estimated capacity %s",
 	    type_to_string(tmpctx, struct short_channel_id_dir, &hint.scid),
 	    hint.enabled ? "true" : "false",
@@ -244,7 +333,7 @@ static void payment_exclude_most_expensive(struct payment *p)
 
 	for (size_t i = 0; i < tal_count(p->route)-1; i++) {
 		if (!amount_msat_sub(&fee, p->route[i].amount, p->route[i+1].amount))
-			plugin_err(p->plugin, "Negative fee in a route.");
+			paymod_err(p, "Negative fee in a route.");
 
 		if (amount_msat_greater_eq(fee, worst)) {
 			e = &p->route[i];
@@ -275,8 +364,8 @@ static struct amount_msat payment_route_fee(struct payment *p)
 {
 	struct amount_msat fee;
 	if (!amount_msat_sub(&fee, p->route[0].amount, p->amount)) {
-		plugin_log(
-		    p->plugin,
+		paymod_log(
+		    p,
 		    LOG_BROKEN,
 		    "gossipd returned a route with a negative fee: sending %s "
 		    "to deliver %s",
@@ -353,8 +442,8 @@ static void payment_chanhints_apply_route(struct payment *p, bool remove)
 					 * concurrent getroute calls using the
 					 * same channel_hints, no biggy, it's
 					 * an estimation anyway. */
-					plugin_log(
-					    p->plugin, LOG_UNUSUAL,
+					paymod_log(
+					    p, LOG_UNUSUAL,
 					    "Could not update the channel hint "
 					    "for %s. Could be a concurrent "
 					    "`getroute` call.",
@@ -405,7 +494,7 @@ static struct command_result *payment_getroute_result(struct command *cmd,
 	/* Now update the constraints in fee_budget and cltv_budget so
 	 * modifiers know what constraints they need to adhere to. */
 	if (!payment_constraints_update(&p->constraints, fee, p->route[0].delay)) {
-		plugin_log(p->plugin, LOG_BROKEN,
+		paymod_log(p, LOG_BROKEN,
 			   "Could not update constraints.");
 		abort();
 	}
@@ -523,7 +612,7 @@ static u8 *tal_towire_legacy_payload(const tal_t *ctx, const struct legacy_paylo
 	/* Prepend 0 byte for realm */
 	u8 *buf = tal_arrz(ctx, u8, 1);
 	towire_short_channel_id(&buf, &payload->scid);
-	towire_u64(&buf, payload->forward_amt.millisatoshis); /* Raw: low-level serializer */
+	towire_amount_msat(&buf, payload->forward_amt);
 	towire_u32(&buf, payload->outgoing_cltv);
 	towire(&buf, padding, ARRAY_SIZE(padding));
 	assert(tal_bytelen(buf) == 1 + 32);
@@ -704,13 +793,13 @@ static void report_tampering(struct payment *p,
 	const struct node_id *id = &p->route[report_pos].nodeid;
 
 	if (report_pos == 0) {
-		plugin_log(p->plugin, LOG_UNUSUAL,
+		paymod_log(p, LOG_UNUSUAL,
 			   "Node #%zu (%s) claimed we sent them invalid %s",
 			   report_pos + 1,
 			   type_to_string(tmpctx, struct node_id, id),
 			   style);
 	} else {
-		plugin_log(p->plugin, LOG_UNUSUAL,
+		paymod_log(p, LOG_UNUSUAL,
 			   "Node #%zu (%s) claimed #%zu (%s) sent them invalid %s",
 			   report_pos + 1,
 			   type_to_string(tmpctx, struct node_id, id),
@@ -748,6 +837,29 @@ failure_is_blockheight_disagreement(const struct payment *p,
 	return true;
 }
 
+static char *describe_failcode(const tal_t *ctx, enum onion_type failcode)
+{
+	char *rv = tal_strdup(ctx, "");
+	if (failcode & BADONION) {
+		tal_append_fmt(&rv, "BADONION|");
+		failcode &= ~BADONION;
+	}
+	if (failcode & PERM) {
+		tal_append_fmt(&rv, "PERM|");
+		failcode &= ~PERM;
+	}
+	if (failcode & NODE) {
+		tal_append_fmt(&rv, "NODE|");
+		failcode &= ~NODE;
+	}
+	if (failcode & UPDATE) {
+		tal_append_fmt(&rv, "UPDATE|");
+		failcode &= ~UPDATE;
+	}
+	tal_append_fmt(&rv, "%u", failcode);
+	return rv;
+}
+
 static struct command_result *
 handle_final_failure(struct command *cmd,
 		     struct payment *p,
@@ -760,10 +872,16 @@ handle_final_failure(struct command *cmd,
 	 * otherwise we would set the abort flag too eagerly.
 	 */
 	if (failure_is_blockheight_disagreement(p, &unused)) {
-		plugin_log(p->plugin, LOG_DBG,
+		paymod_log(p, LOG_DBG,
 			   "Blockheight disagreement, not aborting.");
 		goto nonerror;
 	}
+
+	paymod_log(p, LOG_DBG,
+		   "Final node %s reported %04x (%s) on route %s",
+		   type_to_string(tmpctx, struct node_id, final_id),
+		   failcode, onion_type_name(failcode),
+		   p->routetxt);
 
 	/* We use an exhaustive switch statement here so you get a compile
 	 * warning when new ones are added, and can think about where they go */
@@ -834,10 +952,10 @@ handle_final_failure(struct command *cmd,
 	}
 
 strange_error:
-	plugin_log(p->plugin, LOG_UNUSUAL,
-		   "Final node %s reported strange error code %u",
+	paymod_log(p, LOG_UNUSUAL,
+		   "Final node %s reported strange error code %04x (%s)",
 		   type_to_string(tmpctx, struct node_id, final_id),
-		   failcode);
+		   failcode, describe_failcode(tmpctx, failcode));
 
 error:
 	p->result->code = PAY_DESTINATION_PERM_FAIL;
@@ -858,6 +976,14 @@ handle_intermediate_failure(struct command *cmd,
 			    enum onion_type failcode)
 {
 	struct payment *root = payment_root(p);
+
+	paymod_log(p, LOG_DBG,
+		   "Intermediate node %s reported %04x (%s) at %s on route %s",
+		   type_to_string(tmpctx, struct node_id, errnode),
+		   failcode, onion_type_name(failcode),
+		   type_to_string(tmpctx, struct short_channel_id,
+				  &errchan->channel_id),
+		   p->routetxt);
 
 	/* We use an exhaustive switch statement here so you get a compile
 	 * warning when new ones are added, and can think about where they go */
@@ -924,10 +1050,10 @@ handle_intermediate_failure(struct command *cmd,
 	}
 
 strange_error:
-	plugin_log(p->plugin, LOG_UNUSUAL,
-		   "Intermediate node %s reported strange error code %u",
+	paymod_log(p, LOG_UNUSUAL,
+		   "Intermediate node %s reported strange error code %04x (%s)",
 		   type_to_string(tmpctx, struct node_id, errnode),
-		   failcode);
+		   failcode, describe_failcode(tmpctx, failcode));
 
 error:
 	payment_fail(p, "%s", p->result->message);
@@ -988,7 +1114,7 @@ payment_waitsendpay_finished(struct command *cmd, const char *buffer,
 	p->result = tal_sendpay_result_from_json(p, buffer, toks);
 
 	if (p->result == NULL) {
-		plugin_log(p->plugin, LOG_UNUSUAL,
+		paymod_log(p, LOG_UNUSUAL,
 			   "Unable to parse `waitsendpay` result: %.*s",
 			   json_tok_full_len(toks),
 			   json_tok_full(buffer, toks));
@@ -1008,7 +1134,7 @@ payment_waitsendpay_finished(struct command *cmd, const char *buffer,
 	payment_chanhints_apply_route(p, true);
 
 	if (!assign_blame(p, &errnode, &errchan)) {
-		plugin_log(p->plugin, LOG_UNUSUAL,
+		paymod_log(p, LOG_UNUSUAL,
 			   "No erring_index set in `waitsendpay` result: %.*s",
 			   json_tok_full_len(toks),
 			   json_tok_full(buffer, toks));
@@ -1165,6 +1291,8 @@ static void payment_compute_onion_payloads(struct payment *p)
 	struct createonion_request *cr;
 	size_t hopcount;
 	struct payment *root = payment_root(p);
+	char *routetxt = tal_strdup(tmpctx, "");
+
 	p->step = PAYMENT_STEP_ONION_PAYLOAD;
 	hopcount = tal_count(p->route);
 
@@ -1181,12 +1309,23 @@ static void payment_compute_onion_payloads(struct payment *p)
 		 * i+1 */
 		payment_add_hop_onion_payload(p, &cr->hops[i], &p->route[i],
 					      &p->route[i + 1], false, NULL);
+		tal_append_fmt(&routetxt, "%s -> ",
+			       type_to_string(tmpctx, struct short_channel_id,
+					      &p->route[i].channel_id));
 	}
 
 	/* Final hop */
 	payment_add_hop_onion_payload(
 	    p, &cr->hops[hopcount - 1], &p->route[hopcount - 1],
 	    &p->route[hopcount - 1], true, root->payment_secret);
+	tal_append_fmt(&routetxt, "%s",
+		       type_to_string(tmpctx, struct short_channel_id,
+				      &p->route[hopcount - 1].channel_id));
+
+	paymod_log(p, LOG_DBG,
+		   "Created outgoing onion for route: %s", routetxt);
+
+	p->routetxt = tal_steal(p, routetxt);
 
 	/* Now allow all the modifiers to mess with the payloads, before we
 	 * serialize via a call to createonion in the next step. */
@@ -1525,7 +1664,7 @@ void payment_fail(struct payment *p, const char *fmt, ...)
 	p->failreason = tal_vfmt(p, fmt, ap);
 	va_end(ap);
 
-	plugin_log(p->plugin, LOG_INFORM, "%s", p->failreason);
+	paymod_log(p, LOG_INFORM, "%s", p->failreason);
 
 	payment_continue(p);
 }
@@ -1633,8 +1772,8 @@ static inline void retry_step_cb(struct retry_mod_data *rd,
 		return payment_continue(p);
 
 	if (time_after(now, p->deadline)) {
-		plugin_log(
-		    p->plugin, LOG_INFORM,
+		paymod_log(
+		    p, LOG_INFORM,
 		    "Payment deadline expired, not retrying (partial-)payment "
 		    "%s/%d",
 		    type_to_string(tmpctx, struct sha256, p->payment_hash),
@@ -1663,8 +1802,8 @@ static inline void retry_step_cb(struct retry_mod_data *rd,
 		subpayment->why =
 		    tal_fmt(subpayment, "Still have %d attempts left",
 			    rdata->retries - 1);
-		plugin_log(
-		    p->plugin, LOG_DBG,
+		paymod_log(
+		    p, LOG_DBG,
 		    "Retrying %s/%d (%s), new partid %d. %d attempts left\n",
 		    type_to_string(tmpctx, struct sha256, p->payment_hash),
 		    p->partid,
@@ -1883,8 +2022,8 @@ static struct route_info *next_routehint(struct routehints_data *d,
 	 *     - MUST specify the most-preferred field first, followed
 	 *       by less-preferred fields, in order.
 	 */
-	for (; d->offset <numhints; d->offset++) {
-		curr = d->routehints[d->offset];
+	for (; d->offset < numhints; d->offset++) {
+		curr = d->routehints[(d->base + d->offset) % numhints];
 		if (curr == NULL || !routehint_excluded(p, curr))
 			return curr;
 	}
@@ -1990,8 +2129,8 @@ static void routehint_pre_getroute(struct routehints_data *d, struct payment *p)
 		p->getroute->cltv =
 		    route_cltv(p->getroute->cltv, d->current_routehint,
 			       tal_count(d->current_routehint));
-		plugin_log(
-		    p->plugin, LOG_DBG, "Using routehint %s (%s) cltv_delta=%d",
+		paymod_log(
+		    p, LOG_DBG, "Using routehint %s (%s) cltv_delta=%d",
 		    type_to_string(tmpctx, struct node_id,
 				   &d->current_routehint->pubkey),
 		    type_to_string(tmpctx, struct short_channel_id,
@@ -2002,7 +2141,7 @@ static void routehint_pre_getroute(struct routehints_data *d, struct payment *p)
 		 * going through the destination to the entrypoint. */
 		p->temp_exclusion = routehint_generate_exclusion_list(p, d->current_routehint, p);
 	} else
-		plugin_log(p->plugin, LOG_DBG, "Not using a routehint");
+		paymod_log(p, LOG_DBG, "Not using a routehint");
 }
 
 static struct command_result *routehint_getroute_result(struct command *cmd,
@@ -2023,7 +2162,7 @@ static struct command_result *routehint_getroute_result(struct command *cmd,
 
 	routehint_pre_getroute(d, p);
 
-	plugin_log(p->plugin, LOG_DBG,
+	paymod_log(p, LOG_DBG,
 		   "The destination is%s directly reachable %s attempts "
 		   "without routehints",
 		   d->destination_reachable ? "" : " not",
@@ -2051,7 +2190,7 @@ static void routehint_check_reachable(struct payment *p)
 	json_add_num(req->js, "maxhops", 20);
 	json_add_num(req->js, "riskfactor", 10);
 	send_outreq(p->plugin, req);
-	plugin_log(p->plugin, LOG_DBG,
+	paymod_log(p, LOG_DBG,
 		   "Asking gossipd whether %s is reachable "
 		   "without routehints.",
 		   type_to_string(tmpctx, struct node_id, p->destination));
@@ -2073,7 +2212,7 @@ static void routehint_step_cb(struct routehints_data *d, struct payment *p)
 			d->routehints = filter_routehints(d, p->local_id,
 							  p->invoice->routes);
 
-			plugin_log(p->plugin, LOG_DBG,
+			paymod_log(p, LOG_DBG,
 				   "After filtering routehints we're left with "
 				   "%zu usable hints",
 				   tal_count(d->routehints));
@@ -2131,18 +2270,50 @@ static struct routehints_data *routehint_data_init(struct payment *p)
 		d->routehints = pd->routehints;
 		pd = payment_mod_routehints_get_data(p->parent);
 		if (p->parent->step == PAYMENT_STEP_RETRY) {
+			d->base = pd->base;
 			d->offset = pd->offset;
 			/* If the previous try failed to route, advance
 			 * to the next routehint.  */
 			if (!p->parent->route)
 				++d->offset;
-		} else
+		} else {
+			size_t num_routehints = tal_count(d->routehints);
 			d->offset = 0;
+			/* This used to be pseudorand.
+			 *
+			 * However, it turns out that using the partid for
+			 * this payment has some nice properties.
+			 * The partid is in general quite random, due to
+			 * getting entropy from the network on the timing
+			 * of when payments complete/fail, and the routehint
+			 * randomization is not a privacy or security feature,
+			 * only a reliability one, thus does not need a lot
+			 * of entropy.
+			 *
+			 * But the most important bit is that *splits get
+			 * contiguous partids*, e.g. a presplit into 4 will
+			 * usually be numbered 2,3,4,5, and an adaptive split
+			 * will get two consecutive partid.
+			 * Because of the contiguity, using the partid for
+			 * the base will cause the split-up payments to
+			 * have fairly diverse initial routehints.
+			 *
+			 * The special-casing for <= 2 and the - 2 is due
+			 * to the presplitter skipping over partid 1, we want
+			 * the starting splits to have partid 2 start at
+			 * base 0.
+			 */
+			if (p->partid <= 2 || num_routehints <= 1)
+				d->base = 0;
+			else
+				d->base = (p->partid - 2) % num_routehints;
+		}
 		return d;
 	} else {
 		/* We defer the actual initialization of the routehints array to
 		 * the step callback when we have the invoice attached. */
 		d->routehints = NULL;
+		d->base = 0;
 		d->offset = 0;
 		return d;
 	}
@@ -2176,8 +2347,8 @@ static void exemptfee_cb(struct exemptfee_data *d, struct payment *p)
 		return payment_continue(p);
 
 	if (amount_msat_greater_eq(d->amount, p->constraints.fee_budget)) {
-		plugin_log(
-		    p->plugin, LOG_INFORM,
+		paymod_log(
+		    p, LOG_INFORM,
 		    "Payment fee constraint %s is below exemption threshold, "
 		    "allowing a maximum fee of %s",
 		    type_to_string(tmpctx, struct amount_msat, &p->constraints.fee_budget),
@@ -2251,12 +2422,11 @@ static struct command_result *shadow_route_listchannels(struct command *cmd,
 					       const jsmntok_t *result,
 					       struct payment *p)
 {
-	/* Use reservoir sampling across the capable channels. */
 	struct shadow_route_data *d = payment_mod_shadowroute_get_data(p);
 	struct payment_constraints *cons = &d->constraints;
 	struct route_info *best = NULL;
+	double total_weight = 0.0;
 	size_t i;
-	u64 sample = 0;
 	struct amount_msat best_fee;
 	const jsmntok_t *sattok, *delaytok, *basefeetok, *propfeetok, *desttok,
 		*channelstok, *chan, *scidtok;
@@ -2268,7 +2438,6 @@ static struct command_result *shadow_route_listchannels(struct command *cmd,
 
 	channelstok = json_get_member(buf, result, "channels");
 	json_for_each_arr(i, chan, channelstok) {
-		u64 v = pseudorand(UINT64_MAX);
 		struct route_info curr;
 		struct amount_sat capacity;
 		struct amount_msat fee;
@@ -2295,28 +2464,27 @@ static struct command_result *shadow_route_listchannels(struct command *cmd,
 		json_to_sat(buf, sattok, &capacity);
 		json_to_node_id(buf, desttok, &curr.pubkey);
 
-		if (!best || v > sample) {
-			/* If the capacity is insufficient to pass the amount
-			 * it's not a plausible extension. */
-			if (amount_msat_greater_sat(p->amount, capacity))
-				continue;
+		/* If the capacity is insufficient to pass the amount
+		 * it's not a plausible extension. */
+		if (amount_msat_greater_sat(p->amount, capacity))
+			continue;
 
-			if (curr.cltv_expiry_delta > cons->cltv_budget)
-				continue;
+		if (curr.cltv_expiry_delta > cons->cltv_budget)
+			continue;
 
-			if (!amount_msat_fee(
-				&fee, p->amount, curr.fee_base_msat,
-				curr.fee_proportional_millionths)) {
-				/* Fee computation failed... */
-				continue;
-			}
+		if (!amount_msat_fee(
+			    &fee, p->amount, curr.fee_base_msat,
+			    curr.fee_proportional_millionths)) {
+			/* Fee computation failed... */
+			continue;
+		}
 
-			if (amount_msat_greater_eq(fee, cons->fee_budget))
-				continue;
+		if (amount_msat_greater_eq(fee, cons->fee_budget))
+			continue;
 
+		if (random_select(1.0, &total_weight)) {
 			best = tal_dup(tmpctx, struct route_info, &curr);
 			best_fee = fee;
-			sample = v;
 		}
 	}
 
@@ -2343,8 +2511,8 @@ static struct command_result *shadow_route_listchannels(struct command *cmd,
 		}
 
 		/* Now we can be sure that adding the shadow route will succeed */
-		plugin_log(
-		    p->plugin, LOG_DBG,
+		paymod_log(
+		    p, LOG_DBG,
 		    "Adding shadow_route hop over channel %s: adding %s "
 		    "in fees and %d CLTV delta",
 		    type_to_string(tmpctx, struct short_channel_id,
@@ -2368,7 +2536,7 @@ static struct command_result *shadow_route_listchannels(struct command *cmd,
 				     d->constraints.fee_budget, best_fee) ||
 		    !amount_msat_sub(&p->constraints.fee_budget,
 				     p->constraints.fee_budget, best_fee))
-			plugin_err(p->plugin,
+			paymod_err(p,
 				   "Could not update fee constraints "
 				   "for shadow route extension. "
 				   "payment fee budget %s, modifier "
@@ -2455,7 +2623,7 @@ static void direct_pay_override(struct payment *p) {
 		p->route[0].direction = hint->scid.dir;
 		p->route[0].nodeid = *p->destination;
 		p->route[0].style = ROUTE_HOP_TLV;
-		plugin_log(p->plugin, LOG_DBG,
+		paymod_log(p, LOG_DBG,
 			   "Found a direct channel (%s) with sufficient "
 			   "capacity, skipping route computation.",
 			   type_to_string(tmpctx, struct short_channel_id_dir,
@@ -2539,6 +2707,9 @@ static struct command_result *waitblockheight_rpc_cb(struct command *cmd,
 	payment_set_step(p, PAYMENT_STEP_RETRY);
 	subpayment->why =
 		tal_fmt(subpayment, "Retrying after waiting for blockchain sync.");
+	paymod_log(p, LOG_DBG,
+		   "Retrying after waitblockheight, new partid %"PRIu32,
+		   subpayment->partid);
 	payment_continue(p);
 	return command_still_pending(cmd);
 }
@@ -2565,7 +2736,7 @@ static void waitblockheight_cb(void *d, struct payment *p)
 	if (!failure_is_blockheight_disagreement(p, &blockheight))
 		return payment_continue(p);
 
-	plugin_log(p->plugin, LOG_INFORM,
+	paymod_log(p, LOG_INFORM,
 		   "Remote node appears to be on a longer chain, which causes "
 		   "CLTV timeouts to be incorrect. Waiting up to %" PRIu64
 		   " seconds to catch up to block %d before retrying.",
@@ -2622,6 +2793,12 @@ REGISTER_PAYMENT_MODIFIER(waitblockheight, void *, NULL, waitblockheight_cb);
  */
 #define MPP_TARGET_SIZE (10 * 1000 * 1000)
 #define PRESPLIT_MAX_HTLC_SHARE 3
+
+/* How many parts do we split into before we increase the bucket size. This is
+ * a tradeoff between the number of payments whose parts are identical and the
+ * number of concurrent HTLCs. The larger this amount the more HTLCs we may
+ * end up starting, but the more payments result in the same part sizes.*/
+#define PRESPLIT_MAX_SPLITS 16
 
 static struct presplit_mod_data *presplit_mod_data_init(struct payment *p)
 {
@@ -2697,6 +2874,17 @@ static void presplit_cb(struct presplit_mod_data *d, struct payment *p)
 		size_t count = 0;
 		u32 htlcs = payment_max_htlcs(p) / PRESPLIT_MAX_HTLC_SHARE;
 		struct amount_msat target, amt = p->amount;
+		char *partids = tal_strdup(tmpctx, "");
+		u64 target_amount = MPP_TARGET_SIZE;
+
+		/* We aim for at most PRESPLIT_MAX_SPLITS parts, even for
+		 * large values. To achieve this we take the base amount and
+		 * multiply it by the number of targetted parts until the
+		 * total amount divided by part amount gives us at most that
+		 * number of parts. */
+		while (amount_msat_less(amount_msat(target_amount * PRESPLIT_MAX_SPLITS),
+					p->amount))
+			target_amount *= PRESPLIT_MAX_SPLITS;
 
 		/* We need to opt-in to the MPP sending facility no matter
 		 * what we do. That means setting all partids to a non-zero
@@ -2714,10 +2902,10 @@ static void presplit_cb(struct presplit_mod_data *d, struct payment *p)
 			return payment_fail(
 			    p, "Cannot attempt payment, we have no channel to "
 			       "which we can add an HTLC");
-		} else if (p->amount.millisatoshis / MPP_TARGET_SIZE > htlcs) /* Raw: division */
-			target.millisatoshis = p->amount.millisatoshis / htlcs; /* Raw: division */
+		} else if (p->amount.millisatoshis / target_amount > htlcs) /* Raw: division */
+			target = amount_msat_div(p->amount, htlcs);
 		else
-			target = AMOUNT_MSAT(MPP_TARGET_SIZE);
+			target = amount_msat(target_amount);
 
 		/* If we are already below the target size don't split it
 		 * either. */
@@ -2742,8 +2930,8 @@ static void presplit_cb(struct presplit_mod_data *d, struct payment *p)
 			c->amount = fuzzed_near(target, amt);
 
 			if (!amount_msat_sub(&amt, amt, c->amount))
-				plugin_err(
-				    p->plugin,
+				paymod_err(
+				    p,
 				    "Cannot subtract %s from %s in splitter",
 				    type_to_string(tmpctx, struct amount_msat,
 						   &c->amount),
@@ -2758,6 +2946,15 @@ static void presplit_cb(struct presplit_mod_data *d, struct payment *p)
 					       multiplier))
 				abort(); /* multiplier < 1! */
 			payment_start(c);
+			/* Why the wordy "new partid n" that we repeat for
+			 * each payment?
+			 * So that you can search the logs for the
+			 * creation of a partid by just "new partid n".
+			 */
+			if (count == 0)
+				tal_append_fmt(&partids, "new partid %"PRIu32, c->partid);
+			else
+				tal_append_fmt(&partids, ", new partid %"PRIu32, c->partid);
 			count++;
 		}
 
@@ -2769,7 +2966,7 @@ static void presplit_cb(struct presplit_mod_data *d, struct payment *p)
 		    count,
 		    type_to_string(tmpctx, struct amount_msat, &root->amount),
 		    type_to_string(tmpctx, struct amount_msat, &target));
-		plugin_log(p->plugin, LOG_INFORM, "%s", p->why);
+		paymod_log(p, LOG_INFORM, "%s: %s", p->why, partids);
 	}
 	payment_continue(p);
 }
@@ -2896,11 +3093,22 @@ static void adaptive_splitter_cb(struct adaptive_split_mod_data *d, struct payme
 			payment_start(a);
 			payment_start(b);
 
+			paymod_log(p, LOG_DBG,
+				   "Adaptively split into 2 sub-payments: "
+				   "new partid %"PRIu32" (%s), "
+				   "new partid %"PRIu32" (%s)",
+				   a->partid,
+				   type_to_string(tmpctx, struct amount_msat,
+						  &a->amount),
+				   b->partid,
+				   type_to_string(tmpctx, struct amount_msat,
+						  &b->amount));
+
 			/* Take note that we now have an additional split that
 			 * may end up using an HTLC. */
 			root_data->htlc_budget--;
 		} else {
-			plugin_log(p->plugin, LOG_INFORM,
+			paymod_log(p, LOG_INFORM,
 				   "Lower limit of adaptive splitter reached "
 				   "(%s < %s), not splitting further.",
 				   type_to_string(tmpctx, struct amount_msat,

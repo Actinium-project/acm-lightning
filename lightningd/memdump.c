@@ -10,10 +10,10 @@
 #include <common/memleak.h>
 #include <common/param.h>
 #include <common/timeout.h>
-#include <connectd/gen_connect_wire.h>
+#include <connectd/connectd_wiregen.h>
 #include <errno.h>
-#include <gossipd/gen_gossip_wire.h>
-#include <hsmd/gen_hsm_wire.h>
+#include <gossipd/gossipd_wiregen.h>
+#include <hsmd/hsmd_wiregen.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/lightningd.h>
@@ -227,7 +227,7 @@ static void gossip_dev_memleak_done(struct subd *gossipd,
 {
 	bool found_leak;
 
-	if (!fromwire_gossip_dev_memleak_reply(reply, &found_leak)) {
+	if (!fromwire_gossipd_dev_memleak_reply(reply, &found_leak)) {
 		was_pending(command_fail(cmd, LIGHTNINGD,
 					 "Bad gossip_dev_memleak"));
 		return;
@@ -243,7 +243,7 @@ static void connect_dev_memleak_done(struct subd *connectd,
 {
 	bool found_leak;
 
-	if (!fromwire_connect_dev_memleak_reply(reply, &found_leak)) {
+	if (!fromwire_connectd_dev_memleak_reply(reply, &found_leak)) {
 		was_pending(command_fail(cmd, LIGHTNINGD,
 					 "Bad connect_dev_memleak"));
 		return;
@@ -265,7 +265,7 @@ static void hsm_dev_memleak_done(struct subd *hsmd,
 	struct lightningd *ld = cmd->ld;
 	bool found_leak;
 
-	if (!fromwire_hsm_dev_memleak_reply(reply, &found_leak)) {
+	if (!fromwire_hsmd_dev_memleak_reply(reply, &found_leak)) {
 		was_pending(command_fail(cmd, LIGHTNINGD,
 					 "Bad hsm_dev_memleak"));
 		return;
@@ -277,7 +277,7 @@ static void hsm_dev_memleak_done(struct subd *hsmd,
 	}
 
 	/* No leak?  Ask gossipd. */
-	subd_req(ld->gossip, ld->gossip, take(towire_gossip_dev_memleak(NULL)),
+	subd_req(ld->gossip, ld->gossip, take(towire_gossipd_dev_memleak(NULL)),
 		 -1, 0, gossip_dev_memleak_done, cmd);
 }
 
@@ -287,7 +287,7 @@ void peer_memleak_done(struct command *cmd, struct subd *leaker)
 		report_leak_info(cmd, leaker);
 	else {
 		/* No leak there, try hsmd (we talk to hsm sync) */
-		u8 *msg = towire_hsm_dev_memleak(NULL);
+		u8 *msg = towire_hsmd_dev_memleak(NULL);
 		if (!wire_sync_write(cmd->ld->hsm_fd, take(msg)))
 			fatal("Could not write to HSM: %s", strerror(errno));
 
@@ -324,7 +324,7 @@ static struct command_result *json_memleak(struct command *cmd,
 
 	/* Start by asking connectd, which is always async. */
 	subd_req(ld->connectd, ld->connectd,
-		 take(towire_connect_dev_memleak(NULL)),
+		 take(towire_connectd_dev_memleak(NULL)),
 		 -1, 0, connect_dev_memleak_done, cmd);
 
 	return command_still_pending(cmd);

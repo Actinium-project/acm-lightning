@@ -24,7 +24,7 @@ CCANDIR := ccan
 
 # Where we keep the BOLT RFCs
 BOLTDIR := ../lightning-rfc/
-BOLTVERSION := 9e8e29af9b9a922eb114b2c716205d0772946e56
+BOLTVERSION := 7e8c478aef0d23a445845b7d297b0e804583697c
 
 -include config.vars
 
@@ -32,7 +32,7 @@ SORT=LC_ALL=C sort
 
 
 ifeq ($V,1)
-VERBOSE = $(ECHO) $(2); $(2)
+VERBOSE = $(ECHO) '$(2)'; $(2)
 else
 VERBOSE = $(ECHO) $(1); $(2)
 endif
@@ -205,7 +205,7 @@ BOLT_DEPS := $(BOLT_GEN)
 ALL_PROGRAMS =
 
 CPPFLAGS += -DBINTOPKGLIBEXECDIR="\"$(shell sh tools/rel.sh $(bindir) $(pkglibexecdir))\""
-CFLAGS = $(CPPFLAGS) $(CWARNFLAGS) $(CDEBUGFLAGS) $(COPTFLAGS) -I $(CCANDIR) $(EXTERNAL_INCLUDE_FLAGS) -I . -I/usr/local/include $(FEATURES) $(COVFLAGS) $(DEV_CFLAGS) -DSHACHAIN_BITS=48 -DJSMN_PARENT_LINKS $(PIE_CFLAGS) $(COMPAT_CFLAGS) -DBUILD_ELEMENTS=1
+CFLAGS = $(CPPFLAGS) $(CWARNFLAGS) $(CDEBUGFLAGS) $(COPTFLAGS) -I $(CCANDIR) $(EXTERNAL_INCLUDE_FLAGS) -I . -I/usr/local/include $(POSTGRES_INCLUDE) $(FEATURES) $(COVFLAGS) $(DEV_CFLAGS) -DSHACHAIN_BITS=48 -DJSMN_PARENT_LINKS $(PIE_CFLAGS) $(COMPAT_CFLAGS) -DBUILD_ELEMENTS=1
 # If CFLAGS is already set in the environment of make (to whatever value, it
 # does not matter) then it would export it to subprocesses with the above value
 # we set, including CWARNFLAGS which by default contains -Wall -Werror. This
@@ -233,7 +233,7 @@ endif
 
 default: show-flags all-programs all-test-programs doc-all
 
-show-flags:
+show-flags: config.vars
 	@$(ECHO) "CC: $(CC) $(CFLAGS) -c -o"
 	@$(ECHO) "LD: $(LINK.o) $(filter-out %.a,$^) $(LOADLIBES) $(EXTERNAL_LDLIBS) $(LDLIBS) -o"
 
@@ -246,6 +246,13 @@ config.vars:
 
 %.o: %.c
 	@$(call VERBOSE, "cc $<", $(CC) $(CFLAGS) -c -o $@ $<)
+
+# generate-wire.py --page [header|impl] hdrfilename wirename < csv > file
+%_wiregen.h: %_wire.csv
+	@if $(CHANGED_FROM_GIT); then $(call VERBOSE,"wiregen $@",tools/generate-wire.py --page header $($@_args) $@ `basename $< .csv` < $< > $@); fi
+
+%_wiregen.c: %_wire.csv
+	@if $(CHANGED_FROM_GIT); then $(call VERBOSE,"wiregen $@",tools/generate-wire.py --page impl $($@_args) ${@:.c=.h} `basename $< .csv` < $< > $@); fi
 
 include external/Makefile
 include bitcoin/Makefile
@@ -276,7 +283,8 @@ gen_list_of_builtin_plugins.h : plugins/Makefile Makefile
 	@echo '};' >> $@
 
 # Git doesn't maintain timestamps, so we only regen if git says we should.
-CHANGED_FROM_GIT = [ x"`git log $@ | head -n1`" != x"`git log $< | head -n1`" -o x"`git diff $<`" != x"" ]
+# If neither is in git, we generate (note: one combines stderr, one discards)
+CHANGED_FROM_GIT = [ x"`git log $@ 2>&1 | head -n1`" != x"`git log $< 2>/dev/null | head -n1`" -o x"`git diff $<`" != x"" ]
 
 ifneq ($(TEST_GROUP_COUNT),)
 PYTEST_OPTS += --test-group=$(TEST_GROUP) --test-group-count=$(TEST_GROUP_COUNT)

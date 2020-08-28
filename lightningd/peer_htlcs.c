@@ -5,7 +5,7 @@
 #include <ccan/crypto/ripemd160/ripemd160.h>
 #include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
-#include <channeld/gen_channel_wire.h>
+#include <channeld/channeld_wiregen.h>
 #include <common/blinding.h>
 #include <common/coin_mvt.h>
 #include <common/ecdh.h>
@@ -19,8 +19,7 @@
 #include <common/sphinx.h>
 #include <common/timeout.h>
 #include <common/utils.h>
-#include <gossipd/gen_gossip_wire.h>
-#include <hsmd/gen_hsm_wire.h>
+#include <gossipd/gossipd_wiregen.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/coin_mvts.h>
 #include <lightningd/htlc_end.h>
@@ -35,8 +34,7 @@
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/plugin_hook.h>
 #include <lightningd/subd.h>
-#include <onchaind/gen_onchain_wire.h>
-#include <onchaind/onchain_wire.h>
+#include <onchaind/onchaind_wiregen.h>
 #include <wallet/wallet.h>
 #include <wire/gen_onion_wire.h>
 #include <wire/wire_sync.h>
@@ -147,7 +145,7 @@ static void tell_channeld_htlc_failed(const struct htlc_in *hin,
 		return;
 
 	subd_send_msg(hin->key.channel->owner,
-		      take(towire_channel_fail_htlc(NULL, failed_htlc)));
+		      take(towire_channeld_fail_htlc(NULL, failed_htlc)));
 }
 
 struct failmsg_update_cbdata {
@@ -165,7 +163,7 @@ static void failmsg_update_reply(struct subd *gossipd,
 	struct failed_htlc *failed_htlc;
 
 	/* This can happen because channel never got properly announced.*/
-	if (!fromwire_gossip_get_stripped_cupdate_reply(msg, msg,
+	if (!fromwire_gossipd_get_stripped_cupdate_reply(msg, msg,
 							&stripped_update)
 	    || !tal_count(stripped_update)) {
 		failmsg = towire_temporary_node_failure(NULL);
@@ -278,7 +276,7 @@ void local_fail_in_htlc_needs_update(struct htlc_in *hin,
 	cbdata->failmsg_needs_update
 		= tal_dup_talarr(cbdata, u8, failmsg_needs_update);
 	subd_req(cbdata, hin->key.channel->peer->ld->gossip,
-		 take(towire_gossip_get_stripped_cupdate(NULL, failmsg_scid)),
+		 take(towire_gossipd_get_stripped_cupdate(NULL, failmsg_scid)),
 		 -1, 0, failmsg_update_reply, cbdata);
 }
 
@@ -429,12 +427,12 @@ void fulfill_htlc(struct htlc_in *hin, const struct preimage *preimage)
 	}
 
 	if (channel_on_chain(channel)) {
-		msg = towire_onchain_known_preimage(hin, preimage, false);
+		msg = towire_onchaind_known_preimage(hin, preimage, false);
 	} else {
 		struct fulfilled_htlc fulfilled_htlc;
 		fulfilled_htlc.id = hin->key.id;
 		fulfilled_htlc.payment_preimage = *preimage;
-		msg = towire_channel_fulfill_htlc(hin, &fulfilled_htlc);
+		msg = towire_channeld_fulfill_htlc(hin, &fulfilled_htlc);
 	}
 	subd_send_msg(channel->owner, take(msg));
 }
@@ -543,7 +541,7 @@ static void rcvd_htlc_reply(struct subd *subd, const u8 *msg, const int *fds UNU
 	char *failurestr;
 	struct lightningd *ld = subd->ld;
 
-	if (!fromwire_channel_offer_htlc_reply(msg, msg,
+	if (!fromwire_channeld_offer_htlc_reply(msg, msg,
 					       &hout->key.id,
 					       &failmsg,
 					       &failurestr)) {
@@ -664,7 +662,7 @@ const u8 *send_htlc_out(const tal_t *ctx,
 						 out, time_from_sec(30),
 						 htlc_offer_timeout,
 						 out);
-	msg = towire_channel_offer_htlc(out, amount, cltv, payment_hash,
+	msg = towire_channeld_offer_htlc(out, amount, cltv, payment_hash,
 					onion_routing_packet, blinding);
 	subd_req(out->peer->ld, out->owner, take(msg), -1, 0, rcvd_htlc_reply,
 		 *houtp);
@@ -1706,7 +1704,7 @@ void peer_sending_commitsig(struct channel *channel, const u8 *msg)
 
 	channel->htlc_timeout = tal_free(channel->htlc_timeout);
 
-	if (!fromwire_channel_sending_commitsig(msg, msg,
+	if (!fromwire_channeld_sending_commitsig(msg, msg,
 						&commitnum,
 						&pbase,
 						&fee_states,
@@ -1769,7 +1767,7 @@ void peer_sending_commitsig(struct channel *channel, const u8 *msg)
 
 	/* Tell it we've got it, and to go ahead with commitment_signed. */
 	subd_send_msg(channel->owner,
-		      take(towire_channel_sending_commitsig_reply(msg)));
+		      take(towire_channeld_sending_commitsig_reply(msg)));
 }
 
 static bool channel_added_their_htlc(struct channel *channel,
@@ -1899,7 +1897,7 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 	size_t i;
 	struct lightningd *ld = channel->peer->ld;
 
-	if (!fromwire_channel_got_commitsig(msg, msg,
+	if (!fromwire_channeld_got_commitsig(msg, msg,
 					    &commitnum,
 					    &fee_states,
 					    &commit_sig,
@@ -1911,7 +1909,7 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 					    &tx)
 	    || !fee_states_valid(fee_states, channel->opener)) {
 		channel_internal_error(channel,
-				    "bad fromwire_channel_got_commitsig %s",
+				    "bad fromwire_channeld_got_commitsig %s",
 				    tal_hex(channel, msg));
 		return;
 	}
@@ -1990,7 +1988,7 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 			      channel->last_htlc_sigs);
 
 	/* Tell it we've committed, and to go ahead with revoke. */
-	msg = towire_channel_got_commitsig_reply(msg);
+	msg = towire_channeld_got_commitsig_reply(msg);
 	subd_send_msg(channel->owner, take(msg));
 }
 
@@ -2053,7 +2051,7 @@ void peer_got_revoke(struct channel *channel, const u8 *msg)
 	struct commitment_revocation_payload *payload;
 	struct bitcoin_tx *penalty_tx;
 
-	if (!fromwire_channel_got_revoke(msg, msg,
+	if (!fromwire_channeld_got_revoke(msg, msg,
 					 &revokenum, &per_commitment_secret,
 					 &next_per_commitment_point,
 					 &fee_states,
@@ -2061,7 +2059,7 @@ void peer_got_revoke(struct channel *channel, const u8 *msg)
 					 &pbase,
 					 &penalty_tx)
 	    || !fee_states_valid(fee_states, channel->opener)) {
-		channel_internal_error(channel, "bad fromwire_channel_got_revoke %s",
+		channel_internal_error(channel, "bad fromwire_channeld_got_revoke %s",
 				    tal_hex(channel, msg));
 		return;
 	}
@@ -2126,7 +2124,7 @@ void peer_got_revoke(struct channel *channel, const u8 *msg)
 	update_per_commit_point(channel, &next_per_commitment_point);
 
 	/* Tell it we've committed, and to go ahead with revoke. */
-	msg = towire_channel_got_revoke_reply(msg);
+	msg = towire_channeld_got_revoke_reply(msg);
 	subd_send_msg(channel->owner, take(msg));
 
 	/* Now, any HTLCs we need to immediately fail? */
@@ -2278,7 +2276,7 @@ void free_htlcs(struct lightningd *ld, const struct channel *channel)
  *
  * 2. the deadline for offered HTLCs: the deadline after which the channel has
  *    to be failed and timed out on-chain. This is `G` blocks after the HTLC's
- *    `cltv_expiry`: 1 block is reasonable.
+ *    `cltv_expiry`: 1 or 2 blocks is reasonable.
  */
 static u32 htlc_out_deadline(const struct htlc_out *hout)
 {
@@ -2290,7 +2288,7 @@ static u32 htlc_out_deadline(const struct htlc_out *hout)
  * 3. the deadline for received HTLCs this node has fulfilled: the deadline
  * after which the channel has to be failed and the HTLC fulfilled on-chain
  * before its `cltv_expiry`. See steps 4-7 above, which imply a deadline of
- * `2R+G+S` blocks before `cltv_expiry`: 7 blocks is reasonable.
+ * `2R+G+S` blocks before `cltv_expiry`: 18 blocks is reasonable.
  */
 /* We approximate this, by using half the cltv_expiry_delta (3R+2G+2S),
  * rounded up. */

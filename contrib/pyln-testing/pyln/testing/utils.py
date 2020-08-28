@@ -6,6 +6,7 @@ from collections import OrderedDict
 from decimal import Decimal
 from ephemeral_port_reserve import reserve
 from pyln.client import LightningRpc
+from pyln.client import Millisatoshi
 
 import json
 import logging
@@ -644,6 +645,30 @@ class LightningNode(object):
         self.daemon.wait_for_log('Owning output .* txid {} CONFIRMED'.format(txid))
         return addr, txid
 
+    def fundbalancedchannel(self, remote_node, total_capacity, announce=True):
+        '''
+        Creates a perfectly-balanced channel, as all things should be.
+        '''
+        if isinstance(total_capacity, Millisatoshi):
+            total_capacity = int(total_capacity.to_satoshi())
+        else:
+            total_capacity = int(total_capacity)
+
+        self.fundwallet(total_capacity + 10000)
+        self.rpc.connect(remote_node.info['id'], 'localhost', remote_node.port)
+
+        # Make sure the fundchannel is confirmed.
+        num_tx = len(self.bitcoin.rpc.getrawmempool())
+        tx = self.rpc.fundchannel(remote_node.info['id'], total_capacity, feerate='slow', minconf=0, announce=announce, push_msat=Millisatoshi(total_capacity * 500))['tx']
+        wait_for(lambda: len(self.bitcoin.rpc.getrawmempool()) == num_tx + 1)
+        self.bitcoin.generate_block(1)
+
+        # Generate the scid.
+        # NOTE This assumes only the coinbase and the fundchannel is
+        # confirmed in the block.
+        return '{}x1x{}'.format(self.bitcoin.rpc.getblockcount(),
+                                get_tx_p2wsh_outnum(self.bitcoin, tx, total_capacity))
+
     def getactivechannels(self):
         return [c for c in self.rpc.listchannels()['channels'] if c['active']]
 
@@ -734,18 +759,9 @@ class LightningNode(object):
                                 get_tx_p2wsh_outnum(self.bitcoin, tx, amount))
 
         if wait_for_active:
-            # We wait until gossipd sees both local updates, as well as status NORMAL,
-            # so it can definitely route through.
-            self.daemon.wait_for_logs([r'update for channel {}/0 now ACTIVE'
-                                       .format(scid),
-                                       r'update for channel {}/1 now ACTIVE'
-                                       .format(scid),
-                                       'to CHANNELD_NORMAL'])
-            l2.daemon.wait_for_logs([r'update for channel {}/0 now ACTIVE'
-                                     .format(scid),
-                                     r'update for channel {}/1 now ACTIVE'
-                                     .format(scid),
-                                     'to CHANNELD_NORMAL'])
+            self.wait_channel_active(scid)
+            l2.wait_channel_active(scid)
+
         return scid
 
     def subd_pid(self, subd, peerid=None):
@@ -1114,40 +1130,20 @@ class NodeFactory(object):
             scid = src.get_channel_scid(dst)
             scids.append(scid)
 
-        # We don't want to assume message order here.
-        # Wait for ends:
-        nodes[0].daemon.wait_for_logs([r'update for channel {}/0 now ACTIVE'
-                                       .format(scids[0]),
-                                       r'update for channel {}/1 now ACTIVE'
-                                       .format(scids[0])])
-        nodes[-1].daemon.wait_for_logs([r'update for channel {}/0 now ACTIVE'
-                                        .format(scids[-1]),
-                                        r'update for channel {}/1 now ACTIVE'
-                                        .format(scids[-1])])
-        # Now wait for intermediate nodes:
-        for i, n in enumerate(nodes[1:-1]):
-            n.daemon.wait_for_logs([r'update for channel {}/0 now ACTIVE'
-                                    .format(scids[i]),
-                                    r'update for channel {}/1 now ACTIVE'
-                                    .format(scids[i]),
-                                    r'update for channel {}/0 now ACTIVE'
-                                    .format(scids[i + 1]),
-                                    r'update for channel {}/1 now ACTIVE'
-                                    .format(scids[i + 1])])
+        # Wait for all channels to be active (locally)
+        for i, n in enumerate(scids):
+            nodes[i].wait_channel_active(scids[i])
+            nodes[i + 1].wait_channel_active(scids[i])
 
         if not wait_for_announce:
             return
 
         bitcoind.generate_block(5)
 
-        def both_dirs_ready(n, scid):
-            resp = n.rpc.listchannels(scid)
-            return [a['active'] for a in resp['channels']] == [True, True]
-
         # Make sure everyone sees all channels: we can cheat and
         # simply check the ends (since it's a line).
-        wait_for(lambda: both_dirs_ready(nodes[0], scids[-1]))
-        wait_for(lambda: both_dirs_ready(nodes[-1], scids[0]))
+        nodes[0].wait_channel_active(scids[-1])
+        nodes[-1].wait_channel_active(scids[0])
 
         # Make sure we have all node announcements, too (just check ends)
         for n in nodes:

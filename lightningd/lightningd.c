@@ -79,7 +79,6 @@
 #include <lightningd/memdump.h>
 #include <lightningd/onchain_control.h>
 #include <lightningd/options.h>
-#include <onchaind/onchain_wire.h>
 #include <signal.h>
 #include <sodium.h>
 #include <sys/resource.h>
@@ -285,6 +284,11 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	 * Set to NULL meaning we are not interested in exiting yet.
 	 */
 	ld->exit_code = NULL;
+
+	/*~ We maintain a round-robin list of channels.
+	 * This round-robin list of channels is used to ensure that
+	 * each invoice we generate has a different set of channels.  */
+	list_head_init(&ld->rr_channels);
 
 	return ld;
 }

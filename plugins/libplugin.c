@@ -40,6 +40,8 @@ struct plugin {
 	/* To read from lightningd */
 	char *buffer;
 	size_t used, len_read;
+	jsmn_parser parser;
+	jsmntok_t *toks;
 
 	/* To write to lightningd */
 	struct json_stream **js_arr;
@@ -49,6 +51,8 @@ struct plugin {
 	struct json_stream **rpc_js_arr;
 	char *rpc_buffer;
 	size_t rpc_used, rpc_len_read;
+	jsmn_parser rpc_parser;
+	jsmntok_t *rpc_toks;
 	/* Tracking async RPC requests */
 	UINTMAP(struct out_req *) out_reqs;
 	u64 next_outreq_id;
@@ -442,12 +446,12 @@ static const jsmntok_t *read_rpc_reply(const tal_t *ctx,
 				       int *reqlen)
 {
 	const jsmntok_t *toks;
-	bool valid;
 
 	*reqlen = read_json_from_rpc(plugin);
 
-	toks = json_parse_input(ctx, membuf_elems(&plugin->rpc_conn->mb), *reqlen, &valid);
-	if (!valid)
+	toks = json_parse_simple(ctx,
+				 membuf_elems(&plugin->rpc_conn->mb), *reqlen);
+	if (!toks)
 		plugin_err(plugin, "Malformed JSON reply '%.*s'",
 			   *reqlen, membuf_elems(&plugin->rpc_conn->mb));
 
@@ -648,44 +652,44 @@ static void rpc_conn_finished(struct io_conn *conn,
 
 static bool rpc_read_response_one(struct plugin *plugin)
 {
-	bool valid;
-	const jsmntok_t *toks, *jrtok;
+	const jsmntok_t *jrtok;
+	bool complete;
 
-	/* FIXME: This could be done more efficiently by storing the
-	 * toks and doing an incremental parse, like lightning-cli
-	 * does. */
-	toks = json_parse_input(NULL, plugin->rpc_buffer, plugin->rpc_used,
-				&valid);
-	if (!toks) {
-		if (!valid) {
-			plugin_err(plugin, "Failed to parse RPC JSON response '%.*s'",
-				   (int)plugin->rpc_used, plugin->rpc_buffer);
-			return false;
-		}
+	if (!json_parse_input(&plugin->rpc_parser, &plugin->rpc_toks,
+			      plugin->rpc_buffer, plugin->rpc_used, &complete)) {
+		plugin_err(plugin, "Failed to parse RPC JSON response '%.*s'",
+			   (int)plugin->rpc_used, plugin->rpc_buffer);
+		return false;
+	}
+
+	if (!complete) {
 		/* We need more. */
 		return false;
 	}
 
 	/* Empty buffer? (eg. just whitespace). */
-	if (tal_count(toks) == 1) {
+	if (tal_count(plugin->rpc_toks) == 1) {
 		plugin->rpc_used = 0;
+		jsmn_init(&plugin->rpc_parser);
+		toks_reset(plugin->rpc_toks);
 		return false;
 	}
 
-	jrtok = json_get_member(plugin->rpc_buffer, toks, "jsonrpc");
+	jrtok = json_get_member(plugin->rpc_buffer, plugin->rpc_toks, "jsonrpc");
 	if (!jrtok) {
 		plugin_err(plugin, "JSON-RPC message does not contain \"jsonrpc\" field: '%.*s'",
                                    (int)plugin->rpc_used, plugin->rpc_buffer);
 		return false;
 	}
 
-	handle_rpc_reply(plugin, toks);
+	handle_rpc_reply(plugin, plugin->rpc_toks);
 
 	/* Move this object out of the buffer */
-	memmove(plugin->rpc_buffer, plugin->rpc_buffer + toks[0].end,
-		tal_count(plugin->rpc_buffer) - toks[0].end);
-	plugin->rpc_used -= toks[0].end;
-	tal_free(toks);
+	memmove(plugin->rpc_buffer, plugin->rpc_buffer + plugin->rpc_toks[0].end,
+		tal_count(plugin->rpc_buffer) - plugin->rpc_toks[0].end);
+	plugin->rpc_used -= plugin->rpc_toks[0].end;
+	jsmn_init(&plugin->rpc_parser);
+	toks_reset(plugin->rpc_toks);
 
 	return true;
 }
@@ -1093,40 +1097,40 @@ static void ld_command_handle(struct plugin *plugin,
  */
 static bool ld_read_json_one(struct plugin *plugin)
 {
-	bool valid;
-	const jsmntok_t *toks;
+	bool complete;
 	struct command *cmd = tal(plugin, struct command);
 
-	/* FIXME: This could be done more efficiently by storing the
-	 * toks and doing an incremental parse, like lightning-cli
-	 * does. */
-	toks = json_parse_input(NULL, plugin->buffer, plugin->used,
-				&valid);
-	if (!toks) {
-		if (!valid) {
-			plugin_err(plugin, "Failed to parse JSON response '%.*s'",
-				   (int)plugin->used, plugin->buffer);
-			return false;
-		}
+	if (!json_parse_input(&plugin->parser, &plugin->toks,
+			      plugin->buffer, plugin->used,
+			      &complete)) {
+		plugin_err(plugin, "Failed to parse JSON response '%.*s'",
+			   (int)plugin->used, plugin->buffer);
+		return false;
+	}
+
+	if (!complete) {
 		/* We need more. */
 		return false;
 	}
 
 	/* Empty buffer? (eg. just whitespace). */
-	if (tal_count(toks) == 1) {
+	if (tal_count(plugin->toks) == 1) {
+		toks_reset(plugin->toks);
+		jsmn_init(&plugin->parser);
 		plugin->used = 0;
 		return false;
 	}
 
 	/* FIXME: Spark doesn't create proper jsonrpc 2.0!  So we don't
 	 * check for "jsonrpc" here. */
-	ld_command_handle(plugin, cmd, toks);
+	ld_command_handle(plugin, cmd, plugin->toks);
 
 	/* Move this object out of the buffer */
-	memmove(plugin->buffer, plugin->buffer + toks[0].end,
-		tal_count(plugin->buffer) - toks[0].end);
-	plugin->used -= toks[0].end;
-	tal_free(toks);
+	memmove(plugin->buffer, plugin->buffer + plugin->toks[0].end,
+		tal_count(plugin->buffer) - plugin->toks[0].end);
+	plugin->used -= plugin->toks[0].end;
+	toks_reset(plugin->toks);
+	jsmn_init(&plugin->parser);
 
 	return true;
 }
@@ -1225,11 +1229,15 @@ static struct plugin *new_plugin(const tal_t *ctx,
 	p->js_arr = tal_arr(p, struct json_stream *, 0);
 	p->used = 0;
 	p->len_read = 0;
+	jsmn_init(&p->parser);
+	p->toks = toks_alloc(p);
 	/* Async RPC */
 	p->rpc_buffer = tal_arr(p, char, 64);
 	p->rpc_js_arr = tal_arr(p, struct json_stream *, 0);
 	p->rpc_used = 0;
 	p->rpc_len_read = 0;
+	jsmn_init(&p->rpc_parser);
+	p->rpc_toks = toks_alloc(p);
 	p->next_outreq_id = 0;
 	uintmap_init(&p->out_reqs);
 

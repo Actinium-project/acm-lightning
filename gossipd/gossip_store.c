@@ -11,9 +11,9 @@
 #include <common/utils.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <gossipd/gen_gossip_peerd_wire.h>
-#include <gossipd/gen_gossip_store.h>
-#include <gossipd/gen_gossip_wire.h>
+#include <gossipd/gossip_store_wiregen.h>
+#include <gossipd/gossipd_peerd_wiregen.h>
+#include <gossipd/gossipd_wiregen.h>
 #include <stdio.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
@@ -619,6 +619,13 @@ void gossip_store_delete(struct gossip_store *gs,
 				WIRE_GOSSIP_STORE_CHANNEL_AMOUNT);
 }
 
+void gossip_store_mark_channel_deleted(struct gossip_store *gs,
+				       const struct short_channel_id *scid)
+{
+	gossip_store_add(gs, towire_gossip_store_delete_chan(tmpctx, scid),
+			 0, false, NULL);
+}
+
 const u8 *gossip_store_get(const tal_t *ctx,
 			   struct gossip_store *gs,
 			   u64 offset)
@@ -782,6 +789,9 @@ u32 gossip_store_load(struct routing_state *rstate, struct gossip_store *gs)
 				bad = "Bad local_add_channel";
 				goto badmsg;
 			}
+			break;
+		case WIRE_GOSSIP_STORE_DELETE_CHAN:
+			/* No need to copy these */
 			break;
 		default:
 			bad = "Unknown message";

@@ -508,6 +508,9 @@ def test_fundpsbt(node_factory, bitcoind, chainparams):
     # Should get one input, plus some excess
     funding = l1.rpc.fundpsbt(amount // 2, feerate, 0, reserve=False)
     psbt = bitcoind.rpc.decodepsbt(funding['psbt'])
+    # We can fuzz this up to 99 blocks back.
+    assert psbt['tx']['locktime'] > bitcoind.rpc.getblockcount() - 100
+    assert psbt['tx']['locktime'] <= bitcoind.rpc.getblockcount()
     assert len(psbt['tx']['vin']) == 1
     assert funding['excess_msat'] > Millisatoshi(0)
     assert funding['excess_msat'] < Millisatoshi(amount // 2 * 1000)
@@ -515,9 +518,10 @@ def test_fundpsbt(node_factory, bitcoind, chainparams):
     assert 'estimated_final_weight' in funding
     assert 'reservations' not in funding
 
-    # This should add 99 to the weight, but otherwise be identical (might choose different inputs though!)
-    funding2 = l1.rpc.fundpsbt(amount // 2, feerate, 99, reserve=False)
+    # This should add 99 to the weight, but otherwise be identical (might choose different inputs though!) except for locktime.
+    funding2 = l1.rpc.fundpsbt(amount // 2, feerate, 99, reserve=False, locktime=bitcoind.rpc.getblockcount() + 1)
     psbt2 = bitcoind.rpc.decodepsbt(funding2['psbt'])
+    assert psbt2['tx']['locktime'] == bitcoind.rpc.getblockcount() + 1
     assert len(psbt2['tx']['vin']) == 1
     assert funding2['excess_msat'] < funding['excess_msat']
     assert funding2['feerate_per_kw'] == 7500
@@ -553,6 +557,92 @@ def test_fundpsbt(node_factory, bitcoind, chainparams):
     # And now we can't afford any more.
     with pytest.raises(RpcError, match=r"not afford"):
         l1.rpc.fundpsbt(amount // 2, feerate, 0)
+
+
+def test_utxopsbt(node_factory, bitcoind):
+    amount = 1000000
+    l1 = node_factory.get_node()
+
+    outputs = []
+    # Add a medley of funds to withdraw later, bech32 + p2sh-p2wpkh
+    txid = bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'],
+                                      amount / 10**8)
+    outputs.append((txid, bitcoind.rpc.gettransaction(txid)['details'][0]['vout']))
+    txid = bitcoind.rpc.sendtoaddress(l1.rpc.newaddr('p2sh-segwit')['p2sh-segwit'],
+                                      amount / 10**8)
+    outputs.append((txid, bitcoind.rpc.gettransaction(txid)['details'][0]['vout']))
+
+    bitcoind.generate_block(1)
+    wait_for(lambda: len(l1.rpc.listfunds()['outputs']) == len(outputs))
+
+    feerate = '7500perkw'
+
+    # Explicitly spend the first output above.
+    funding = l1.rpc.utxopsbt(amount // 2, feerate, 0,
+                              ['{}:{}'.format(outputs[0][0], outputs[0][1])],
+                              reserve=False)
+    psbt = bitcoind.rpc.decodepsbt(funding['psbt'])
+    # We can fuzz this up to 99 blocks back.
+    assert psbt['tx']['locktime'] > bitcoind.rpc.getblockcount() - 100
+    assert psbt['tx']['locktime'] <= bitcoind.rpc.getblockcount()
+    assert len(psbt['tx']['vin']) == 1
+    assert funding['excess_msat'] > Millisatoshi(0)
+    assert funding['excess_msat'] < Millisatoshi(amount // 2 * 1000)
+    assert funding['feerate_per_kw'] == 7500
+    assert 'estimated_final_weight' in funding
+    assert 'reservations' not in funding
+
+    # This should add 99 to the weight, but otherwise be identical except for locktime.
+    funding2 = l1.rpc.utxopsbt(amount // 2, feerate, 99,
+                               ['{}:{}'.format(outputs[0][0], outputs[0][1])],
+                               reserve=False, locktime=bitcoind.rpc.getblockcount() + 1)
+    psbt2 = bitcoind.rpc.decodepsbt(funding2['psbt'])
+    assert psbt2['tx']['locktime'] == bitcoind.rpc.getblockcount() + 1
+    assert psbt2['tx']['vin'] == psbt['tx']['vin']
+    assert psbt2['tx']['vout'] == psbt['tx']['vout']
+    assert funding2['excess_msat'] < funding['excess_msat']
+    assert funding2['feerate_per_kw'] == 7500
+    assert funding2['estimated_final_weight'] == funding['estimated_final_weight'] + 99
+    assert 'reservations' not in funding2
+
+    # Cannot afford this one (too much)
+    with pytest.raises(RpcError, match=r"not afford"):
+        l1.rpc.utxopsbt(amount, feerate, 0,
+                        ['{}:{}'.format(outputs[0][0], outputs[0][1])])
+
+    # Nor this (even with both)
+    with pytest.raises(RpcError, match=r"not afford"):
+        l1.rpc.utxopsbt(amount * 2, feerate, 0,
+                        ['{}:{}'.format(outputs[0][0], outputs[0][1]),
+                         '{}:{}'.format(outputs[1][0], outputs[1][1])])
+
+    # Should get two inputs (and reserve!)
+    funding = l1.rpc.utxopsbt(amount, feerate, 0,
+                              ['{}:{}'.format(outputs[0][0], outputs[0][1]),
+                               '{}:{}'.format(outputs[1][0], outputs[1][1])])
+    psbt = bitcoind.rpc.decodepsbt(funding['psbt'])
+    assert len(psbt['tx']['vin']) == 2
+    assert len(funding['reservations']) == 2
+    assert funding['reservations'][0]['txid'] == outputs[0][0]
+    assert funding['reservations'][0]['vout'] == outputs[0][1]
+    assert funding['reservations'][0]['was_reserved'] is False
+    assert funding['reservations'][0]['reserved'] is True
+    assert funding['reservations'][1]['txid'] == outputs[1][0]
+    assert funding['reservations'][1]['vout'] == outputs[1][1]
+    assert funding['reservations'][1]['was_reserved'] is False
+    assert funding['reservations'][1]['reserved'] is True
+
+    # Should refuse to use reserved outputs.
+    with pytest.raises(RpcError, match=r"already reserved"):
+        l1.rpc.utxopsbt(amount, feerate, 0,
+                        ['{}:{}'.format(outputs[0][0], outputs[0][1]),
+                         '{}:{}'.format(outputs[1][0], outputs[1][1])])
+
+    # Unless we tell it that's ok.
+    l1.rpc.utxopsbt(amount, feerate, 0,
+                    ['{}:{}'.format(outputs[0][0], outputs[0][1]),
+                     '{}:{}'.format(outputs[1][0], outputs[1][1])],
+                    reservedok=True)
 
 
 def test_sign_and_send_psbt(node_factory, bitcoind, chainparams):
@@ -648,17 +738,42 @@ def test_sign_and_send_psbt(node_factory, bitcoind, chainparams):
     with pytest.raises(RpcError, match=r"No wallet inputs to sign"):
         l1.rpc.signpsbt(l2_funding['psbt'])
 
+    # With signonly it will fail if it can't sign it.
+    with pytest.raises(RpcError, match=r"is unknown"):
+        l1.rpc.signpsbt(l2_funding['psbt'], signonly=[0])
+
     # Add some of our own PSBT inputs to it
     l1_funding = l1.rpc.fundpsbt(satoshi=Millisatoshi(3 * amount * 1000),
                                  feerate=7500,
                                  startweight=42,
                                  reserve=True)
+    l1_num_inputs = len(bitcoind.rpc.decodepsbt(l1_funding['psbt'])['tx']['vin'])
+    l2_num_inputs = len(bitcoind.rpc.decodepsbt(l2_funding['psbt'])['tx']['vin'])
 
-    # Join and add an output
+    # Join and add an output (reorders!)
     joint_psbt = bitcoind.rpc.joinpsbts([l1_funding['psbt'], l2_funding['psbt'],
                                          output_pbst])
 
-    half_signed_psbt = l1.rpc.signpsbt(joint_psbt)['signed_psbt']
+    # Ask it to sign inputs it doesn't know, it will fail.
+    with pytest.raises(RpcError, match=r"is unknown"):
+        l1.rpc.signpsbt(joint_psbt,
+                        signonly=list(range(l1_num_inputs + 1)))
+
+    # Similarly, it can't sign inputs it doesn't know.
+    sign_success = []
+    for i in range(l1_num_inputs + l2_num_inputs):
+        try:
+            l1.rpc.signpsbt(joint_psbt, signonly=[i])
+        except RpcError:
+            continue
+        sign_success.append(i)
+    assert len(sign_success) == l1_num_inputs
+
+    # But it can sign all the valid ones at once.
+    half_signed_psbt = l1.rpc.signpsbt(joint_psbt, signonly=sign_success)['signed_psbt']
+    for s in sign_success:
+        assert bitcoind.rpc.decodepsbt(half_signed_psbt)['inputs'][s]['partial_signatures'] is not None
+
     totally_signed = l2.rpc.signpsbt(half_signed_psbt)['signed_psbt']
 
     broadcast_tx = l1.rpc.sendpsbt(totally_signed)

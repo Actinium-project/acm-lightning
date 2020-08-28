@@ -18,7 +18,7 @@
 #include <common/wallet_tx.h>
 #include <common/withdraw_tx.h>
 #include <errno.h>
-#include <hsmd/gen_hsm_wire.h>
+#include <hsmd/hsmd_wiregen.h>
 #include <inttypes.h>
 #include <lightningd/bitcoind.h>
 #include <lightningd/chaintopology.h>
@@ -115,7 +115,7 @@ static struct command_result *broadcast_and_wait(struct command *cmd,
 
 	/* FIXME: hsm will sign almost anything, but it should really
 	 * fail cleanly (not abort!) and let us report the error here. */
-	u8 *msg = towire_hsm_sign_withdrawal(cmd, utx->wtx->utxos, utx->tx->psbt);
+	u8 *msg = towire_hsmd_sign_withdrawal(cmd, utx->wtx->utxos, utx->tx->psbt);
 
 	if (!wire_sync_write(cmd->ld->hsm_fd, take(msg)))
 		fatal("Could not write sign_withdrawal to HSM: %s",
@@ -123,7 +123,7 @@ static struct command_result *broadcast_and_wait(struct command *cmd,
 
 	msg = wire_sync_read(cmd, cmd->ld->hsm_fd);
 
-	if (!fromwire_hsm_sign_withdrawal_reply(utx, msg, &signed_psbt))
+	if (!fromwire_hsmd_sign_withdrawal_reply(utx, msg, &signed_psbt))
 		fatal("HSM gave bad sign_withdrawal_reply %s",
 		      tal_hex(tmpctx, msg));
 
@@ -1221,8 +1221,17 @@ struct command_result *param_psbt(struct command *cmd,
 			    json_tok_full(buffer, tok));
 }
 
+static bool in_only_inputs(const u32 *only_inputs, u32 this)
+{
+	for (size_t i = 0; i < tal_count(only_inputs); i++)
+		if (only_inputs[i] == this)
+			return true;
+	return false;
+}
+
 static struct command_result *match_psbt_inputs_to_utxos(struct command *cmd,
 							 struct wally_psbt *psbt,
+							 const u32 *only_inputs,
 							 struct utxo ***utxos)
 {
 	*utxos = tal_arr(cmd, struct utxo *, 0);
@@ -1230,11 +1239,21 @@ static struct command_result *match_psbt_inputs_to_utxos(struct command *cmd,
 		struct utxo *utxo;
 		struct bitcoin_txid txid;
 
+		if (only_inputs && !in_only_inputs(only_inputs, i))
+			continue;
+
 		wally_tx_input_get_txid(&psbt->tx->inputs[i], &txid);
 		utxo = wallet_utxo_get(*utxos, cmd->ld->wallet,
 				       &txid, psbt->tx->inputs[i].index);
-		if (!utxo)
+		if (!utxo) {
+			if (only_inputs)
+				return command_fail(cmd, LIGHTNINGD,
+						    "Aborting PSBT signing. UTXO %s:%u is unknown (and specified by signonly)",
+						    type_to_string(tmpctx, struct bitcoin_txid,
+								   &txid),
+						    psbt->tx->inputs[i].index);
 			continue;
+		}
 
 		/* Oops we haven't reserved this utxo yet! */
 		if (!is_reserved(utxo, get_block_height(cmd->ld->topology)))
@@ -1249,6 +1268,32 @@ static struct command_result *match_psbt_inputs_to_utxos(struct command *cmd,
 	return NULL;
 }
 
+static struct command_result *param_input_numbers(struct command *cmd,
+						  const char *name,
+						  const char *buffer,
+						  const jsmntok_t *tok,
+						  u32 **input_nums)
+{
+	struct command_result *res;
+	const jsmntok_t *arr, *t;
+	size_t i;
+
+	res = param_array(cmd, name, buffer, tok, &arr);
+	if (res)
+		return res;
+
+	*input_nums = tal_arr(cmd, u32, arr->size);
+	json_for_each_arr(i, t, arr) {
+		u32 *num;
+		res = param_number(cmd, name, buffer, t, &num);
+		if (res)
+			return res;
+		(*input_nums)[i] = *num;
+		tal_free(num);
+	}
+	return NULL;
+}
+
 static struct command_result *json_signpsbt(struct command *cmd,
 					    const char *buffer,
 					    const jsmntok_t *obj UNNEEDED,
@@ -1258,17 +1303,27 @@ static struct command_result *json_signpsbt(struct command *cmd,
 	struct json_stream *response;
 	struct wally_psbt *psbt, *signed_psbt;
 	struct utxo **utxos;
+	u32 *input_nums;
 
 	if (!param(cmd, buffer, params,
 		   p_req("psbt", param_psbt, &psbt),
+		   p_opt("signonly", param_input_numbers, &input_nums),
 		   NULL))
 		return command_param_failed();
+
+	/* Sanity check! */
+	for (size_t i = 0; i < tal_count(input_nums); i++) {
+		if (input_nums[i] >= psbt->num_inputs)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "signonly[%zu]: %u out of range",
+					    i, input_nums[i]);
+	}
 
 	/* We have to find/locate the utxos that are ours on this PSBT,
 	 * so that the HSM knows how/what to sign for (it's possible some of
 	 * our utxos require more complicated data to sign for e.g.
 	 * closeinfo outputs */
-	res = match_psbt_inputs_to_utxos(cmd, psbt, &utxos);
+	res = match_psbt_inputs_to_utxos(cmd, psbt, input_nums, &utxos);
 	if (res)
 		return res;
 
@@ -1278,7 +1333,7 @@ static struct command_result *json_signpsbt(struct command *cmd,
 
 	/* FIXME: hsm will sign almost anything, but it should really
 	 * fail cleanly (not abort!) and let us report the error here. */
-	u8 *msg = towire_hsm_sign_withdrawal(cmd,
+	u8 *msg = towire_hsmd_sign_withdrawal(cmd,
 					     cast_const2(const struct utxo **, utxos),
 					     psbt);
 
@@ -1288,7 +1343,7 @@ static struct command_result *json_signpsbt(struct command *cmd,
 
 	msg = wire_sync_read(cmd, cmd->ld->hsm_fd);
 
-	if (!fromwire_hsm_sign_withdrawal_reply(cmd, msg, &signed_psbt))
+	if (!fromwire_hsmd_sign_withdrawal_reply(cmd, msg, &signed_psbt))
 		fatal("HSM gave bad sign_withdrawal_reply %s",
 		      tal_hex(tmpctx, msg));
 
@@ -1334,7 +1389,7 @@ static struct command_result *json_sendpsbt(struct command *cmd,
 	/* We have to find/locate the utxos that are ours on this PSBT,
 	 * so that we know who to mark as used.
 	 */
-	res = match_psbt_inputs_to_utxos(cmd, psbt, &utxos);
+	res = match_psbt_inputs_to_utxos(cmd, psbt, NULL, &utxos);
 	if (res)
 		return res;
 

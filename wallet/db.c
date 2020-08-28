@@ -3,13 +3,14 @@
 #include <bitcoin/psbt.h>
 #include <bitcoin/script.h>
 #include <ccan/array_size/array_size.h>
+#include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
 #include <common/derive_basepoints.h>
 #include <common/key_derive.h>
 #include <common/node_id.h>
 #include <common/onionreply.h>
 #include <common/version.h>
-#include <hsmd/gen_hsm_wire.h>
+#include <hsmd/hsmd_wiregen.h>
 #include <inttypes.h>
 #include <lightningd/channel.h>
 #include <lightningd/lightningd.h>
@@ -1187,14 +1188,14 @@ void fillin_missing_scriptpubkeys(struct lightningd *ld, struct db *db,
 				commitment_point = NULL;
 
 			/* Have to go ask the HSM to derive the pubkey for us */
-			msg = towire_hsm_get_output_scriptpubkey(NULL,
+			msg = towire_hsmd_get_output_scriptpubkey(NULL,
 								 channel_id,
 								 &peer_id,
 								 commitment_point);
 			if (!wire_sync_write(ld->hsm_fd, take(msg)))
 				fatal("Could not write to HSM: %s", strerror(errno));
 			msg = wire_sync_read(stmt, ld->hsm_fd);
-			if (!fromwire_hsm_get_output_scriptpubkey_reply(stmt, msg,
+			if (!fromwire_hsmd_get_output_scriptpubkey_reply(stmt, msg,
 									&scriptPubkey))
 				fatal("HSM gave bad hsm_get_output_scriptpubkey_reply %s",
 				      tal_hex(msg, msg));
@@ -1319,12 +1320,14 @@ void db_bind_null(struct db_stmt *stmt, int pos)
 void db_bind_int(struct db_stmt *stmt, int pos, int val)
 {
 	assert(pos < tal_count(stmt->bindings));
+	memcheck(&val, sizeof(val));
 	stmt->bindings[pos].type = DB_BINDING_INT;
 	stmt->bindings[pos].v.i = val;
 }
 
 void db_bind_u64(struct db_stmt *stmt, int pos, u64 val)
 {
+	memcheck(&val, sizeof(val));
 	assert(pos < tal_count(stmt->bindings));
 	stmt->bindings[pos].type = DB_BINDING_UINT64;
 	stmt->bindings[pos].v.u64 = val;
@@ -1334,7 +1337,7 @@ void db_bind_blob(struct db_stmt *stmt, int pos, const u8 *val, size_t len)
 {
 	assert(pos < tal_count(stmt->bindings));
 	stmt->bindings[pos].type = DB_BINDING_BLOB;
-	stmt->bindings[pos].v.blob = val;
+	stmt->bindings[pos].v.blob = memcheck(val, len);
 	stmt->bindings[pos].len = len;
 }
 
@@ -1498,7 +1501,6 @@ void db_column_node_id(struct db_stmt *stmt, int col, struct node_id *dest)
 {
 	assert(db_column_bytes(stmt, col) == sizeof(dest->k));
 	memcpy(dest->k, db_column_blob(stmt, col), sizeof(dest->k));
-	assert(node_id_valid(dest));
 }
 
 struct node_id *db_column_node_id_arr(const tal_t *ctx, struct db_stmt *stmt,
@@ -1510,11 +1512,8 @@ struct node_id *db_column_node_id_arr(const tal_t *ctx, struct db_stmt *stmt,
 	assert(n * sizeof(ret->k) == (size_t)db_column_bytes(stmt, col));
 	ret = tal_arr(ctx, struct node_id, n);
 
-	for (size_t i = 0; i < n; i++) {
+	for (size_t i = 0; i < n; i++)
 		memcpy(ret[i].k, arr + i * sizeof(ret[i].k), sizeof(ret[i].k));
-		if (!node_id_valid(&ret[i]))
-			return tal_free(ret);
-	}
 
 	return ret;
 }

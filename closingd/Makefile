@@ -10,7 +10,7 @@ closingd-all: lightningd/lightning_closingd
 
 # closingd needs these:
 LIGHTNINGD_CLOSING_HEADERS_GEN :=			\
-	closingd/gen_closing_wire.h
+	closingd/closingd_wiregen.h
 
 LIGHTNINGD_CLOSING_HEADERS_NOGEN :=
 
@@ -30,9 +30,9 @@ LIGHTNINGD_CLOSING_CONTROL_HEADERS := $(LIGHTNINGD_CLOSING_HEADERS)
 LIGHTNINGD_CLOSING_CONTROL_SRC := $(LIGHTNINGD_CLOSING_HEADERS:.h=.c)
 LIGHTNINGD_CLOSING_CONTROL_OBJS := $(LIGHTNINGD_CLOSING_CONTROL_SRC:.c=.o)
 
-LIGHTNINGD_CLOSING_GEN_SRC := $(filter closingd/gen_%, $(LIGHTNINGD_CLOSING_SRC) $(LIGHTNINGD_CLOSING_CONTROL_SRC))
+LIGHTNINGD_CLOSING_GEN_SRC := $(filter closingd/%wiregen.c, $(LIGHTNINGD_CLOSING_SRC) $(LIGHTNINGD_CLOSING_CONTROL_SRC))
 
-LIGHTNINGD_CLOSING_SRC_NOGEN := $(filter-out closingd/gen_%, $(LIGHTNINGD_CLOSING_SRC))
+LIGHTNINGD_CLOSING_SRC_NOGEN := $(filter-out closingd/%wiregen.c, $(LIGHTNINGD_CLOSING_SRC))
 
 # Add to headers which any object might need.
 LIGHTNINGD_HEADERS_GEN += $(LIGHTNINGD_CLOSING_HEADERS_GEN)
@@ -55,8 +55,8 @@ CLOSINGD_COMMON_OBJS :=				\
 	common/daemon_conn.o			\
 	common/dev_disconnect.o			\
 	common/derive_basepoints.o		\
-	common/gen_peer_status_wire.o		\
-	common/gen_status_wire.o		\
+	common/peer_status_wiregen.o		\
+	common/status_wiregen.o			\
 	common/gossip_rcvd_filter.o		\
 	common/gossip_store.o			\
 	common/htlc_wire.o			\
@@ -82,14 +82,7 @@ CLOSINGD_COMMON_OBJS :=				\
 	common/version.o			\
 	common/wire_error.o			\
 	common/wireaddr.o			\
-	gossipd/gen_gossip_peerd_wire.o		\
-	hsmd/gen_hsm_wire.o
-
-closingd/gen_closing_wire.h: $(WIRE_GEN) closingd/closing_wire.csv
-	$(WIRE_GEN) --page header $@ closing_wire_type < closingd/closing_wire.csv > $@
-
-closingd/gen_closing_wire.c: $(WIRE_GEN) closingd/closing_wire.csv
-	$(WIRE_GEN) --page impl ${@:.c=.h} closing_wire_type < closingd/closing_wire.csv > $@
+	gossipd/gossipd_peerd_wiregen.o
 
 LIGHTNINGD_CLOSING_OBJS := $(LIGHTNINGD_CLOSING_SRC:.c=.o) $(LIGHTNINGD_CLOSING_GEN_SRC:.c=.o)
 

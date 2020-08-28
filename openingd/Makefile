@@ -10,7 +10,7 @@ opening-all: lightningd/lightning_openingd
 
 # opening needs these:
 LIGHTNINGD_OPENING_HEADERS_GEN :=			\
-	openingd/gen_opening_wire.h
+	openingd/openingd_wiregen.h
 
 LIGHTNINGD_OPENING_HEADERS_NOGEN :=
 
@@ -25,9 +25,9 @@ LIGHTNINGD_OPENING_CONTROL_HEADERS := $(LIGHTNINGD_OPENING_HEADERS)
 LIGHTNINGD_OPENING_CONTROL_SRC := $(LIGHTNINGD_OPENING_HEADERS:.h=.c)
 LIGHTNINGD_OPENING_CONTROL_OBJS := $(LIGHTNINGD_OPENING_CONTROL_SRC:.c=.o)
 
-LIGHTNINGD_OPENING_GEN_SRC := $(filter openingd/gen_%, $(LIGHTNINGD_OPENING_SRC) $(LIGHTNINGD_OPENING_CONTROL_SRC))
+LIGHTNINGD_OPENING_GEN_SRC := $(filter openingd/%wiregen.c, $(LIGHTNINGD_OPENING_SRC) $(LIGHTNINGD_OPENING_CONTROL_SRC))
 
-LIGHTNINGD_OPENING_SRC_NOGEN := $(filter-out openingd/gen_%, $(LIGHTNINGD_OPENING_SRC))
+LIGHTNINGD_OPENING_SRC_NOGEN := $(filter-out openingd/%wiregen.c, $(LIGHTNINGD_OPENING_SRC))
 
 # Add to headers which any object might need.
 LIGHTNINGD_HEADERS_GEN += $(LIGHTNINGD_OPENING_HEADERS_GEN)
@@ -51,8 +51,8 @@ OPENINGD_COMMON_OBJS :=				\
 	common/features.o			\
 	common/fee_states.o			\
 	common/funding_tx.o			\
-	common/gen_status_wire.o		\
-	common/gen_peer_status_wire.o		\
+	common/status_wiregen.o			\
+	common/peer_status_wiregen.o		\
 	common/gossip_rcvd_filter.o		\
 	common/gossip_store.o			\
 	common/htlc_state.o			\
@@ -82,17 +82,10 @@ OPENINGD_COMMON_OBJS :=				\
 	common/version.o			\
 	common/wire_error.o			\
 	common/wireaddr.o			\
-	gossipd/gen_gossip_peerd_wire.o		\
-	hsmd/gen_hsm_wire.o			\
+	gossipd/gossipd_peerd_wiregen.o		\
 	lightningd/gossip_msg.o
 
 $(LIGHTNINGD_OPENING_OBJS): $(LIGHTNINGD_HEADERS)
-
-openingd/gen_opening_wire.h: $(WIRE_GEN) openingd/opening_wire.csv
-	$(WIRE_GEN) --page header $@ opening_wire_type < openingd/opening_wire.csv > $@
-
-openingd/gen_opening_wire.c: $(WIRE_GEN) openingd/opening_wire.csv
-	$(WIRE_GEN) --page impl ${@:.c=.h} opening_wire_type < openingd/opening_wire.csv > $@
 
 LIGHTNINGD_OPENING_OBJS := $(LIGHTNINGD_OPENING_SRC:.c=.o) $(LIGHTNINGD_OPENING_GEN_SRC:.c=.o)
 

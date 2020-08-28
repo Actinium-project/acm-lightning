@@ -7,9 +7,9 @@
 #include <common/jsonrpc_errors.h>
 #include <common/utils.h>
 #include <common/wire_error.h>
-#include <connectd/gen_connect_wire.h>
+#include <connectd/connectd_wiregen.h>
 #include <errno.h>
-#include <hsmd/gen_hsm_wire.h>
+#include <hsmd/hsmd_wiregen.h>
 #include <inttypes.h>
 #include <lightningd/channel.h>
 #include <lightningd/connect_control.h>
@@ -43,7 +43,7 @@ void channel_set_owner(struct channel *channel, struct subd *owner)
 			 */
 			if (channel->peer->ld->connectd) {
 				u8 *msg;
-				msg = towire_connectctl_peer_disconnected(
+				msg = towire_connectd_peer_disconnected(
 						NULL,
 						&channel->peer->id);
 				subd_send_msg(channel->peer->ld->connectd,
@@ -110,6 +110,8 @@ static void destroy_channel(struct channel *channel)
 	channel_set_owner(channel, NULL);
 
 	list_del_from(&channel->peer->channels, &channel->list);
+
+	list_del(&channel->rr_list);
 }
 
 void delete_channel(struct channel *channel STEALS)
@@ -130,12 +132,12 @@ void get_channel_basepoints(struct lightningd *ld,
 	u8 *msg;
 
 	assert(dbid != 0);
-	msg = towire_hsm_get_channel_basepoints(NULL, peer_id, dbid);
+	msg = towire_hsmd_get_channel_basepoints(NULL, peer_id, dbid);
 	if (!wire_sync_write(ld->hsm_fd, take(msg)))
 		fatal("Could not write to HSM: %s", strerror(errno));
 
 	msg = wire_sync_read(tmpctx, ld->hsm_fd);
-	if (!fromwire_hsm_get_channel_basepoints_reply(msg, local_basepoints,
+	if (!fromwire_hsmd_get_channel_basepoints_reply(msg, local_basepoints,
 						       local_funding_pubkey))
 		fatal("HSM gave bad hsm_get_channel_basepoints_reply %s",
 		      tal_hex(msg, msg));
@@ -275,6 +277,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 	channel->forgets = tal_arr(channel, struct command *, 0);
 
 	list_add_tail(&peer->channels, &channel->list);
+	list_add_tail(&peer->ld->rr_channels, &channel->rr_list);
 	tal_add_destructor(channel, destroy_channel);
 
 	/* Make sure we see any spends using this key */

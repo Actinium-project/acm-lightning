@@ -7,8 +7,8 @@
 #include <common/type_to_string.h>
 #include <common/utils.h>
 #include <errno.h>
-#include <gossipd/gen_gossip_wire.h>
-#include <hsmd/gen_hsm_wire.h>
+#include <gossipd/gossipd_wiregen.h>
+#include <hsmd/hsmd_wiregen.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/subd.h>
@@ -85,14 +85,14 @@ static struct command_result *json_signmessage(struct command *cmd,
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 				    "Message must be < 64k");
 
-	msg = towire_hsm_sign_message(NULL,
+	msg = towire_hsmd_sign_message(NULL,
 				      tal_dup_arr(tmpctx, u8, (u8 *)message,
 						  strlen(message), 0));
 	if (!wire_sync_write(cmd->ld->hsm_fd, take(msg)))
 		fatal("Could not write to HSM: %s", strerror(errno));
 
 	msg = wire_sync_read(tmpctx, cmd->ld->hsm_fd);
-	if (!fromwire_hsm_sign_message_reply(msg, &rsig))
+	if (!fromwire_hsmd_sign_message_reply(msg, &rsig))
 		fatal("HSM gave bad hsm_sign_message_reply %s",
 		      tal_hex(msg, msg));
 
@@ -137,7 +137,7 @@ static void getnode_reply(struct subd *gossip UNUSED, const u8 *reply,
 	struct gossip_getnodes_entry **nodes;
 	struct json_stream *response;
 
-	if (!fromwire_gossip_getnodes_reply(reply, reply, &nodes)) {
+	if (!fromwire_gossipd_getnodes_reply(reply, reply, &nodes)) {
 		log_broken(can->cmd->ld->log,
 			   "Malformed gossip_getnodes response %s",
 			   tal_hex(tmpctx, reply));
@@ -212,7 +212,7 @@ static struct command_result *json_checkmessage(struct command *cmd,
 
 		node_id_from_pubkey(&can->id, &reckey);
 		can->cmd = cmd;
-		req = towire_gossip_getnodes_request(cmd, &can->id);
+		req = towire_gossipd_getnodes_request(cmd, &can->id);
 		subd_req(cmd, cmd->ld->gossip, req, -1, 0, getnode_reply, can);
 		return command_still_pending(cmd);
 	}

@@ -17,9 +17,8 @@
 #include <common/utils.h>
 #include <common/wallet_tx.h>
 #include <common/wire_error.h>
-#include <connectd/gen_connect_wire.h>
+#include <connectd/connectd_wiregen.h>
 #include <errno.h>
-#include <hsmd/gen_hsm_wire.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/channel_control.h>
 #include <lightningd/closing_control.h>
@@ -33,7 +32,7 @@
 #include <lightningd/options.h>
 #include <lightningd/plugin_hook.h>
 #include <lightningd/subd.h>
-#include <openingd/gen_opening_wire.h>
+#include <openingd/openingd_wiregen.h>
 #include <string.h>
 #include <wire/gen_common_wire.h>
 #include <wire/wire.h>
@@ -105,7 +104,7 @@ static void uncommitted_channel_disconnect(struct uncommitted_channel *uc,
 					   enum log_level level,
 					   const char *desc)
 {
-	u8 *msg = towire_connectctl_peer_disconnected(tmpctx, &uc->peer->id);
+	u8 *msg = towire_connectd_peer_disconnected(tmpctx, &uc->peer->id);
 	log_(uc->log, level, NULL, false, "%s", desc);
 	subd_send_msg(uc->peer->ld->connectd, msg);
 	if (uc->fc && uc->fc->cmd)
@@ -366,7 +365,7 @@ static void opening_funder_start_replied(struct subd *openingd, const u8 *resp,
 	u8 *funding_scriptPubkey;
 	bool supports_shutdown_script;
 
-	if (!fromwire_opening_funder_start_reply(resp, resp,
+	if (!fromwire_openingd_funder_start_reply(resp, resp,
 						 &funding_scriptPubkey,
 						 &supports_shutdown_script)) {
 		log_broken(fc->uc->log,
@@ -415,7 +414,7 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 	/* This is a new channel_info.their_config so set its ID to 0 */
 	channel_info.their_config.id = 0;
 
-	if (!fromwire_opening_funder_reply(resp, resp,
+	if (!fromwire_openingd_funder_reply(resp, resp,
 					   &channel_info.their_config,
 					   &remote_commit,
 					   &pbase,
@@ -512,7 +511,7 @@ static void opening_fundee_finished(struct subd *openingd,
 	/* This is a new channel_info.their_config, set its ID to 0 */
 	channel_info.their_config.id = 0;
 
-	if (!fromwire_opening_fundee(tmpctx, reply,
+	if (!fromwire_openingd_fundee(tmpctx, reply,
 				     &channel_info.their_config,
 				     &remote_commit,
 				     &pbase,
@@ -604,7 +603,7 @@ static void opening_funder_failed(struct subd *openingd, const u8 *msg,
 {
 	char *desc;
 
-	if (!fromwire_opening_funder_failed(msg, msg, &desc)) {
+	if (!fromwire_openingd_funder_failed(msg, msg, &desc)) {
 		log_broken(uc->log,
 			   "bad OPENING_FUNDER_FAILED %s",
 			   tal_hex(tmpctx, msg));
@@ -873,7 +872,7 @@ static void openchannel_hook_cb(struct openchannel_hook_payload *payload STEALS,
 		our_upfront_shutdown_script = NULL;
 
 	subd_send_msg(openingd,
-		      take(towire_opening_got_offer_reply(NULL, errmsg,
+		      take(towire_openingd_got_offer_reply(NULL, errmsg,
 							  our_upfront_shutdown_script)));
 }
 
@@ -891,14 +890,14 @@ static void opening_got_offer(struct subd *openingd,
 	/* Tell them they can't open, if we already have open channel. */
 	if (peer_active_channel(uc->peer)) {
 		subd_send_msg(openingd,
-			      take(towire_opening_got_offer_reply(NULL,
+			      take(towire_openingd_got_offer_reply(NULL,
 					  "Already have active channel", NULL)));
 		return;
 	}
 
 	payload = tal(openingd, struct openchannel_hook_payload);
 	payload->openingd = openingd;
-	if (!fromwire_opening_got_offer(payload, msg,
+	if (!fromwire_openingd_got_offer(payload, msg,
 					&payload->funding_satoshis,
 					&payload->push_msat,
 					&payload->dust_limit_satoshis,
@@ -923,11 +922,11 @@ static void opening_got_offer(struct subd *openingd,
 static unsigned int openingd_msg(struct subd *openingd,
 				 const u8 *msg, const int *fds)
 {
-	enum opening_wire_type t = fromwire_peektype(msg);
+	enum openingd_wire t = fromwire_peektype(msg);
 	struct uncommitted_channel *uc = openingd->channel;
 
 	switch (t) {
-	case WIRE_OPENING_FUNDER_REPLY:
+	case WIRE_OPENINGD_FUNDER_REPLY:
 		if (!uc->fc) {
 			log_broken(openingd->log, "Unexpected FUNDER_REPLY %s",
 				   tal_hex(tmpctx, msg));
@@ -938,7 +937,7 @@ static unsigned int openingd_msg(struct subd *openingd,
 			return 3;
 		opening_funder_finished(openingd, msg, fds, uc->fc);
 		return 0;
-	case WIRE_OPENING_FUNDER_START_REPLY:
+	case WIRE_OPENINGD_FUNDER_START_REPLY:
 		if (!uc->fc) {
 			log_broken(openingd->log, "Unexpected FUNDER_START_REPLY %s",
 				   tal_hex(tmpctx, msg));
@@ -947,7 +946,7 @@ static unsigned int openingd_msg(struct subd *openingd,
 		}
 		opening_funder_start_replied(openingd, msg, fds, uc->fc);
 		return 0;
-	case WIRE_OPENING_FUNDER_FAILED:
+	case WIRE_OPENINGD_FUNDER_FAILED:
 		if (!uc->fc) {
 			log_unusual(openingd->log, "Unexpected FUNDER_FAILED %s",
 				   tal_hex(tmpctx, msg));
@@ -957,25 +956,25 @@ static unsigned int openingd_msg(struct subd *openingd,
 		opening_funder_failed(openingd, msg, uc);
 		return 0;
 
-	case WIRE_OPENING_FUNDEE:
+	case WIRE_OPENINGD_FUNDEE:
 		if (tal_count(fds) != 3)
 			return 3;
 		opening_fundee_finished(openingd, msg, fds, uc);
 		return 0;
 
-	case WIRE_OPENING_GOT_OFFER:
+	case WIRE_OPENINGD_GOT_OFFER:
 		opening_got_offer(openingd, msg, uc);
 		return 0;
 
 	/* We send these! */
-	case WIRE_OPENING_INIT:
-	case WIRE_OPENING_FUNDER_START:
-	case WIRE_OPENING_FUNDER_COMPLETE:
-	case WIRE_OPENING_FUNDER_CANCEL:
-	case WIRE_OPENING_GOT_OFFER_REPLY:
-	case WIRE_OPENING_DEV_MEMLEAK:
+	case WIRE_OPENINGD_INIT:
+	case WIRE_OPENINGD_FUNDER_START:
+	case WIRE_OPENINGD_FUNDER_COMPLETE:
+	case WIRE_OPENINGD_FUNDER_CANCEL:
+	case WIRE_OPENINGD_GOT_OFFER_REPLY:
+	case WIRE_OPENINGD_DEV_MEMLEAK:
 	/* Replies never get here */
-	case WIRE_OPENING_DEV_MEMLEAK_REPLY:
+	case WIRE_OPENINGD_DEV_MEMLEAK_REPLY:
 		break;
 	}
 
@@ -993,7 +992,7 @@ static unsigned int openingd_msg(struct subd *openingd,
 	}
 
 	log_broken(openingd->log, "Unexpected msg %s: %s",
-		   opening_wire_type_name(t), tal_hex(tmpctx, msg));
+		   openingd_wire_name(t), tal_hex(tmpctx, msg));
 	tal_free(openingd);
 	return 0;
 }
@@ -1019,7 +1018,7 @@ void peer_start_openingd(struct peer *peer,
 	uc->openingd = new_channel_subd(peer->ld,
 					"lightning_openingd",
 					uc, &peer->id, uc->log,
-					true, opening_wire_type_name,
+					true, openingd_wire_name,
 					openingd_msg,
 					opening_channel_errmsg,
 					opening_channel_set_billboard,
@@ -1048,7 +1047,7 @@ void peer_start_openingd(struct peer *peer,
 	 */
 	uc->minimum_depth = peer->ld->config.anchor_confirms;
 
-	msg = towire_opening_init(NULL,
+	msg = towire_openingd_init(NULL,
 				  chainparams,
 				  peer->ld->our_features,
 				  &uc->our_config,
@@ -1119,7 +1118,7 @@ static struct command_result *json_fund_channel_complete(struct command *cmd,
 
 	/* Set the cmd to this new cmd */
 	peer->uncommitted_channel->fc->cmd = cmd;
-	msg = towire_opening_funder_complete(NULL,
+	msg = towire_openingd_funder_complete(NULL,
 					     funding_txid,
 					     funding_txout);
 	subd_send_msg(peer->uncommitted_channel->openingd, take(msg));
@@ -1156,7 +1155,7 @@ static struct command_result *json_fund_channel_cancel(struct command *cmd,
 
 		/* Make sure this gets notified if we succeed or cancel */
 		tal_arr_expand(&peer->uncommitted_channel->fc->cancels, cmd);
-		msg = towire_opening_funder_cancel(NULL);
+		msg = towire_openingd_funder_cancel(NULL);
 		subd_send_msg(peer->uncommitted_channel->openingd, take(msg));
 		return command_still_pending(cmd);
 	}
@@ -1276,7 +1275,7 @@ static struct command_result *json_fund_channel_start(struct command *cmd,
 		fc->our_upfront_shutdown_script
 			= tal_steal(fc, fc->our_upfront_shutdown_script);
 
-	msg = towire_opening_funder_start(NULL,
+	msg = towire_openingd_funder_start(NULL,
 					  *amount,
 					  fc->push,
 					  fc->our_upfront_shutdown_script,
@@ -1334,7 +1333,7 @@ static void opening_memleak_req_done(struct subd *openingd,
 	struct uncommitted_channel *uc = openingd->channel;
 
 	tal_del_destructor2(openingd, opening_died_forget_memleak, cmd);
-	if (!fromwire_opening_dev_memleak_reply(msg, &found_leak)) {
+	if (!fromwire_openingd_dev_memleak_reply(msg, &found_leak)) {
 		was_pending(command_fail(cmd, LIGHTNINGD,
 					 "Bad opening_dev_memleak"));
 		return;
@@ -1363,7 +1362,7 @@ static void opening_memleak_req_next(struct command *cmd, struct peer *prev)
 
 		subd_req(p,
 			 p->uncommitted_channel->openingd,
-			 take(towire_opening_dev_memleak(NULL)),
+			 take(towire_openingd_dev_memleak(NULL)),
 			 -1, 0, opening_memleak_req_done, cmd);
 		/* Just in case it dies before replying! */
 		tal_add_destructor2(p->uncommitted_channel->openingd,

@@ -1110,7 +1110,7 @@ def test_onchaind_replay(node_factory, bitcoind):
     }
     l1.rpc.sendpay([routestep], rhash)
     l1.daemon.wait_for_log('sendrawtx exit 0')
-    bitcoind.generate_block(1)
+    bitcoind.generate_block(1, wait_for_mempool=1)
 
     # Wait for nodes to notice the failure, this seach needle is after the
     # DB commit so we're sure the tx entries in onchaindtxs have been added
@@ -1347,7 +1347,7 @@ def test_onchain_middleman(node_factory, bitcoind):
 
     # l2 will drop to chain.
     l2.daemon.wait_for_log('sendrawtx exit 0')
-    l1.bitcoin.generate_block(1)
+    l1.bitcoin.generate_block(1, wait_for_mempool=1)
     l2.daemon.wait_for_log(' to ONCHAIN')
     l1.daemon.wait_for_log(' to ONCHAIN')
     l2.daemon.wait_for_log('OUR_UNILATERAL/THEIR_HTLC')
