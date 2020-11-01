@@ -206,7 +206,21 @@ simple JSON object containing the options:
   "configuration": {
     "lightning-dir": "/home/user/.lightning/testnet",
     "rpc-file": "lightning-rpc",
-    "startup": true
+    "startup": true,
+    "network": "testnet",
+    "feature_set": {
+        "init": "02aaa2",
+        "node": "8000000002aaa2",
+        "channel": "",
+        "invoice": "028200"
+    },
+    "proxy": {
+        "type": "ipv4",
+        "address": "127.0.0.1",
+        "port": 9050
+    },
+    "torv3-enabled": true,
+    "use_proxy_always": false
   }
 }
 ```
@@ -305,6 +319,24 @@ into a block.
     "funding_txid": "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
     "funding_locked": false
   }
+}
+```
+
+### `channel_state_changed`
+
+A notification for topic `channel_state_changed` is sent every time a channel
+changes its state. The notification includes the peer and channel ids as well
+as the old and the new channel states.
+
+```json
+{
+    "channel_state_changed": {
+        "peer_id": "03bc9337c7a28bb784d67742ebedd30a93bacdf7e4ca16436ef3798000242b2251",
+        "channel_id": "a2d0851832f0e30a0cf778a826d72f077ca86b69f72677e0267f23f63a0599b4",
+        "short_channel_id" : "561820x1020x1",
+        "old_state": "CHANNELD_NORMAL",
+        "new_state": "CHANNELD_SHUTTING_DOWN"
+    }
 }
 ```
 
@@ -621,6 +653,22 @@ at the time lightningd broadcasts the notification.
 
 `coin_type` is the BIP173 name for the coin which moved.
 
+### `openchannel_peer_sigs`
+
+When opening a channel with a peer using the collaborative transaction protocol
+(`opt_dual_fund`), this notification is fired when the peer sends us their funding
+transaction signatures, `tx_signatures`. We update the in-progress PSBT and return it
+here, with the peer's signatures attached.
+
+```json
+{
+	"openchannel_peer_sigs": {
+		"channel_id": "<hex of a channel id (note, v2 format)>",
+		"signed_psbt": "<Base64 serialized PSBT of funding transaction,
+				with peer's sigs>"
+	}
+}
+```
 
 ## Hooks
 
@@ -1164,8 +1212,11 @@ The plugin must respond to `gettxout` with the following fields:
 
 ### `sendrawtransaction`
 
-This call takes one parameter, a string representing a hex-encoded Bitcoin
-transaction.
+This call takes two parameters,
+a string `tx` representing a hex-encoded Bitcoin transaction,
+and a boolean `allowhighfees`, which if set means suppress
+any high-fees check implemented in the backend, since the given
+transaction may have fees that are very high.
 
 The plugin must broadcast it and respond with the following fields:
     - `success` (boolean), which is `true` if the broadcast succeeded

@@ -1,0 +1,104 @@
+.TH "LIGHTNING-LISTNODES" "7" "" "" "lightning-listnodes"
+.SH NAME
+lightning-listnodes - Command to get the list of nodes in the known network\.
+.SH SYNOPSIS
+
+\fBlistnodes\fR [id]
+
+.SH DESCRIPTION
+
+The \fBlistnodes\fR command returns nodes the node has learned about via gossip messages, or a single one if the node \fIid\fR was specified\.
+
+.SH EXAMPLE JSON REQUEST
+.nf
+.RS
+{
+  "id": 82,
+  "method": "listnodes",
+  "params": {
+    "id": "02e29856dab8ddd9044c18486e4cab79ec717b490447af2d4831e290e48d57638a"
+  }
+}
+.RE
+
+.fi
+.SH RETURN VALUE
+
+On success, the command will return a list of nodes, each object represents a node, with the following details:
+
+.RS
+.IP \[bu]
+\fInodeid\fR: A string that represents the node id\.
+
+.RE
+
+For nodes which have sent a node_announcement message, the following
+are also returned:
+
+.RS
+.IP \[bu]
+\fIalias\fR: A string that represents alias of the node on the network\.
+.IP \[bu]
+\fIcolor\fR: A string that represents the personal color of the node\.
+.IP \[bu]
+\fIlast_timestamp\fR: An integer that represents the timestamp of the last-received node_announcement message\.
+.IP \[bu]
+\fIfeatures\fR: A string that represents the features value\.
+.IP \[bu]
+\fIaddresses\fR: An array that represents the addreses avaible\. Each address is represented with an object with the following properties:.RS
+.IP \[bu]
+\fItype\fR: A string that represents the address type (ipv4 or ipv6)\.
+.IP \[bu]
+\fIaddress\fR: A string that represents the address value\.
+.IP \[bu]
+\fIport\fR: An integer that represents the port number where the node are listening\.
+
+.RE
+
+
+.RE
+
+On failure, one of the following error codes may be returned:
+
+.RS
+.IP \[bu]
+-32602: Error in given parameters\.
+
+.RE
+.SH EXAMPLE JSON RESPONSE
+.nf
+.RS
+{
+   "nodes": [
+      {
+         "nodeid": "02e29856dab8ddd9044c14586e4cab79ec717b490447af2d4831e290e48d58638a",
+         "alias": "some_alias",
+         "color": "68f442",
+         "last_timestamp": 1597213741,
+         "features": "02a2a1",
+         "addresses": [
+            {
+               "type": "ipv4",
+               "address": "zzz.yy.xx.xx",
+               "port": 9735
+            }
+         ]
+      }
+    ]
+}
+.RE
+
+.fi
+.SH AUTHOR
+
+Vincenzo Palazzo \fI<vincenzo.palazzo@protonmail.com\fR> wrote the initial version of this man page, but many others did the hard work of actually implementing this rpc command\.
+
+.SH SEE ALSO
+
+FIXME: 
+
+.SH RESOURCES
+
+Main web site: \fIhttps://github.com/ElementsProject/lightning\fR
+
+\" SHA256STAMP:901b147ccbfe0a18310a44ca848b623e83fa3c68912dacadefd045d4a2095523

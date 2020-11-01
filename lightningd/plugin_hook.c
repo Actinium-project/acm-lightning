@@ -231,6 +231,7 @@ static void plugin_hook_call_next(struct plugin_hook_request *ph_req)
 
 	req = jsonrpc_request_start(NULL, hook->name,
 				    plugin_get_log(ph_req->plugin),
+				    NULL,
 				    plugin_hook_callback, ph_req);
 
 	hook->serialize_payload(ph_req->cb_arg, req->stream);
@@ -299,33 +300,6 @@ static void db_hook_response(const char *buffer, const jsmntok_t *toks,
 		fatal("Plugin returned an invalid response to the db_write "
 		      "hook: %s", buffer);
 
-#ifdef COMPAT_V080
-	/* For back-compatibility we allow to return a simple Boolean true.  */
-	if (deprecated_apis) {
-		bool resp;
-		if (json_to_bool(buffer, resulttok, &resp)) {
-			static bool warned = false;
-			/* If it fails, we must not commit to our db. */
-			if (!resp)
-				fatal("Plugin returned failed db_write: %s.",
-				      buffer);
-			if (!warned) {
-				warned = true;
-				log_unusual(ph_req->db->log,
-					    "Plugin returned 'true' to "
-					    "'db_hook'.  "
-					    "This is now deprecated and "
-					    "you should return "
-					    "{'result': 'continue'} "
-					    "instead.");
-			}
-			/* Resume.  */
-			io_break(ph_req);
-			return;
-		}
-	}
-#endif /* defined(COMPAT_V080) */
-
 	/* We expect result: { 'result' : 'continue' }.
 	 * Anything else we abort.
 	 */
@@ -355,7 +329,8 @@ void plugin_hook_db_sync(struct db *db)
 
 	ph_req = notleak(tal(hook->plugins, struct plugin_hook_request));
 	/* FIXME: do IO logging for this! */
-	req = jsonrpc_request_start(NULL, hook->name, NULL, db_hook_response,
+	req = jsonrpc_request_start(NULL, hook->name, NULL, NULL,
+				    db_hook_response,
 				    ph_req);
 
 	ph_req->hook = hook;

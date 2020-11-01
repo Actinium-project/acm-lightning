@@ -5,7 +5,7 @@ SYNOPSIS
 --------
 
 **fundchannel** *id* *amount* \[*feerate* *announce*\] \[*minconf*\]
-\[*utxos*\] \[*push_msat*\]
+\[*utxos*\] \[*push_msat*\] \[*close_to*\]
 
 DESCRIPTION
 -----------
@@ -20,7 +20,7 @@ This auto-connection can fail if C-lightning does not know how to contact
 the target node; see lightning-connect(7).
 Once the
 transaction is confirmed, normal channel operations may begin. Readiness
-is indicated by **listpeers** reporting a *state* of CHANNELD\_NORMAL
+is indicated by **listpeers** reporting a *state* of `CHANNELD_NORMAL`
 for the channel.
 
 *id* is the peer id obtained from **connect**.
@@ -60,6 +60,10 @@ open. Note that this is a gift to the peer -- these satoshis are
 added to the initial balance of the peer at channel start and are largely
 unrecoverable once pushed.
 
+*close_to* is a Bitcoin address to which the channel funds should be sent to
+on close. Only valid if both peers have negotiated `option_upfront_shutdown_script`.
+Returns `close_to` set to closing script iff is negotiated.
+
 RETURN VALUE
 ------------
 
@@ -67,6 +71,10 @@ On success, the *tx* and *txid* of the transaction is returned, as well
 as the *outnum* indicating the output index which creates the channel, as well
 as the *channel\_id* of the newly created channel. On failure, an error
 is reported and the channel is not funded.
+
+If a `close_to` address was provided, will close to this address
+iff the `close_to` script is returned in the response. Otherwise,
+the peer does not support `option_upfront_shutdownscript`.
 
 The following error codes may occur:
 - -1: Catchall nonspecific error.
@@ -82,7 +90,7 @@ SEE ALSO
 --------
 
 lightning-connect(7), lightning-listfunds(), lightning-listpeers(7),
-lightning-feerates(7)
+lightning-feerates(7), lightning-multifundchannel(7)
 
 RESOURCES
 ---------

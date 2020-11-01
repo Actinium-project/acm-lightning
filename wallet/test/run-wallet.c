@@ -111,6 +111,10 @@ char *encode_scriptpubkey_to_addr(const tal_t *ctx UNNEEDED,
 /* Generated stub for fatal */
 void   fatal(const char *fmt UNNEEDED, ...)
 { fprintf(stderr, "fatal called!\n"); abort(); }
+/* Generated stub for feature_negotiated */
+bool feature_negotiated(const struct feature_set *our_features UNNEEDED,
+			const u8 *their_features UNNEEDED, size_t f UNNEEDED)
+{ fprintf(stderr, "feature_negotiated called!\n"); abort(); }
 /* Generated stub for fromwire_channeld_dev_memleak_reply */
 bool fromwire_channeld_dev_memleak_reply(const void *p UNNEEDED, bool *leak UNNEEDED)
 { fprintf(stderr, "fromwire_channeld_dev_memleak_reply called!\n"); abort(); }
@@ -343,6 +347,12 @@ void json_array_start(struct json_stream *js UNNEEDED, const char *fieldname UNN
 const jsmntok_t *json_get_member(const char *buffer UNNEEDED, const jsmntok_t tok[] UNNEEDED,
 				 const char *label UNNEEDED)
 { fprintf(stderr, "json_get_member called!\n"); abort(); }
+/* Generated stub for json_notify_fmt */
+void json_notify_fmt(struct command *cmd UNNEEDED,
+		     enum log_level level UNNEEDED,
+		     const char *fmt UNNEEDED, ...)
+
+{ fprintf(stderr, "json_notify_fmt called!\n"); abort(); }
 /* Generated stub for json_object_end */
 void json_object_end(struct json_stream *js UNNEEDED)
 { fprintf(stderr, "json_object_end called!\n"); abort(); }
@@ -424,6 +434,14 @@ void notify_chain_mvt(struct lightningd *ld UNNEEDED, const struct chain_coin_mv
 /* Generated stub for notify_channel_mvt */
 void notify_channel_mvt(struct lightningd *ld UNNEEDED, const struct channel_coin_mvt *mvt UNNEEDED)
 { fprintf(stderr, "notify_channel_mvt called!\n"); abort(); }
+/* Generated stub for notify_channel_state_changed */
+void notify_channel_state_changed(struct lightningd *ld UNNEEDED,
+				  struct node_id *peer_id UNNEEDED,
+				  struct channel_id *cid UNNEEDED,
+				  struct short_channel_id *scid UNNEEDED,
+				  enum channel_state old_state UNNEEDED,
+				  enum channel_state new_state UNNEEDED)
+{ fprintf(stderr, "notify_channel_state_changed called!\n"); abort(); }
 /* Generated stub for notify_connect */
 void notify_connect(struct lightningd *ld UNNEEDED, struct node_id *nodeid UNNEEDED,
 		    struct wireaddr_internal *addr UNNEEDED)
@@ -439,7 +457,7 @@ void notify_forward_event(struct lightningd *ld UNNEEDED,
 			  /* May be NULL. */
 			  const struct amount_msat *amount_out UNNEEDED,
 			  enum forward_status state UNNEEDED,
-			  enum onion_type failcode UNNEEDED,
+			  enum onion_wire failcode UNNEEDED,
 			  struct timeabs *resolved_time UNNEEDED)
 { fprintf(stderr, "notify_forward_event called!\n"); abort(); }
 /* Generated stub for onchaind_funding_spent */
@@ -456,9 +474,9 @@ struct onion_payload *onion_decode(const tal_t *ctx UNNEEDED,
 				   u64 *failtlvtype UNNEEDED,
 				   size_t *failtlvpos UNNEEDED)
 { fprintf(stderr, "onion_decode called!\n"); abort(); }
-/* Generated stub for onion_type_name */
-const char *onion_type_name(int e UNNEEDED)
-{ fprintf(stderr, "onion_type_name called!\n"); abort(); }
+/* Generated stub for onion_wire_name */
+const char *onion_wire_name(int e UNNEEDED)
+{ fprintf(stderr, "onion_wire_name called!\n"); abort(); }
 /* Generated stub for outpointfilter_add */
 void outpointfilter_add(struct outpointfilter *of UNNEEDED,
 			const struct bitcoin_txid *txid UNNEEDED, const u32 outnum UNNEEDED)
@@ -470,10 +488,6 @@ bool outpointfilter_matches(struct outpointfilter *of UNNEEDED,
 /* Generated stub for outpointfilter_new */
 struct outpointfilter *outpointfilter_new(tal_t *ctx UNNEEDED)
 { fprintf(stderr, "outpointfilter_new called!\n"); abort(); }
-/* Generated stub for outpointfilter_remove */
-void outpointfilter_remove(struct outpointfilter *of UNNEEDED,
-			   const struct bitcoin_txid *txid UNNEEDED, const u32 outnum UNNEEDED)
-{ fprintf(stderr, "outpointfilter_remove called!\n"); abort(); }
 /* Generated stub for param */
 bool param(struct command *cmd UNNEEDED, const char *buffer UNNEEDED,
 	   const jsmntok_t params[] UNNEEDED, ...)
@@ -544,7 +558,7 @@ struct command_result *param_tok(struct command *cmd UNNEEDED, const char *name 
 				 const jsmntok_t **out UNNEEDED)
 { fprintf(stderr, "param_tok called!\n"); abort(); }
 /* Generated stub for parse_onionpacket */
-enum onion_type parse_onionpacket(const u8 *src UNNEEDED,
+enum onion_wire parse_onionpacket(const u8 *src UNNEEDED,
 				  const size_t srclen UNNEEDED,
 				  struct onionpacket *dest UNNEEDED)
 { fprintf(stderr, "parse_onionpacket called!\n"); abort(); }
@@ -568,7 +582,8 @@ void peer_memleak_done(struct command *cmd UNNEEDED, struct subd *leaker UNNEEDE
 /* Generated stub for peer_start_channeld */
 void peer_start_channeld(struct channel *channel UNNEEDED,
 			 struct per_peer_state *pps UNNEEDED,
-			 const u8 *funding_signed UNNEEDED,
+			 const u8 *fwd_msg UNNEEDED,
+			 const struct wally_psbt *psbt UNNEEDED,
 			 bool reconnected UNNEEDED)
 { fprintf(stderr, "peer_start_channeld called!\n"); abort(); }
 /* Generated stub for peer_start_closingd */
@@ -577,11 +592,22 @@ void peer_start_closingd(struct channel *channel UNNEEDED,
 			 bool reconnected UNNEEDED,
 			 const u8 *channel_reestablish UNNEEDED)
 { fprintf(stderr, "peer_start_closingd called!\n"); abort(); }
+/* Generated stub for peer_start_dualopend */
+void peer_start_dualopend(struct peer *peer UNNEEDED,
+			  struct per_peer_state *pps UNNEEDED,
+			  const u8 *send_msg UNNEEDED)
+{ fprintf(stderr, "peer_start_dualopend called!\n"); abort(); }
 /* Generated stub for peer_start_openingd */
 void peer_start_openingd(struct peer *peer UNNEEDED,
 			 struct per_peer_state *pps UNNEEDED,
 			 const u8 *msg UNNEEDED)
 { fprintf(stderr, "peer_start_openingd called!\n"); abort(); }
+/* Generated stub for peer_wire_is_defined */
+bool peer_wire_is_defined(u16 type UNNEEDED)
+{ fprintf(stderr, "peer_wire_is_defined called!\n"); abort(); }
+/* Generated stub for peer_wire_name */
+const char *peer_wire_name(int e UNNEEDED)
+{ fprintf(stderr, "peer_wire_name called!\n"); abort(); }
 /* Generated stub for per_peer_state_set_fds */
 void per_peer_state_set_fds(struct per_peer_state *pps UNNEEDED,
 			    int peer_fd UNNEEDED, int gossip_fd UNNEEDED, int gossip_store_fd UNNEEDED)
@@ -763,12 +789,6 @@ struct txowatch *watch_txo(const tal_t *ctx UNNEEDED,
 						   size_t input_num UNNEEDED,
 						   const struct block *block))
 { fprintf(stderr, "watch_txo called!\n"); abort(); }
-/* Generated stub for wire_type_is_defined */
-bool wire_type_is_defined(u16 type UNNEEDED)
-{ fprintf(stderr, "wire_type_is_defined called!\n"); abort(); }
-/* Generated stub for wire_type_name */
-const char *wire_type_name(int e UNNEEDED)
-{ fprintf(stderr, "wire_type_name called!\n"); abort(); }
 /* Generated stub for wrap_onionreply */
 struct onionreply *wrap_onionreply(const tal_t *ctx UNNEEDED,
 				   const struct secret *shared_secret UNNEEDED,
@@ -908,7 +928,7 @@ static bool test_wallet_outputs(struct lightningd *ld, const tal_t *ctx)
 	struct utxo u;
 	struct pubkey pk;
 	struct node_id id;
-	struct amount_sat fee_estimate, change_satoshis;
+	struct utxo *one_utxo;
 	const struct utxo **utxos;
 	CHECK(w);
 
@@ -941,42 +961,46 @@ static bool test_wallet_outputs(struct lightningd *ld, const tal_t *ctx)
 		  "wallet_add_utxo with close_info");
 
 	/* Now select them */
-	utxos = wallet_select_coins(w, w, true, AMOUNT_SAT(2), 0, 21,
-				    0 /* no confirmations required */,
-				    &fee_estimate, &change_satoshis);
-	CHECK(utxos && tal_count(utxos) == 2);
+	utxos = tal_arr(w, const struct utxo *, 0);
+	while ((one_utxo = wallet_find_utxo(w, w, 0, NULL, 253,
+					    0 /* no confirmations required */,
+					    utxos)) != NULL) {
+		tal_arr_expand(&utxos, one_utxo);
+	}
+	CHECK(tal_count(utxos) == 2);
 
-	u = *utxos[1];
+	if (utxos[0]->close_info)
+		u = *utxos[0];
+	else
+		u = *utxos[1];
+
 	CHECK(u.close_info->channel_id == 42 &&
 	      pubkey_eq(u.close_info->commitment_point, &pk) &&
 	      node_id_eq(&u.close_info->peer_id, &id) &&
 	      u.close_info->option_anchor_outputs == false);
-	/* Now un-reserve them for the tests below */
-	tal_free(utxos);
-
 
 	/* Attempt to reserve the utxo */
 	CHECK_MSG(wallet_update_output_status(w, &u.txid, u.outnum,
-					      output_state_available,
-					      output_state_reserved),
+					      OUTPUT_STATE_AVAILABLE,
+					      OUTPUT_STATE_RESERVED),
 		  "could not reserve available output");
 
 	/* Reserving twice should fail */
 	CHECK_MSG(!wallet_update_output_status(w, &u.txid, u.outnum,
-					       output_state_available,
-					       output_state_reserved),
+					       OUTPUT_STATE_AVAILABLE,
+					       OUTPUT_STATE_RESERVED),
 		  "could reserve already reserved output");
 
 	/* Un-reserving should work */
 	CHECK_MSG(wallet_update_output_status(w, &u.txid, u.outnum,
-					      output_state_reserved,
-					      output_state_available),
+					      OUTPUT_STATE_RESERVED,
+					      OUTPUT_STATE_AVAILABLE),
 		  "could not unreserve reserved output");
 
 	/* Switching from any to something else */
 	CHECK_MSG(wallet_update_output_status(w, &u.txid, u.outnum,
-					      output_state_any,
-					      output_state_spent),
+					      OUTPUT_STATE_ANY,
+					      OUTPUT_STATE_SPENT),
 		  "could not change output state ignoring oldstate");
 
 	/* Attempt to save an UTXO with close_info set, no commitment_point */
@@ -993,12 +1017,19 @@ static bool test_wallet_outputs(struct lightningd *ld, const tal_t *ctx)
 		  "wallet_add_utxo with close_info no commitment_point");
 
 	/* Now select it */
-	utxos = wallet_select_coins(w, w, true, AMOUNT_SAT(5), 0, 21,
-				    0 /* no confirmations required */,
-				    &fee_estimate, &change_satoshis);
-	CHECK(utxos && tal_count(utxos) == 2);
+	utxos = tal_arr(w, const struct utxo *, 0);
+	while ((one_utxo = wallet_find_utxo(w, w, 0, NULL, 253,
+					    0 /* no confirmations required */,
+					    utxos)) != NULL) {
+		tal_arr_expand(&utxos, one_utxo);
+	}
+	CHECK(tal_count(utxos) == 2);
 
-	u = *utxos[1];
+	if (utxos[0]->close_info)
+		u = *utxos[0];
+	else
+		u = *utxos[1];
+
 	CHECK(u.close_info->channel_id == 42 &&
 	      u.close_info->commitment_point == NULL &&
 	      node_id_eq(&u.close_info->peer_id, &id) &&
@@ -1090,15 +1121,15 @@ static bool channelseq(struct channel *c1, struct channel *c2)
 	CHECK(pubkey_eq(&ci1->remote_per_commit, &ci2->remote_per_commit));
 	CHECK(pubkey_eq(&ci1->old_remote_per_commit, &ci2->old_remote_per_commit));
 	CHECK(ci1->their_config.id != 0 && ci1->their_config.id == ci2->their_config.id);
-	CHECK(fee_states_valid(ci1->fee_states, c1->opener));
-	CHECK(fee_states_valid(ci2->fee_states, c2->opener));
-	for (enum htlc_state i = 0; i < ARRAY_SIZE(ci1->fee_states->feerate);
+	CHECK(fee_states_valid(c1->fee_states, c1->opener));
+	CHECK(fee_states_valid(c2->fee_states, c2->opener));
+	for (enum htlc_state i = 0; i < ARRAY_SIZE(c1->fee_states->feerate);
 	     i++) {
-		if (ci1->fee_states->feerate[i] == NULL) {
-			CHECK(ci2->fee_states->feerate[i] == NULL);
+		if (c1->fee_states->feerate[i] == NULL) {
+			CHECK(c2->fee_states->feerate[i] == NULL);
 		} else {
-			CHECK(*ci1->fee_states->feerate[i]
-			      == *ci2->fee_states->feerate[i]);
+			CHECK(*c1->fee_states->feerate[i]
+			      == *c2->fee_states->feerate[i]);
 		}
 	}
 
@@ -1176,7 +1207,7 @@ static bool test_channel_crud(struct lightningd *ld, const tal_t *ctx)
 	pubkey_from_der(tal_hexdata(w, "02a1633cafcc01ebfb6d78e39f687a1f0995c62fc95f51ead10a02ee0be551b5dc", 66), 33, &pk);
 	node_id_from_pubkey(&id, &pk);
 	feerate = 31337;
-	ci->fee_states = new_fee_states(w, c1.opener, &feerate);
+	c1.fee_states = new_fee_states(w, c1.opener, &feerate);
 	mempat(scriptpubkey, tal_count(scriptpubkey));
 	c1.first_blocknum = 1;
 	parse_wireaddr_internal("localhost:1234", &addr, 0, false, false, false,
@@ -1498,7 +1529,7 @@ int main(int argc, const char *argv[])
 
 	/* Only elements in ld we should access */
 	list_head_init(&ld->peers);
-	list_head_init(&ld->rr_channels);
+	ld->rr_counter = 0;
 	node_id_from_hexstr("02a1633cafcc01ebfb6d78e39f687a1f0995c62fc95f51ead10a02ee0be551b5dc", 66, &ld->id);
 	/* Accessed in peer destructor sanity check */
 	htlc_in_map_init(&ld->htlcs_in);

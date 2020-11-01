@@ -1,3 +1,4 @@
+#include <assert.h>
 #include <ccan/ccan/err/err.h>
 #include <common/memleak.h>
 #include <common/setup.h>
@@ -5,11 +6,10 @@
 #include <sodium.h>
 #include <wally_core.h>
 
-static const tal_t *wally_tal_ctx;
-
 static void *wally_tal(size_t size)
 {
-	return tal_arr_label(wally_tal_ctx, u8, size, "wally_notleak");
+	assert(wally_tal_ctx);
+	return tal_arr_label(wally_tal_ctx, u8, size, "wally_tal");
 }
 
 static void wally_free(void *ptr)
@@ -35,7 +35,6 @@ void common_setup(const char *argv0)
 		     " available ?");
 
 	/* We set up Wally, the bitcoin wallet lib */
-	wally_tal_ctx = tal_label(NULL, char, "wally_ctx_notleak");
 	wally_init(0);
 	wally_set_operations(&wally_tal_ops);
 	secp256k1_ctx = wally_get_secp_context();

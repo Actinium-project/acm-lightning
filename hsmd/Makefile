@@ -1,15 +1,19 @@
 #! /usr/bin/make
 
-# Designed to be run one level up
-hsmd-wrongdir:
-	$(MAKE) -C .. lightningd/hsm-all
-
-default: hsmd-all
-
-LIGHTNINGD_HSM_SRC := hsmd/hsmd.c	\
+HSMD_SRC := hsmd/hsmd.c	\
 	hsmd/hsmd_wiregen.c
-LIGHTNINGD_HSM_HEADERS := hsmd/hsmd_wiregen.h
-LIGHTNINGD_HSM_OBJS := $(LIGHTNINGD_HSM_SRC:.c=.o)
+HSMD_HEADERS := hsmd/hsmd_wiregen.h
+HSMD_OBJS := $(HSMD_SRC:.c=.o)
+
+$(HSMD_OBJS): $(HSMD_HEADERS)
+
+# Other programs which use the hsm need this.
+HSMD_CLIENT_OBJS := hsmd/hsmd_wiregen.o
+
+# Make sure these depend on everything.
+ALL_C_SOURCES += $(HSMD_SRC)
+ALL_C_HEADERS += $(HSMD_HEADERS)
+ALL_PROGRAMS += lightningd/lightning_hsmd
 
 # Common source we use.
 HSMD_COMMON_OBJS :=				\
@@ -20,7 +24,6 @@ HSMD_COMMON_OBJS :=				\
 	common/daemon.o				\
 	common/daemon_conn.o			\
 	common/derive_basepoints.o		\
-	common/funding_tx.o			\
 	common/status_wiregen.o			\
 	common/hash_u5.o			\
 	common/key_derive.o			\
@@ -28,6 +31,8 @@ HSMD_COMMON_OBJS :=				\
 	common/msg_queue.o			\
 	common/node_id.o			\
 	common/permute_tx.o			\
+	common/psbt_open.o			\
+	common/pseudorand.o			\
 	common/setup.o				\
 	common/status.o				\
 	common/status_wire.o			\
@@ -35,34 +40,8 @@ HSMD_COMMON_OBJS :=				\
 	common/type_to_string.o			\
 	common/utils.o				\
 	common/utxo.o				\
-	common/version.o			\
-	common/withdraw_tx.o
+	common/version.o
 
-LIGHTNINGD_HSM_CLIENT_OBJS := hsmd/hsmd_wiregen.o
-
-# For checking
-LIGHTNINGD_HSM_ALLSRC_NOGEN := $(filter-out hsmd/%wiregen.c, $(LIGHTNINGD_HSM_SRC) $(LIGHTNINGD_HSM_SRC))
-LIGHTNINGD_HSM_ALLHEADERS_NOGEN := $(filter-out hsmd/%wiregen.h, $(LIGHTNINGD_HSM_HEADERS))
-
-$(LIGHTNINGD_HSM_OBJS): $(LIGHTNINGD_HEADERS)
-
-# Make sure these depend on everything.
-ALL_OBJS += $(LIGHTNINGD_HSM_OBJS)
-ALL_PROGRAMS += lightningd/lightning_hsmd
-ALL_GEN_HEADERS += hsmd/hsmd_wiregen.h
-
-hsmd-all: lightningd/lightning_hsmd
-
-lightningd/lightning_hsmd: $(LIGHTNINGD_HSM_OBJS) $(LIGHTNINGD_LIB_OBJS) $(HSMD_COMMON_OBJS) $(BITCOIN_OBJS) $(WIRE_OBJS)
-
-check-source: $(LIGHTNINGD_HSM_ALLSRC_NOGEN:%=check-src-include-order/%) $(LIGHTNINGD_HSM_ALLHEADERS_NOGEN:%=check-hdr-include-order/%)
-check-source-bolt: $(LIGHTNINGD_HSM_SRC:%=bolt-check/%)
-
-check-whitespace: $(LIGHTNINGD_HSM_ALLSRC_NOGEN:%=check-whitespace/%) $(LIGHTNINGD_HSM_ALLHEADERS_NOGEN:%=check-whitespace/%)
-
-clean: lightningd/hsm-clean
-
-lightningd/hsm-clean:
-	$(RM) $(LIGHTNINGD_HSM_OBJS) hsmd/gen_*
+lightningd/lightning_hsmd: $(HSMD_OBJS) $(HSMD_COMMON_OBJS) $(BITCOIN_OBJS) $(WIRE_OBJS)
 
 -include hsmd/test/Makefile

@@ -7,6 +7,7 @@
 #include <ccan/mem/mem.h>
 #include <ccan/ptrint/ptrint.h>
 #include <ccan/tal/str/str.h>
+#include <common/features.h>
 #include <common/gossip_store.h>
 #include <common/gossmap.h>
 #include <common/node_id.h>
@@ -20,7 +21,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <wire/gen_peer_wire.h>
+#include <wire/peer_wire.h>
 
 /* We need this global to decode indexes for hash functions */
 static struct gossmap *map;
@@ -127,6 +128,27 @@ static void map_nodeid(const struct gossmap *map, size_t offset,
 		       struct node_id *id)
 {
 	map_copy(map, offset, id, sizeof(*id));
+}
+
+/* Returns optional or compulsory feature if set, otherwise -1 */
+static int map_feature_test(const struct gossmap *map,
+			    int compulsory_bit,
+			    size_t offset, size_t len)
+{
+	size_t bytenum = compulsory_bit / 8;
+	u8 bits;
+
+	assert(COMPULSORY_FEATURE(compulsory_bit) == compulsory_bit);
+	if (bytenum >= len)
+		return -1;
+
+	/* Note reversed! */
+	bits = map_u8(map, offset + len - 1 - bytenum);
+	if (bits & (1 << (compulsory_bit % 8)))
+		return compulsory_bit;
+	if (bits & (1 << (OPTIONAL_FEATURE(compulsory_bit) % 8)))
+		return OPTIONAL_FEATURE(compulsory_bit);
+	return -1;
 }
 
 /* These values can change across calls to gossmap_check. */
@@ -589,8 +611,12 @@ static bool map_catchup(struct gossmap *map)
 		type = map_be16(map, off);
 		if (type == WIRE_CHANNEL_ANNOUNCEMENT)
 			add_channel(map, off);
+		else if (type == WIRE_GOSSIP_STORE_PRIVATE_CHANNEL)
+			add_channel(map, off + 2 + 8 + 2);
 		else if (type == WIRE_CHANNEL_UPDATE)
 			update_channel(map, off);
+		else if (type == WIRE_GOSSIP_STORE_PRIVATE_UPDATE)
+			update_channel(map, off + 2 + 2);
 		else if (type == WIRE_GOSSIP_STORE_DELETE_CHAN)
 			remove_channel_by_deletemsg(map, off);
 		else if (type == WIRE_NODE_ANNOUNCEMENT)
@@ -823,9 +849,72 @@ u8 *gossmap_node_get_announce(const tal_t *ctx,
 			      const struct gossmap *map,
 			      const struct gossmap_node *n)
 {
-	u16 len = map_be16(map, n->nann_off);
-	u8 *msg = tal_arr(ctx, u8, len);
+	u16 len;
+	u8 *msg;
+
+	if (n->nann_off == 0)
+		return NULL;
+
+	len = map_be16(map, n->nann_off);
+	msg = tal_arr(ctx, u8, len);
 
 	map_copy(map, n->nann_off, msg, len);
 	return msg;
+}
+
+/* BOLT #7:
+ * 1. type: 256 (`channel_announcement`)
+ * 2. data:
+ *     * [`signature`:`node_signature_1`]
+ *     * [`signature`:`node_signature_2`]
+ *     * [`signature`:`bitcoin_signature_1`]
+ *     * [`signature`:`bitcoin_signature_2`]
+ *     * [`u16`:`len`]
+ *     * [`len*byte`:`features`]
+ *     * [`chain_hash`:`chain_hash`]
+ *     * [`short_channel_id`:`short_channel_id`]
+ *     * [`point`:`node_id_1`]
+ *     * [`point`:`node_id_2`]
+ */
+int gossmap_chan_get_feature(const struct gossmap *map,
+			     const struct gossmap_chan *c,
+			     int fbit)
+{
+	/* Note that first two bytes are message type */
+	const size_t feature_len_off = 2 + (64 + 64 + 64 + 64);
+	size_t feature_len;
+
+	feature_len = map_be16(map, c->cann_off + feature_len_off);
+
+	return map_feature_test(map, COMPULSORY_FEATURE(fbit),
+				c->cann_off + feature_len_off + 2, feature_len);
+}
+
+/* BOLT #7:
+ * 1. type: 257 (`node_announcement`)
+ * 2. data:
+ *    * [`signature`:`signature`]
+ *    * [`u16`:`flen`]
+ *    * [`flen*byte`:`features`]
+ *    * [`u32`:`timestamp`]
+ *    * [`point`:`node_id`]
+ *    * [`3*byte`:`rgb_color`]
+ *    * [`32*byte`:`alias`]
+ *    * [`u16`:`addrlen`]
+ *    * [`addrlen*byte`:`addresses`]
+ */
+int gossmap_node_get_feature(const struct gossmap *map,
+			     const struct gossmap_node *n,
+			     int fbit)
+{
+	const size_t feature_len_off = 2 + 64;
+	size_t feature_len;
+
+	if (n->nann_off == 0)
+		return -1;
+
+	feature_len = map_be16(map, n->nann_off + feature_len_off);
+
+	return map_feature_test(map, COMPULSORY_FEATURE(fbit),
+				n->nann_off + feature_len_off + 2, feature_len);
 }

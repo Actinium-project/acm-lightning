@@ -498,7 +498,7 @@ static struct command_result *estimatefees_final_step(struct bitcoin_cli *bcli)
 
 	response = jsonrpc_stream_success(bcli->cmd);
 	json_add_u64(response, "opening", stash->normal);
-	json_add_u64(response, "mutual_close", stash->normal);
+	json_add_u64(response, "mutual_close", stash->slow);
 	json_add_u64(response, "unilateral_close",
 		     stash->very_urgent * bitcoind->commit_fee_percent / 100);
 	json_add_u64(response, "delayed_to_us", stash->normal);
@@ -618,9 +618,9 @@ static struct command_result *process_getrawblock(struct bitcoin_cli *bcli)
 	struct json_stream *response;
 	struct getrawblock_stash *stash = bcli->stash;
 
-	/* -1 to strip \n. */
-	stash->block_hex = tal_fmt(stash, "%.*s",
-	                           (int)bcli->output_bytes-1, bcli->output);
+	/* -1 to strip \n and steal onto the stash. */
+	bcli->output[bcli->output_bytes-1] = 0x00;
+	stash->block_hex = tal_steal(stash, bcli->output);
 
 	response = jsonrpc_stream_success(bcli->cmd);
 	json_add_string(response, "blockhash", stash->block_hash);
@@ -753,12 +753,28 @@ static struct command_result *sendrawtransaction(struct command *cmd,
                                                  const jsmntok_t *toks)
 {
 	const char **params = tal_arr(cmd, const char *, 1);
+	bool *allowhighfees;
 
 	/* bitcoin-cli wants strings. */
 	if (!param(cmd, buf, toks,
 	           p_req("tx", param_string, &params[0]),
+		   p_req("allowhighfees", param_bool, &allowhighfees),
 	           NULL))
 		return command_param_failed();
+
+	if (*allowhighfees) {
+		if (bitcoind->version >= 190001)
+			/* Starting in 19.0.1, second argument is
+			 * maxfeerate, which when set to 0 means
+			 * no max feerate.
+			 */
+			tal_arr_expand(&params, "0");
+		else
+			/* in older versions, second arg is allowhighfees,
+			 * set to true to allow high fees.
+			 */
+			tal_arr_expand(&params, "true");
+	}
 
 	start_bitcoin_cli(NULL, cmd, process_sendrawtransaction, true,
 			  BITCOIND_HIGH_PRIO, "sendrawtransaction", params, NULL);

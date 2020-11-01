@@ -12,12 +12,14 @@
 #include <hsmd/hsmd_wiregen.h>
 #include <inttypes.h>
 #include <lightningd/channel.h>
+#include <lightningd/channel_state_names_gen.h>
 #include <lightningd/connect_control.h>
-#include <lightningd/gen_channel_state_names.h>
 #include <lightningd/hsm_control.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
+#include <lightningd/notification.h>
+#include <lightningd/opening_common.h>
 #include <lightningd/opening_control.h>
 #include <lightningd/peer_control.h>
 #include <lightningd/subd.h>
@@ -110,8 +112,6 @@ static void destroy_channel(struct channel *channel)
 	channel_set_owner(channel, NULL);
 
 	list_del_from(&channel->peer->channels, &channel->list);
-
-	list_del(&channel->rr_list);
 }
 
 void delete_channel(struct channel *channel STEALS)
@@ -165,6 +165,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    bool remote_funding_locked,
 			    /* NULL or stolen */
 			    struct short_channel_id *scid,
+			    struct channel_id *cid,
 			    struct amount_msat our_msat,
 			    struct amount_msat msat_to_us_min,
 			    struct amount_msat msat_to_us_max,
@@ -174,6 +175,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    /* NULL or stolen */
 			    const struct bitcoin_signature *last_htlc_sigs,
 			    const struct channel_info *channel_info,
+			    const struct fee_states *fee_states TAKES,
 			    /* NULL or stolen */
 			    u8 *remote_shutdown_scriptpubkey,
 			    const u8 *local_shutdown_scriptpubkey,
@@ -192,7 +194,8 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    u32 feerate_ppm,
 			    const u8 *remote_upfront_shutdown_script,
 			    bool option_static_remotekey,
-			    bool option_anchor_outputs)
+			    bool option_anchor_outputs,
+			    struct wally_psbt *psbt STEALS)
 {
 	struct channel *channel = tal(peer->ld, struct channel);
 
@@ -234,6 +237,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 	channel->our_funds = our_funds;
 	channel->remote_funding_locked = remote_funding_locked;
 	channel->scid = tal_steal(channel, scid);
+	channel->cid = *cid;
 	channel->our_msat = our_msat;
 	channel->msat_to_us_min = msat_to_us_min;
 	channel->msat_to_us_max = msat_to_us_max;
@@ -243,8 +247,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 	channel->last_sig = *last_sig;
 	channel->last_htlc_sigs = tal_steal(channel, last_htlc_sigs);
 	channel->channel_info = *channel_info;
-	channel->channel_info.fee_states
-		= dup_fee_states(channel, channel_info->fee_states);
+	channel->fee_states = dup_fee_states(channel, fee_states);
 	channel->shutdown_scriptpubkey[REMOTE]
 		= tal_steal(channel, remote_shutdown_scriptpubkey);
 	channel->final_key_idx = final_key_idx;
@@ -276,8 +279,14 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 	channel->option_anchor_outputs = option_anchor_outputs;
 	channel->forgets = tal_arr(channel, struct command *, 0);
 
+	/* If we're already locked in, we no longer need the PSBT */
+	if (!remote_funding_locked && psbt)
+		channel->psbt = tal_steal(channel, psbt);
+	else
+		channel->psbt = tal_free(psbt);
+
 	list_add_tail(&peer->channels, &channel->list);
-	list_add_tail(&peer->ld->rr_channels, &channel->rr_list);
+	channel->rr_number = peer->ld->rr_counter++;
 	tal_add_destructor(channel, destroy_channel);
 
 	/* Make sure we see any spends using this key */
@@ -368,6 +377,35 @@ struct channel *channel_by_dbid(struct lightningd *ld, const u64 dbid)
 	return NULL;
 }
 
+struct channel *channel_by_cid(struct lightningd *ld,
+			       const struct channel_id *cid,
+			       struct uncommitted_channel **uc)
+{
+	struct peer *p;
+	struct channel *channel;
+
+	list_for_each(&ld->peers, p, list) {
+		if (p->uncommitted_channel) {
+			if (channel_id_eq(&p->uncommitted_channel->cid, cid)) {
+				if (uc)
+					*uc = p->uncommitted_channel;
+				return NULL;
+			}
+		}
+		list_for_each(&p->channels, channel, list) {
+			if (channel_id_eq(&channel->cid, cid)) {
+				if (uc)
+					*uc = p->uncommitted_channel;
+				return channel;
+			}
+		}
+	}
+	if (uc)
+		*uc = NULL;
+	return NULL;
+}
+
+
 void channel_set_last_tx(struct channel *channel,
 			 struct bitcoin_tx *tx,
 			 const struct bitcoin_signature *sig,
@@ -384,6 +422,8 @@ void channel_set_state(struct channel *channel,
 		       enum channel_state old_state,
 		       enum channel_state state)
 {
+	struct channel_id cid;
+
 	log_info(channel->log, "State changed from %s to %s",
 		 channel_state_name(channel), channel_state_str(state));
 	if (channel->state != old_state)
@@ -394,6 +434,17 @@ void channel_set_state(struct channel *channel,
 
 	/* TODO(cdecker) Selectively save updated fields to DB */
 	wallet_channel_save(channel->peer->ld->wallet, channel);
+
+	/* plugin notification channel_state_changed */
+	if (state != old_state) {  /* see issue #4029 */
+		derive_channel_id(&cid, &channel->funding_txid, channel->funding_outnum);
+		notify_channel_state_changed(channel->peer->ld,
+					     &channel->peer->id,
+					     &cid,
+					     channel->scid,
+					     old_state,
+					     state);
+	}
 }
 
 void channel_fail_permanent(struct channel *channel, const char *fmt, ...)
@@ -401,7 +452,6 @@ void channel_fail_permanent(struct channel *channel, const char *fmt, ...)
 	struct lightningd *ld = channel->peer->ld;
 	va_list ap;
 	char *why;
-	struct channel_id cid;
 
 	va_start(ap, fmt);
 	why = tal_vfmt(tmpctx, fmt, ap);
@@ -411,12 +461,9 @@ void channel_fail_permanent(struct channel *channel, const char *fmt, ...)
 		    channel_state_name(channel), why);
 
 	/* We can have multiple errors, eg. onchaind failures. */
-	if (!channel->error) {
-		derive_channel_id(&cid,
-				  &channel->funding_txid,
-				  channel->funding_outnum);
-		channel->error = towire_errorfmt(channel, &cid, "%s", why);
-	}
+	if (!channel->error)
+		channel->error = towire_errorfmt(channel,
+						 &channel->cid, "%s", why);
 
 	channel_set_owner(channel, NULL);
 	/* Drop non-cooperatively (unilateral) to chain. */
@@ -432,7 +479,6 @@ void channel_fail_forget(struct channel *channel, const char *fmt, ...)
 {
 	va_list ap;
 	char *why;
-	struct channel_id cid;
 
 	assert(channel->opener == REMOTE &&
 	       channel->state == CHANNELD_AWAITING_LOCKIN);
@@ -444,12 +490,9 @@ void channel_fail_forget(struct channel *channel, const char *fmt, ...)
 		    "forget channel",
 		    channel_state_name(channel), why);
 
-	if (!channel->error) {
-		derive_channel_id(&cid,
-				  &channel->funding_txid,
-				  channel->funding_outnum);
-		channel->error = towire_errorfmt(channel, &cid, "%s", why);
-	}
+	if (!channel->error)
+		channel->error = towire_errorfmt(channel,
+						 &channel->cid, "%s", why);
 
 	delete_channel(channel);
 	tal_free(why);

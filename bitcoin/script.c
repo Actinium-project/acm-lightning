@@ -9,6 +9,7 @@
 #include <ccan/endian/endian.h>
 #include <ccan/mem/mem.h>
 #include <common/utils.h>
+#include <sodium/randombytes.h>
 
 /* Some standard ops */
 #define OP_0		0x00
@@ -221,6 +222,16 @@ u8 *scriptpubkey_opreturn(const tal_t *ctx)
 	add_op(&script, OP_RETURN);
 	return script;
 }
+u8 *scriptpubkey_opreturn_padded(const tal_t *ctx)
+{
+	u8 *script = tal_arr(ctx, u8, 0);
+	u8 random[20];
+	randombytes_buf(random, sizeof(random));
+
+	add_op(&script, OP_RETURN);
+	script_push_bytes(&script, random, sizeof(random));
+	return script;
+}
 
 /* Create an input script which spends p2pkh */
 u8 *bitcoin_redeem_p2pkh(const tal_t *ctx, const struct pubkey *pubkey,
@@ -250,16 +261,28 @@ u8 *bitcoin_redeem_p2sh_p2wpkh(const tal_t *ctx, const struct pubkey *key)
 	return script;
 }
 
-u8 *bitcoin_scriptsig_p2sh_p2wpkh(const tal_t *ctx, const struct pubkey *key)
+u8 *bitcoin_scriptsig_redeem(const tal_t *ctx,
+			     const u8 *redeemscript TAKES)
 {
-	u8 *redeemscript = bitcoin_redeem_p2sh_p2wpkh(ctx, key), *script;
+	u8 *script;
 
 	/* BIP141: The scriptSig must be exactly a push of the BIP16
 	 * redeemScript or validation fails. */
 	script = tal_arr(ctx, u8, 0);
-	script_push_bytes(&script, redeemscript, tal_count(redeemscript));
-	tal_free(redeemscript);
+	script_push_bytes(&script, redeemscript,
+			  tal_count(redeemscript));
+
+	if (taken(redeemscript))
+		tal_free(redeemscript);
+
 	return script;
+}
+
+u8 *bitcoin_scriptsig_p2sh_p2wpkh(const tal_t *ctx, const struct pubkey *key)
+{
+	u8 *redeemscript =
+		bitcoin_redeem_p2sh_p2wpkh(NULL, key);
+	return bitcoin_scriptsig_redeem(ctx, take(redeemscript));
 }
 
 u8 **bitcoin_witness_p2wpkh(const tal_t *ctx,

@@ -34,8 +34,8 @@ def test_gossip_pruning(node_factory, bitcoind):
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     l2.rpc.connect(l3.info['id'], 'localhost', l3.port)
 
-    scid1 = l1.fund_channel(l2, 10**6)
-    scid2 = l2.fund_channel(l3, 10**6)
+    scid1, _ = l1.fundchannel(l2, 10**6)
+    scid2, _ = l2.fundchannel(l3, 10**6)
 
     bitcoind.generate_block(6)
 
@@ -80,7 +80,7 @@ def test_gossip_disable_channels(node_factory, bitcoind):
     l1, l2 = node_factory.get_nodes(2, opts=opts)
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
-    scid = l1.fund_channel(l2, 10**6)
+    scid, _ = l1.fundchannel(l2, 10**6)
     bitcoind.generate_block(5)
 
     def count_active(node):
@@ -121,7 +121,7 @@ def test_announce_address(node_factory, bitcoind):
     l1, l2 = node_factory.get_nodes(2, opts=[opts, {}])
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
-    scid = l1.fund_channel(l2, 10**6)
+    scid, _ = l1.fundchannel(l2, 10**6)
     bitcoind.generate_block(5)
 
     l1.wait_channel_active(scid)
@@ -146,7 +146,7 @@ def test_gossip_timestamp_filter(node_factory, bitcoind):
     before_anything = int(time.time())
 
     # Make a public channel.
-    chan12 = l1.fund_channel(l2, 10**5)
+    chan12, _ = l1.fundchannel(l2, 10**5)
     bitcoind.generate_block(5)
 
     l3.wait_for_channel_updates([chan12])
@@ -154,7 +154,7 @@ def test_gossip_timestamp_filter(node_factory, bitcoind):
 
     # Make another one, different timestamp.
     time.sleep(1)
-    chan23 = l2.fund_channel(l3, 10**5)
+    chan23, _ = l2.fundchannel(l3, 10**5)
     bitcoind.generate_block(5)
 
     l1.wait_for_channel_updates([chan23])
@@ -229,7 +229,7 @@ def test_connect_by_gossip(node_factory, bitcoind):
     l2.rpc.connect(l3.info['id'], 'localhost', l3.port)
 
     # Nodes are gossiped only if they have channels
-    chanid = l2.fund_channel(l3, 10**6)
+    chanid, _ = l2.fundchannel(l3, 10**6)
     bitcoind.generate_block(5)
 
     # Let channel reach announcement depth
@@ -334,8 +334,8 @@ def test_gossip_badsig(node_factory):
     # l2 connects to both, so l1 can't reconnect and thus l2 drops to chain
     l2.rpc.connect(l1.info['id'], 'localhost', l1.port)
     l2.rpc.connect(l3.info['id'], 'localhost', l3.port)
-    l2.fund_channel(l1, 10**6)
-    l2.fund_channel(l3, 10**6)
+    l2.fundchannel(l1, 10**6)
+    l2.fundchannel(l3, 10**6)
 
     # Wait for route propagation.
     l1.bitcoin.generate_block(5)
@@ -354,7 +354,7 @@ def test_gossip_weirdalias(node_factory, bitcoind):
         {'alias': normal_name}
     ]
     l1, l2 = node_factory.get_nodes(2, opts=opts)
-    weird_name_json = json.encoder.JSONEncoder().encode(weird_name)[1:-1].replace('\\', '\\\\')
+    weird_name_json = json.encoder.JSONEncoder().encode(weird_name)[1:-1]
     aliasline = l1.daemon.is_in_log('Server started with public key .* alias')
     assert weird_name_json in str(aliasline)
     assert l2.daemon.is_in_log('Server started with public key .* alias {}'
@@ -362,7 +362,7 @@ def test_gossip_weirdalias(node_factory, bitcoind):
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     l2.daemon.wait_for_log('openingd-chan#1: Handed peer, entering loop')
-    l2.fund_channel(l1, 10**6)
+    l2.fundchannel(l1, 10**6)
     bitcoind.generate_block(6)
 
     # They should gossip together.
@@ -391,12 +391,12 @@ def test_gossip_persistence(node_factory, bitcoind):
     l2.rpc.connect(l3.info['id'], 'localhost', l3.port)
     l3.rpc.connect(l4.info['id'], 'localhost', l4.port)
 
-    scid12 = l1.fund_channel(l2, 10**6)
-    scid23 = l2.fund_channel(l3, 10**6)
+    scid12, _ = l1.fundchannel(l2, 10**6)
+    scid23, _ = l2.fundchannel(l3, 10**6)
 
     # Make channels public, except for l3 -> l4, which is kept local-only for now
     bitcoind.generate_block(5)
-    scid34 = l3.fund_channel(l4, 10**6)
+    scid34, _ = l3.fundchannel(l4, 10**6)
     bitcoind.generate_block(1)
 
     def active(node):
@@ -462,11 +462,11 @@ def test_routing_gossip_reconnect(node_factory):
                                               {'may_reconnect': True},
                                               {}])
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
-    l1.openchannel(l2, 20000)
+    l1.openchannel(l2, 25000)
 
     # Now open new channels and everybody should sync
     l2.rpc.connect(l3.info['id'], 'localhost', l3.port)
-    l2.openchannel(l3, 20000)
+    l2.openchannel(l3, 25000)
 
     # Settle the gossip
     for n in [l1, l2, l3]:
@@ -485,7 +485,7 @@ def test_gossip_no_empty_announcements(node_factory, bitcoind):
                                              fundchannel=False)
 
     # Make an announced-but-not-updated channel.
-    l3.fund_channel(l4, 10**5)
+    l3.fundchannel(l4, 10**5)
     bitcoind.generate_block(5)
 
     # 0x0100 = channel_announcement, which goes to l2 before l3 dies.
@@ -508,7 +508,7 @@ def test_routing_gossip(node_factory, bitcoind):
     for i in range(len(nodes) - 1):
         src, dst = nodes[i], nodes[i + 1]
         src.rpc.connect(dst.info['id'], 'localhost', dst.port)
-        src.openchannel(dst, 20000)
+        src.openchannel(dst, 25000)
 
     # Allow announce messages.
     bitcoind.generate_block(5)
@@ -727,7 +727,7 @@ def test_gossip_query_channel_range(node_factory, bitcoind, chainparams):
     assert len(msgs) == 8
 
     # This should actually be large enough for zlib to kick in!
-    scid34 = l3.fund_channel(l4, 10**5)
+    scid34, _ = l3.fundchannel(l4, 10**5)
     bitcoind.generate_block(5)
     l2.daemon.wait_for_log('Received node_announcement for node ' + l4.info['id'])
 
@@ -780,7 +780,7 @@ def test_report_routing_failure(node_factory, bitcoind):
 
     def fund_from_to_payer(lsrc, ldst, lpayer):
         lsrc.rpc.connect(ldst.info['id'], 'localhost', ldst.port)
-        c = lsrc.fund_channel(ldst, 10000000)
+        c, _ = lsrc.fundchannel(ldst, 10000000)
         bitcoind.generate_block(5)
         lpayer.wait_for_channel_updates([c])
 
@@ -798,7 +798,8 @@ def test_report_routing_failure(node_factory, bitcoind):
         src.rpc.connect(dst.info['id'], 'localhost', dst.port)
         print("src={}, dst={}".format(src.daemon.lightning_dir,
                                       dst.daemon.lightning_dir))
-        channels.append(src.fund_channel(dst, 10**6))
+        c, _ = src.fundchannel(dst, 10**6)
+        channels.append(c)
     bitcoind.generate_block(5)
 
     for c in channels:
@@ -833,8 +834,8 @@ def test_query_short_channel_id(node_factory, bitcoind, chainparams):
     assert msgs[0] == '0106{}01'.format(chain_hash)
 
     # Make channels public.
-    scid12 = l1.fund_channel(l2, 10**5)
-    scid23 = l2.fund_channel(l3, 10**5)
+    scid12, _ = l1.fundchannel(l2, 10**5)
+    scid23, _ = l2.fundchannel(l3, 10**5)
     bitcoind.generate_block(5)
 
     # It will know about everything.
@@ -899,7 +900,7 @@ def test_gossip_addresses(node_factory, bitcoind):
     l2 = node_factory.get_node()
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
 
-    l1.fund_channel(l2, 100000)
+    l1.fundchannel(l2, 100000)
     bitcoind.generate_block(6)
     l2.daemon.wait_for_log('Received node_announcement for node {}'
                            .format(l1.info['id']))
@@ -917,7 +918,7 @@ def test_gossip_store_load(node_factory):
     """Make sure we can read canned gossip store"""
     l1 = node_factory.get_node(start=False)
     with open(os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, 'gossip_store'), 'wb') as f:
-        f.write(bytearray.fromhex("08"        # GOSSIP_STORE_VERSION
+        f.write(bytearray.fromhex("09"        # GOSSIP_STORE_VERSION
                                   "000001b0"  # len
                                   "fea676e8"  # csum
                                   "5b8d9b44"  # timestamp
@@ -949,7 +950,7 @@ def test_gossip_store_load_announce_before_update(node_factory):
     """Make sure we can read canned gossip store with node_announce before update.  This happens when a channel_update gets replaced, leaving node_announce before it"""
     l1 = node_factory.get_node(start=False)
     with open(os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, 'gossip_store'), 'wb') as f:
-        f.write(bytearray.fromhex("08"        # GOSSIP_STORE_VERSION
+        f.write(bytearray.fromhex("09"        # GOSSIP_STORE_VERSION
                                   "000001b0"  # len
                                   "fea676e8"  # csum
                                   "5b8d9b44"  # timestamp
@@ -992,7 +993,7 @@ def test_gossip_store_load_amount_truncated(node_factory):
     """Make sure we can read canned gossip store with truncated amount"""
     l1 = node_factory.get_node(start=False, allow_broken_log=True)
     with open(os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, 'gossip_store'), 'wb') as f:
-        f.write(bytearray.fromhex("08"        # GOSSIP_STORE_VERSION
+        f.write(bytearray.fromhex("09"        # GOSSIP_STORE_VERSION
                                   "000001b0"  # len
                                   "fea676e8"  # csum
                                   "5b8d9b44"  # timestamp
@@ -1196,7 +1197,7 @@ def test_getroute_exclude(node_factory, bitcoind):
 
     # Now, create an alternate (better) route.
     l2.rpc.connect(l4.info['id'], 'localhost', l4.port)
-    scid = l2.fund_channel(l4, 1000000, wait_for_active=False)
+    scid, _ = l2.fundchannel(l4, 1000000, wait_for_active=False)
     bitcoind.generate_block(5)
 
     # We don't wait above, because we care about it hitting l1.
@@ -1231,9 +1232,9 @@ def test_getroute_exclude(node_factory, bitcoind):
         l1.rpc.getroute(l4.info['id'], 1, 1, exclude=[l3.info['id'], chan_l2l4])
 
     l1.rpc.connect(l5.info['id'], 'localhost', l5.port)
-    scid15 = l1.fund_channel(l5, 1000000, wait_for_active=False)
+    scid15, _ = l1.fundchannel(l5, 1000000, wait_for_active=False)
     l5.rpc.connect(l4.info['id'], 'localhost', l4.port)
-    scid54 = l5.fund_channel(l4, 1000000, wait_for_active=False)
+    scid54, _ = l5.fundchannel(l4, 1000000, wait_for_active=False)
     bitcoind.generate_block(5)
 
     # We don't wait above, because we care about it hitting l1.
@@ -1315,7 +1316,7 @@ def setup_gossip_store_test(node_factory, bitcoind):
     l1, l2, l3 = node_factory.line_graph(3, fundchannel=False)
 
     # Create channel.
-    scid23 = l2.fund_channel(l3, 10**6)
+    scid23, _ = l2.fundchannel(l3, 10**6)
 
     # Have that channel announced.
     bitcoind.generate_block(5)
@@ -1328,7 +1329,7 @@ def setup_gossip_store_test(node_factory, bitcoind):
     wait_for(lambda: sum([c['base_fee_millisatoshi'] for c in l2.rpc.listchannels()['channels']]) == 21)
 
     # Create another channel, which will stay private.
-    scid12 = l1.fund_channel(l2, 10**6)
+    scid12, _ = l1.fundchannel(l2, 10**6)
 
     # Now insert channel_update for previous channel; now they're both past the
     # node announcements.
@@ -1341,9 +1342,10 @@ def setup_gossip_store_test(node_factory, bitcoind):
     wait_for(lambda: [c['base_fee_millisatoshi'] for c in l2.rpc.listchannels(scid12)['channels']] == [20, 20])
 
     # Records in store now looks (something) like:
-    #    DELETED: local-add-channel (scid23)
+    #    DELETED: private channel_announcement (scid23)
     #    DELETED: private channel_update (scid23/0)
     #    DELETED: private channel_update (scid23/1)
+    #  delete channel (scid23)
     #  channel_announcement (scid23)
     #  channel_amount
     #    DELETED: channel_update (scid23/0)
@@ -1351,7 +1353,7 @@ def setup_gossip_store_test(node_factory, bitcoind):
     #  node_announcement
     #  node_announcement
     #  channel_update (scid23)
-    #  local_add_channel (scid12)
+    #  private channel_announcement (scid12)
     #    DELETED: private channel_update (scid12/0)
     #    DELETED: private channel_update (scid12/1)
     #  channel_update (scid23)
@@ -1418,7 +1420,7 @@ def test_gossip_store_load_no_channel_update(node_factory):
 
     # A channel announcement with no channel_update.
     with open(os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, 'gossip_store'), 'wb') as f:
-        f.write(bytearray.fromhex("08"        # GOSSIP_STORE_VERSION
+        f.write(bytearray.fromhex("09"        # GOSSIP_STORE_VERSION
                                   "000001b0"  # len
                                   "fea676e8"  # csum
                                   "5b8d9b44"  # timestamp
@@ -1445,7 +1447,7 @@ def test_gossip_store_load_no_channel_update(node_factory):
     l1.rpc.call('dev-compact-gossip-store')
 
     with open(os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, 'gossip_store'), "rb") as f:
-        assert bytearray(f.read()) == bytearray.fromhex("08")
+        assert bytearray(f.read()) == bytearray.fromhex("09")
 
 
 @unittest.skipIf(not DEVELOPER, "gossip without DEVELOPER=1 is slow")
@@ -1456,7 +1458,7 @@ def test_gossip_store_compact_on_load(node_factory, bitcoind):
 
     wait_for(lambda: l2.daemon.is_in_log(r'gossip_store_compact_offline: [5-8] deleted, 9 copied'))
 
-    wait_for(lambda: l2.daemon.is_in_log(r'gossip_store: Read 1/4/2/0 cannounce/cupdate/nannounce/cdelete from store \(0 deleted\) in [0-9]* bytes'))
+    wait_for(lambda: l2.daemon.is_in_log(r'gossip_store: Read 2/4/2/0 cannounce/cupdate/nannounce/cdelete from store \(0 deleted\) in [0-9]* bytes'))
 
 
 def test_gossip_announce_invalid_block(node_factory, bitcoind):
@@ -1536,41 +1538,86 @@ def test_gossip_no_backtalk(node_factory):
 
 
 @unittest.skipIf(not DEVELOPER, "Needs --dev-gossip")
-@unittest.skipIf(TEST_NETWORK != 'regtest', "Channel announcement contains genesis hash, receiving node discards on mismatch")
-def test_gossip_ratelimit(node_factory):
-    l1, l2, l3 = node_factory.get_nodes(3,
-                                        opts=[{}, {}, {'dev-gossip-time': 1568096251}])
-    # These make the channel exist, but we use our own gossip.
-    node_factory.join_nodes([l1, l2], wait_for_announce=True)
+@unittest.skipIf(
+    TEST_NETWORK != 'regtest',
+    "Channel announcement contains genesis hash, receiving node discards on mismatch"
+)
+def test_gossip_ratelimit(node_factory, bitcoind):
+    """Check that we ratelimit incoming gossip.
+
+    We create a partitioned network, in which the first partition consisting
+    of l1 and l2 is used to create an on-chain footprint and twe then feed
+    canned gossip to the other partition consisting of l3. l3 should ratelimit
+    the incoming gossip.
+
+    """
+    l3, = node_factory.get_nodes(
+        1,
+        opts=[{'dev-gossip-time': 1568096251}]
+    )
+
+    # Bump to block 102, so the following tx ends up in 103x1:
+    bitcoind.generate_block(1)
+
+    # We don't actually need to start l1 and l2, they're just there to create
+    # an unspent outpoint matching the expected script. This is also more
+    # stable against output ordering issues.
+    tx = bitcoind.rpc.createrawtransaction(
+        [],
+        [
+            # Fundrawtransaction will fill in the first output with the change
+            {"bcrt1qtwxd8wg5eanumk86vfeujvp48hfkgannf77evggzct048wggsrxsum2pmm": 0.01000000}
+        ]
+    )
+    tx = bitcoind.rpc.fundrawtransaction(tx, {'changePosition': 0})['hex']
+    tx = bitcoind.rpc.signrawtransactionwithwallet(tx)['hex']
+    txid = bitcoind.rpc.sendrawtransaction(tx)
+    wait_for(lambda: txid in bitcoind.rpc.getrawmempool())
+
+    # Make the tx gossipable:
+    bitcoind.generate_block(6)
+    sync_blockheight(bitcoind, [l3, ])
+
+    def channel_fees(node):
+        channels = node.rpc.listchannels()['channels']
+        return [c['fee_per_millionth'] for c in channels]
 
     # Here are some ones I generated earlier (by removing gossip
     # ratelimiting)
-    subprocess.run(['devtools/gossipwith',
-                    '--max-messages=0',
-                    '{}@localhost:{}'.format(l3.info['id'], l3.port),
-                    # announcement
-                    '0100987b271fc95a37dbed78e6159e0ab792cda64603780454ce80832b4e31f63a6760abc8fdc53be35bb7cfccd125ee3d15b4fbdfb42165098970c19c7822bb413f46390e0c043c777226927eacd2186a03f064e4bdc30f891cb6e4990af49967d34b338755e99d728987e3d49227815e17f3ab40092434a59e33548e870071176db7d44d8c8f4c4cac27ae6554eb9350e97d47617e3a1355296c78e8234446fa2f138ad1b03439f18520227fb9e9eb92689b3a0ed36e6764f5a41777e9a2a4ce1026d19a4e4d8f7715c13ac2d6bf3238608a1ccf9afd91f774d84d170d9edddebf7460c54d49bd6cd81410bc3eeeba2b7278b1b5f7e748d77d793f31086847d582000006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f0000670000010001022d223620a359a47ff7f7ac447c85c46c923da53389221a0054c11c1e3ca31d590266e4598d1d3c415f572a8488830b60f7e744ed9235eb0b1ba93283b315c0351802e3bd38009866c9da8ec4aa99cc4ea9c6c0dd46df15c61ef0ce1f271291714e5702324266de8403b3ab157a09f1f784d587af61831c998c151bcc21bb74c2b2314b',
-                    # first update is free
-                    '010225bfd9c5e2c5660188a14deb4002cd645ee67f00ad3b82146e46711ec460cb0c6819fdd1c680cb6d24e3906679ef071f13243a04a123e4b83310ebf0518ffd4206226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f00006700000100015d773ffb010100060000000000000000000000010000000a000000003b023380'],
-                   check=True, timeout=TIMEOUT)
+    subprocess.check_call(
+        [
+            'devtools/gossipwith',
+            '--max-messages=0',
+            '{}@localhost:{}'.format(l3.info['id'], l3.port),
+            # announcement
+            '0100987b271fc95a37dbed78e6159e0ab792cda64603780454ce80832b4e31f63a6760abc8fdc53be35bb7cfccd125ee3d15b4fbdfb42165098970c19c7822bb413f46390e0c043c777226927eacd2186a03f064e4bdc30f891cb6e4990af49967d34b338755e99d728987e3d49227815e17f3ab40092434a59e33548e870071176db7d44d8c8f4c4cac27ae6554eb9350e97d47617e3a1355296c78e8234446fa2f138ad1b03439f18520227fb9e9eb92689b3a0ed36e6764f5a41777e9a2a4ce1026d19a4e4d8f7715c13ac2d6bf3238608a1ccf9afd91f774d84d170d9edddebf7460c54d49bd6cd81410bc3eeeba2b7278b1b5f7e748d77d793f31086847d582000006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f0000670000010001022d223620a359a47ff7f7ac447c85c46c923da53389221a0054c11c1e3ca31d590266e4598d1d3c415f572a8488830b60f7e744ed9235eb0b1ba93283b315c0351802e3bd38009866c9da8ec4aa99cc4ea9c6c0dd46df15c61ef0ce1f271291714e5702324266de8403b3ab157a09f1f784d587af61831c998c151bcc21bb74c2b2314b',
+            # first update is free
+            '010225bfd9c5e2c5660188a14deb4002cd645ee67f00ad3b82146e46711ec460cb0c6819fdd1c680cb6d24e3906679ef071f13243a04a123e4b83310ebf0518ffd4206226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f00006700000100015d773ffb010100060000000000000000000000010000000a000000003b023380'
+        ],
+        timeout=TIMEOUT
+    )
 
     # Wait for it to process channel.
-    wait_for(lambda: [c['fee_per_millionth'] for c in l3.rpc.listchannels()['channels']] == [10])
+    wait_for(lambda: channel_fees(l3) == [10])
 
-    subprocess.run(['devtools/gossipwith',
-                    '--max-messages=0',
-                    '{}@localhost:{}'.format(l3.info['id'], l3.port),
-                    # next 4 are let through...
-                    '01023a892ad9c9953a54ad3b8e2e03a93d1c973241b62f9a5cd1f17d5cdf08de0e8b4fcd24aa8bd45a48b788fe9dab3d416f28dfa390bc900ec0176ec5bd1afd435706226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f00006700000100015d77400001010006000000000000000000000014000003e9000000003b023380',
-                    '010245966763623ebc16796165263d4b21711ef04ebf3929491e695ff89ed2b8ccc0668ceb9e35e0ff5b8901d95732a119c1ed84ac99861daa2de462118f7b70049f06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f00006700000100015d77400101010006000000000000000000000014000003ea000000003b023380',
-                    '0102c479b7684b9db496b844f6925f4ffd8a27c5840a020d1b537623c1545dcd8e195776381bbf51213e541a853a4a49a0faf84316e7ccca5e7074901a96bbabe04e06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f00006700000100015d77400201010006000000000000000000000014000003eb000000003b023380',
-                    # timestamp=1568096259, fee_proportional_millionths=1004
-                    '01024b866012d995d3d7aec7b7218a283de2d03492dbfa21e71dd546ec2e36c3d4200453420aa02f476f99c73fe1e223ea192f5fa544b70a8319f2a216f1513d503d06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f00006700000100015d77400301010006000000000000000000000014000003ec000000003b023380',
-                    # update 5 marks you as a nasty spammer!
-                    '01025b5b5a0daed874ab02bd3356d38190ff46bbaf5f10db5067da70f3ca203480ca78059e6621c6143f3da4e454d0adda6d01a9980ed48e71ccd0c613af73570a7106226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f00006700000100015d77400401010006000000000000000000000014000003ed000000003b023380'],
-                   check=True, timeout=TIMEOUT)
+    subprocess.check_call(
+        [
+            'devtools/gossipwith',
+            '--max-messages=0',
+            '{}@localhost:{}'.format(l3.info['id'], l3.port),
+            # next 4 are let through...
+            '01023a892ad9c9953a54ad3b8e2e03a93d1c973241b62f9a5cd1f17d5cdf08de0e8b4fcd24aa8bd45a48b788fe9dab3d416f28dfa390bc900ec0176ec5bd1afd435706226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f00006700000100015d77400001010006000000000000000000000014000003e9000000003b023380',
+            '010245966763623ebc16796165263d4b21711ef04ebf3929491e695ff89ed2b8ccc0668ceb9e35e0ff5b8901d95732a119c1ed84ac99861daa2de462118f7b70049f06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f00006700000100015d77400101010006000000000000000000000014000003ea000000003b023380',
+            '0102c479b7684b9db496b844f6925f4ffd8a27c5840a020d1b537623c1545dcd8e195776381bbf51213e541a853a4a49a0faf84316e7ccca5e7074901a96bbabe04e06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f00006700000100015d77400201010006000000000000000000000014000003eb000000003b023380',
+            # timestamp=1568096259, fee_proportional_millionths=1004
+            '01024b866012d995d3d7aec7b7218a283de2d03492dbfa21e71dd546ec2e36c3d4200453420aa02f476f99c73fe1e223ea192f5fa544b70a8319f2a216f1513d503d06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f00006700000100015d77400301010006000000000000000000000014000003ec000000003b023380',
+            # update 5 marks you as a nasty spammer!
+            '01025b5b5a0daed874ab02bd3356d38190ff46bbaf5f10db5067da70f3ca203480ca78059e6621c6143f3da4e454d0adda6d01a9980ed48e71ccd0c613af73570a7106226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f00006700000100015d77400401010006000000000000000000000014000003ed000000003b023380'
+        ],
+        timeout=TIMEOUT
+    )
 
-    wait_for(lambda: [c['fee_per_millionth'] for c in l3.rpc.listchannels()['channels']] == [1004])
+    wait_for(lambda: channel_fees(l3) == [1004])
 
     # 24 seconds later, it will accept another.
     l3.rpc.call('dev-gossip-set-time', [1568096251 + 24])
@@ -1582,7 +1629,7 @@ def test_gossip_ratelimit(node_factory):
                     '010282d24bcd984956bd9b891848404ee59d89643923b21641d2c2c0770a51b8f5da00cef82458add970f0b654aa4c8d54f68a9a1cc6470a35810303b09437f1f73d06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f00006700000100015d77401c01010006000000000000000000000014000003ee000000003b023380'],
                    check=True, timeout=TIMEOUT)
 
-    wait_for(lambda: [c['fee_per_millionth'] for c in l3.rpc.listchannels()['channels']] == [1006])
+    wait_for(lambda: channel_fees(l3) == [1006])
 
 
 def check_socket(ip_addr, port):
@@ -1728,3 +1775,17 @@ def test_gossip_store_upgrade_v7_v8(node_factory):
          'htlc_minimum_msat': Millisatoshi(0),
          'htlc_maximum_msat': Millisatoshi(990000000),
          'features': '80000000000000000000000000'}]
+
+
+@unittest.skipIf(not DEVELOPER, "devtools are for devs anyway")
+def test_routetool(node_factory):
+    """Test that route tool can see unpublished channels"""
+    l1, l2 = node_factory.line_graph(2)
+
+    subprocess.run(['devtools/route',
+                    os.path.join(l1.daemon.lightning_dir,
+                                 TEST_NETWORK,
+                                 'gossip_store'),
+                    l1.info['id'],
+                    l2.info['id']],
+                   check=True, timeout=TIMEOUT)

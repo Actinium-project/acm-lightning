@@ -89,6 +89,11 @@ void json_add_node_id(struct json_stream *response,
 				const char *fieldname,
 				const struct node_id *id);
 
+/* '"fieldname" : "0289abcdef..."' or "0289abcdef..." if fieldname is NULL */
+void json_add_channel_id(struct json_stream *response,
+			 const char *fieldname,
+			 const struct channel_id *cid);
+
 /* '"fieldname" : <hexrev>' or "<hexrev>" if fieldname is NULL */
 void json_add_txid(struct json_stream *result, const char *fieldname,
 		   const struct bitcoin_txid *txid);
@@ -152,6 +157,6 @@ void json_add_tx(struct json_stream *result,
 /* '"fieldname" : "cHNidP8BAJoCAAAAAljo..." or "cHNidP8BAJoCAAAAAljo..." if fieldname is NULL */
 void json_add_psbt(struct json_stream *stream,
 		   const char *fieldname,
-		   struct wally_psbt *psbt);
+		   const struct wally_psbt *psbt);
 
 #endif /* LIGHTNING_COMMON_JSON_HELPERS_H */

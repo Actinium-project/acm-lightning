@@ -21,6 +21,7 @@
 #include <ccan/tal/grab_file/grab_file.h>
 #include <ccan/tal/path/path.h>
 #include <ccan/tal/str/str.h>
+#include <common/configdir.h>
 #include <common/json_helpers.h>
 #include <common/memleak.h>
 #include <common/timeout.h>
@@ -56,7 +57,7 @@ static void config_plugin(struct plugin *plugin)
 	struct jsonrpc_request *req;
 
 	req = jsonrpc_request_start(plugin, "init", plugin->log,
-	                            plugin_config_cb, plugin);
+	                            NULL, plugin_config_cb, plugin);
 	plugin_populate_init_request(plugin, req);
 	jsonrpc_request_end(req);
 	plugin_request_send(plugin, req);
@@ -180,7 +181,7 @@ static void estimatefees_callback(const char *buf, const jsmntok_t *toks,
 				     "estimatefees",
 				     "bad 'result' field");
 
-	for (enum feerate f = 0; f < NUM_FEERATES; f++) {
+	for (int f = 0; f < NUM_FEERATES; f++) {
 		feeratetok = json_get_member(buf, resulttok, feerate_name(f));
 		if (!feeratetok)
 			bitcoin_plugin_error(call->bitcoind, buf, toks,
@@ -231,7 +232,7 @@ void bitcoind_estimate_fees_(struct bitcoind *bitcoind,
 	call->arg = arg;
 
 	req = jsonrpc_request_start(bitcoind, "estimatefees", bitcoind->log,
-				    estimatefees_callback, call);
+				    NULL, estimatefees_callback, call);
 	jsonrpc_request_end(req);
 	plugin_request_send(strmap_get(&bitcoind->pluginsmap,
 				       "estimatefees"), req);
@@ -252,6 +253,7 @@ void bitcoind_estimate_fees_(struct bitcoind *bitcoind,
 
 struct sendrawtx_call {
 	struct bitcoind *bitcoind;
+	const char *hextx;
 	void (*cb)(struct bitcoind *bitcoind,
 		   bool success,
 		   const char *err_msg,
@@ -293,26 +295,111 @@ static void sendrawtx_callback(const char *buf, const jsmntok_t *toks,
 	tal_free(call);
 }
 
-void bitcoind_sendrawtx_(struct bitcoind *bitcoind,
-			 const char *hextx,
-			 void (*cb)(struct bitcoind *bitcoind,
-				    bool success, const char *err_msg, void *),
-			 void *cb_arg)
+/* For compatibility with `sendrawtransaction` plugins written for
+ * 0.9.0 or earlier.
+ * Once this deprecated API is removed, we can just delete this function
+ * and use sendrawtx_callback directly in bitcoind_sendrawtx_ahf_.
+ */
+static void sendrawtx_compatv090_callback(const char *buf,
+					  const jsmntok_t *toks,
+					  const jsmntok_t *idtok,
+					  struct sendrawtx_call *call)
+{
+	const jsmntok_t *errtok;
+	const jsmntok_t *codetok;
+	errcode_t code;
+	struct jsonrpc_request *req;
+
+	static bool warned = false;
+
+
+	/* If deprecated APIs not enabled, fail it outright.  */
+	if (!deprecated_apis)
+		goto fallback;
+
+	/* If we got a JSONRPC2_INVALID_PARAMS error, assume it is
+	 * because it is an old plugin which does not support the
+	 * new `allowhighfees` parameter.
+	 */
+	errtok = json_get_member(buf, toks, "error");
+	if (!errtok)
+		goto fallback;
+
+	codetok = json_get_member(buf, errtok, "code");
+	if (!codetok)
+		goto fallback;
+
+	if (!json_to_errcode(buf, codetok, &code))
+		goto fallback;
+
+	if (code != JSONRPC2_INVALID_PARAMS)
+		goto fallback;
+
+	/* Possibly it is because `allowhighfees` is not understood
+	 * by the plugin.  */
+	if (!warned) {
+		warned = true;
+		log_unusual(call->bitcoind->log,
+			    "`sendrawtransaction` failed when given two "
+			    "arguments, will retry with single-argument "
+			    "deprecated API.");
+	}
+
+	/* Retry with a single argument, hextx.  */
+	req = jsonrpc_request_start(call->bitcoind, "sendrawtransaction",
+				    call->bitcoind->log,
+				    NULL, sendrawtx_callback, call);
+	json_add_string(req->stream, "tx", call->hextx);
+	jsonrpc_request_end(req);
+	bitcoin_plugin_send(call->bitcoind, req);
+
+	return;
+
+fallback:
+	sendrawtx_callback(buf, toks, idtok, call);
+	return;
+}
+
+void bitcoind_sendrawtx_ahf_(struct bitcoind *bitcoind,
+			     const char *hextx,
+			     bool allowhighfees,
+			     void (*cb)(struct bitcoind *bitcoind,
+					bool success, const char *msg, void *),
+			     void *cb_arg)
 {
 	struct jsonrpc_request *req;
 	struct sendrawtx_call *call = tal(bitcoind, struct sendrawtx_call);
 
 	call->bitcoind = bitcoind;
+	/* For compatibility with 0.9.0 or earlier.
+	 * Once removed, we can remove the hextx field in
+	 * struct sendrawtx_call as well.
+	 */
+	if (deprecated_apis)
+		call->hextx = tal_strdup(call, hextx);
+	else
+		call->hextx = NULL;
 	call->cb = cb;
 	call->cb_arg = cb_arg;
 	log_debug(bitcoind->log, "sendrawtransaction: %s", hextx);
 
 	req = jsonrpc_request_start(bitcoind, "sendrawtransaction",
-				    bitcoind->log, sendrawtx_callback,
+				    bitcoind->log,
+				    NULL, sendrawtx_compatv090_callback,
 				    call);
 	json_add_string(req->stream, "tx", hextx);
+	json_add_bool(req->stream, "allowhighfees", allowhighfees);
 	jsonrpc_request_end(req);
 	bitcoin_plugin_send(bitcoind, req);
+}
+
+void bitcoind_sendrawtx_(struct bitcoind *bitcoind,
+			 const char *hextx,
+			 void (*cb)(struct bitcoind *bitcoind,
+				    bool success, const char *msg, void *),
+			 void *arg)
+{
+	return bitcoind_sendrawtx_ahf_(bitcoind, hextx, false, cb, arg);
 }
 
 /* `getrawblockbyheight`
@@ -407,7 +494,8 @@ void bitcoind_getrawblockbyheight_(struct bitcoind *bitcoind,
 	call->cb_arg = cb_arg;
 
 	req = jsonrpc_request_start(bitcoind, "getrawblockbyheight",
-				    bitcoind->log, getrawblockbyheight_callback,
+				    bitcoind->log,
+				    NULL,  getrawblockbyheight_callback,
 				    /* Freed in cb. */
 				    notleak(call));
 	json_add_num(req->stream, "height", height);
@@ -504,7 +592,7 @@ void bitcoind_getchaininfo_(struct bitcoind *bitcoind,
 	call->first_call = first_call;
 
 	req = jsonrpc_request_start(bitcoind, "getchaininfo", bitcoind->log,
-				    getchaininfo_callback, call);
+				    NULL, getchaininfo_callback, call);
 	jsonrpc_request_end(req);
 	bitcoin_plugin_send(bitcoind, req);
 }
@@ -585,7 +673,7 @@ void bitcoind_getutxout_(struct bitcoind *bitcoind,
 	call->cb_arg = cb_arg;
 
 	req = jsonrpc_request_start(bitcoind, "getutxout", bitcoind->log,
-				    getutxout_callback, call);
+				    NULL, getutxout_callback, call);
 	json_add_txid(req->stream, "txid", txid);
 	json_add_num(req->stream, "vout", outnum);
 	jsonrpc_request_end(req);

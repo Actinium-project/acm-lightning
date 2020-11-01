@@ -50,6 +50,9 @@ void log_io(struct log *log UNNEEDED, enum log_level dir UNNEEDED,
 	    const char *comment UNNEEDED,
 	    const void *data UNNEEDED, size_t len UNNEEDED)
 { fprintf(stderr, "log_io called!\n"); abort(); }
+/* Generated stub for log_level_name */
+const char *log_level_name(enum log_level level UNNEEDED)
+{ fprintf(stderr, "log_level_name called!\n"); abort(); }
 /* Generated stub for memleak_remove_strmap_ */
 void memleak_remove_strmap_(struct htable *memtable UNNEEDED, const struct strmap *m UNNEEDED)
 { fprintf(stderr, "memleak_remove_strmap_ called!\n"); abort(); }
@@ -68,6 +71,11 @@ struct oneshot *new_reltimer_(struct timers *timers UNNEEDED,
 bool param(struct command *cmd UNNEEDED, const char *buffer UNNEEDED,
 	   const jsmntok_t params[] UNNEEDED, ...)
 { fprintf(stderr, "param called!\n"); abort(); }
+/* Generated stub for param_bool */
+struct command_result *param_bool(struct command *cmd UNNEEDED, const char *name UNNEEDED,
+				  const char *buffer UNNEEDED, const jsmntok_t *tok UNNEEDED,
+				  bool **b UNNEEDED)
+{ fprintf(stderr, "param_bool called!\n"); abort(); }
 /* Generated stub for param_feerate_estimate */
 struct command_result *param_feerate_estimate(struct command *cmd UNNEEDED,
 					      u32 **feerate_per_kw UNNEEDED,

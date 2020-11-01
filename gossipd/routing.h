@@ -11,7 +11,7 @@
 #include <common/node_id.h>
 #include <gossipd/broadcast.h>
 #include <gossipd/gossip_store.h>
-#include <wire/gen_onion_wire.h>
+#include <wire/onion_wire.h>
 #include <wire/wire.h>
 
 struct daemon;
@@ -478,10 +478,9 @@ bool routing_add_node_announcement(struct routing_state *rstate,
  * is the case for private channels or channels that have not yet reached
  * `announce_depth`.
  */
-bool handle_local_add_channel(struct routing_state *rstate,
-			      const struct peer *peer,
-			      const u8 *msg,
-			      u64 index);
+bool routing_add_private_channel(struct routing_state *rstate,
+				 const struct peer *peer,
+				 const u8 *msg, u64 index);
 
 /**
  * Get the local time.

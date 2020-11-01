@@ -1,29 +1,29 @@
-from ephemeral_port_reserve import reserve
-from glob import glob
+from ephemeral_port_reserve import reserve  # type: ignore
 
+import itertools
 import logging
 import os
-import psycopg2
+import psycopg2  # type: ignore
 import random
-import re
 import shutil
 import signal
 import sqlite3
 import string
 import subprocess
 import time
+from typing import Dict, List, Optional, Union
 
 
 class Sqlite3Db(object):
-    def __init__(self, path):
+    def __init__(self, path: str) -> None:
         self.path = path
 
-    def get_dsn(self):
+    def get_dsn(self) -> None:
         """SQLite3 doesn't provide a DSN, resulting in no CLI-option.
         """
         return None
 
-    def query(self, query):
+    def query(self, query: str) -> Union[List[Dict[str, Union[int, bytes]]], List[Dict[str, Optional[int]]], List[Dict[str, str]], List[Dict[str, Union[str, int]]], List[Dict[str, int]]]:
         orig = os.path.join(self.path)
         copy = self.path + ".copy"
         shutil.copyfile(orig, copy)
@@ -43,7 +43,7 @@ class Sqlite3Db(object):
         db.close()
         return result
 
-    def execute(self, query):
+    def execute(self, query: str) -> None:
         db = sqlite3.connect(self.path)
         c = db.cursor()
         c.execute(query)
@@ -90,20 +90,20 @@ class PostgresDb(object):
 
 
 class SqliteDbProvider(object):
-    def __init__(self, directory):
+    def __init__(self, directory: str) -> None:
         self.directory = directory
 
-    def start(self):
+    def start(self) -> None:
         pass
 
-    def get_db(self, node_directory, testname, node_id):
+    def get_db(self, node_directory: str, testname: str, node_id: int) -> Sqlite3Db:
         path = os.path.join(
             node_directory,
             'lightningd.sqlite3'
         )
         return Sqlite3Db(path)
 
-    def stop(self):
+    def stop(self) -> None:
         pass
 
 
@@ -115,35 +115,39 @@ class PostgresDbProvider(object):
         print("Starting PostgresDbProvider")
 
     def locate_path(self):
-        prefix = '/usr/lib/postgresql/*'
-        matches = glob(prefix)
+        # Use `pg_config` to determine correct PostgreSQL installation
+        pg_config = shutil.which('pg_config')
+        if not pg_config:
+            raise ValueError("Could not find `pg_config` to determine PostgreSQL binaries. Is PostgreSQL installed?")
 
-        candidates = {}
-        for m in matches:
-            g = re.search(r'([0-9]+[\.0-9]*)', m)
-            if not g:
-                continue
-            candidates[float(g.group(1))] = m
+        bindir = subprocess.check_output([pg_config, '--bindir']).decode().rstrip()
+        if not os.path.isdir(bindir):
+            raise ValueError("Error: `pg_config --bindir` didn't return a proper path: {}".format(bindir))
 
-        if len(candidates) == 0:
-            raise ValueError("Could not find `postgres` and `initdb` binaries in {}. Is postgresql installed?".format(prefix))
-
-        # Now iterate in reverse order through matches
-        for k, v in sorted(candidates.items())[::-1]:
-            initdb = os.path.join(v, 'bin', 'initdb')
-            postgres = os.path.join(v, 'bin', 'postgres')
-            if os.path.isfile(initdb) and os.path.isfile(postgres):
-                logging.info("Found `postgres` and `initdb` in {}".format(os.path.join(v, 'bin')))
+        initdb = os.path.join(bindir, 'initdb')
+        postgres = os.path.join(bindir, 'postgres')
+        if os.path.isfile(initdb) and os.path.isfile(postgres):
+            if os.access(initdb, os.X_OK) and os.access(postgres, os.X_OK):
+                logging.info("Found `postgres` and `initdb` in {}".format(bindir))
                 return initdb, postgres
 
-        raise ValueError("Could not find `postgres` and `initdb` in any of the possible paths: {}".format(candidates.values()))
+        raise ValueError("Could not find `postgres` and `initdb` binaries in {}".format(bindir))
 
     def start(self):
         passfile = os.path.join(self.directory, "pgpass.txt")
-        self.pgdir = os.path.join(self.directory, 'pgsql')
-        # Need to write a tiny file containing the password so `initdb` can pick it up
+        # Need to write a tiny file containing the password so `initdb` can
+        # pick it up
         with open(passfile, 'w') as f:
             f.write('cltest\n')
+
+        # Look for a postgres directory that isn't taken yet. Not locking
+        # since this is run in a single-threaded context, at the start of each
+        # test. Multiple workers have separate directories, so they can't
+        # trample each other either.
+        for i in itertools.count():
+            self.pgdir = os.path.join(self.directory, 'pgsql-{}'.format(i))
+            if not os.path.exists(self.pgdir):
+                break
 
         initdb, postgres = self.locate_path()
         subprocess.check_call([
@@ -153,6 +157,10 @@ class PostgresDbProvider(object):
             '--auth=trust',
             '--username=postgres',
         ])
+        conffile = os.path.join(self.pgdir, 'postgresql.conf')
+        with open(conffile, 'a') as f:
+            f.write('max_connections = 1000\nshared_buffers = 240MB\n')
+
         self.port = reserve()
         self.proc = subprocess.Popen([
             postgres,
@@ -162,9 +170,14 @@ class PostgresDbProvider(object):
             '-F',
             '-i',
         ])
-        # Hacky but seems to work ok (might want to make the postgres proc a TailableProc as well if too flaky).
-        time.sleep(1)
-        self.conn = psycopg2.connect("dbname=template1 user=postgres host=localhost port={}".format(self.port))
+        # Hacky but seems to work ok (might want to make the postgres proc a
+        # TailableProc as well if too flaky).
+        for i in range(30):
+            try:
+                self.conn = psycopg2.connect("dbname=template1 user=postgres host=localhost port={}".format(self.port))
+                break
+            except Exception:
+                time.sleep(0.5)
 
         # Required for CREATE DATABASE to work
         self.conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)

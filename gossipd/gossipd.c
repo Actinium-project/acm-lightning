@@ -46,6 +46,7 @@
 #include <fcntl.h>
 #include <gossipd/broadcast.h>
 #include <gossipd/gossip_generation.h>
+#include <gossipd/gossip_store_wiregen.h>
 #include <gossipd/gossipd.h>
 #include <gossipd/gossipd_peerd_wiregen.h>
 #include <gossipd/gossipd_wiregen.h>
@@ -63,7 +64,7 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
-#include <wire/gen_peer_wire.h>
+#include <wire/peer_wire.h>
 #include <wire/wire_io.h>
 #include <wire/wire_sync.h>
 
@@ -439,7 +440,7 @@ static struct io_plan *peer_msg_in(struct io_conn *conn,
 	bool ok;
 
 	/* These are messages relayed from peer */
-	switch ((enum wire_type)fromwire_peektype(msg)) {
+	switch ((enum peer_wire)fromwire_peektype(msg)) {
 	case WIRE_CHANNEL_ANNOUNCEMENT:
 		err = handle_channel_announcement_msg(peer, msg);
 		goto handled_relay;
@@ -490,10 +491,20 @@ static struct io_plan *peer_msg_in(struct io_conn *conn,
 	case WIRE_GOSSIP_TIMESTAMP_FILTER:
 #if EXPERIMENTAL_FEATURES
 	case WIRE_ONION_MESSAGE:
+	case WIRE_TX_ADD_INPUT:
+	case WIRE_TX_REMOVE_INPUT:
+	case WIRE_TX_ADD_OUTPUT:
+	case WIRE_TX_REMOVE_OUTPUT:
+	case WIRE_TX_COMPLETE:
+	case WIRE_TX_SIGNATURES:
+	case WIRE_OPEN_CHANNEL2:
+	case WIRE_ACCEPT_CHANNEL2:
+	case WIRE_INIT_RBF:
+	case WIRE_BLACKLIST_PODLE:
 #endif
 		status_broken("peer %s: relayed unexpected msg of type %s",
 			      type_to_string(tmpctx, struct node_id, &peer->id),
-			      wire_type_name(fromwire_peektype(msg)));
+			      peer_wire_name(fromwire_peektype(msg)));
 		return io_close(conn);
 	}
 
@@ -501,10 +512,6 @@ static struct io_plan *peer_msg_in(struct io_conn *conn,
 	switch ((enum gossipd_peerd_wire)fromwire_peektype(msg)) {
 	case WIRE_GOSSIPD_GET_UPDATE:
 		ok = handle_get_local_channel_update(peer, msg);
-		goto handled_cmd;
-	case WIRE_GOSSIPD_LOCAL_ADD_CHANNEL:
-		ok = handle_local_add_channel(peer->daemon->rstate, peer,
-					      msg, 0);
 		goto handled_cmd;
 	case WIRE_GOSSIPD_LOCAL_CHANNEL_UPDATE:
 		ok = handle_local_channel_update(peer->daemon, &peer->id, msg);
@@ -517,6 +524,12 @@ static struct io_plan *peer_msg_in(struct io_conn *conn,
 	case WIRE_GOSSIPD_GET_UPDATE_REPLY:
 	case WIRE_GOSSIPD_NEW_STORE_FD:
 		break;
+	}
+
+	if (fromwire_peektype(msg) == WIRE_GOSSIP_STORE_PRIVATE_CHANNEL) {
+		ok = routing_add_private_channel(peer->daemon->rstate, peer,
+						 msg, 0);
+		goto handled_cmd;
 	}
 
 	/* Anything else should not have been sent to us: close on it */
@@ -979,21 +992,22 @@ static u8 *get_channel_features(const tal_t *ctx,
 	struct node_id node_id;
 	struct pubkey bitcoin_key;
 	struct amount_sat sats;
-	const u8 *ann;
+	u8 *ann;
 
 	/* This is where we stash a flag to indicate it exists. */
 	if (!chan->half[0].any_features)
 		return NULL;
 
-	/* Could be a channel_announcement, could be a local_add_channel */
-	ann = gossip_store_get(tmpctx, gs, chan->bcast.index);
+	ann = cast_const(u8 *, gossip_store_get(tmpctx, gs, chan->bcast.index));
+
+	/* Could be a private_channel */
+	fromwire_gossip_store_private_channel(tmpctx, ann, &sats, &ann);
+
 	if (!fromwire_channel_announcement(ctx, ann, &sig, &sig, &sig, &sig,
 					   &features, &chain_hash,
 					   &short_channel_id,
 					   &node_id, &node_id,
-					   &bitcoin_key, &bitcoin_key)
-	    && !fromwire_gossipd_local_add_channel(ctx, ann, &short_channel_id,
-						   &node_id, &sats, &features))
+					   &bitcoin_key, &bitcoin_key))
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "bad channel_announcement / local_add_channel at %u: %s",
 			      chan->bcast.index, tal_hex(tmpctx, ann));
@@ -1336,10 +1350,10 @@ static struct io_plan *dev_gossip_memleak(struct io_conn *conn,
 	struct htable *memtable;
 	bool found_leak;
 
-	memtable = memleak_enter_allocations(tmpctx, msg, msg);
+	memtable = memleak_find_allocations(tmpctx, msg, msg);
 
 	/* Now delete daemon and those which it has pointers to. */
-	memleak_remove_referenced(memtable, daemon);
+	memleak_remove_region(memtable, daemon, sizeof(*daemon));
 
 	found_leak = dump_memleak(memtable);
 	daemon_conn_send(daemon->master,

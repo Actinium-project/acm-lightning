@@ -3,7 +3,7 @@
 #include <ccan/tal/str/str.h>
 #include <plugins/libplugin-pay.h>
 #include <plugins/libplugin.h>
-#include <wire/gen_onion_wire.h>
+#include <wire/onion_wire.h>
 
 #define PREIMAGE_TLV_TYPE 5482373484
 #define KEYSEND_FEATUREBIT 55
@@ -52,17 +52,8 @@ static struct keysend_data *keysend_init(struct payment *p)
 }
 
 static void keysend_cb(struct keysend_data *d, struct payment *p) {
-	struct route_hop *last_hop;
 	struct createonion_hop *last_payload;
 	size_t hopcount;
-
-	if (p->step == PAYMENT_STEP_GOT_ROUTE) {
-		/* Force the last step to be a TLV, we might not have an
-		 * announcement and it still supports it. Required later when
-		 * we adjust the payload. */
-		last_hop = &p->route[tal_count(p->route) - 1];
-		last_hop->style = ROUTE_HOP_TLV;
-	}
 
 	if (p->step != PAYMENT_STEP_ONION_PAYLOAD)
 		return payment_continue(p);
@@ -122,7 +113,6 @@ static struct command_result *json_keysend(struct command *cmd, const char *buf,
 #if DEVELOPER
 	bool *use_shadow;
 #endif
-	p = payment_new(NULL, cmd, NULL /* No parent */, pay_mods);
 	if (!param(cmd, buf, params,
 		   p_req("destination", param_node_id, &destination),
 		   p_req("msatoshi", param_msat, &msat),
@@ -139,10 +129,12 @@ static struct command_result *json_keysend(struct command *cmd, const char *buf,
 		   NULL))
 		return command_param_failed();
 
+	p = payment_new(cmd, cmd, NULL /* No parent */, pay_mods);
 	p->local_id = &my_id;
 	p->json_buffer = tal_steal(p, buf);
 	p->json_toks = params;
 	p->destination = tal_steal(p, destination);
+	p->destination_has_tlv = true;
 	p->payment_secret = NULL;
 	p->amount = *msat;
 	p->invoice = NULL;
@@ -167,6 +159,8 @@ static struct command_result *json_keysend(struct command *cmd, const char *buf,
 #endif
 	p->label = tal_steal(p, label);
 	payment_start(p);
+	/* We're keeping this around now */
+	tal_steal(cmd->plugin, p);
 	return command_still_pending(cmd);
 }
 
@@ -250,7 +244,7 @@ static struct command_result *htlc_accepted_call(struct command *cmd,
 	max = tal_bytelen(rawpayload);
 	payload = tlv_tlv_payload_new(cmd);
 
-	s = fromwire_varint(&rawpayload, &max);
+	s = fromwire_bigsize(&rawpayload, &max);
 	if (s != max) {
 		return htlc_accepted_continue(cmd, NULL);
 	}

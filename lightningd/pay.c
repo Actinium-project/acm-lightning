@@ -25,7 +25,7 @@
 /* Routing failure object */
 struct routing_failure {
 	unsigned int erring_index;
-	enum onion_type failcode;
+	enum onion_wire failcode;
 	const struct node_id *erring_node;
 	const struct short_channel_id *erring_channel;
 	int channel_dir;
@@ -41,6 +41,36 @@ struct sendpay_command {
 	u64 partid;
 	struct command *cmd;
 };
+
+static bool string_to_payment_status(const char *status_str, enum wallet_payment_status *status)
+{
+	if (streq(status_str, "complete")) {
+		*status = PAYMENT_COMPLETE;
+		return true;
+	} else if (streq(status_str, "pending")) {
+		*status = PAYMENT_PENDING;
+		return true;
+	} else if (streq(status_str, "failed")) {
+		*status = PAYMENT_FAILED;
+		return true;
+	}
+	return false;
+}
+
+static const char *payment_status_to_string(const enum wallet_payment_status status)
+{
+	switch (status) {
+	case PAYMENT_COMPLETE:
+		return "complete";
+	case PAYMENT_FAILED:
+		return "failed";
+	case PAYMENT_PENDING:
+		return "pending";
+	}
+	//This should never happen
+	abort();
+}
+
 
 static void destroy_sendpay_command(struct sendpay_command *pc)
 {
@@ -144,13 +174,13 @@ static struct command_result *sendpay_success(struct command *cmd,
 static void
 json_add_routefail_info(struct json_stream *js,
 			unsigned int erring_index,
-			enum onion_type failcode,
+			enum onion_wire failcode,
 			const struct node_id *erring_node,
 			const struct short_channel_id *erring_channel,
 			int channel_dir,
 			const u8 *msg)
 {
-	const char *failcodename = onion_type_name(failcode);
+	const char *failcodename = onion_wire_name(failcode);
 
 	json_add_num(js, "erring_index", erring_index);
 	json_add_num(js, "failcode", failcode);
@@ -201,7 +231,7 @@ static const char *sendpay_errmsg_fmt(const tal_t *ctx, errcode_t pay_errcode,
 	else {
 		assert(fail);
 		errmsg = tal_fmt(ctx, "failed: %s (%s)",
-				 onion_type_name(fail->failcode), details);
+				 onion_wire_name(fail->failcode), details);
 	}
 	return errmsg;
 }
@@ -313,7 +343,7 @@ void payment_succeeded(struct lightningd *ld, struct htlc_out *hout,
 static struct routing_failure*
 immediate_routing_failure(const tal_t *ctx,
 			  const struct lightningd *ld,
-			  enum onion_type failcode,
+			  enum onion_wire failcode,
 			  const struct short_channel_id *channel0,
 			  const struct node_id *dstid)
 {
@@ -340,7 +370,7 @@ static struct routing_failure*
 local_routing_failure(const tal_t *ctx,
 		      const struct lightningd *ld,
 		      const struct htlc_out *hout,
-		      enum onion_type failcode,
+		      enum onion_wire failcode,
 		      const struct wallet_payment *payment)
 {
 	struct routing_failure *routing_failure;
@@ -366,7 +396,7 @@ local_routing_failure(const tal_t *ctx,
 
 	log_debug(hout->key.channel->log, "local_routing_failure: %u (%s)",
 		  routing_failure->failcode,
-		  onion_type_name(routing_failure->failcode));
+		  onion_wire_name(routing_failure->failcode));
 	return routing_failure;
 }
 
@@ -380,7 +410,7 @@ remote_routing_failure(const tal_t *ctx,
 		       struct log *log,
 		       errcode_t *pay_errcode)
 {
-	enum onion_type failcode = fromwire_peektype(failuremsg);
+	enum onion_wire failcode = fromwire_peektype(failuremsg);
 	struct routing_failure *routing_failure;
 	const struct node_id *route_nodes;
 	const struct node_id *erring_node;
@@ -538,7 +568,7 @@ void payment_failed(struct lightningd *ld, const struct htlc_out *hout,
 	/* This gives more details than a generic failure message */
 	if (localfail) {
 		/* Use temporary_channel_failure if failmsg has it */
-		enum onion_type failcode;
+		enum onion_wire failcode;
 		if (failmsg_needs_update)
 			failcode = fromwire_peektype(failmsg_needs_update);
 		else
@@ -583,7 +613,7 @@ void payment_failed(struct lightningd *ld, const struct htlc_out *hout,
 			fail = NULL;
 			pay_errcode = PAY_UNPARSEABLE_ONION;
 		} else {
-			enum onion_type failcode;
+			enum onion_wire failcode;
 
 		use_failmsg:
 			failcode = fromwire_peektype(failmsg);
@@ -593,7 +623,7 @@ void payment_failed(struct lightningd *ld, const struct htlc_out *hout,
 				 "with code 0x%04x (%s)",
 				 hout->key.id,
 				 origin_index,
-				 failcode, onion_type_name(failcode));
+				 failcode, onion_wire_name(failcode));
 			fail = remote_routing_failure(tmpctx, ld,
 						      payment, failmsg,
 						      origin_index,
@@ -636,7 +666,7 @@ static struct command_result *wait_payment(struct lightningd *ld,
 	struct onionreply *failonionreply;
 	bool faildestperm;
 	int failindex;
-	enum onion_type failcode;
+	enum onion_wire failcode;
 	struct node_id *failnode;
 	struct short_channel_id *failchannel;
 	u8 *failupdate;
@@ -1128,39 +1158,29 @@ param_route_hop(struct command *cmd, const char *name, const char *buffer,
 	if (!idtok) {
 		memset(&res->nodeid, 0, sizeof(struct node_id));
 	} else if (!json_to_node_id(buffer, idtok, &res->nodeid)) {
-		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				    "'%s' should be a node_id, not '%.*s'",
-				    name, tok->end - tok->start,
-				    buffer + tok->start);
+		return command_fail_badparam(cmd, name, buffer, idtok,
+					     "should be a node_id");
 	}
 
 	if (!channeltok) {
 		memset(&res->channel_id, 0, sizeof(struct node_id));
 	} else if (!json_to_short_channel_id(buffer, channeltok, &res->channel_id)) {
-		return command_fail(
-		    cmd, JSONRPC2_INVALID_PARAMS,
-		    "'%s' should be a short_channel_id, not '%.*s'", name,
-		    tok->end - tok->start, buffer + tok->start);
+		return command_fail_badparam(cmd, name, buffer, channeltok,
+					     "should be a short_channel_id");
 	}
 
 	if (directiontok && (!json_to_int(buffer, directiontok, &res->direction) ||
 			     res->direction > 1 || res->direction < 0))
-		return command_fail(
-		    cmd, JSONRPC2_INVALID_PARAMS,
-		    "'%s' should be an integer in [0,1], not '%.*s'", name,
-		    tok->end - tok->start, buffer + tok->start);
+		return command_fail_badparam(cmd, name, buffer, directiontok,
+					     "should be 0 or 1");
 
 	if (!json_to_msat(buffer, amounttok, &res->amount))
-		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				    "'%s' should be a valid amount_msat, not '%.*s'",
-				    name, tok->end - tok->start,
-				    buffer + tok->start);
+		return command_fail_badparam(cmd, name, buffer, amounttok,
+					     "should be a valid amount_msat");
 
 	if (!json_to_number(buffer, delaytok, &res->delay) || res->delay < 1)
-		return command_fail(
-		    cmd, JSONRPC2_INVALID_PARAMS,
-		    "'%s' should be a positive, non-zero, number, not '%.*s'",
-		    name, tok->end - tok->start, buffer + tok->start);
+		return command_fail_badparam(cmd, name, buffer, delaytok,
+					     "should be a positive, non-zero, number");
 
 	*hop = res;
 	return NULL;
@@ -1173,7 +1193,7 @@ static struct command_result *json_sendonion(struct command *cmd,
 {
 	u8 *onion;
 	struct onionpacket packet;
-	enum onion_type failcode;
+	enum onion_wire failcode;
 	struct route_hop *first_hop;
 	struct sha256 *payment_hash;
 	struct lightningd *ld = cmd->ld;
@@ -1237,10 +1257,8 @@ static struct command_result *param_route_hop_style(struct command *cmd,
 		return NULL;
 	}
 
-	return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-			    "'%s' should be a legacy or tlv, not '%.*s'",
-			    name, json_tok_full_len(tok),
-			    json_tok_full(buffer, tok));
+	return command_fail_badparam(cmd, name, buffer, tok,
+			    "should be 'legacy' or 'tlv'");
 }
 
 static struct command_result *param_route_hops(struct command *cmd,
@@ -1467,7 +1485,8 @@ static struct command_result *json_listsendpays(struct command *cmd,
 		struct bolt11 *b11;
 		char *fail;
 
-		b11 = bolt11_decode(cmd, b11str, cmd->ld->our_features, NULL, &fail);
+		b11 = bolt11_decode(cmd, b11str, cmd->ld->our_features, NULL,
+				    chainparams, &fail);
 		if (!b11) {
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "Invalid bolt11: %s", fail);
@@ -1497,6 +1516,72 @@ static const struct json_command listsendpays_command = {
 	"Show sendpay, old and current, optionally limiting to {bolt11} or {payment_hash}."
 };
 AUTODATA(json_command, &listsendpays_command);
+
+
+static struct command_result *json_delpay(struct command *cmd,
+						const char *buffer,
+						const jsmntok_t *obj UNNEEDED,
+						const jsmntok_t *params)
+{
+	struct json_stream *response;
+	const struct wallet_payment **payments;
+	const char *status_str;
+	enum wallet_payment_status status;
+	struct sha256 *payment_hash;
+
+	if (!param(cmd, buffer, params,
+		p_req("payment_hash", param_sha256, &payment_hash),
+		p_req("status", param_string, &status_str),
+		NULL))
+		return command_param_failed();
+
+	if (!string_to_payment_status(status_str, &status))
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS, "Unrecognized status: %s", status_str);
+
+	switch(status){
+		case PAYMENT_COMPLETE:
+		case PAYMENT_FAILED:
+			break;
+		case PAYMENT_PENDING:
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS, "Invalid status: %s",
+				payment_status_to_string(status));
+	}
+
+	payments = wallet_payment_list(cmd, cmd->ld->wallet, payment_hash);
+
+	if (tal_count(payments) == 0)
+		return command_fail(cmd, PAY_NO_SUCH_PAYMENT, "Unknown payment with payment_hash: %s",
+				    type_to_string(tmpctx, struct sha256, payment_hash));
+
+	for (int i = 0; i < tal_count(payments); i++) {
+		if (payments[i]->status != status) {
+			return command_fail(cmd, PAY_STATUS_UNEXPECTED, "Payment with hash %s has %s status but it should be %s",
+					type_to_string(tmpctx, struct sha256, payment_hash),
+					payment_status_to_string(payments[i]->status),
+					payment_status_to_string(status));
+		}
+	}
+
+	wallet_payment_delete_by_hash(cmd->ld->wallet, payment_hash);
+
+	response = json_stream_success(cmd);
+	json_array_start(response, "payments");
+	for (int i = 0; i < tal_count(payments); i++) {
+		json_object_start(response, NULL);
+		json_add_payment_fields(response, payments[i]);
+		json_object_end(response);
+	}
+	json_array_end(response);
+	return command_success(cmd, response);
+}
+
+static const struct json_command delpay_command = {
+	"delpay",
+	"payment",
+	json_delpay,
+	"Delete payment with {payment_hash} and {status}",
+};
+AUTODATA(json_command, &delpay_command);
 
 static struct command_result *json_createonion(struct command *cmd,
 						const char *buffer,

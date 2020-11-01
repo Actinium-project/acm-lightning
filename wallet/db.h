@@ -15,6 +15,7 @@
 #include <secp256k1_ecdh.h>
 #include <stdbool.h>
 
+struct channel_id;
 struct ext_key;
 struct lightningd;
 struct log;
@@ -23,6 +24,7 @@ struct onionreply;
 struct db_stmt;
 struct db;
 struct wally_psbt;
+struct wally_tx;
 
 /**
  * Macro to annotate a named SQL query.
@@ -107,6 +109,7 @@ void db_bind_sha256d(struct db_stmt *stmt, int pos, const struct sha256_double *
 void db_bind_secret(struct db_stmt *stmt, int pos, const struct secret *s);
 void db_bind_secret_arr(struct db_stmt *stmt, int col, const struct secret *s);
 void db_bind_txid(struct db_stmt *stmt, int pos, const struct bitcoin_txid *t);
+void db_bind_channel_id(struct db_stmt *stmt, int pos, const struct channel_id *id);
 void db_bind_node_id(struct db_stmt *stmt, int pos, const struct node_id *ni);
 void db_bind_node_id_arr(struct db_stmt *stmt, int col,
 			 const struct node_id *ids);
@@ -128,6 +131,7 @@ void db_bind_json_escape(struct db_stmt *stmt, int pos,
 			 const struct json_escape *esc);
 void db_bind_onionreply(struct db_stmt *stmt, int col,
 			const struct onionreply *r);
+void db_bind_talarr(struct db_stmt *stmt, int col, const u8 *arr);
 
 bool db_step(struct db_stmt *stmt);
 u64 db_column_u64(struct db_stmt *stmt, int col);
@@ -146,6 +150,7 @@ void db_column_secret(struct db_stmt *stmt, int col, struct secret *s);
 struct secret *db_column_secret_arr(const tal_t *ctx, struct db_stmt *stmt,
 				    int col);
 void db_column_txid(struct db_stmt *stmt, int pos, struct bitcoin_txid *t);
+void db_column_channel_id(struct db_stmt *stmt, int col, struct channel_id *dest);
 void db_column_node_id(struct db_stmt *stmt, int pos, struct node_id *ni);
 struct node_id *db_column_node_id_arr(const tal_t *ctx, struct db_stmt *stmt,
 				      int col);
@@ -158,10 +163,12 @@ bool db_column_signature(struct db_stmt *stmt, int col,
 			 secp256k1_ecdsa_signature *sig);
 struct timeabs db_column_timeabs(struct db_stmt *stmt, int col);
 struct bitcoin_tx *db_column_tx(const tal_t *ctx, struct db_stmt *stmt, int col);
+struct wally_psbt *db_column_psbt(const tal_t *ctx, struct db_stmt *stmt, int col);
 struct bitcoin_tx *db_column_psbt_to_tx(const tal_t *ctx, struct db_stmt *stmt, int col);
 
 struct onionreply *db_column_onionreply(const tal_t *ctx,
 					struct db_stmt *stmt, int col);
+u8 *db_column_talarr(const tal_t *ctx, struct db_stmt *stmt, int col);
 
 #define db_column_arr(ctx, stmt, col, type)			\
 	((type *)db_column_arr_((ctx), (stmt), (col),		\

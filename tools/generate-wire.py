@@ -236,6 +236,7 @@ class Type(FieldSet):
         'route_hop',
         'tx_parts',
         'wally_psbt',
+        'wally_tx',
     ]
 
     # Some BOLT types are re-typed based on their field name
@@ -537,7 +538,8 @@ class Master(object):
             stuff['messages'] = list(self.messages.values()) + list(self.extension_msgs.values())
         stuff['subtypes'] = subtypes
 
-        print(template.render(**stuff), file=output)
+        for line in template.render(**stuff).splitlines():
+            print(line.rstrip(), file=output)
 
 
 def main(options, args=None, output=sys.stdout, lines=None):

@@ -2,11 +2,15 @@
 #define LIGHTNING_LIGHTNINGD_CHANNEL_H
 #include "config.h"
 #include <ccan/list/list.h>
+#include <common/channel_id.h>
+#include <common/per_peer_state.h>
 #include <lightningd/channel_state.h>
 #include <lightningd/peer_htlcs.h>
 #include <wallet/wallet.h>
 
+struct channel_id;
 struct uncommitted_channel;
+struct wally_psbt;
 
 struct billboard {
 	/* Status information to display on listpeers */
@@ -69,6 +73,8 @@ struct channel {
 	/* Channel if locked locally. */
 	struct short_channel_id *scid;
 
+	struct channel_id cid;
+
 	/* Amount going to us, not counting unfinished HTLCs; if we have one. */
 	struct amount_msat our_msat;
 	/* Statistics for min and max our_msatoshi. */
@@ -86,6 +92,9 @@ struct channel {
 
 	/* Keys for channel */
 	struct channel_info channel_info;
+
+	/* Fee status */
+	const struct fee_states *fee_states;
 
 	/* Our local basepoints */
 	struct basepoints local_basepoints;
@@ -138,7 +147,10 @@ struct channel {
 	struct command **forgets;
 
 	/* Our position in the round-robin list.  */
-	struct list_node rr_list;
+	u64 rr_number;
+
+	/* PSBT, for v2 channels. Saved until it's sent */
+	struct wally_psbt *psbt;
 };
 
 struct channel *new_channel(struct peer *peer, u64 dbid,
@@ -163,6 +175,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    bool remote_funding_locked,
 			    /* NULL or stolen */
 			    struct short_channel_id *scid STEALS,
+			    struct channel_id *cid,
 			    struct amount_msat our_msatoshi,
 			    struct amount_msat msatoshi_to_us_min,
 			    struct amount_msat msatoshi_to_us_max,
@@ -171,6 +184,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    /* NULL or stolen */
 			    const struct bitcoin_signature *last_htlc_sigs STEALS,
 			    const struct channel_info *channel_info,
+			    const struct fee_states *fee_states TAKES,
 			    /* NULL or stolen */
 			    u8 *remote_shutdown_scriptpubkey STEALS,
 			    const u8 *local_shutdown_scriptpubkey,
@@ -190,7 +204,8 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    /* NULL or stolen */
 			    const u8 *remote_upfront_shutdown_script STEALS,
 			    bool option_static_remotekey,
-			    bool option_anchor_outputs);
+			    bool option_anchor_outputs,
+			    struct wally_psbt *psbt STEALS);
 
 void delete_channel(struct channel *channel STEALS);
 
@@ -233,6 +248,11 @@ struct channel *channel_by_dbid(struct lightningd *ld, const u64 dbid);
 
 struct channel *active_channel_by_scid(struct lightningd *ld,
 				       const struct short_channel_id *scid);
+
+/* Get channel by channel_id, optionally returning uncommitted_channel. */
+struct channel *channel_by_cid(struct lightningd *ld,
+			       const struct channel_id *cid,
+			       struct uncommitted_channel **uc);
 
 void channel_set_last_tx(struct channel *channel,
 			 struct bitcoin_tx *tx,

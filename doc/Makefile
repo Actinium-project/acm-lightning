@@ -16,6 +16,7 @@ MANPAGES := doc/lightning-cli.1 \
 	doc/lightning-decodepay.7 \
 	doc/lightning-delexpiredinvoice.7 \
 	doc/lightning-delinvoice.7 \
+	doc/lightning-delpay.7 \
 	doc/lightning-dev-sendcustommsg.7 \
 	doc/lightning-disconnect.7 \
 	doc/lightning-feerates.7 \
@@ -36,7 +37,13 @@ MANPAGES := doc/lightning-cli.1 \
 	doc/lightning-listpays.7 \
 	doc/lightning-listpeers.7 \
 	doc/lightning-listsendpays.7 \
+	doc/lightning-multifundchannel.7 \
+	doc/lightning-multiwithdraw.7 \
 	doc/lightning-newaddr.7 \
+	doc/lightning-notifications.7 \
+	doc/lightning-openchannel_init.7 \
+	doc/lightning-openchannel_signed.7 \
+	doc/lightning-openchannel_update.7 \
 	doc/lightning-pay.7 \
 	doc/lightning-plugin.7 \
 	doc/lightning-reserveinputs.7 \
@@ -53,12 +60,24 @@ MANPAGES := doc/lightning-cli.1 \
 	doc/lightning-waitanyinvoice.7 \
 	doc/lightning-waitblockheight.7 \
 	doc/lightning-waitsendpay.7 \
-	doc/lightning-withdraw.7
+	doc/lightning-withdraw.7 \
+	doc/lightning-ping.7 \
+	doc/lightning-stop.7 \
+	doc/lightning-signpsbt.7 \
+	doc/lightning-sendpsbt.7 \
+	doc/lightning-getinfo.7 \
+	doc/lightning-listtransactions.7 \
+	doc/lightning-listnodes.7 \
+	doc/lightning-listconfigs.7 \
+	doc/lightning-help.7 \
+	doc/lightning-getlog.7
 
 doc-all: $(MANPAGES) doc/index.rst
 
 $(MANPAGES): doc/%: doc/%.md
-	@if $(CHANGED_FROM_GIT); then $(call VERBOSE, "mrkd $<", mrkd $< $@); else touch $@; fi
+	@if $(call SHA256STAMP_CHANGED); then $(call VERBOSE, "mrkd $<", mrkd $< $@ && $(call SHA256STAMP,\")); else touch $@; fi
+
+$(MANPAGES): FORCE
 
 doc/protocol-%.svg: test/test_protocol
 	test/test_protocol --svg < test/commits/$*.script > $@
@@ -98,7 +117,6 @@ check-manpages: all-programs
 	@tools/check-manpage.sh "lightningd/lightningd --lightning-dir=/tmp/" doc/lightningd-config.5.md
 
 doc-maintainer-clean:
-	$(RM) doc/deployable-lightning.pdf
 	$(RM) $(MANPAGES)
 
 doc-clean:

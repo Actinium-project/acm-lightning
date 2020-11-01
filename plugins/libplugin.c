@@ -447,13 +447,18 @@ static const jsmntok_t *read_rpc_reply(const tal_t *ctx,
 {
 	const jsmntok_t *toks;
 
-	*reqlen = read_json_from_rpc(plugin);
+	do {
+		*reqlen = read_json_from_rpc(plugin);
 
-	toks = json_parse_simple(ctx,
-				 membuf_elems(&plugin->rpc_conn->mb), *reqlen);
-	if (!toks)
-		plugin_err(plugin, "Malformed JSON reply '%.*s'",
-			   *reqlen, membuf_elems(&plugin->rpc_conn->mb));
+		toks = json_parse_simple(ctx,
+					 membuf_elems(&plugin->rpc_conn->mb),
+					 *reqlen);
+		if (!toks)
+			plugin_err(plugin, "Malformed JSON reply '%.*s'",
+				   *reqlen, membuf_elems(&plugin->rpc_conn->mb));
+		/* FIXME: Don't simply ignore notifications here! */
+	} while (!json_get_member(membuf_elems(&plugin->rpc_conn->mb), toks,
+				  "id"));
 
 	*contents = json_get_member(membuf_elems(&plugin->rpc_conn->mb), toks, "error");
 	if (*contents)
@@ -525,9 +530,9 @@ static void handle_rpc_reply(struct plugin *plugin, const jsmntok_t *toks)
 
 	idtok = json_get_member(plugin->rpc_buffer, toks, "id");
 	if (!idtok)
-		plugin_err(plugin, "JSON reply without id '%.*s'",
-			   json_tok_full_len(toks),
-			   json_tok_full(plugin->rpc_buffer, toks));
+		/* FIXME: Don't simply ignore notifications! */
+		return;
+
 	if (!json_to_u64(plugin->rpc_buffer, idtok, &id))
 		plugin_err(plugin, "JSON reply without numeric id '%.*s'",
 			   json_tok_full_len(toks),
@@ -983,6 +988,65 @@ static void plugin_logv(struct plugin *p, enum log_level l,
 	json_object_end(js);
 
 	jsonrpc_finish_and_send(p, js);
+}
+
+struct json_stream *plugin_notify_start(struct command *cmd, const char *method)
+{
+	struct json_stream *js = new_json_stream(cmd, NULL, NULL);
+
+	json_object_start(js, NULL);
+	json_add_string(js, "jsonrpc", "2.0");
+	json_add_string(js, "method", method);
+
+	json_object_start(js, "params");
+	json_add_u64(js, "id", *cmd->id);
+
+	return js;
+}
+
+void plugin_notify_end(struct command *cmd, struct json_stream *js)
+{
+	json_object_end(js);
+
+	jsonrpc_finish_and_send(cmd->plugin, js);
+}
+
+/* Convenience wrapper for notify with "message" */
+void plugin_notify_message(struct command *cmd,
+			   enum log_level level,
+			   const char *fmt, ...)
+{
+	va_list ap;
+	struct json_stream *js = plugin_notify_start(cmd, "message");
+
+	va_start(ap, fmt);
+	json_add_string(js, "level", log_level_name(level));
+
+	/* In case we're OOM */
+	if (js->jout)
+		json_out_addv(js->jout, "message", true, fmt, ap);
+	va_end(ap);
+
+	plugin_notify_end(cmd, js);
+}
+
+void plugin_notify_progress(struct command *cmd,
+			    u32 num_stages, u32 stage,
+			    u32 num_progress, u32 progress)
+{
+	struct json_stream *js = plugin_notify_start(cmd, "progress");
+
+	assert(progress < num_progress);
+	json_add_u32(js, "num", progress);
+	json_add_u32(js, "total", num_progress);
+	if (num_stages > 0) {
+		assert(stage < num_stages);
+		json_object_start(js, "stage");
+		json_add_u32(js, "num", stage);
+		json_add_u32(js, "total", num_stages);
+		json_object_end(js);
+	}
+	plugin_notify_end(cmd, js);
 }
 
 void NORETURN plugin_err(struct plugin *p, const char *fmt, ...)

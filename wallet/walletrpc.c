@@ -15,8 +15,6 @@
 #include <common/status.h>
 #include <common/utils.h>
 #include <common/utxo.h>
-#include <common/wallet_tx.h>
-#include <common/withdraw_tx.h>
 #include <errno.h>
 #include <hsmd/hsmd_wiregen.h>
 #include <inttypes.h>
@@ -34,602 +32,6 @@
 #include <wallet/walletrpc.h>
 #include <wally_bip32.h>
 #include <wire/wire_sync.h>
-
-struct tx_broadcast {
-	struct command *cmd;
-	const struct utxo **utxos;
-	const struct wally_tx *wtx;
-	struct amount_sat *expected_change;
-};
-
-static struct tx_broadcast *unreleased_tx_to_broadcast(const tal_t *ctx,
-						       struct command *cmd,
-						       struct unreleased_tx *utx)
-{
-	struct tx_broadcast *txb = tal(ctx, struct tx_broadcast);
-	struct amount_sat *change = tal(txb, struct amount_sat);
-
-	txb->cmd = cmd;
-	txb->utxos = utx->wtx->utxos;
-	txb->wtx = utx->tx->wtx;
-	*change = utx->wtx->change;
-	txb->expected_change = change;
-	return txb;
-}
-
-/**
- * wallet_withdrawal_broadcast - The tx has been broadcast (or it failed)
- *
- * This is the final step in the withdrawal. We either successfully
- * broadcast the withdrawal transaction or it failed somehow. So we
- * report success or a broadcast failure. Upon success we also mark
- * the used outputs as spent, and add the change output to our pool of
- * available outputs.
- */
-static void wallet_withdrawal_broadcast(struct bitcoind *bitcoind UNUSED,
-					bool success, const char *msg,
-					struct tx_broadcast *txb)
-{
-	struct command *cmd = txb->cmd;
-	struct lightningd *ld = cmd->ld;
-
-	/* FIXME: This won't be necessary once we use ccan/json_out! */
-	/* Massage output into shape so it doesn't kill the JSON serialization */
-	char *output = tal_strjoin(cmd, tal_strsplit(cmd, msg, "\n", STR_NO_EMPTY), " ", STR_NO_TRAIL);
-	if (success) {
-		struct bitcoin_txid txid;
-		struct amount_sat change = AMOUNT_SAT(0);
-
-		/* Mark used outputs as spent */
-		wallet_confirm_utxos(ld->wallet, txb->utxos);
-
-		/* Extract the change output and add it to the DB */
-		wallet_extract_owned_outputs(ld->wallet, txb->wtx, NULL, &change);
-
-		/* Note normally, change_satoshi == withdraw->wtx->change, but
-		 * not if we're actually making a payment to ourselves! */
-		if (txb->expected_change)
-			assert(amount_sat_greater_eq(change, *txb->expected_change));
-
-		struct json_stream *response = json_stream_success(cmd);
-		wally_txid(txb->wtx, &txid);
-		json_add_hex_talarr(response, "tx",
-				    linearize_wtx(tmpctx, txb->wtx));
-		json_add_txid(response, "txid", &txid);
-		was_pending(command_success(cmd, response));
-	} else {
-		was_pending(command_fail(cmd, LIGHTNINGD,
-					 "Error broadcasting transaction: %s. Unsent tx discarded %s",
-					 output,
-					 type_to_string(tmpctx, struct wally_tx, txb->wtx)));
-	}
-}
-
-/* Signs the tx, broadcasts it: broadcast calls wallet_withdrawal_broadcast */
-static struct command_result *broadcast_and_wait(struct command *cmd,
-						 struct unreleased_tx *utx)
-{
-	struct wally_psbt *signed_psbt;
-	struct wally_tx *signed_wtx;
-	struct bitcoin_txid signed_txid;
-
-	/* FIXME: hsm will sign almost anything, but it should really
-	 * fail cleanly (not abort!) and let us report the error here. */
-	u8 *msg = towire_hsmd_sign_withdrawal(cmd, utx->wtx->utxos, utx->tx->psbt);
-
-	if (!wire_sync_write(cmd->ld->hsm_fd, take(msg)))
-		fatal("Could not write sign_withdrawal to HSM: %s",
-		      strerror(errno));
-
-	msg = wire_sync_read(cmd, cmd->ld->hsm_fd);
-
-	if (!fromwire_hsmd_sign_withdrawal_reply(utx, msg, &signed_psbt))
-		fatal("HSM gave bad sign_withdrawal_reply %s",
-		      tal_hex(tmpctx, msg));
-
-	signed_wtx = psbt_finalize(signed_psbt, true);
-
-	if (!signed_wtx) {
-		/* Have the utx persist past this command */
-		tal_steal(cmd->ld->wallet, utx);
-		add_unreleased_tx(cmd->ld->wallet, utx);
-		return command_fail(cmd, LIGHTNINGD,
-				    "PSBT is not finalized %s",
-				    type_to_string(tmpctx,
-						   struct wally_psbt,
-						   signed_psbt));
-	}
-
-	/* Sanity check */
-	wally_txid(signed_wtx, &signed_txid);
-	if (!bitcoin_txid_eq(&signed_txid, &utx->txid))
-		fatal("HSM changed txid: unsigned %s, signed %s",
-		      tal_hex(tmpctx, linearize_tx(tmpctx, utx->tx)),
-		      tal_hex(tmpctx, linearize_wtx(tmpctx, signed_wtx)));
-
-	/* Replace unsigned tx by signed tx. */
-	wally_tx_free(utx->tx->wtx);
-	utx->tx->wtx = tal_steal(utx->tx, signed_wtx);
-	tal_free(utx->tx->psbt);
-	utx->tx->psbt = tal_steal(utx->tx, signed_psbt);
-
-	/* Now broadcast the transaction */
-	bitcoind_sendrawtx(cmd->ld->topology->bitcoind,
-			   tal_hex(tmpctx, linearize_tx(tmpctx, utx->tx)),
-			   wallet_withdrawal_broadcast,
-			   unreleased_tx_to_broadcast(cmd, cmd, utx));
-
-	return command_still_pending(cmd);
-}
-
-/* Common code for withdraw and txprepare.
- *
- * Returns NULL on success, and fills in wtx, output and
- * maybe changekey (owned by cmd).  Otherwise, cmd has failed, so don't
- * access it! (It's been freed). */
-static struct command_result *json_prepare_tx(struct command *cmd,
-					      const char *buffer,
-					      const jsmntok_t *params,
-					      bool for_withdraw,
-					      struct unreleased_tx **utx,
-					      u32 *feerate)
-{
-	u32 *feerate_per_kw = NULL;
-	struct command_result *result;
-	u32 *minconf, maxheight;
-	struct pubkey *changekey;
-	struct bitcoin_tx_output **outputs;
-	const jsmntok_t *outputstok = NULL, *t;
-	const u8 *destination = NULL;
-	size_t out_len, i;
-	const struct utxo **chosen_utxos = NULL;
-	u32 locktime;
-
-	*utx = tal(cmd, struct unreleased_tx);
-	(*utx)->wtx = tal(*utx, struct wallet_tx);
-	wtx_init(cmd, (*utx)->wtx, AMOUNT_SAT(-1ULL));
-
-	if (!for_withdraw) {
-		/* From v0.7.3, the new style for *txprepare* use array of outputs
-		 * to replace original 'destination' and 'satoshi' parameters.*/
-		/* For generating help, give new-style. */
-		if (!params || !deprecated_apis) {
-			if (!param(cmd, buffer, params,
-				   p_req("outputs", param_array, &outputstok),
-				   p_opt("feerate", param_feerate, &feerate_per_kw),
-				   p_opt_def("minconf", param_number, &minconf, 1),
-				   p_opt("utxos", param_utxos, &chosen_utxos),
-				   NULL))
-				return command_param_failed();
-		} else if (params->type == JSMN_ARRAY) {
-			const jsmntok_t *firsttok, *secondtok, *thirdtok, *fourthtok;
-
-			/* FIXME: This change completely destroyes the support for `check`. */
-			if (!param(cmd, buffer, params,
-				   p_req("outputs_or_destination", param_tok, &firsttok),
-				   p_opt("feerate_or_sat", param_tok, &secondtok),
-				   p_opt("minconf_or_feerate", param_tok, &thirdtok),
-				   p_opt("utxos_or_minconf", param_tok, &fourthtok),
-				   NULL))
-				return command_param_failed();
-
-			if (firsttok->type == JSMN_ARRAY) {
-				/* New style:
-				 * *txprepare* 'outputs' ['feerate'] ['minconf'] ['utxos'] */
-
-				/* outputs (required) */
-				outputstok = firsttok;
-
-				/* feerate (optional) */
-				if (secondtok) {
-					result = param_feerate(cmd, "feerate", buffer,
-							       secondtok, &feerate_per_kw);
-					if (result)
-						return result;
-				}
-
-				/* minconf (optional) */
-				if (thirdtok) {
-					result = param_number(cmd, "minconf", buffer,
-							      thirdtok, &minconf);
-					if (result)
-						return result;
-				} else {
-					minconf = tal(cmd, u32);
-					*minconf = 1;
-				}
-
-				/* utxos (optional) */
-				if (fourthtok) {
-					result = param_utxos(cmd, "utxos", buffer,
-							     fourthtok, &chosen_utxos);
-					if (result)
-						return result;
-				}
-			} else {
-				/* Old style:
-				 * *txprepare* 'destination' 'satoshi' ['feerate'] ['minconf'] */
-
-				/* destination (required) */
-				result = param_bitcoin_address(cmd, "destination", buffer,
-							       firsttok, &destination);
-				if (result)
-					return result;
-
-				/* satoshi (required) */
-				if (!secondtok)
-					return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-							    "Need set 'satoshi' field.");
-				result = param_wtx(cmd, "satoshi", buffer,
-						   secondtok, (*utx)->wtx);
-				if (result)
-					return result;
-
-				/* feerate (optional) */
-				if (thirdtok) {
-					result = param_feerate(cmd, "feerate", buffer,
-							       thirdtok, &feerate_per_kw);
-					if (result)
-						return result;
-				}
-
-				/* minconf (optional) */
-				if (fourthtok) {
-					result = param_number(cmd, "minconf", buffer,
-							      fourthtok, &minconf);
-					if (result)
-						return result;
-				} else {
-					minconf = tal(cmd, u32);
-					*minconf = 1;
-				}
-			}
-		} else {
-			const jsmntok_t *satoshitok = NULL;
-			if (!param(cmd, buffer, params,
-				   p_opt("outputs", param_array, &outputstok),
-				   p_opt("destination", param_bitcoin_address,
-					 &destination),
-				   p_opt("satoshi", param_tok, &satoshitok),
-				   p_opt("feerate", param_feerate, &feerate_per_kw),
-				   p_opt_def("minconf", param_number, &minconf, 1),
-				   p_opt("utxos", param_utxos, &chosen_utxos),
-				   NULL))
-				/* If the parameters mixed the new style and the old style,
-				 * fail it. */
-				return command_param_failed();
-
-			if (!outputstok) {
-				if (!destination || !satoshitok)
-					return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-							    "Need set 'outputs' field.");
-
-				result = param_wtx(cmd, "satoshi", buffer,
-						   satoshitok, (*utx)->wtx);
-				if (result)
-					return result;
-			}
-		}
-	} else {
-		/* *withdraw* command still use 'destination' and 'satoshi' as parameters. */
-		if (!param(cmd, buffer, params,
-			   p_req("destination", param_bitcoin_address,
-				 &destination),
-			   p_req("satoshi", param_wtx, (*utx)->wtx),
-			   p_opt("feerate", param_feerate, &feerate_per_kw),
-			   p_opt_def("minconf", param_number, &minconf, 1),
-			   p_opt("utxos", param_utxos, &chosen_utxos),
-			   NULL))
-			return command_param_failed();
-	}
-
-	/* Setting the locktime to the next block to be mined has multiple
-	 * benefits:
-	 * - anti fee-snipping (even if not yet likely)
-	 * - less distinguishable transactions (with this we create
-	 *   general-purpose transactions which looks like bitcoind:
-	 *   native segwit, nlocktime set to tip, and sequence set to
-	 *   0xFFFFFFFE by default. Other wallets are likely to implement
-	 *   this too).
-	 */
-	locktime = cmd->ld->topology->tip->height;
-	/* Eventually fuzz it too. */
-	if (pseudorand(10) == 0)
-		locktime -= (u32)pseudorand(100);
-
-	if (!feerate_per_kw) {
-		/* We mainly use `txprepare` for opening transactions, and FEERATE_OPENING
-		 * is kind of the new FEERATE_NORMAL so it fits well `withdraw` too. */
-		result = param_feerate_estimate(cmd, &feerate_per_kw,
-						FEERATE_OPENING);
-		if (result)
-			return result;
-	}
-
-	maxheight = minconf_to_maxheight(*minconf, cmd->ld);
-
-	/* *withdraw* command or old *txprepare* command.
-	 * Support only one output. */
-	if (destination) {
-		outputs = tal_arr(tmpctx, struct bitcoin_tx_output *, 1);
-		outputs[0] = new_tx_output(outputs, (*utx)->wtx->amount,
-					   destination);
-		out_len = tal_count(outputs[0]->script);
-
-		goto create_tx;
-	}
-
-	if (outputstok->size == 0)
-		return command_fail(cmd, JSONRPC2_INVALID_PARAMS, "Empty outputs");
-
-	outputs = tal_arr(tmpctx, struct bitcoin_tx_output *, outputstok->size);
-	out_len = 0;
-	(*utx)->wtx->all_funds = false;
-	(*utx)->wtx->amount = AMOUNT_SAT(0);
-	json_for_each_arr(i, t, outputstok) {
-		struct amount_sat *amount;
-		const u8 *destination;
-		enum address_parse_result res;
-
-		/* output format: {destination: amount} */
-		if (t->type != JSMN_OBJECT)
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "The output format must be "
-					    "{destination: amount}");
-
-		res = json_to_address_scriptpubkey(cmd,
-						   chainparams,
-						   buffer, &t[1],
-						   &destination);
-		if (res == ADDRESS_PARSE_UNRECOGNIZED)
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "Could not parse destination address");
-		else if (res == ADDRESS_PARSE_WRONG_NETWORK)
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "Destination address is not on network %s",
-					    chainparams->network_name);
-
-		amount = tal(tmpctx, struct amount_sat);
-		if (!json_to_sat_or_all(buffer, &t[2], amount))
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "'%.*s' is a invalid satoshi amount",
-					    t[2].end - t[2].start, buffer + t[2].start);
-
-		outputs[i] = new_tx_output(outputs, *amount,
-					   cast_const(u8 *, destination));
-		out_len += tal_count(destination);
-
-		/* In fact, the maximum amount of bitcoin satoshi is 2.1e15.
-		 * It can't be equal to/bigger than 2^64.
-		 * On the hand, the maximum amount of litoshi is 8.4e15,
-		 * which also can't overflow. */
-		/* This means this destination need "all" satoshi we have. */
-		if (amount_sat_eq(*amount, AMOUNT_SAT(-1ULL))) {
-			if (outputstok->size > 1)
-				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-						    "outputs[%zi]: this destination wants"
-						    " all satoshi. The count of outputs"
-						    " can't be more than 1. ", i);
-			(*utx)->wtx->all_funds = true;
-			/* `AMOUNT_SAT(-1ULL)` is the max permissible for `wallet_select_all`. */
-			(*utx)->wtx->amount = *amount;
-			break;
-		}
-
-		if (!amount_sat_add(&(*utx)->wtx->amount, (*utx)->wtx->amount, *amount))
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "outputs: The sum of first %zi outputs"
-					    " overflow. ", i);
-	}
-
-create_tx:
-	if (chosen_utxos)
-		result = wtx_from_utxos((*utx)->wtx, *feerate_per_kw,
-					out_len, maxheight,
-					chosen_utxos);
-	else
-		result = wtx_select_utxos((*utx)->wtx, *feerate_per_kw,
-					  out_len, maxheight);
-
-	if (result)
-		return result;
-
-	/* Because of the max limit of AMOUNT_SAT(-1ULL),
-	 * `(*utx)->wtx->all_funds` won't change in `wtx_select_utxos()` */
-	if ((*utx)->wtx->all_funds)
-		outputs[0]->amount = (*utx)->wtx->amount;
-
-	/* Add the change as the last output */
-	if (!amount_sat_eq((*utx)->wtx->change, AMOUNT_SAT(0))) {
-		struct bitcoin_tx_output *change_output;
-
-		changekey = tal(tmpctx, struct pubkey);
-		if (!bip32_pubkey(cmd->ld->wallet->bip32_base, changekey,
-				  (*utx)->wtx->change_key_index))
-			return command_fail(cmd, LIGHTNINGD, "Keys generation failure");
-
-		change_output = new_tx_output(outputs, (*utx)->wtx->change,
-					      scriptpubkey_p2wpkh(tmpctx, changekey));
-		tal_arr_expand(&outputs, change_output);
-	}
-
-	(*utx)->outputs = tal_steal(*utx, outputs);
-	(*utx)->tx = withdraw_tx(*utx, chainparams,
-				 (*utx)->wtx->utxos,
-				 (*utx)->outputs,
-				 cmd->ld->wallet->bip32_base,
-				 /* FIXME: Should probably be
-				  * struct abs_locktime.
-				  */
-				 locktime);
-
-	bitcoin_txid((*utx)->tx, &(*utx)->txid);
-
-	if (feerate)
-		*feerate = *feerate_per_kw;
-	return NULL;
-}
-
-static struct command_result *json_txprepare(struct command *cmd,
-					     const char *buffer,
-					     const jsmntok_t *obj UNNEEDED,
-					     const jsmntok_t *params)
-{
-	struct unreleased_tx *utx;
-	struct command_result *res;
-	struct json_stream *response;
-
-	res = json_prepare_tx(cmd, buffer, params, false, &utx, NULL);
-	if (res)
-		return res;
-
-	/* utx will persist past this command. */
-	tal_steal(cmd->ld->wallet, utx);
-	add_unreleased_tx(cmd->ld->wallet, utx);
-
-	response = json_stream_success(cmd);
-	json_add_tx(response, "unsigned_tx", utx->tx);
-	json_add_txid(response, "txid", &utx->txid);
-	return command_success(cmd, response);
-}
-static const struct json_command txprepare_command = {
-	"txprepare",
-	"bitcoin",
-	json_txprepare,
-	"Create a transaction, with option to spend in future (either txsend and txdiscard)",
-	false
-};
-AUTODATA(json_command, &txprepare_command);
-
-static struct command_result *param_unreleased_txid(struct command *cmd,
-						    const char *name,
-						    const char *buffer,
-						    const jsmntok_t *tok,
-						    struct unreleased_tx **utx)
-{
-	struct command_result *res;
-	struct bitcoin_txid *txid;
-
-	res = param_txid(cmd, name, buffer, tok, &txid);
-	if (res)
-		return res;
-
-	*utx = find_unreleased_tx(cmd->ld->wallet, txid);
-	if (!*utx)
-		return command_fail(cmd, LIGHTNINGD,
-				    "%s not an unreleased txid",
-				    type_to_string(cmd, struct bitcoin_txid,
-						   txid));
-	tal_free(txid);
-	return NULL;
-}
-
-static struct command_result *json_txsend(struct command *cmd,
-					  const char *buffer,
-					  const jsmntok_t *obj UNNEEDED,
-					  const jsmntok_t *params)
-{
-	struct unreleased_tx *utx;
-
-	if (!param(cmd, buffer, params,
-		   p_req("txid", param_unreleased_txid, &utx),
-		   NULL))
-		return command_param_failed();
-
-	/* We delete from list now, and this command owns it. */
-	remove_unreleased_tx(utx);
-	tal_steal(cmd, utx);
-
-	/* We're the owning cmd now. */
-	utx->wtx->cmd = cmd;
-
-	wallet_transaction_add(cmd->ld->wallet, utx->tx->wtx, 0, 0);
-	wallet_transaction_annotate(cmd->ld->wallet, &utx->txid,
-				    TX_UNKNOWN, 0);
-
-	return broadcast_and_wait(cmd, utx);
-}
-
-static const struct json_command txsend_command = {
-	"txsend",
-	"bitcoin",
-	json_txsend,
-	"Sign and broadcast a transaction created by txprepare",
-	false
-};
-AUTODATA(json_command, &txsend_command);
-
-static struct command_result *json_txdiscard(struct command *cmd,
-					     const char *buffer,
-					     const jsmntok_t *obj UNNEEDED,
-					     const jsmntok_t *params)
-{
-	struct unreleased_tx *utx;
-	struct json_stream *response;
-
-	if (!param(cmd, buffer, params,
-		   p_req("txid", param_unreleased_txid, &utx),
-		   NULL))
-		return command_param_failed();
-
-	/* Free utx with this command */
-	tal_steal(cmd, utx);
-
-	response = json_stream_success(cmd);
-	json_add_tx(response, "unsigned_tx", utx->tx);
-	json_add_txid(response, "txid", &utx->txid);
-	return command_success(cmd, response);
-}
-
-static const struct json_command txdiscard_command = {
-	"txdiscard",
-	"bitcoin",
-	json_txdiscard,
-	"Abandon a transaction created by txprepare",
-	false
-};
-AUTODATA(json_command, &txdiscard_command);
-
-/**
- * json_withdraw - Entrypoint for the withdrawal flow
- *
- * A user has requested a withdrawal over the JSON-RPC, parse the
- * request, select coins and a change key. Then send the request to
- * the HSM to generate the signatures.
- */
-static struct command_result *json_withdraw(struct command *cmd,
-					    const char *buffer,
-					    const jsmntok_t *obj UNNEEDED,
-					    const jsmntok_t *params)
-{
-	struct unreleased_tx *utx;
-	struct command_result *res;
-
-	res = json_prepare_tx(cmd, buffer, params, true, &utx, NULL);
-	if (res)
-		return res;
-
-	/* Store the transaction in the DB and annotate it as a withdrawal */
-	wallet_transaction_add(cmd->ld->wallet, utx->tx->wtx, 0, 0);
-	wallet_transaction_annotate(cmd->ld->wallet, &utx->txid,
-				    TX_WALLET_WITHDRAWAL, 0);
-
-	return broadcast_and_wait(cmd, utx);
-}
-
-static const struct json_command withdraw_command = {
-	"withdraw",
-	"bitcoin",
-	json_withdraw,
-	"Send to {destination} address {satoshi} (or 'all') amount via Bitcoin "
-	"transaction, at optional {feerate}",
-	false,
-	"Send funds from the internal wallet to the specified address. Either "
-	"specify a number of satoshis to send or 'all' to sweep all funds in the "
-	"internal wallet to the address. Only use outputs that have at least "
-	"{minconf} confirmations."
-};
-AUTODATA(json_command, &withdraw_command);
 
 /* May return NULL if encoding error occurs. */
 static char *
@@ -842,19 +244,6 @@ static const struct json_command listaddrs_command = {
 };
 AUTODATA(json_command, &listaddrs_command);
 
-bool is_reserved(const struct utxo *utxo, u32 current_height)
-{
-	if (utxo->status != output_state_reserved)
-		return false;
-
-	/* FIXME: Eventually this will always be set! */
-	if (!utxo->reserved_til)
-		return true;
-
-	return *utxo->reserved_til > current_height;
-}
-
-
 static void json_add_utxo(struct json_stream *response,
 			  const char *fieldname,
 			  struct wallet *wallet,
@@ -899,8 +288,8 @@ static void json_add_utxo(struct json_stream *response,
 		json_add_string(response, "status", "unconfirmed");
 
 	json_add_bool(response, "reserved",
-		      is_reserved(utxo,
-				  get_block_height(wallet->ld->topology)));
+		      utxo_is_reserved(utxo,
+				       get_block_height(wallet->ld->topology)));
 	json_object_end(response);
 }
 
@@ -926,8 +315,8 @@ static struct command_result *json_listfunds(struct command *cmd,
 
 	response = json_stream_success(cmd);
 
-	utxos = wallet_get_utxos(cmd, cmd->ld->wallet, output_state_available);
-	reserved_utxos = wallet_get_utxos(cmd, cmd->ld->wallet, output_state_reserved);
+	utxos = wallet_get_utxos(cmd, cmd->ld->wallet, OUTPUT_STATE_AVAILABLE);
+	reserved_utxos = wallet_get_utxos(cmd, cmd->ld->wallet, OUTPUT_STATE_RESERVED);
 	json_array_start(response, "outputs");
 	json_add_utxos(response, cmd->ld->wallet, utxos);
 	json_add_utxos(response, cmd->ld->wallet, reserved_utxos);
@@ -993,7 +382,7 @@ static void process_utxo_result(struct bitcoind *bitcoind,
 	struct json_stream *response = rescan->response;
 	struct utxo *u = rescan->utxos[0];
 	enum output_status newstate =
-	    txout == NULL ? output_state_spent : output_state_available;
+	    txout == NULL ? OUTPUT_STATE_SPENT : OUTPUT_STATE_AVAILABLE;
 
 	json_object_start(rescan->response, NULL);
 	json_add_txid(response, "txid", &u->txid);
@@ -1034,7 +423,7 @@ static struct command_result *json_dev_rescan_outputs(struct command *cmd,
 
 	/* Open the outputs structure so we can incrementally add results */
 	json_array_start(rescan->response, "outputs");
-	rescan->utxos = wallet_get_utxos(rescan, cmd->ld->wallet, output_state_any);
+	rescan->utxos = wallet_get_utxos(rescan, cmd->ld->wallet, OUTPUT_STATE_ANY);
 	if (tal_count(rescan->utxos) == 0) {
 		json_array_end(rescan->response);
 		return command_success(cmd, rescan->response);
@@ -1205,22 +594,6 @@ static const struct json_command listtransactions_command = {
 };
 AUTODATA(json_command, &listtransactions_command);
 
-struct command_result *param_psbt(struct command *cmd,
-				  const char *name,
-				  const char *buffer,
-				  const jsmntok_t *tok,
-				  struct wally_psbt **psbt)
-{
-	*psbt = psbt_from_b64(cmd, buffer + tok->start, tok->end - tok->start);
-	if (*psbt)
-		return NULL;
-
-	return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-			    "'%s' should be a PSBT, not '%.*s'",
-			    name, json_tok_full_len(tok),
-			    json_tok_full(buffer, tok));
-}
-
 static bool in_only_inputs(const u32 *only_inputs, u32 this)
 {
 	for (size_t i = 0; i < tal_count(only_inputs); i++)
@@ -1256,7 +629,7 @@ static struct command_result *match_psbt_inputs_to_utxos(struct command *cmd,
 		}
 
 		/* Oops we haven't reserved this utxo yet! */
-		if (!is_reserved(utxo, get_block_height(cmd->ld->topology)))
+		if (!utxo_is_reserved(utxo, get_block_height(cmd->ld->topology)))
 			return command_fail(cmd, LIGHTNINGD,
 					    "Aborting PSBT signing. UTXO %s:%u is not reserved",
 					    type_to_string(tmpctx, struct bitcoin_txid,
@@ -1362,25 +735,71 @@ static const struct json_command signpsbt_command = {
 
 AUTODATA(json_command, &signpsbt_command);
 
+struct sending_psbt {
+	struct command *cmd;
+	struct utxo **utxos;
+	struct wally_tx *wtx;
+};
+
+static void sendpsbt_done(struct bitcoind *bitcoind UNUSED,
+			  bool success, const char *msg,
+			  struct sending_psbt *sending)
+{
+	struct lightningd *ld = sending->cmd->ld;
+	struct json_stream *response;
+	struct bitcoin_txid txid;
+	struct amount_sat change;
+
+	if (!success) {
+		/* Unreserve the inputs again. */
+		for (size_t i = 0; i < tal_count(sending->utxos); i++) {
+			wallet_unreserve_utxo(ld->wallet,
+					      sending->utxos[i],
+					      get_block_height(ld->topology));
+		}
+
+		was_pending(command_fail(sending->cmd, LIGHTNINGD,
+					 "Error broadcasting transaction: %s."
+					 " Unsent tx discarded %s",
+					 msg,
+					 type_to_string(tmpctx, struct wally_tx,
+							sending->wtx)));
+		return;
+	}
+
+	wallet_transaction_add(ld->wallet, sending->wtx, 0, 0);
+
+	/* Extract the change output and add it to the DB */
+	wallet_extract_owned_outputs(ld->wallet, sending->wtx, NULL, &change);
+
+	response = json_stream_success(sending->cmd);
+	wally_txid(sending->wtx, &txid);
+	json_add_hex_talarr(response, "tx", linearize_wtx(tmpctx, sending->wtx));
+	json_add_txid(response, "txid", &txid);
+	was_pending(command_success(sending->cmd, response));
+}
+
 static struct command_result *json_sendpsbt(struct command *cmd,
 					    const char *buffer,
 					    const jsmntok_t *obj UNNEEDED,
 					    const jsmntok_t *params)
 {
 	struct command_result *res;
+	struct sending_psbt *sending;
 	struct wally_psbt *psbt;
-	struct wally_tx *w_tx;
-	struct tx_broadcast *txb;
-	struct utxo **utxos;
-	struct bitcoin_txid txid;
+	struct lightningd *ld = cmd->ld;
 
 	if (!param(cmd, buffer, params,
 		   p_req("psbt", param_psbt, &psbt),
 		   NULL))
 		return command_param_failed();
 
-	w_tx = psbt_finalize(psbt, true);
-	if (!w_tx)
+	sending = tal(cmd, struct sending_psbt);
+	sending->cmd = cmd;
+
+	psbt_finalize(psbt);
+	sending->wtx = psbt_final_tx(sending, psbt);
+	if (!sending->wtx)
 		return command_fail(cmd, LIGHTNINGD,
 				    "PSBT not finalizeable %s",
 				    type_to_string(tmpctx, struct wally_psbt,
@@ -1389,27 +808,21 @@ static struct command_result *json_sendpsbt(struct command *cmd,
 	/* We have to find/locate the utxos that are ours on this PSBT,
 	 * so that we know who to mark as used.
 	 */
-	res = match_psbt_inputs_to_utxos(cmd, psbt, NULL, &utxos);
+	res = match_psbt_inputs_to_utxos(cmd, psbt, NULL, &sending->utxos);
 	if (res)
 		return res;
 
-	txb = tal(cmd, struct tx_broadcast);
-	txb->utxos = cast_const2(const struct utxo **,
-				tal_steal(txb, utxos));
-	txb->wtx = tal_steal(txb, w_tx);
-	txb->cmd = cmd;
-	txb->expected_change = NULL;
-
-	/* FIXME: Do this *after* successful broadcast! */
-	wallet_transaction_add(cmd->ld->wallet, txb->wtx, 0, 0);
-	wally_txid(txb->wtx, &txid);
-	wallet_transaction_annotate(cmd->ld->wallet, &txid,
-				    TX_UNKNOWN, 0);
+	for (size_t i = 0; i < tal_count(sending->utxos); i++) {
+		if (!wallet_reserve_utxo(ld->wallet, sending->utxos[i],
+					 get_block_height(ld->topology)))
+			fatal("UTXO not reservable?");
+	}
 
 	/* Now broadcast the transaction */
 	bitcoind_sendrawtx(cmd->ld->topology->bitcoind,
-			   tal_hex(tmpctx, linearize_wtx(tmpctx, w_tx)),
-			   wallet_withdrawal_broadcast, txb);
+			   tal_hex(tmpctx,
+				   linearize_wtx(tmpctx, sending->wtx)),
+			   sendpsbt_done, sending);
 
 	return command_still_pending(cmd);
 }

@@ -30,6 +30,11 @@ u8 *scriptpubkey_p2pkh(const tal_t *ctx, const struct bitcoin_address *addr);
 
 /* Create a prunable output script */
 u8 *scriptpubkey_opreturn(const tal_t *ctx);
+/* Create a prunable output script with 20 random bytes.
+ * This is needed since a spend from a p2wpkh to an `OP_RETURN` without
+ * any other outputs would result in a transaction smaller than the
+ * minimum size.  */
+u8 *scriptpubkey_opreturn_padded(const tal_t *ctx);
 
 /* Create an input script which spends p2pkh */
 u8 *bitcoin_redeem_p2pkh(const tal_t *ctx, const struct pubkey *pubkey,
@@ -37,6 +42,10 @@ u8 *bitcoin_redeem_p2pkh(const tal_t *ctx, const struct pubkey *pubkey,
 
 /* Create the redeemscript for a P2SH + P2WPKH. */
 u8 *bitcoin_redeem_p2sh_p2wpkh(const tal_t *ctx, const struct pubkey *key);
+
+/* Create the scriptsig for a redeemscript */
+u8 *bitcoin_scriptsig_redeem(const tal_t *ctx,
+			     const u8 *redeemscript TAKES);
 
 /* Create scriptsig for p2sh-p2wpkh */
 u8 *bitcoin_scriptsig_p2sh_p2wpkh(const tal_t *ctx, const struct pubkey *key);

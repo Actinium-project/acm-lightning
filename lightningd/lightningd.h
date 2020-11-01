@@ -26,12 +26,6 @@ struct config {
 	/* How many confirms until we consider an anchor "settled". */
 	u32 anchor_confirms;
 
-	/* Maximum percent of fee rate we'll accept. */
-	u32 commitment_fee_max_percent;
-
-	/* Minimum percent of fee rate we'll accept. */
-	u32 commitment_fee_min_percent;
-
 	/* Minimum CLTV to subtract from incoming HTLCs to outgoing */
 	u32 cltv_expiry_delta;
 
@@ -69,6 +63,9 @@ struct config {
 
 	/* This is the key we use to encrypt `hsm_secret`. */
 	struct secret *keypass;
+
+	/* How long before we give up waiting for INIT msg */
+	u32 connection_timeout_secs;
 };
 
 typedef STRMAP(const char *) alt_subdaemon_map;
@@ -181,6 +178,8 @@ struct lightningd {
 	struct list_head sendpay_commands;
 	/* Outstanding close commands. */
 	struct list_head close_commands;
+	/* Outstanding openchannel_signed commands. */
+	struct list_head open_commands;
 	/* Outstanding ping commands. */
 	struct list_head ping_commands;
 
@@ -276,7 +275,7 @@ struct lightningd {
 	int *exit_code;
 
 	/* The round-robin list of channels, for use when doing MPP.  */
-	struct list_head rr_channels;
+	u64 rr_counter;
 };
 
 /* Turning this on allows a tal allocation to return NULL, rather than aborting.

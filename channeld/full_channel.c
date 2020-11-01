@@ -26,7 +26,7 @@
 #include <stdio.h>
 #include <string.h>
   /* Needs to be at end, since it doesn't include its own hdrs */
-  #include "gen_full_channel_error_names.h"
+  #include "full_channel_error_names_gen.h"
 
 #if DEVELOPER
 static void memleak_help_htlcmap(struct htable *memtable,
@@ -90,6 +90,7 @@ static bool balance_ok(const struct balance *balance,
 }
 
 struct channel *new_full_channel(const tal_t *ctx,
+				 const struct channel_id *cid,
 				 const struct bitcoin_txid *funding_txid,
 				 unsigned int funding_txout,
 				 u32 minimum_depth,
@@ -107,6 +108,7 @@ struct channel *new_full_channel(const tal_t *ctx,
 				 enum side opener)
 {
 	struct channel *channel = new_initial_channel(ctx,
+						      cid,
 						      funding_txid,
 						      funding_txout,
 						      minimum_depth,
@@ -755,6 +757,13 @@ enum channel_add_err channel_add_htlc(struct channel *channel,
 		state = SENT_ADD_HTLC;
 	else
 		state = RCVD_ADD_HTLC;
+
+	/* BOLT #2:
+	 * - MUST increase the value of `id` by 1 for each successive offer.
+	 */
+	/* This is a weak (bit cheap) check: */
+	if (htlc_get(channel->htlcs, id+1, sender))
+		status_broken("Peer sent out-of-order HTLC ids (is that you, old c-lightning node?)");
 
 	return add_htlc(channel, state, id, amount, cltv_expiry,
 			payment_hash, routing, blinding,

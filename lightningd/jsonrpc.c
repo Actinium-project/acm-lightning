@@ -96,6 +96,9 @@ struct json_connection {
 	/* Our commands */
 	struct list_head commands;
 
+	/* Are notifications enabled? */
+	bool notifications_enabled;
+
 	/* Our json_streams (owned by the commands themselves while running).
 	 * Since multiple streams could start returning data at once, we
 	 * always service these in order, freeing once empty. */
@@ -524,9 +527,40 @@ static void json_command_malformed(struct json_connection *jcon,
 	json_stream_close(js, NULL);
 }
 
+void json_notify_fmt(struct command *cmd,
+		     enum log_level level,
+		     const char *fmt, ...)
+{
+	va_list ap;
+	struct json_stream *js;
+
+	if (!cmd->send_notifications)
+		return;
+
+	js = json_stream_raw_for_cmd(cmd);
+
+	va_start(ap, fmt);
+	json_object_start(js, NULL);
+	json_add_string(js, "jsonrpc", "2.0");
+	json_add_string(js, "method", "message");
+	json_object_start(js, "params");
+	json_add_string(js, "id", cmd->id);
+	json_add_string(js, "level", log_level_name(level));
+	json_add_string(js, "message", tal_vfmt(tmpctx, fmt, ap));
+	json_object_end(js);
+	json_object_end(js);
+
+	json_stream_double_cr(js);
+	json_stream_flush(js);
+}
+
 struct json_stream *json_stream_raw_for_cmd(struct command *cmd)
 {
 	struct json_stream *js;
+
+	/* Might have already opened it for a notification */
+	if (cmd->json_stream)
+		return cmd->json_stream;
 
 	/* If they still care about the result, attach it to them. */
 	if (cmd->jcon)
@@ -712,28 +746,6 @@ rpc_command_hook_callback(struct rpc_command_hook_payload *p STEALS,
 	    return was_pending(command_exec(p->cmd->jcon, p->cmd, p->buffer,
 		                                p->request, params));
 
-#ifdef COMPAT_V080
-	if (deprecated_apis) {
-		const jsmntok_t *tok_continue;
-		bool exec;
-		tok_continue = json_get_member(buffer, resulttok, "continue");
-		if (tok_continue && json_to_bool(buffer, tok_continue, &exec) && exec) {
-			static bool warned = false;
-			if (!warned) {
-				warned = true;
-				log_unusual(p->cmd->ld->log,
-					    "Plugin returned 'continue' : true "
-					    "to rpc_command hook.  "
-					    "This is now deprecated and "
-					    "you should return with "
-					    "{'result': 'continue'} instead.");
-			}
-			return was_pending(command_exec(p->cmd->jcon, p->cmd, p->buffer,
-			                                p->request, params));
-		}
-	}
-#endif /* defined(COMPAT_V080) */
-
 	innerresulttok = json_get_member(buffer, resulttok, "result");
 	if (innerresulttok) {
 		if (json_tok_streq(buffer, innerresulttok, "continue")) {
@@ -825,6 +837,7 @@ parse_request(struct json_connection *jcon, const jsmntok_t tok[])
 	 * the connection since the command may outlive `conn`. */
 	c = tal(jcon->ld->jsonrpc, struct command);
 	c->jcon = jcon;
+	c->send_notifications = jcon->notifications_enabled;
 	c->ld = jcon->ld;
 	c->pending = false;
 	c->json_stream = NULL;
@@ -995,6 +1008,7 @@ static struct io_plan *jcon_connected(struct io_conn *conn,
 	jcon->len_read = 0;
 	jsmn_init(&jcon->input_parser);
 	jcon->input_toks = toks_alloc(jcon);
+	jcon->notifications_enabled = false;
 	list_head_init(&jcon->commands);
 
 	/* We want to log on destruction, so we free this in destructor. */
@@ -1218,6 +1232,11 @@ void jsonrpc_notification_end(struct jsonrpc_notification *n)
 
 struct jsonrpc_request *jsonrpc_request_start_(
     const tal_t *ctx, const char *method, struct log *log,
+    void (*notify_cb)(const char *buffer,
+		      const jsmntok_t *methodtok,
+		      const jsmntok_t *paramtoks,
+		      const jsmntok_t *idtok,
+		      void *),
     void (*response_cb)(const char *buffer, const jsmntok_t *toks,
 			const jsmntok_t *idtok, void *),
     void *response_cb_arg)
@@ -1225,6 +1244,7 @@ struct jsonrpc_request *jsonrpc_request_start_(
 	struct jsonrpc_request *r = tal(ctx, struct jsonrpc_request);
 	static u64 next_request_id = 0;
 	r->id = next_request_id++;
+	r->notify_cb = notify_cb;
 	r->response_cb = response_cb;
 	r->response_cb_arg = response_cb_arg;
 	r->method = NULL;
@@ -1314,3 +1334,28 @@ static const struct json_command check_command = {
 };
 
 AUTODATA(json_command, &check_command);
+
+static struct command_result *json_notifications(struct command *cmd,
+						 const char *buffer,
+						 const jsmntok_t *obj UNNEEDED,
+						 const jsmntok_t *params)
+{
+	bool *enable;
+
+	if (!param(cmd, buffer, params,
+		   p_req("enable", param_bool, &enable),
+		   NULL))
+		return command_param_failed();
+
+	cmd->jcon->notifications_enabled = *enable;
+	return command_success(cmd, json_stream_success(cmd));
+}
+
+static const struct json_command notifications_command = {
+	"notifications",
+	"utility",
+	json_notifications,
+	"Enable notifications for {level} (or 'false' to disable)",
+};
+
+AUTODATA(json_command, &notifications_command);

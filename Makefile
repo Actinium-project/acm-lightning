@@ -1,7 +1,7 @@
 #! /usr/bin/make
 
 # Extract version from git, or if we're from a zipfile, use dirname
-VERSION=$(shell git describe --always --dirty=-modded --abbrev=7 2>/dev/null || pwd | sed -n 's|.*/c\{0,1\}lightning-v\{0,1\}\([0-9a-f.rc]*\)$$|\1|gp')
+VERSION=$(shell git describe --always --dirty=-modded --abbrev=7 2>/dev/null || pwd | sed -n 's|.*/c\{0,1\}lightning-v\{0,1\}\([0-9a-f.rc\-]*\)$$|\1|gp')
 
 ifeq ($(VERSION),)
 $(error "ERROR: git is required for generating version information")
@@ -42,10 +42,18 @@ VG=VALGRIND=1 valgrind -q --error-exitcode=7
 VG_TEST_ARGS = --track-origins=yes --leak-check=full --show-reachable=yes --errors-for-leak-kinds=all
 endif
 
+SANITIZER_FLAGS :=
+
 ifneq ($(ASAN),0)
-SANITIZER_FLAGS=-fsanitize=address
-else
-SANITIZER_FLAGS=
+SANITIZER_FLAGS += -fsanitize=address
+endif
+
+ifneq ($(UBSAN),0)
+SANITIZER_FLAGS += -fsanitize=undefined
+endif
+
+ifneq ($(FUZZING), 0)
+SANITIZER_FLAGS += -fsanitize=fuzzer-no-link
 endif
 
 ifeq ($(DEVELOPER),1)
@@ -70,7 +78,8 @@ endif
 
 # Timeout shortly before the 600 second travis silence timeout
 # (method=thread to support xdist)
-PYTEST_OPTS := -v --timeout=550 --timeout_method=thread -p no:logging
+PYTEST_OPTS := -v --timeout=550 --timeout_method=thread -p no:logging $(PYTEST_OPTS)
+PYTHONPATH=$(shell pwd)/contrib/pyln-client:$(shell pwd)/contrib/pyln-testing:$(shell pwd)/contrib/pyln-proto/
 
 # This is where we add new features as bitcoin adds them.
 FEATURES :=
@@ -200,12 +209,19 @@ CDUMP_OBJS := ccan-cdump.o ccan-strmap.o
 
 BOLT_GEN := tools/generate-wire.py
 WIRE_GEN := $(BOLT_GEN)
-BOLT_DEPS := $(BOLT_GEN)
 
-ALL_PROGRAMS =
+# If you use wiregen, you're dependent on the tool and its templates
+WIRE_GEN_DEPS := $(WIRE_GEN) $(wildcard tools/gen/*_template)
+
+# These are filled by individual Makefiles
+ALL_PROGRAMS :=
+ALL_TEST_PROGRAMS :=
+ALL_FUZZ_TARGETS :=
+ALL_C_SOURCES :=
+ALL_C_HEADERS := header_versions_gen.h version_gen.h
 
 CPPFLAGS += -DBINTOPKGLIBEXECDIR="\"$(shell sh tools/rel.sh $(bindir) $(pkglibexecdir))\""
-CFLAGS = $(CPPFLAGS) $(CWARNFLAGS) $(CDEBUGFLAGS) $(COPTFLAGS) -I $(CCANDIR) $(EXTERNAL_INCLUDE_FLAGS) -I . -I/usr/local/include $(POSTGRES_INCLUDE) $(FEATURES) $(COVFLAGS) $(DEV_CFLAGS) -DSHACHAIN_BITS=48 -DJSMN_PARENT_LINKS $(PIE_CFLAGS) $(COMPAT_CFLAGS) -DBUILD_ELEMENTS=1
+CFLAGS = $(CPPFLAGS) $(CWARNFLAGS) $(CDEBUGFLAGS) $(COPTFLAGS) -I $(CCANDIR) $(EXTERNAL_INCLUDE_FLAGS) -I . -I/usr/local/include $(SQLITE3_CFLAGS) $(POSTGRES_INCLUDE) $(FEATURES) $(COVFLAGS) $(DEV_CFLAGS) -DSHACHAIN_BITS=48 -DJSMN_PARENT_LINKS $(PIE_CFLAGS) $(COMPAT_CFLAGS) -DBUILD_ELEMENTS=1
 # If CFLAGS is already set in the environment of make (to whatever value, it
 # does not matter) then it would export it to subprocesses with the above value
 # we set, including CWARNFLAGS which by default contains -Wall -Werror. This
@@ -217,18 +233,20 @@ unexport CFLAGS
 CONFIGURATOR_CC := $(CC)
 
 LDFLAGS += $(PIE_LDFLAGS) $(SANITIZER_FLAGS) $(COPTFLAGS)
+CFLAGS += $(SANITIZER_FLAGS)
+
 ifeq ($(STATIC),1)
 # For MacOS, Jacob Rapoport <jacob@rumblemonkey.com> changed this to:
 #  -L/usr/local/lib -Wl,-lgmp -lsqlite3 -lz -Wl,-lm -lpthread -ldl $(COVFLAGS)
 # But that doesn't static link.
-LDLIBS = -L/usr/local/lib -Wl,-dn -lgmp -lsqlite3 -lz -Wl,-dy -lm -lpthread -ldl $(COVFLAGS)
+LDLIBS = -L/usr/local/lib -Wl,-dn -lgmp $(SQLITE3_LDLIBS) -lz -Wl,-dy -lm -lpthread -ldl $(COVFLAGS)
 else
-LDLIBS = -L/usr/local/lib -lm -lgmp -lsqlite3 -lz $(COVFLAGS)
+LDLIBS = -L/usr/local/lib -lm -lgmp $(SQLITE3_LDLIBS) -lz $(COVFLAGS)
 endif
 
 # If we have the postgres client library we need to link against it as well
 ifeq ($(HAVE_POSTGRES),1)
-LDLIBS += -lpq
+LDLIBS += $(POSTGRES_LDLIBS)
 endif
 
 default: show-flags all-programs all-test-programs doc-all
@@ -247,12 +265,41 @@ config.vars:
 %.o: %.c
 	@$(call VERBOSE, "cc $<", $(CC) $(CFLAGS) -c -o $@ $<)
 
-# generate-wire.py --page [header|impl] hdrfilename wirename < csv > file
-%_wiregen.h: %_wire.csv
-	@if $(CHANGED_FROM_GIT); then $(call VERBOSE,"wiregen $@",tools/generate-wire.py --page header $($@_args) $@ `basename $< .csv` < $< > $@); fi
+# '_exp' inserted before _wiregen.[ch] to demark experimental
+# spec-derived headers, which are *not* committed into git.
+ifeq ($(EXPERIMENTAL_FEATURES),1)
+EXP := _exp
+else
+EXP :=
+endif
 
-%_wiregen.c: %_wire.csv
-	@if $(CHANGED_FROM_GIT); then $(call VERBOSE,"wiregen $@",tools/generate-wire.py --page impl $($@_args) ${@:.c=.h} `basename $< .csv` < $< > $@); fi
+# Git doesn't maintain timestamps, so we only regen if sources actually changed:
+# We place the SHA inside some generated files so we can tell if they need updating.
+# Usage: $(call SHA256STAMP_CHANGED)
+SHA256STAMP_CHANGED = [ x"`sed -n 's/.*SHA256STAMP://p' $@ 2>/dev/null`" != x"`cat $(sort $(filter-out FORCE,$^)) | $(SHA256SUM) | cut -c1-64`" ]
+# Usage: $(call SHA256STAMP,commentprefix)
+SHA256STAMP = echo '$(1) SHA256STAMP:'`cat $(sort $(filter-out FORCE,$^)) | $(SHA256SUM) | cut -c1-64` >> $@
+
+# generate-wire.py --page [header|impl] hdrfilename wirename < csv > file
+%_wiregen.h: %_wire.csv $(WIRE_GEN_DEPS)
+	@if $(call SHA256STAMP_CHANGED); then if [ "$$NO_PYTHON" = 1 ]; then echo "Error: NO_PYTHON on $@"; exit 1; fi; \
+		$(call VERBOSE,"wiregen $@",tools/generate-wire.py --page header $($@_args) $@ `basename $< .csv | sed 's/_exp_/_/'` < $< > $@ && $(call SHA256STAMP,//)); \
+	fi
+
+%_wiregen.c: %_wire.csv $(WIRE_GEN_DEPS)
+	@if $(call SHA256STAMP_CHANGED); then if [ "$$NO_PYTHON" = 1 ]; then echo "Error: NO_PYTHON on $@"; exit 1; fi; \
+		$(call VERBOSE,"wiregen $@",tools/generate-wire.py --page impl $($@_args) ${@:.c=.h} `basename $< .csv | sed 's/_exp_/_/'` < $< > $@ && $(call SHA256STAMP,//)); \
+	fi
+
+%_printgen.h: %_wire.csv $(WIRE_GEN_DEPS)
+	@if $(call SHA256STAMP_CHANGED); then if [ "$$NO_PYTHON" = 1 ]; then echo "Error: NO_PYTHON on $@"; exit 1; fi; \
+		$(call VERBOSE,"printgen $@",tools/generate-wire.py -s -P --page header $($@_args) $@ `basename $< .csv | sed 's/_exp_/_/'` < $< > $@ && $(call SHA256STAMP,//)); \
+	fi
+
+%_printgen.c: %_wire.csv $(WIRE_GEN_DEPS)
+	@if $(call SHA256STAMP_CHANGED); then  if [ "$$NO_PYTHON" = 1 ]; then echo "Error: NO_PYTHON on $@"; exit 1; fi; \
+		$(call VERBOSE,"printgen $@",tools/generate-wire.py -s -P --page impl $($@_args) ${@:.c=.h} `basename $< .csv | sed 's/_exp_/_/'` < $< > $@ && $(call SHA256STAMP,//)); \
+	fi
 
 include external/Makefile
 include bitcoin/Makefile
@@ -272,19 +319,47 @@ include devtools/Makefile
 include tools/Makefile
 include plugins/Makefile
 include tests/plugins/Makefile
+ifneq ($(FUZZING),0)
+	include tests/fuzz/Makefile
+endif
 
-# Generated from PLUGINS definition in plugins/Makefile
-gen_list_of_builtin_plugins.h : plugins/Makefile Makefile
-	@echo GEN $@
-	@rm -f $@ || true
-	@echo 'static const char *list_of_builtin_plugins[] = {' >> $@
-	@echo '$(PLUGINS)' | sed 's@plugins/\([^ 	]*\)@"\1",@g'>> $@
-	@echo 'NULL' >> $@
-	@echo '};' >> $@
+# We make pretty much everything depend on these.
+ALL_GEN_HEADERS := $(filter %gen.h,$(ALL_C_HEADERS))
+ALL_GEN_SOURCES := $(filter %gen.c,$(ALL_C_SOURCES))
+ALL_NONGEN_HEADERS := $(filter-out %gen.h,$(ALL_C_HEADERS))
+ALL_NONGEN_SOURCES := $(filter-out %gen.c,$(ALL_C_SOURCES))
+ALL_NONGEN_SRCFILES := $(ALL_NONGEN_HEADERS) $(ALL_NONGEN_SOURCES)
 
-# Git doesn't maintain timestamps, so we only regen if git says we should.
-# If neither is in git, we generate (note: one combines stderr, one discards)
-CHANGED_FROM_GIT = [ x"`git log $@ 2>&1 | head -n1`" != x"`git log $< 2>/dev/null | head -n1`" -o x"`git diff $<`" != x"" ]
+# Programs to install in bindir and pkglibexecdir.
+# TODO: $(EXEEXT) support for Windows?  Needs more coding for
+# the individual Makefiles, however.
+BIN_PROGRAMS = \
+	       cli/lightning-cli \
+	       lightningd/lightningd \
+	       tools/lightning-hsmtool
+PKGLIBEXEC_PROGRAMS = \
+	       lightningd/lightning_channeld \
+	       lightningd/lightning_closingd \
+	       lightningd/lightning_connectd \
+	       lightningd/lightning_gossipd \
+	       lightningd/lightning_hsmd \
+	       lightningd/lightning_onchaind \
+	       lightningd/lightning_openingd
+
+# Only build dualopend if experimental features is on
+ifeq ($(EXPERIMENTAL_FEATURES),1)
+PKGLIBEXEC_PROGRAMS += lightningd/lightning_dualopend
+endif
+
+# Don't delete these intermediaries.
+.PRECIOUS: $(ALL_GEN_HEADERS) $(ALL_GEN_SOURCES)
+
+# Every single object file.
+ALL_OBJS := $(ALL_C_SOURCES:.c=.o)
+
+# We always regen wiregen and printgen files, since SHA256STAMP protects against
+# spurious rebuilds.
+$(filter %printgen.h %printgen.c %wiregen.h %wiregen.c, $(ALL_C_HEADERS) $(ALL_C_SOURCES)): FORCE
 
 ifneq ($(TEST_GROUP_COUNT),)
 PYTEST_OPTS += --test-group=$(TEST_GROUP) --test-group-count=$(TEST_GROUP_COUNT)
@@ -310,7 +385,7 @@ ifeq ($(PYTEST),)
 	exit 1
 else
 # Explicitly hand DEVELOPER and VALGRIND so you can override on make cmd line.
-	PYTHONPATH=`pwd`/contrib/pyln-client:`pwd`/contrib/pyln-testing:`pwd`/contrib/pyln-proto/:$(PYTHONPATH) TEST_DEBUG=1 DEVELOPER=$(DEVELOPER) VALGRIND=$(VALGRIND) $(PYTEST) tests/ $(PYTEST_OPTS)
+	PYTHONPATH=$(PYTHONPATH) TEST_DEBUG=1 DEVELOPER=$(DEVELOPER) VALGRIND=$(VALGRIND) $(PYTEST) tests/ $(PYTEST_OPTS)
 endif
 
 # Keep includes in alpha order.
@@ -325,6 +400,11 @@ check-hdr-include-order/%: %
 # Make sure Makefile includes all headers.
 check-makefile:
 	@if [ x"$(CCANDIR)/config.h `find $(CCANDIR)/ccan -name '*.h' | grep -v /test/ | $(SORT) | tr '\n' ' '`" != x"$(CCAN_HEADERS) " ]; then echo CCAN_HEADERS incorrect; exit 1; fi
+
+# We exclude test files, which need to do weird include tricks!
+SRC_TO_CHECK := $(filter-out $(ALL_TEST_PROGRAMS:=.c), $(ALL_NONGEN_SOURCES))
+check-src-includes: $(SRC_TO_CHECK:%=check-src-include-order/%)
+check-hdr-includes: $(ALL_NONGEN_HEADERS:%=check-hdr-include-order/%)
 
 # Experimental quotes quote the exact version.
 ifeq ($(EXPERIMENTAL_FEATURES),1)
@@ -342,12 +422,12 @@ LOCAL_BOLTDIR=.tmp.lightningrfc
 bolt-precheck:
 	@[ -d $(BOLTDIR) ] || exit 0; set -e; if [ -z "$(BOLTVERSION)" ]; then rm -rf $(LOCAL_BOLTDIR); ln -sf $(BOLTDIR) $(LOCAL_BOLTDIR); exit 0; fi; [ "$$(git -C $(LOCAL_BOLTDIR) rev-list --max-count=1 HEAD 2>/dev/null)" != "$(BOLTVERSION)" ] || exit 0; rm -rf $(LOCAL_BOLTDIR) && git clone -q $(BOLTDIR) $(LOCAL_BOLTDIR) && cd $(LOCAL_BOLTDIR) && git checkout -q $(BOLTVERSION)
 
-check-source-bolt: $(ALL_TEST_PROGRAMS:%=bolt-check/%.c)
+check-source-bolt: $(ALL_NONGEN_SRCFILES:%=bolt-check/%)
 
 check-whitespace/%: %
 	@if grep -Hn '[ 	]$$' $<; then echo Extraneous whitespace found >&2; exit 1; fi
 
-check-whitespace: check-whitespace/Makefile check-whitespace/tools/check-bolt.c $(ALL_TEST_PROGRAMS:%=check-whitespace/%.c)
+check-whitespace: check-whitespace/Makefile check-whitespace/tools/check-bolt.c $(ALL_NONGEN_SRCFILES:%=check-whitespace/%)
 
 check-markdown:
 	@tools/check-markdown.sh
@@ -357,16 +437,21 @@ check-spelling:
 
 PYSRC=$(shell git ls-files "*.py" | grep -v /text.py) contrib/pylightning/lightning-pay
 
-check-python:
+# Some tests in pyln will need to find lightningd to run, so have a PATH that
+# allows it to find that
+PYLN_PATH=$(shell pwd)/lightningd:$(PATH)
+check-pyln-%: $(BIN_PROGRAMS) $(PKGLIBEXEC_PROGRAMS) $(PLUGINS)
+	@(cd contrib/$(shell echo $@ | cut -b 7-) && PATH=$(PYLN_PATH) PYTHONPATH=$(PYTHONPATH) $(MAKE) check)
+
+check-python: check-pyln-client check-pyln-testing
 	@# E501 line too long (N > 79 characters)
 	@# E731 do not assign a lambda expression, use a def
 	@# W503: line break before binary operator
 	@flake8 --ignore=E501,E731,W503 ${PYSRC}
 
-	PYTHONPATH=contrib/pyln-client:$$PYTHONPATH $(PYTEST) contrib/pyln-client/
-	PYTHONPATH=contrib/pyln-proto:$$PYTHONPATH $(PYTEST) contrib/pyln-proto/
+	PATH=$(PYLN_PATH) PYTHONPATH=$(PYTHONPATH) $(PYTEST) contrib/pyln-proto/tests/
 
-check-includes:
+check-includes: check-src-includes check-hdr-includes
 	@tools/check-includes.sh
 
 # cppcheck gets confused by list_for_each(head, i, list): thinks i is uninit.
@@ -421,22 +506,19 @@ ALL_PROGRAMS += ccan/ccan/cdump/tools/cdump-enumstr
 # Can't add to ALL_OBJS, as that makes a circular dep.
 ccan/ccan/cdump/tools/cdump-enumstr.o: $(CCAN_HEADERS) Makefile
 
-gen_version.h: FORCE
+version_gen.h: FORCE
 	@(echo "#define VERSION \"$(VERSION)\"" && echo "#define BUILD_FEATURES \"$(FEATURES)\"") > $@.new
 	@if cmp $@.new $@ >/dev/null 2>&1; then rm -f $@.new; else mv $@.new $@; $(ECHO) Version updated; fi
 
 # That forces this rule to be run every time, too.
-gen_header_versions.h: tools/headerversions
+header_versions_gen.h: tools/headerversions
 	@tools/headerversions $@
 
-# Rebuild the world if this changes.
-ALL_GEN_HEADERS += gen_header_versions.h
-
 # All binaries require the external libs, ccan and system library versions.
-$(ALL_PROGRAMS) $(ALL_TEST_PROGRAMS): $(EXTERNAL_LIBS) $(CCAN_OBJS)
+$(ALL_PROGRAMS) $(ALL_TEST_PROGRAMS) $(ALL_FUZZ_TARGETS): $(EXTERNAL_LIBS) $(CCAN_OBJS)
 
 # Each test program depends on its own object.
-$(ALL_TEST_PROGRAMS): %: %.o
+$(ALL_TEST_PROGRAMS) $(ALL_FUZZ_TARGETS): %: %.o
 
 # Without this rule, the (built-in) link line contains
 # external/libwallycore.a directly, which causes a symbol clash (it
@@ -445,14 +527,18 @@ $(ALL_TEST_PROGRAMS): %: %.o
 $(ALL_PROGRAMS) $(ALL_TEST_PROGRAMS):
 	@$(call VERBOSE, "ld $@", $(LINK.o) $(filter-out %.a,$^) $(LOADLIBES) $(EXTERNAL_LDLIBS) $(LDLIBS) -o $@)
 
+# We special case the fuzzing target binaries, as they need to link against libfuzzer,
+# which brings its own main().
+FUZZ_LDFLAGS = -fsanitize=fuzzer
+$(ALL_FUZZ_TARGETS):
+	@$(call VERBOSE, "ld $@", $(LINK.o) $(filter-out %.a,$^) $(LOADLIBES) $(EXTERNAL_LDLIBS) $(LDLIBS) $(FUZZ_LDFLAGS) -o $@)
+
+
 # Everything depends on the CCAN headers, and Makefile
 $(CCAN_OBJS) $(CDUMP_OBJS): $(CCAN_HEADERS) Makefile
 
 # Except for CCAN, we treat everything else as dependent on external/ bitcoin/ common/ wire/ and all generated headers, and Makefile
 $(ALL_OBJS): $(BITCOIN_HEADERS) $(COMMON_HEADERS) $(CCAN_HEADERS) $(WIRE_HEADERS) $(ALL_GEN_HEADERS) $(EXTERNAL_HEADERS) Makefile
-
-# We generate headers in two ways, so regen when either changes (or Makefile)
-$(ALL_GEN_HEADERS): ccan/ccan/cdump/tools/cdump-enumstr $(WIRE_GEN) Makefile
 
 update-ccan:
 	mv ccan ccan.old
@@ -467,7 +553,7 @@ update-ccan:
 
 # Now ALL_PROGRAMS is fully populated, we can expand it.
 all-programs: $(ALL_PROGRAMS)
-all-test-programs: $(ALL_TEST_PROGRAMS)
+all-test-programs: $(ALL_TEST_PROGRAMS) $(ALL_FUZZ_TARGETS)
 
 distclean: clean
 	$(RM) ccan/config.h config.vars
@@ -475,12 +561,18 @@ distclean: clean
 maintainer-clean: distclean
 	@echo 'This command is intended for maintainers to use; it'
 	@echo 'deletes files that may need special tools to rebuild.'
+	$(RM) $(ALL_GEN_HEADERS) $(ALL_GEN_SOURCES)
 
-clean:
+# We used to have gen_ files, now we have _gen files.
+obsclean:
+	$(RM) gen_*.h */gen_*.[ch] */*/gen_*.[ch]
+
+clean: obsclean
 	$(RM) $(CCAN_OBJS) $(CDUMP_OBJS) $(ALL_OBJS)
-	$(RM) $(ALL_PROGRAMS) $(ALL_PROGRAMS:=.o)
-	$(RM) $(ALL_TEST_PROGRAMS) $(ALL_TEST_PROGRAMS:=.o)
-	$(RM) gen_*.h ccan/tools/configurator/configurator
+	$(RM) $(ALL_PROGRAMS)
+	$(RM) $(ALL_TEST_PROGRAMS)
+	$(RM) $(ALL_FUZZ_TARGETS)
+	$(RM) ccan/tools/configurator/configurator
 	$(RM) ccan/ccan/cdump/tools/cdump-enumstr.o
 	find . -name '*gcda' -delete
 	find . -name '*gcno' -delete
@@ -532,22 +624,6 @@ installdirs:
 	$(MKDIR_P) $(DESTDIR)$(man7dir)
 	$(MKDIR_P) $(DESTDIR)$(man8dir)
 	$(MKDIR_P) $(DESTDIR)$(docdir)
-
-# Programs to install in bindir and pkglibexecdir.
-# TODO: $(EXEEXT) support for Windows?  Needs more coding for
-# the individual Makefiles, however.
-BIN_PROGRAMS = \
-	       cli/lightning-cli \
-	       lightningd/lightningd \
-	       tools/lightning-hsmtool
-PKGLIBEXEC_PROGRAMS = \
-	       lightningd/lightning_channeld \
-	       lightningd/lightning_closingd \
-	       lightningd/lightning_connectd \
-	       lightningd/lightning_gossipd \
-	       lightningd/lightning_hsmd \
-	       lightningd/lightning_onchaind \
-	       lightningd/lightning_openingd
 
 # $(PLUGINS) is defined in plugins/Makefile.
 

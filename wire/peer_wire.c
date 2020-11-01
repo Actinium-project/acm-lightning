@@ -1,7 +1,7 @@
 #include <bitcoin/block.h>
 #include <wire/peer_wire.h>
 
-static bool unknown_type(enum wire_type t)
+static bool unknown_type(enum peer_wire t)
 {
 	switch (t) {
 	case WIRE_INIT:
@@ -34,6 +34,16 @@ static bool unknown_type(enum wire_type t)
 	case WIRE_GOSSIP_TIMESTAMP_FILTER:
 #if EXPERIMENTAL_FEATURES
 	case WIRE_ONION_MESSAGE:
+	case WIRE_TX_ADD_INPUT:
+	case WIRE_TX_REMOVE_INPUT:
+	case WIRE_TX_ADD_OUTPUT:
+	case WIRE_TX_REMOVE_OUTPUT:
+	case WIRE_TX_COMPLETE:
+	case WIRE_TX_SIGNATURES:
+	case WIRE_OPEN_CHANNEL2:
+	case WIRE_ACCEPT_CHANNEL2:
+	case WIRE_INIT_RBF:
+	case WIRE_BLACKLIST_PODLE:
 #endif
 		return false;
 	}
@@ -42,7 +52,7 @@ static bool unknown_type(enum wire_type t)
 
 bool is_msg_for_gossipd(const u8 *cursor)
 {
-	switch ((enum wire_type)fromwire_peektype(cursor)) {
+	switch ((enum peer_wire)fromwire_peektype(cursor)) {
 	case WIRE_CHANNEL_ANNOUNCEMENT:
 	case WIRE_NODE_ANNOUNCEMENT:
 	case WIRE_CHANNEL_UPDATE:
@@ -74,6 +84,16 @@ bool is_msg_for_gossipd(const u8 *cursor)
 	case WIRE_GOSSIP_TIMESTAMP_FILTER:
 #if EXPERIMENTAL_FEATURES
 	case WIRE_ONION_MESSAGE:
+	case WIRE_TX_ADD_INPUT:
+	case WIRE_TX_REMOVE_INPUT:
+	case WIRE_TX_ADD_OUTPUT:
+	case WIRE_TX_REMOVE_OUTPUT:
+	case WIRE_TX_COMPLETE:
+	case WIRE_TX_SIGNATURES:
+	case WIRE_OPEN_CHANNEL2:
+	case WIRE_ACCEPT_CHANNEL2:
+	case WIRE_INIT_RBF:
+	case WIRE_BLACKLIST_PODLE:
 #endif
 		break;
 	}
@@ -83,7 +103,7 @@ bool is_msg_for_gossipd(const u8 *cursor)
 /* Return true if it's an unknown ODD message.  cursor is a tal ptr. */
 bool is_unknown_msg_discardable(const u8 *cursor)
 {
-	enum wire_type t = fromwire_peektype(cursor);
+	enum peer_wire t = fromwire_peektype(cursor);
 	return unknown_type(t) && (t & 1);
 }
 

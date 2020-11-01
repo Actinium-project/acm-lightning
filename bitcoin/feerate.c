@@ -1,4 +1,5 @@
 #include <bitcoin/feerate.h>
+#include <bitcoin/varint.h>
 #include <limits.h>
 #include <stdlib.h>
 

@@ -4,8 +4,8 @@ PLUGIN_PAY_OBJS := $(PLUGIN_PAY_SRC:.c=.o)
 PLUGIN_AUTOCLEAN_SRC := plugins/autoclean.c
 PLUGIN_AUTOCLEAN_OBJS := $(PLUGIN_AUTOCLEAN_SRC:.c=.o)
 
-PLUGIN_FUNDCHANNEL_SRC := plugins/fundchannel.c
-PLUGIN_FUNDCHANNEL_OBJS := $(PLUGIN_FUNDCHANNEL_SRC:.c=.o)
+PLUGIN_TXPREPARE_SRC := plugins/txprepare.c
+PLUGIN_TXPREPARE_OBJS := $(PLUGIN_TXPREPARE_SRC:.c=.o)
 
 PLUGIN_BCLI_SRC := plugins/bcli.c
 PLUGIN_BCLI_OBJS := $(PLUGIN_BCLI_SRC:.c=.o)
@@ -21,25 +21,45 @@ PLUGIN_PAY_LIB_SRC := plugins/libplugin-pay.c
 PLUGIN_PAY_LIB_HEADER := plugins/libplugin-pay.h
 PLUGIN_PAY_LIB_OBJS := $(PLUGIN_PAY_LIB_SRC:.c=.o)
 
+PLUGIN_SPENDER_SRC :=				\
+	plugins/spender/fundchannel.c		\
+	plugins/spender/main.c			\
+	plugins/spender/multifundchannel.c	\
+	plugins/spender/multiwithdraw.c
+PLUGIN_SPENDER_HEADER :=			\
+	plugins/spender/multifundchannel.h	\
+	plugins/spender/multiwithdraw.h		\
+	plugins/spender/fundchannel.h		\
+	plugins/spender/multifundchannel.h
+PLUGIN_SPENDER_OBJS := $(PLUGIN_SPENDER_SRC:.c=.o)
+
 PLUGIN_ALL_SRC :=				\
 	$(PLUGIN_AUTOCLEAN_SRC)			\
 	$(PLUGIN_BCLI_SRC)			\
-	$(PLUGIN_FUNDCHANNEL_SRC)		\
 	$(PLUGIN_KEYSEND_SRC)			\
+	$(PLUGIN_TXPREPARE_SRC)			\
 	$(PLUGIN_LIB_SRC)			\
 	$(PLUGIN_PAY_LIB_SRC)			\
-	$(PLUGIN_PAY_SRC)
+	$(PLUGIN_PAY_SRC)			\
+	$(PLUGIN_SPENDER_SRC)
 PLUGIN_ALL_HEADER :=				\
 	$(PLUGIN_LIB_HEADER)			\
-	$(PLUGIN_PAY_LIB_HEADER)
+	$(PLUGIN_PAY_LIB_HEADER)		\
+	$(PLUGIN_SPENDER_HEADER)
 PLUGIN_ALL_OBJS := $(PLUGIN_ALL_SRC:.c=.o)
 
 PLUGINS :=					\
 	plugins/autoclean			\
 	plugins/bcli				\
-	plugins/fundchannel			\
 	plugins/keysend				\
-	plugins/pay
+	plugins/pay				\
+	plugins/txprepare			\
+	plugins/spenderp
+
+# Make sure these depend on everything.
+ALL_C_SOURCES += $(PLUGIN_ALL_SRC)
+ALL_C_HEADERS += $(PLUGIN_ALL_HEADER)
+ALL_PROGRAMS += $(PLUGINS)
 
 PLUGIN_COMMON_OBJS :=				\
 	bitcoin/base58.o			\
@@ -72,41 +92,33 @@ PLUGIN_COMMON_OBJS :=				\
 	common/pseudorand.o			\
 	common/random_select.o			\
 	common/setup.o				\
+	common/status_levels.o			\
 	common/type_to_string.o			\
 	common/utils.o				\
 	common/version.o			\
 	common/wireaddr.o			\
 	wire/fromwire.o				\
-	wire/gen_onion_wire.o			\
+	wire/onion$(EXP)_wiregen.o		\
 	wire/tlvstream.o			\
 	wire/towire.o
 
-plugins/pay: bitcoin/chainparams.o $(PLUGIN_PAY_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_PAY_LIB_OBJS) $(PLUGIN_COMMON_OBJS) $(JSMN_OBJS) $(CCAN_OBJS)
+plugins/pay: bitcoin/chainparams.o $(PLUGIN_PAY_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_PAY_LIB_OBJS) $(PLUGIN_COMMON_OBJS) $(JSMN_OBJS) $(CCAN_OBJS) common/gossmap.o common/route.o common/dijkstra.o
 $(PLUGIN_PAY_OBJS): $(PLUGIN_PAY_LIB_HEADER)
 
 plugins/autoclean: bitcoin/chainparams.o $(PLUGIN_AUTOCLEAN_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_COMMON_OBJS) $(JSMN_OBJS) $(CCAN_OBJS)
 
-plugins/fundchannel: common/addr.o $(PLUGIN_FUNDCHANNEL_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_COMMON_OBJS) $(JSMN_OBJS) $(CCAN_OBJS)
+plugins/txprepare: bitcoin/chainparams.o $(PLUGIN_TXPREPARE_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_COMMON_OBJS) $(JSMN_OBJS) $(CCAN_OBJS)
 
 plugins/bcli: bitcoin/chainparams.o $(PLUGIN_BCLI_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_COMMON_OBJS) $(JSMN_OBJS) $(CCAN_OBJS)
 
-plugins/keysend: bitcoin/chainparams.o wire/tlvstream.o wire/gen_onion_wire.o $(PLUGIN_KEYSEND_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_PAY_LIB_OBJS) $(PLUGIN_COMMON_OBJS) $(JSMN_OBJS) $(CCAN_OBJS)
+plugins/keysend: bitcoin/chainparams.o wire/tlvstream.o wire/onion$(EXP)_wiregen.o $(PLUGIN_KEYSEND_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_PAY_LIB_OBJS) $(PLUGIN_COMMON_OBJS) $(JSMN_OBJS) $(CCAN_OBJS) common/gossmap.o common/route.o common/dijkstra.o
 $(PLUGIN_KEYSEND_OBJS): $(PLUGIN_PAY_LIB_HEADER)
+
+plugins/spenderp: bitcoin/chainparams.o $(PLUGIN_SPENDER_OBJS) $(PLUGIN_LIB_OBJS) $(PLUGIN_COMMON_OBJS) $(JSMN_OBJS) $(CCAN_OBJS)
 
 $(PLUGIN_ALL_OBJS): $(PLUGIN_LIB_HEADER)
 
-# Make sure these depend on everything.
-ALL_PROGRAMS += $(PLUGINS)
-ALL_OBJS += $(PLUGIN_ALL_OBJS)
-
-check-source: $(PLUGIN_ALL_SRC:%=check-src-include-order/%)
-check-source: $(PLUGIN_ALL_HEADER:%=check-hdr-include-order/%)
-check-source-bolt: $(PLUGIN_ALL_SRC:%=bolt-check/%)
-check-source-bolt: $(PLUGIN_ALL_HEADER:%=bolt-check/%)
-check-whitespace: $(PLUGIN_ALL_SRC:%=check-whitespace/%)
-check-whitespace: $(PLUGIN_ALL_HEADER:%=check-whitespace/%)
-
-clean: plugin-clean
-
-plugin-clean:
-	$(RM) $(PLUGIN_ALL_OBJS)
+# Generated from PLUGINS definition in plugins/Makefile
+ALL_C_HEADERS += plugins/list_of_builtin_plugins_gen.h
+plugins/list_of_builtin_plugins_gen.h: plugins/Makefile Makefile
+	@$(call VERBOSE,GEN $@,echo "static const char *list_of_builtin_plugins[] = { $(foreach d,$(notdir $(PLUGINS)),\"$d\",) NULL };" > $@)

@@ -60,17 +60,17 @@ page.
 Bitcoin control options:
 
  **network**=*NETWORK*
-Select the network parameters (*bitcoin*, *testnet*, or *regtest*).
+Select the network parameters (*bitcoin*, *testnet*, *signet*, or *regtest*).
 This is not valid within the per-network configuration file.
+
+ **mainnet**
+Alias for *network=bitcoin*.
 
  **testnet**
 Alias for *network=testnet*.
 
  **signet**
 Alias for *network=signet*.
-
- **mainnet**
-Alias for *network=bitcoin*.
 
  **bitcoin-cli**=*PATH*
 The name of *bitcoin-cli* executable to run.
@@ -194,7 +194,7 @@ The following is an example of a postgresql wallet DSN:
 --wallet=postgres://user:pass@localhost:5432/db_name
 ```
 
-This will connect to a the DB server running on `localhost` port `5432`,
+This will connect to a DB server running on `localhost` port `5432`,
 authenticate with username `user` and password `pass`, and then use the
 database `db_name`. The database must exist, but the schema will be managed
 automatically by `lightningd`.
@@ -234,8 +234,12 @@ for existing channels, use the RPC call lightning-setchannelfee(7).
 
  **min-capacity-sat**=*SATOSHI*
 Default: 10000. This value defines the minimal effective channel
-capacity in satoshi to accept for channel opening requests. If a peer
-tries to open a channel smaller than this, the opening will be rejected.
+capacity in satoshi to accept for channel opening requests. This will
+reject any opening of a channel which can't pass an HTLC of least this
+value.  Usually this prevents a peer opening a tiny channel, but it
+can also prevent a channel you open with a reasonable amount and the peer
+requesting such a large reserve that the capacity of the channel
+falls below this.
 
  **ignore-fee-limits**=*BOOL*
 Allow nodes which establish channels to us to set any fee they want.
@@ -275,13 +279,6 @@ opens a channel before the channel is usable.
  **commit-fee**=*PERCENT*
 The percentage of *estimatesmartfee 2/CONSERVATIVE* to use for the commitment
 transactions: default is 100.
-
- **commit-fee-min**=*PERCENT*
- **commit-fee-max**=*PERCENT*
-Limits on what onchain fee range we’ll allow when a node opens a channel
-with us, as a percentage of *estimatesmartfee 2*. If they’re outside
-this range, we abort their opening attempt. Note that **commit-fee-max**
-can (should!) be greater than 100.
 
  **max-concurrent-htlcs**=*INTEGER*
 Number of HTLCs one channel can handle concurrently in each direction.
@@ -402,7 +399,7 @@ this to *false* disables that.
 
  **proxy**=*IPADDRESS\[:PORT\]*
 Set a socks proxy to use to connect to Tor nodes (or for all connections
-if **always-use-proxy** is set).
+if **always-use-proxy** is set).  The port defaults to 9050 if not specified.
 
  **always-use-proxy**=*BOOL*
 Always use the **proxy**, even to connect to normal IP addresses (you

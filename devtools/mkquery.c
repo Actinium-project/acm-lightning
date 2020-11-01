@@ -11,8 +11,8 @@
 #include <common/gossip_constants.h>
 #include <common/utils.h>
 #include <inttypes.h>
-#include <wire/gen_peer_wire.h>
 #include <stdio.h>
+#include <wire/peer_wire.h>
 
 static void usage(void)
 {
@@ -49,7 +49,7 @@ int main(int argc, char *argv[])
 			tlvs = NULL;
 		else if (argc == 6) {
 			tlvs = tlv_query_channel_range_tlvs_new(ctx);
-			tlvs->query_option = tal(tlvs, varint);
+			tlvs->query_option = tal(tlvs, bigsize_t);
 			*tlvs->query_option = strtol(argv[5], NULL, 0);
 		} else
 			usage();

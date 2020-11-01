@@ -16,6 +16,7 @@
 #include <wire/peer_wire.h>
 
 struct per_peer_state;
+struct wally_psbt;
 
 struct peer {
 	/* Inside ld->peers. */
@@ -49,6 +50,15 @@ struct peer {
 	/* Swallow incoming HTLCs (for testing) */
 	bool ignore_htlcs;
 #endif
+};
+
+struct open_command {
+	/* Inside struct lightningd open_commands. */
+	struct list_node list;
+	/* Command structure. This is the parent of the open command. */
+	struct command *cmd;
+	/* Channel being opened. */
+	struct channel *channel;
 };
 
 struct peer *find_peer_by_dbid(struct lightningd *ld, u64 dbid);
@@ -86,6 +96,18 @@ void activate_peers(struct lightningd *ld);
 void drop_to_chain(struct lightningd *ld, struct channel *channel, bool cooperative);
 
 void channel_watch_funding(struct lightningd *ld, struct channel *channel);
+
+struct amount_msat channel_amount_receivable(const struct channel *channel);
+
+/* Find the open command that was registered for this channel */
+struct open_command *find_open_command(struct lightningd *ld,
+				       const struct channel *channel);
+
+/* Save an `openchannel_signed` command */
+void register_open_command(struct lightningd *ld,
+			   struct command *cmd,
+			   struct channel *channel);
+
 
 /* Pull peers, channels and HTLCs from db, and wire them up.
  * Returns any HTLCs we have to resubmit via htlcs_resubmit. */

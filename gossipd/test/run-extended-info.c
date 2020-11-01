@@ -59,12 +59,6 @@ void json_add_member(struct json_stream *js UNNEEDED,
 		     bool quote UNNEEDED,
 		     const char *fmt UNNEEDED, ...)
 { fprintf(stderr, "json_add_member called!\n"); abort(); }
-/* Generated stub for json_array_end */
-void json_array_end(struct json_stream *js UNNEEDED)
-{ fprintf(stderr, "json_array_end called!\n"); abort(); }
-/* Generated stub for json_array_start */
-void json_array_start(struct json_stream *js UNNEEDED, const char *fieldname UNNEEDED)
-{ fprintf(stderr, "json_array_start called!\n"); abort(); }
 /* Generated stub for json_member_direct */
 char *json_member_direct(struct json_stream *js UNNEEDED,
 			 const char *fieldname UNNEEDED, size_t extra UNNEEDED)
@@ -341,7 +335,7 @@ static u8 *test_query_channel_range(const char *test_vector, const jsmntok_t *ob
 	json_for_each_arr(i, t, opt) {
 		assert(json_tok_streq(test_vector, t,
 				      "WANT_TIMESTAMPS | WANT_CHECKSUMS"));
-		tlvs->query_option = tal(tlvs, varint);
+		tlvs->query_option = tal(tlvs, bigsize_t);
 		*tlvs->query_option =
 			QUERY_ADD_TIMESTAMPS | QUERY_ADD_CHECKSUMS;
 	}

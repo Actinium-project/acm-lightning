@@ -53,7 +53,7 @@ bool ${enum_set['name']}_is_defined(u16 type)
 towire_${type_obj.name}_array(${ptr}, ${fieldname}, ${f.size('tal_count(' + fieldname + ')')});
     % else:
 	for (size_t i = 0; i < ${f.size('tal_count(' + fieldname + ')')}; i++)
-	% if type_obj.is_assignable() or type_obj.has_len_fields():
+	% if type_obj.is_assignable() or type_obj.is_varsize():
 		towire_${type_obj.name}(${ptr}, ${fieldname}[i]);
 	% else:
 		towire_${type_obj.name}(${ptr}, ${fieldname} + i);
@@ -64,7 +64,7 @@ towire_${type_obj.name}(${ptr}, ${f.name});
 % elif is_single_ptr:
 towire_${type_obj.name}(${ptr}, ${'*' if type_obj.is_assignable() else ''}${fieldname});
 % else:
-towire_${type_obj.name}(${ptr}, ${'' if type_obj.is_assignable() else '&'}${fieldname});
+towire_${type_obj.name}(${ptr}, ${'' if type_obj.is_assignable() or type_obj.is_varsize() else '&'}${fieldname});
 % endif
 </%def>
 ## Subtype and TLV-msg fromwire
@@ -110,7 +110,7 @@ ${fieldname} = ${f.size('*plen')} ? tal_arr(${ctx}, ${typename}, 0) : NULL;
     % if f.type_obj.is_assignable():
 ${ f.name if f.len_field_of else fieldname} = fromwire_${type_}(cursor, plen);
     % elif f.type_obj.is_varsize():
-${fieldname} = *fromwire_${type_}(${ctx}, cursor, plen);
+${fieldname} = fromwire_${type_}(${ctx}, cursor, plen);
     % else:
 fromwire_${type_}(cursor, plen, &${fieldname});
     % endif
@@ -296,9 +296,7 @@ bool fromwire_${tlv.name}(const u8 **cursor, size_t *max, struct ${tlv.struct_na
 
 		/* BOLT #1:
 		 *
-		 * A `varint` is a variable-length, unsigned integer encoding
-		 * using the [BigSize](#appendix-a-bigsize-test-vectors)
-		 * format
+		 * The `type` is encoded using the BigSize format.
 		 */
 		field.numtype = fromwire_bigsize(cursor, max);
 
@@ -396,7 +394,9 @@ bool ${tlv.name}_is_valid(const struct ${tlv.struct_name()} *record, size_t *err
 			return false;
 		} else if (!first && f->numtype <= prev_type) {
 			/* BOLT #1:
-			 *  - if decoded `type`s are not monotonically-increasing:
+			 *  - if decoded `type`s are not strictly-increasing
+			 *    (including situations when two or more occurrences
+			 *    of the same `type` are met):
 			 *    - MUST fail to parse the `tlv_stream`.
 			 */
 			if (f->numtype == prev_type)

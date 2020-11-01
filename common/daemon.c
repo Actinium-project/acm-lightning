@@ -86,6 +86,9 @@ int daemon_poll(struct pollfd *fds, nfds_t nfds, int timeout)
 	if (t)
 		errx(1, "Outstanding taken pointers: %s", t);
 
+	if (wally_tal_ctx)
+		errx(1, "Outstanding tal_wally_start!");
+
 	clean_tmpctx();
 
 	return poll(fds, nfds, timeout);

@@ -49,7 +49,7 @@ struct ${struct.struct_name()} {
         % endif
             % if f.is_varlen() and f.type_obj.is_varsize():
         ${f.type_obj.type_name()} **${f.name};
-            % elif f.is_varlen():
+            % elif f.is_varlen() or f.type_obj.is_varsize():
         ${f.type_obj.type_name()} *${f.name};
             % elif f.is_array():
         ${f.type_obj.type_name()} ${f.name}[${f.count}];
@@ -69,7 +69,12 @@ struct ${tlv.struct_name()} {
 	 * tlv_field entries above to save on memory. */
     % for msg in tlv.messages.values():
         % if msg.singleton():
+	## Array of variable-length elems needs ptr-to-ptr!
+            % if msg.singleton().is_varlen() and msg.singleton().type_obj.is_varsize():
+	${msg.singleton().type_obj.type_name()} **${msg.name};
+	    % else:
 	${msg.singleton().type_obj.type_name()} *${msg.name};
+	    % endif
 	% else:
         struct ${msg.struct_name()} *${msg.name};
 	% endif

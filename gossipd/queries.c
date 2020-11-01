@@ -15,7 +15,7 @@
 #include <gossipd/queries.h>
 #include <gossipd/routing.h>
 #include <gossipd/seeker.h>
-#include <wire/gen_peer_wire.h>
+#include <wire/peer_wire.h>
 #include <wire/wire.h>
 #include <zlib.h>
 
@@ -1040,7 +1040,7 @@ bool query_channel_range(struct daemon *daemon,
 
 	if (qflags) {
 		tlvs = tlv_query_channel_range_tlvs_new(tmpctx);
-		tlvs->query_option = tal(tlvs, varint);
+		tlvs->query_option = tal(tlvs, bigsize_t);
 		*tlvs->query_option = qflags;
 	} else
 		tlvs = NULL;

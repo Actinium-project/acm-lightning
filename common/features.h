@@ -32,6 +32,10 @@ void towire_feature_set(u8 **pptr, const struct feature_set *fset);
 bool feature_set_or(struct feature_set *a,
 		    const struct feature_set *b TAKES);
 
+/* a - b, or returns false if features not already in a */
+bool feature_set_sub(struct feature_set *a,
+		     const struct feature_set *b TAKES);
+
 /* Returns -1 if we're OK with all these offered features, otherwise first
  * unsupported (even) feature. */
 int features_unsupported(const struct feature_set *our_features,
@@ -115,5 +119,10 @@ u8 *featurebits_or(const tal_t *ctx, const u8 *f1 TAKES, const u8 *f2 TAKES);
  */
 #if EXPERIMENTAL_FEATURES
 #define OPT_ONION_MESSAGES			102
+
+/* BOLT-7b04b1461739c5036add61782d58ac490842d98b #9:
+ * | 222/223 | `option_dual_fund` | ... IN9 ...
+ */
+#define OPT_DUAL_FUND 				222
 #endif
 #endif /* LIGHTNING_COMMON_FEATURES_H */

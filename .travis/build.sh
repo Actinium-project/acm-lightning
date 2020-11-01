@@ -6,12 +6,15 @@ export SLOW_MACHINE=1
 export CC=${COMPILER:-gcc}
 export DEVELOPER=${DEVELOPER:-1}
 export EXPERIMENTAL_FEATURES=${EXPERIMENTAL_FEATURES:-0}
-export SOURCE_CHECK_ONLY=${SOURCE_CHECK_ONLY:-"false"}
 export COMPAT=${COMPAT:-1}
 export PATH=$CWD/dependencies/bin:"$HOME"/.local/bin:"$PATH"
-export PYTEST_PAR=2
+export PYTEST_PAR=${PYTEST_PAR:-2}
 export PYTEST_SENTRY_ALWAYS_REPORT=1
 export BOLTDIR=lightning-rfc
+export TEST_DB_PROVIDER=${DB:-"sqlite3"}
+export TEST_NETWORK=${NETWORK:-"regtest"}
+export PYTEST_OPTS="--reruns=2 --maxfail=5 ${PYTEST_OPTS}"
+
 # Allow up to 4 concurrent tests when not under valgrind, which might run out of memory.
 if [ "$VALGRIND" = 0 ]; then
     PYTEST_PAR=4
@@ -20,41 +23,45 @@ export TEST_CMD=${TEST_CMD:-"make -j $PYTEST_PAR pytest"}
 
 mkdir -p dependencies/bin || true
 
-# Download bitcoind and bitcoin-cli 
+# Download bitcoind, elementsd, bitcoin-cli and elements-cli
 if [ ! -f dependencies/bin/bitcoind ]; then
-    wget https://storage.googleapis.com/c-lightning-tests/bitcoin-0.18.1-x86_64-linux-gnu.tar.bz2
-    tar -xjf bitcoin-0.18.1-x86_64-linux-gnu.tar.bz2
-    mv bitcoin-0.18.1/bin/* dependencies/bin
-    rm -rf bitcoin-0.18.1-x86_64-linux-gnu.tar.gz bitcoin-0.18.1
+    wget -q https://storage.googleapis.com/c-lightning-tests/bitcoin-0.20.1-x86_64-linux-gnu.tar.bz2
+    wget -q https://storage.googleapis.com/c-lightning-tests/elements-0.18.1.8-x86_64-linux-gnu.tar.bz2
+    tar -xjf bitcoin-0.20.1-x86_64-linux-gnu.tar.bz2
+    tar -xjf elements-0.18.1.8-x86_64-linux-gnu.tar.bz2
+    mv bitcoin-0.20.1/bin/* dependencies/bin
+    mv elements-0.18.1.8/bin/* dependencies/bin
+    rm -rf \
+       bitcoin-0.20.1-x86_64-linux-gnu.tar.gz \
+       bitcoin-0.20.1 \
+       elements-0.18.1.8-x86_64-linux-gnu.tar.bz2 \
+       elements-0.18.1.8
 fi
 
-pyenv global 3.7
+if [ "$NO_PYTHON" != 1 ]; then
+    pyenv global 3.7
 
-# Update pip first, may save us the compilation of binary packages in the next call
-pip3 install --user -U --quiet --progress-bar off \
-     pip \
-     pytest-test-groups==1.0.3
+    pip3 install --user -U --quiet --progress-bar off \
+	 pip \
+	 pytest-test-groups==1.0.3
 
-pip3 install --user -U --quiet --progress-bar off \
-     -r requirements.txt \
-     -r contrib/pyln-client/requirements.txt \
-     -r contrib/pyln-proto/requirements.txt \
-     -r contrib/pyln-testing/requirements.txt
+    pip3 install --user -U --quiet --progress-bar off \
+	 -r requirements.txt \
+	 -r contrib/pyln-client/requirements.txt \
+	 -r contrib/pyln-proto/requirements.txt \
+	 -r contrib/pyln-testing/requirements.txt
 
-pip3 install --user -U --quiet --progress-bar off \
-     pytest-sentry \
-     pytest-rerunfailures
+    pip3 install --user -U --quiet --progress-bar off \
+	 blinker \
+	 pytest-sentry \
+	 pytest-rerunfailures==9.1
+fi
 
 echo "Configuration which is going to be built:"
 echo -en 'travis_fold:start:script.1\\r'
 ./configure CC="$CC"
 cat config.vars
 echo -en 'travis_fold:end:script.1\\r'
-
-cat > pytest.ini << EOF
-[pytest]
-addopts=-p no:logging --color=no --reruns=5
-EOF
 
 git clone https://github.com/lightningnetwork/lightning-rfc.git
 
@@ -108,7 +115,7 @@ then
     #echo -en 'travis_fold:end:script.3\\r'
 else
     echo -en 'travis_fold:start:script.2\\r'
-    make -j8 > /dev/null
+    make -j8
     echo -en 'travis_fold:end:script.2\\r'
 
     echo -en 'travis_fold:start:script.3\\r'

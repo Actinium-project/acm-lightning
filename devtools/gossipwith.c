@@ -42,7 +42,7 @@ static struct io_plan *simple_close(struct io_conn *conn)
 	return NULL;
 }
 
-#include "../connectd/handshake.c"
+  #include "../connectd/handshake.c"
 
 /* This makes the handshake prototypes work. */
 struct io_conn {
@@ -279,8 +279,9 @@ int main(int argc, char *argv[])
 			 &features, "Send these features in init");
 	opt_register_arg("--network", opt_set_network, opt_show_network,
 	                 NULL,
-	                 "Select the network parameters (bitcoin, testnet, regtest"
-	                 " liquid, liquid-regtest, actinium, actinium-testnet, litecoin or litecoin-testnet)");
+	                 "Select the network parameters (bitcoin, testnet, signet,"
+	                 " regtest, liquid, liquid-regtest, actinium, actinium-testnet, litecoin or"
+	                 " litecoin-testnet)");
 	opt_register_noarg("--help|-h", opt_usage_and_exit,
 			   "id@addr[:port] [hex-msg-tosend...]\n"
 			   "Connect to a lightning peer and relay gossip messages from it",

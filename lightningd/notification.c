@@ -210,12 +210,56 @@ void notify_channel_opened(struct lightningd *ld, struct node_id *node_id,
 	plugins_notify(ld->plugins, take(n));
 }
 
+static void channel_state_changed_notification_serialize(struct json_stream *stream,
+							 struct node_id *peer_id,
+							 struct channel_id *cid,
+							 struct short_channel_id *scid,
+							 enum channel_state old_state,
+							 enum channel_state new_state)
+{
+	json_object_start(stream, "channel_state_changed");
+	json_add_node_id(stream, "peer_id", peer_id);
+	json_add_channel_id(stream, "channel_id", cid);
+	if (scid)
+		json_add_short_channel_id(stream, "short_channel_id", scid);
+	else
+		json_add_null(stream, "short_channel_id");
+	json_add_string(stream, "old_state", channel_state_str(old_state));
+	json_add_string(stream, "new_state", channel_state_str(new_state));
+	json_object_end(stream);
+}
+
+
+REGISTER_NOTIFICATION(channel_state_changed,
+		      channel_state_changed_notification_serialize)
+
+void notify_channel_state_changed(struct lightningd *ld,
+				  struct node_id *peer_id,
+				  struct channel_id *cid,
+				  struct short_channel_id *scid,
+				  enum channel_state old_state,
+				  enum channel_state new_state)
+{
+	void (*serialize)(struct json_stream *,
+			  struct node_id *,
+			  struct channel_id *,
+			  struct short_channel_id *,
+			  enum channel_state,
+			  enum channel_state) = channel_state_changed_notification_gen.serialize;
+
+	struct jsonrpc_notification *n
+		= jsonrpc_notification_start(NULL, channel_state_changed_notification_gen.topic);
+	serialize(n->stream, peer_id, cid, scid, old_state, new_state);
+	jsonrpc_notification_end(n);
+	plugins_notify(ld->plugins, take(n));
+}
+
 static void forward_event_notification_serialize(struct json_stream *stream,
 						 const struct htlc_in *in,
 						 const struct short_channel_id *scid_out,
 						 const struct amount_msat *amount_out,
 						 enum forward_status state,
-						 enum onion_type failcode,
+						 enum onion_wire failcode,
 						 struct timeabs *resolved_time)
 {
 	/* Here is more neat to initial a forwarding structure than
@@ -256,7 +300,7 @@ void notify_forward_event(struct lightningd *ld,
 			  const struct short_channel_id *scid_out,
 			  const struct amount_msat *amount_out,
 			  enum forward_status state,
-			  enum onion_type failcode,
+			  enum onion_wire failcode,
 			  struct timeabs *resolved_time)
 {
 	void (*serialize)(struct json_stream *,
@@ -264,7 +308,7 @@ void notify_forward_event(struct lightningd *ld,
 			  const struct short_channel_id *,
 			  const struct amount_msat *,
 			  enum forward_status,
-			  enum onion_type,
+			  enum onion_wire,
 			  struct timeabs *) = forward_event_notification_gen.serialize;
 
 	struct jsonrpc_notification *n
@@ -420,6 +464,34 @@ void notify_coin_mvt(struct lightningd *ld,
 	struct jsonrpc_notification *n =
 		jsonrpc_notification_start(NULL, "coin_movement");
 	serialize(n->stream, mvt);
+	jsonrpc_notification_end(n);
+	plugins_notify(ld->plugins, take(n));
+}
+
+static void openchannel_peer_sigs_serialize(struct json_stream *stream,
+					    const struct channel_id *cid,
+					    const struct wally_psbt *psbt)
+{
+	json_object_start(stream, "openchannel_peer_sigs");
+	json_add_channel_id(stream, "channel_id", cid);
+	json_add_psbt(stream, "signed_psbt", psbt);
+	json_object_end(stream);
+}
+
+REGISTER_NOTIFICATION(openchannel_peer_sigs,
+		      openchannel_peer_sigs_serialize);
+
+void notify_openchannel_peer_sigs(struct lightningd *ld,
+				  const struct channel_id *cid,
+				  const struct wally_psbt *psbt)
+{
+	void (*serialize)(struct json_stream *,
+			  const struct channel_id *cid,
+			  const struct wally_psbt *) = openchannel_peer_sigs_notification_gen.serialize;
+
+	struct jsonrpc_notification *n =
+		jsonrpc_notification_start(NULL, "openchannel_peer_sigs");
+	serialize(n->stream, cid, psbt);
 	jsonrpc_notification_end(n);
 	plugins_notify(ld->plugins, take(n));
 }

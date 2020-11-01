@@ -66,7 +66,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <gen_header_versions.h>
+#include <header_versions_gen.h>
 #include <lightningd/bitcoind.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/channel_control.h>
@@ -147,8 +147,8 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	 *
 	 * You declare them as a `struct list_head` (or use the LIST_HEAD()
 	 * macro which doesn't work on dynamically-allocated objects like `ld`
-	 * here).  The item which will go into the list must declared a
-	 * `struct list_node` for each list it can be in.
+	 * here).  The item which will go into the list must be declared
+	 * a `struct list_node` for each list it can be in.
 	 *
 	 * The most common operations are list_head_init(), list_add(),
 	 * list_del() and list_for_each().
@@ -180,7 +180,7 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	 * book to hold all the entries (and trims as necessary), and multiple
 	 * log objects which each can write into it, each with a unique
 	 * prefix. */
-	ld->log_book = new_log_book(ld, 100*1024*1024);
+	ld->log_book = new_log_book(ld, 10*1024*1024);
 	/*~ Note the tal context arg (by convention, the first argument to any
 	 * allocation function): ld->log will be implicitly freed when ld
 	 * is. */
@@ -195,6 +195,7 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	list_head_init(&ld->waitsendpay_commands);
 	list_head_init(&ld->sendpay_commands);
 	list_head_init(&ld->close_commands);
+	list_head_init(&ld->open_commands);
 	list_head_init(&ld->ping_commands);
 	list_head_init(&ld->waitblockheight_commands);
 
@@ -202,7 +203,7 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	 * elements, which can be accessed with tal_count() (or tal_bytelen()
 	 * for raw bytecount).  It's common for simple arrays to use
 	 * tal_resize() (or tal_arr_expand) to expand, which does not work on
-	 * NULL.  So we start with an zero-length array. */
+	 * NULL.  So we start with a zero-length array. */
 	ld->proposed_wireaddr = tal_arr(ld, struct wireaddr_internal, 0);
 	ld->proposed_listen_announce = tal_arr(ld, enum addr_listen_announce, 0);
 	ld->portnum = DEFAULT_PORT;
@@ -288,7 +289,7 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	/*~ We maintain a round-robin list of channels.
 	 * This round-robin list of channels is used to ensure that
 	 * each invoice we generate has a different set of channels.  */
-	list_head_init(&ld->rr_channels);
+	ld->rr_counter = 0;
 
 	return ld;
 }
@@ -384,7 +385,7 @@ void test_subdaemons(const struct lightningd *ld)
 
 		/*~ Our logging system: spam goes in at log_debug level, but
 		 * logging is mainly added by developer necessity and removed
-		 * by developer/user complaints .  The only strong convention
+		 * by developer/user complaints.  The only strong convention
 		 * is that log_broken() is used for "should never happen".
 		 *
 		 * Note, however, that logging takes care to preserve the
@@ -598,7 +599,7 @@ static void init_txfilter(struct wallet *w, struct txfilter *filter)
  *
  * But we define every path relative to our (~/.lightning) data dir, so we
  * make sure we stay there.  The rest of this is taken from ccan/daemonize,
- * which was based on W. Richard Steven's advice in Programming in The Unix
+ * which was based on W. Richard Stevens' advice in Programming in The Unix
  * Environment.
  */
 static void complete_daemonize(struct lightningd *ld)
@@ -935,9 +936,6 @@ int main(int argc, char *argv[])
 		       min_blockheight, max_blockheight);
 
 	db_begin_transaction(ld->wallet->db);
-	/*~ Tell the wallet to start figuring out what to do for any reserved
-	 * unspent outputs we may have crashed with. */
-	wallet_clean_utxos(ld->wallet, ld->topology->bitcoind);
 
 	/*~ Pull peers, channels and HTLCs from db. Needs to happen after the
 	 *  topology is initialized since some decisions rely on being able to
@@ -1045,7 +1043,6 @@ int main(int argc, char *argv[])
 	 * unreserving UTXOs (see #1737) */
 	db_begin_transaction(ld->wallet->db);
 	tal_free(ld->jsonrpc);
-	free_unreleased_txs(ld->wallet);
 	db_commit_transaction(ld->wallet->db);
 
 	/* Clean our our HTLC maps, since they use malloc. */

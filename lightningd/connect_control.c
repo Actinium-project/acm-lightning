@@ -24,10 +24,10 @@
 #include <lightningd/jsonrpc.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
-#include <lightningd/opening_control.h>
+#include <lightningd/opening_common.h>
 #include <lightningd/peer_control.h>
 #include <lightningd/subd.h>
-#include <wire/gen_peer_wire.h>
+#include <wire/peer_wire.h>
 #include <wire/wire_sync.h>
 
 struct connect {
@@ -371,7 +371,8 @@ int connectd_init(struct lightningd *ld)
 	    ld->proxyaddr, ld->use_proxy_always || ld->pure_tor_setup,
 	    IFDEV(ld->dev_allow_localhost, false), ld->config.use_dns,
 	    ld->tor_service_password ? ld->tor_service_password : "",
-	    ld->config.use_v3_autotor);
+	    ld->config.use_v3_autotor,
+	    ld->config.connection_timeout_secs);
 
 	subd_req(ld->connectd, ld->connectd, take(msg), -1, 0,
 		 connect_init_done, NULL);

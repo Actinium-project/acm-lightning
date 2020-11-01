@@ -3,10 +3,12 @@
 #include "config.h"
 #include <ccan/short_types/short_types.h>
 #include <ccan/tal/tal.h>
+#include <common/tx_roles.h>
 #include <stdbool.h>
 #include <wally_psbt.h>
 #include <wally_transaction.h>
 
+struct channel_id;
 struct wally_tx_input;
 struct wally_tx_output;
 struct wally_psbt;
@@ -17,11 +19,22 @@ struct wally_map;
 struct input_set {
 	struct wally_tx_input tx_input;
 	struct wally_psbt_input input;
+	/* index on PSBT of this input */
+	size_t idx;
 };
 
 struct output_set {
 	struct wally_tx_output tx_output;
 	struct wally_psbt_output output;
+	/* index on PSBT of this output */
+	size_t idx;
+};
+
+struct psbt_changeset {
+	struct input_set *added_ins;
+	struct input_set *rm_ins;
+	struct output_set *added_outs;
+	struct output_set *rm_outs;
 };
 
 #define PSBT_TYPE_SERIAL_ID 0x01
@@ -35,7 +48,7 @@ struct output_set {
  * Returns false if serial_id is not present
  */
 WARN_UNUSED_RESULT bool psbt_get_serial_id(const struct wally_map *map,
-					   u16 *serial_id);
+					   u64 *serial_id);
 
 /* psbt_sort_by_serial_id - Sort PSBT by serial_ids
  *
@@ -45,46 +58,40 @@ WARN_UNUSED_RESULT bool psbt_get_serial_id(const struct wally_map *map,
  */
 void psbt_sort_by_serial_id(struct wally_psbt *psbt);
 
-/* psbt_has_diff - Returns set of diffs btw orig + new psbt
+/* psbt_get_changeset - Returns set of diffs btw orig + new psbt
  *
  * All inputs+outputs MUST have a serial_id field present before
  * calling this.
  *
- * @ctx - allocation context for returned diffsets
+ * @ctx - allocation context for returned changeset
  * @orig - original psbt
  * @new - updated psbt
- * @added_ins - inputs added {new}
- * @rm_ins - inputs removed {orig}
- * @added_outs - outputs added {new}
- * @rm_outs - outputs removed {orig}
  *
- * Note that the input + output data returned in the diff sets
- * contain references to the originating PSBT; they are not copies.
- *
- * Returns true if changes are found.
+ * Note that the input + output data returned in the changeset
+ * contains references to the originating PSBT; they are not copies.
  */
-bool psbt_has_diff(const tal_t *ctx,
-		   struct wally_psbt *orig,
-		   struct wally_psbt *new,
-		   struct input_set **added_ins,
-		   struct input_set **rm_ins,
-		   struct output_set **added_outs,
-		   struct output_set **rm_outs);
+struct psbt_changeset *psbt_get_changeset(const tal_t *ctx,
+					  struct wally_psbt *orig,
+					  struct wally_psbt *new);
 
-/* psbt_input_add_serial_id - Adds a serial id to given input
+/* psbt_input_set_serial_id - Sets a serial id on given input
  *
- * @input - to add serial_id to
- * @serial_id - to add
+ * @ctx - tal context for allocations
+ * @input - to set serial_id on
+ * @serial_id - to set
  */
-void psbt_input_add_serial_id(struct wally_psbt_input *input,
-			       u16 serial_id);
-/* psbt_output_add_serial_id - Adds a serial id to given output
+void psbt_input_set_serial_id(const tal_t *ctx,
+			      struct wally_psbt_input *input,
+			       u64 serial_id);
+/* psbt_output_set_serial_id - Sets a serial id on given output
  *
- * @output - to add serial_id to
- * @serial_id - to add
+ * @ctx - tal context for allocations
+ * @output - to set serial_id on
+ * @serial_id - to set
  */
-void psbt_output_add_serial_id(struct wally_psbt_output *output,
-			       u16 serial_id);
+void psbt_output_set_serial_id(const tal_t *ctx,
+			       struct wally_psbt_output *output,
+			       u64 serial_id);
 
 /* psbt_sort_by_serial_id - Sorts the inputs + outputs by serial_id
  *
@@ -94,41 +101,41 @@ void psbt_output_add_serial_id(struct wally_psbt_output *output,
  */
 void psbt_sort_by_serial_id(struct wally_psbt *psbt);
 
-/* psbt_has_serial_input - Checks inputs for provided serial_id
+/* psbt_find_serial_input - Checks inputs for provided serial_id
  *
  * @psbt - psbt's inputs to check
  * @serial_id - id to look for
- * Returns true if serial_id found.
+ *
+ * Returns index of input with matching serial if found or -1
  */
-WARN_UNUSED_RESULT bool
-psbt_has_serial_input(struct wally_psbt *psbt, u16 serial_id);
+int psbt_find_serial_input(struct wally_psbt *psbt, u64 serial_id);
 
-/* psbt_has_serial_output - Checks outputs for provided serial_id
+/* psbt_find_serial_output - Checks outputs for provided serial_id
  *
  * @psbt - psbt's outputs to check
  * @serial_id - id to look for
- * Returns true if serial_id found.
+ *
+ * Returns index of output with matching serial if found or -1
  */
-WARN_UNUSED_RESULT bool
-psbt_has_serial_output(struct wally_psbt *psbt, u16 serial_id);
+int psbt_find_serial_output(struct wally_psbt *psbt, u64 serial_id);
 
-/* psbt_input_add_max_witness_len - Put a max witness len on a thing
+/* psbt_new_input_serial - Generate a new serial for an input for {role}
  *
- * @input - input to add max-witness-len to
- * @max_witness_len - value
+ * @psbt - psbt to get a new serial for
+ * @role - which tx role to generate the serial for
+ *
+ * Returns a new, unique serial of the correct parity for the specified {role}
  */
-void psbt_input_add_max_witness_len(struct wally_psbt_input *input,
-				    u16 max_witness_len);
+u64 psbt_new_input_serial(struct wally_psbt *psbt, enum tx_role role);
 
-/* psbt_input_get_max_witness_len - Get the max_witness_len
+/* psbt_new_output_serial - Generate a new serial for an output for {role}
  *
- * @input - psbt input to look for max witness len on
- * @max_witness_len - found length
+ * @psbt - psbt to get a new serial for
+ * @role - which tx role to generate the serial for
  *
- * Returns false if key not present */
-WARN_UNUSED_RESULT bool
-psbt_input_get_max_witness_len(struct wally_psbt_input *input,
-			       u16 *max_witness_len);
+ * Returns a new, unique serial of the correct parity for the specified {role}
+ */
+u64 psbt_new_output_serial(struct wally_psbt *psbt, enum tx_role role);
 
 /* psbt_has_required_fields - Validates psbt field completion
  *
@@ -142,4 +149,18 @@ psbt_input_get_max_witness_len(struct wally_psbt_input *input,
  */
 bool psbt_has_required_fields(struct wally_psbt *psbt);
 
+/* psbt_side_finalized - True if designated role has all signature data */
+bool psbt_side_finalized(const struct wally_psbt *psbt,
+			 enum tx_role role);
+
+/* psbt_add_serials - Add serials to inputs/outputs that are missing them
+ *
+ * Adds a serial of the correct parity for the designated {role} to all
+ * inputs and outputs of this PSBT that do not currently have a serial_id
+ * set.
+ *
+ * @psbt - the psbt to add serials to
+ * @role - the role we should use to select serial parity
+ */
+void psbt_add_serials(struct wally_psbt *psbt, enum tx_role role);
 #endif /* LIGHTNING_COMMON_PSBT_OPEN_H */

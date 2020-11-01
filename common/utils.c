@@ -5,6 +5,7 @@
 #include <ccan/tal/str/str.h>
 #include <locale.h>
 
+const tal_t *wally_tal_ctx;
 secp256k1_context *secp256k1_ctx;
 const tal_t *tmpctx;
 
@@ -13,6 +14,27 @@ const struct chainparams *chainparams;
 bool is_elements(const struct chainparams *chainparams)
 {
 	return chainparams->is_elements;
+}
+
+void tal_wally_start(void)
+{
+	if (wally_tal_ctx) {
+		/* This makes valgrind show us backtraces! */
+		*(u8 *)wally_tal_ctx = '\0';
+		abort();
+	}
+
+	wally_tal_ctx = tal_arr(NULL, char, 0);
+}
+
+void tal_wally_end(const tal_t *parent)
+{
+	tal_t *p;
+	while ((p = tal_first(wally_tal_ctx)) != NULL) {
+		if (p != parent)
+			tal_steal(parent, p);
+	}
+	wally_tal_ctx = tal_free(wally_tal_ctx);
 }
 
 #if DEVELOPER

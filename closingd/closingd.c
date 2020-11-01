@@ -203,7 +203,7 @@ static void do_reconnect(struct per_peer_state *pps,
 					  &next_commitment_point)) {
 		peer_failed(pps, channel_id,
 			    "bad reestablish msg: %s %s",
-			    wire_type_name(fromwire_peektype(channel_reestablish)),
+			    peer_wire_name(fromwire_peektype(channel_reestablish)),
 			    tal_hex(tmpctx, channel_reestablish));
 	}
 	status_debug("Got reestablish commit=%"PRIu64" revoke=%"PRIu64,
@@ -581,14 +581,12 @@ static void closing_dev_memleak(const tal_t *ctx,
 {
 	struct htable *memtable;
 
-	memtable = memleak_enter_allocations(tmpctx,
-					     scriptpubkey[LOCAL],
-					     scriptpubkey[REMOTE]);
+	memtable = memleak_find_allocations(tmpctx, NULL, NULL);
 
-	/* Now delete known pointers (these aren't really roots, just
-	 * pointers we know are referenced).*/
-	memleak_remove_referenced(memtable, ctx);
-	memleak_remove_referenced(memtable, funding_wscript);
+	memleak_remove_pointer(memtable, ctx);
+	memleak_remove_pointer(memtable, scriptpubkey[LOCAL]);
+	memleak_remove_pointer(memtable, scriptpubkey[REMOTE]);
+	memleak_remove_pointer(memtable, funding_wscript);
 
 	dump_memleak(memtable);
 }
@@ -628,6 +626,7 @@ int main(int argc, char *argv[])
 	if (!fromwire_closingd_init(ctx, msg,
 				   &chainparams,
 				   &pps,
+				   &channel_id,
 				   &funding_txid, &funding_txout,
 				   &funding,
 				   &funding_pubkey[LOCAL],
@@ -652,7 +651,7 @@ int main(int argc, char *argv[])
 		master_badmsg(WIRE_CLOSINGD_INIT, msg);
 
 	/* stdin == requests, 3 == peer, 4 = gossip, 5 = gossip_store, 6 = hsmd */
-	per_peer_state_set_fds(pps, 3, 4, 5);
+	per_peer_state_set_fds(notleak(pps), 3, 4, 5);
 
 	snprintf(fee_negotiation_step_str, sizeof(fee_negotiation_step_str),
 		 "%" PRIu64 "%s", fee_negotiation_step,
@@ -669,7 +668,6 @@ int main(int argc, char *argv[])
 	status_debug("fee = %s",
 		     type_to_string(tmpctx, struct amount_sat, &offer[LOCAL]));
 	status_debug("fee negotiation step = %s", fee_negotiation_step_str);
-	derive_channel_id(&channel_id, &funding_txid, funding_txout);
 
 	funding_wscript = bitcoin_redeem_2of2(ctx,
 					      &funding_pubkey[LOCAL],

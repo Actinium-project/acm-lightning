@@ -122,6 +122,9 @@ static void parse_include(const char *filename, bool must_exist, bool early,
 			/* Only valid forms are "foo" and "foo=bar" */
 			all_args[i] = tal_fmt(all_args, "--%s", lines[i]);
 		}
+		/* This isn't a leak either */
+		if (all_args[i])
+			tal_set_name(all_args[i], TAL_LABEL(config_notleak, ""));
 	}
 
 	/*
@@ -375,7 +378,7 @@ void initial_config_opts(const tal_t *ctx,
 	opt_register_early_arg("--network", opt_set_network, opt_show_network,
 			       NULL,
 			       "Select the network parameters (bitcoin, testnet,"
-			       " regtest, actinium, actinium-testnet, litecoin or litecoin-testnet)");
+			       " signet, regtest, actinium, actinium-testnet, litecoin or litecoin-testnet)");
 	opt_register_early_noarg("--testnet",
 				 opt_set_specific_network, "actinium-testnet",
 				 "Alias for --network=actinium-testnet");
@@ -434,16 +437,22 @@ void initial_config_opts(const tal_t *ctx,
 			       opt_restricted_toplevel, opt_show_network,
 			       NULL,
 			       "Select the network parameters (bitcoin, testnet,"
-			       " regtest, actinium, actinium-testnet, litecoin or litecoin-testnet)");
+			       " signet, regtest, actinium, actinium-testnet, litecoin or litecoin-testnet)");
+	opt_register_early_noarg("--mainnet",
+				 opt_restricted_toplevel_noarg, NULL,
+				 "Alias for --network=actinium");
 	opt_register_early_noarg("--testnet",
 				 opt_restricted_toplevel_noarg, NULL,
 				 "Alias for --network=actinium-testnet");
 	opt_register_early_noarg("--signet",
 				 opt_restricted_toplevel_noarg, NULL,
 				 "Alias for --network=signet");
+<<<<<<< HEAD
 	opt_register_early_noarg("--mainnet",
 				 opt_restricted_toplevel_noarg, NULL,
 				 "Alias for --network=actinium");
+=======
+>>>>>>> d151d554b37e8cbf117d3a85f1503588830da8a8
 
 	/* They can set this later, it's just less effective. */
 	opt_register_early_arg("--allow-deprecated-apis",

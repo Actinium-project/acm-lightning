@@ -1,16 +1,35 @@
 from decimal import Decimal
 from math import floor, log10
+from typing import Optional, Union
 import json
 import logging
 import os
 import socket
 import warnings
+from json import JSONEncoder
+
+
+def _patched_default(self, obj):
+    return getattr(obj.__class__, "to_json", _patched_default.default)(obj)
+
+
+def monkey_patch_json(patch=True):
+    is_patched = JSONEncoder.default == _patched_default
+
+    if patch and not is_patched:
+        _patched_default.default = JSONEncoder.default  # Save unmodified
+        JSONEncoder.default = _patched_default  # Replace it.
+    elif not patch and is_patched:
+        JSONEncoder.default = _patched_default.default
 
 
 class RpcError(ValueError):
-    def __init__(self, method, payload, error):
-        super(ValueError, self).__init__("RPC call failed: method: {}, payload: {}, error: {}"
-                                         .format(method, payload, error))
+    def __init__(self, method: str, payload: dict, error: str):
+        super(ValueError, self).__init__(
+            "RPC call failed: method: {}, payload: {}, error: {}".format(
+                method, payload, error
+            )
+        )
 
         self.method = method
         self.payload = payload
@@ -21,10 +40,10 @@ class Millisatoshi:
     """
     A subtype to represent thousandths of a satoshi.
 
-    Many JSON API fields are expressed in millisatoshis: these automatically get
-    turned into Millisatoshi types. Converts to and from int.
+    Many JSON API fields are expressed in millisatoshis: these automatically
+    get turned into Millisatoshi types. Converts to and from int.
     """
-    def __init__(self, v):
+    def __init__(self, v: Union[int, str, Decimal]):
         """
         Takes either a string ending in 'msat', 'sat', 'btc' or an integer.
         """
@@ -32,43 +51,50 @@ class Millisatoshi:
             if v.endswith("msat"):
                 self.millisatoshis = int(v[0:-4])
             elif v.endswith("sat"):
-                self.millisatoshis = Decimal(v[0:-3]) * 1000
+                self.millisatoshis = int(v[0:-3]) * 1000
             elif v.endswith("btc"):
-                self.millisatoshis = Decimal(v[0:-3]) * 1000 * 10**8
+                self.millisatoshis = int(v[0:-3]) * 1000 * 10**8
             else:
-                raise TypeError("Millisatoshi must be string with msat/sat/btc suffix or int")
+                raise TypeError(
+                    "Millisatoshi must be string with msat/sat/btc suffix or"
+                    " int"
+                )
             if self.millisatoshis != int(self.millisatoshis):
                 raise ValueError("Millisatoshi must be a whole number")
             self.millisatoshis = int(self.millisatoshis)
+
         elif isinstance(v, Millisatoshi):
             self.millisatoshis = v.millisatoshis
+
         elif int(v) == v:
             self.millisatoshis = int(v)
         else:
-            raise TypeError("Millisatoshi must be string with msat/sat/btc suffix or int")
+            raise TypeError(
+                "Millisatoshi must be string with msat/sat/btc suffix or int"
+            )
 
         if self.millisatoshis < 0:
             raise ValueError("Millisatoshi must be >= 0")
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         """
         Appends the 'msat' as expected for this type.
         """
         return str(self.millisatoshis) + "msat"
 
-    def to_satoshi(self):
+    def to_satoshi(self) -> Decimal:
         """
         Return a Decimal representing the number of satoshis.
         """
         return Decimal(self.millisatoshis) / 1000
 
-    def to_btc(self):
+    def to_btc(self) -> Decimal:
         """
         Return a Decimal representing the number of bitcoin.
         """
         return Decimal(self.millisatoshis) / 1000 / 10**8
 
-    def to_satoshi_str(self):
+    def to_satoshi_str(self) -> str:
         """
         Return a string of form 1234sat or 1234.567sat.
         """
@@ -77,7 +103,7 @@ class Millisatoshi:
         else:
             return '{:.0f}sat'.format(self.to_satoshi())
 
-    def to_btc_str(self):
+    def to_btc_str(self) -> str:
         """
         Return a string of form 12.34567890btc or 12.34567890123btc.
         """
@@ -86,13 +112,14 @@ class Millisatoshi:
         else:
             return '{:.8f}btc'.format(self.to_btc())
 
-    def to_approx_str(self, digits: int = 3):
+    def to_approx_str(self, digits: int = 3) -> str:
         """Returns the shortmost string using common units representation.
 
         Rounds to significant `digits`. Default: 3
         """
-        round_to_n = lambda x, n: round(x, -int(floor(log10(x))) + (n - 1))
-        result = None
+        def round_to_n(x: int, n: int) -> float:
+            return round(x, -int(floor(log10(x))) + (n - 1))
+        result = self.to_satoshi_str()
 
         # we try to increase digits to check if we did loose out on precision
         # without gaining a shorter string, since this is a rarely used UI
@@ -117,46 +144,51 @@ class Millisatoshi:
             else:
                 return result
 
-    def to_json(self):
+    def to_json(self) -> str:
         return self.__repr__()
 
-    def __int__(self):
+    def __int__(self) -> int:
         return self.millisatoshis
 
-    def __lt__(self, other):
+    def __lt__(self, other: 'Millisatoshi') -> bool:
         return self.millisatoshis < other.millisatoshis
 
-    def __le__(self, other):
+    def __le__(self, other: 'Millisatoshi') -> bool:
         return self.millisatoshis <= other.millisatoshis
 
-    def __eq__(self, other):
-        return self.millisatoshis == other.millisatoshis
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Millisatoshi):
+            return self.millisatoshis == other.millisatoshis
+        elif isinstance(other, int):
+            return self.millisatoshis == other
+        else:
+            return False
 
-    def __gt__(self, other):
+    def __gt__(self, other: 'Millisatoshi') -> bool:
         return self.millisatoshis > other.millisatoshis
 
-    def __ge__(self, other):
+    def __ge__(self, other: 'Millisatoshi') -> bool:
         return self.millisatoshis >= other.millisatoshis
 
-    def __add__(self, other):
+    def __add__(self, other: 'Millisatoshi') -> 'Millisatoshi':
         return Millisatoshi(int(self) + int(other))
 
-    def __sub__(self, other):
+    def __sub__(self, other: 'Millisatoshi') -> 'Millisatoshi':
         return Millisatoshi(int(self) - int(other))
 
-    def __mul__(self, other):
-        return Millisatoshi(int(int(self) * other))
+    def __mul__(self, other: int) -> 'Millisatoshi':
+        return Millisatoshi(self.millisatoshis * other)
 
-    def __truediv__(self, other):
-        return Millisatoshi(int(int(self) / other))
+    def __truediv__(self, other: Union[int, float]) -> 'Millisatoshi':
+        return Millisatoshi(int(self.millisatoshis / other))
 
-    def __floordiv__(self, other):
-        return Millisatoshi(int(self) // other)
+    def __floordiv__(self, other: Union[int, float]) -> 'Millisatoshi':
+        return Millisatoshi(int(self.millisatoshis // float(other)))
 
-    def __mod__(self, other):
-        return Millisatoshi(int(self) % other)
+    def __mod__(self, other: Union[float, int]) -> 'Millisatoshi':
+        return Millisatoshi(int(self.millisatoshis % other))
 
-    def __radd__(self, other):
+    def __radd__(self, other: 'Millisatoshi') -> 'Millisatoshi':
         return Millisatoshi(int(self) + int(other))
 
 
@@ -173,17 +205,17 @@ class UnixSocket(object):
 
     """
 
-    def __init__(self, path):
+    def __init__(self, path: str):
         self.path = path
-        self.sock = None
+        self.sock: Optional[socket.SocketType] = None
         self.connect()
 
-    def connect(self):
+    def connect(self) -> None:
         try:
             self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            return self.sock.connect(self.path)
+            self.sock.connect(self.path)
         except OSError as e:
-            self.sock.close()
+            self.close()
 
             if (e.args[0] == "AF_UNIX path too long" and os.uname()[0] == "Linux"):
                 # If this is a Linux system we may be able to work around this
@@ -201,29 +233,29 @@ class UnixSocket(object):
                 dirfd = os.open(dirname, os.O_DIRECTORY | os.O_RDONLY)
                 short_path = "/proc/self/fd/%d/%s" % (dirfd, basename)
                 self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                return self.sock.connect(short_path)
+                self.sock.connect(short_path)
             else:
                 # There is no good way to recover from this.
                 raise
 
-    def close(self):
+    def close(self) -> None:
         if self.sock is not None:
             self.sock.close()
         self.sock = None
 
-    def sendall(self, b):
+    def sendall(self, b: bytes) -> None:
         if self.sock is None:
             raise socket.error("not connected")
 
         self.sock.sendall(b)
 
-    def recv(self, length):
+    def recv(self, length: int) -> bytes:
         if self.sock is None:
             raise socket.error("not connected")
 
         return self.sock.recv(length)
 
-    def __del__(self):
+    def __del__(self) -> None:
         self.close()
 
 
@@ -284,17 +316,26 @@ class UnixDomainSocketRpc(object):
 
         # FIXME: we open a new socket for every readobj call...
         sock = UnixSocket(self.socket_path)
+        this_id = self.next_id
         self._writeobj(sock, {
             "jsonrpc": "2.0",
             "method": method,
             "params": payload,
-            "id": self.next_id,
+            "id": this_id,
         })
         self.next_id += 1
-        resp, _ = self._readobj(sock)
-        sock.close()
+        buf = b''
+        while True:
+            resp, buf = self._readobj(sock, buf)
+            # FIXME: We should offer a callback for notifications.
+            if 'method' not in resp or 'id' in resp:
+                break
 
         self.logger.debug("Received response for %s call: %r", method, resp)
+        if 'id' in resp and resp['id'] != this_id:
+            raise ValueError("Malformed response, id is not {}: {}.".format(this_id, resp))
+        sock.close()
+
         if not isinstance(resp, dict):
             raise ValueError("Malformed response, response is not a dictionary %s." % resp)
         elif "error" in resp:
@@ -327,7 +368,10 @@ class LightningRpc(UnixDomainSocketRpc):
             return json.JSONEncoder.default(self, o)
 
     class LightningJSONDecoder(json.JSONDecoder):
-        def __init__(self, *, object_hook=None, parse_float=None, parse_int=None, parse_constant=None, strict=True, object_pairs_hook=None):
+        def __init__(self, *, object_hook=None, parse_float=None,
+                     parse_int=None, parse_constant=None,
+                     strict=True, object_pairs_hook=None,
+                     patch_json=True):
             self.object_hook_next = object_hook
             super().__init__(object_hook=self.millisatoshi_hook, parse_float=parse_float, parse_int=parse_int, parse_constant=parse_constant, strict=strict, object_pairs_hook=object_pairs_hook)
 
@@ -357,8 +401,18 @@ class LightningRpc(UnixDomainSocketRpc):
                 obj = self.object_hook_next(obj)
             return obj
 
-    def __init__(self, socket_path, executor=None, logger=logging):
-        super().__init__(socket_path, executor, logger, self.LightningJSONEncoder, self.LightningJSONDecoder())
+    def __init__(self, socket_path, executor=None, logger=logging,
+                 patch_json=True):
+        super().__init__(
+            socket_path,
+            executor,
+            logger,
+            self.LightningJSONEncoder,
+            self.LightningJSONDecoder()
+        )
+
+        if patch_json:
+            monkey_patch_json(patch=True)
 
     def autocleaninvoice(self, cycle_seconds=None, expired_by=None):
         """
@@ -612,12 +666,13 @@ class LightningRpc(UnixDomainSocketRpc):
         Only select outputs with {minconf} confirmations.
         If {utxos} is specified (as a list of 'txid:vout' strings),
         fund a channel from these specifics utxos.
+        {close_to} is a valid Bitcoin address.
         """
 
         if 'satoshi' in kwargs:
             return self._deprecated_fundchannel(node_id, *args, **kwargs)
 
-        def _fundchannel(node_id, amount, feerate=None, announce=True, minconf=None, utxos=None, push_msat=None):
+        def _fundchannel(node_id, amount, feerate=None, announce=True, minconf=None, utxos=None, push_msat=None, close_to=None):
             payload = {
                 "id": node_id,
                 "amount": amount,
@@ -625,7 +680,8 @@ class LightningRpc(UnixDomainSocketRpc):
                 "announce": announce,
                 "minconf": minconf,
                 "utxos": utxos,
-                "push_msat": push_msat
+                "push_msat": push_msat,
+                "close_to": close_to,
             }
             return self.call("fundchannel", payload)
 
@@ -816,7 +872,7 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("listnodes", payload)
 
-    def listpayments(self, bolt11=None, payment_hash=None):
+    def listpays(self, bolt11=None, payment_hash=None):
         """
         Show outgoing payments, regarding {bolt11} or {payment_hash} if set
         Can only specify one of {bolt11} or {payment_hash}.
@@ -826,7 +882,7 @@ class LightningRpc(UnixDomainSocketRpc):
             "bolt11": bolt11,
             "payment_hash": payment_hash
         }
-        return self.call("listpayments", payload)
+        return self.call("listpays", payload)
 
     def listpeers(self, peerid=None, level=None):
         """
@@ -845,6 +901,43 @@ class LightningRpc(UnixDomainSocketRpc):
             "payment_hash": payment_hash
         }
         return self.call("listsendpays", payload)
+
+    def multifundchannel(self, destinations, feerate=None, minconf=None, utxos=None, minchannels=None, **kwargs):
+        """
+        Fund channels to an array of {destinations},
+        each entry of which is a dict of node {id}
+        and {amount} to fund, and optionally whether
+        to {announce} and how much {push_msat} to
+        give outright to the node.
+        You may optionally specify {feerate},
+        {minconf} depth, and the {utxos} set to use
+        for the single transaction that funds all
+        the channels.
+        """
+        payload = {
+            "destinations": destinations,
+            "feerate": feerate,
+            "minconf": minconf,
+            "utxos": utxos,
+            "minchannels": minchannels,
+        }
+        payload.update({k: v for k, v in kwargs.items()})
+        return self.call("multifundchannel", payload)
+
+    def multiwithdraw(self, outputs, feerate=None, minconf=None, utxos=None, **kwargs):
+        """
+        Send to {outputs}
+        via Bitcoin transaction. Only select outputs
+        with {minconf} confirmations.
+        """
+        payload = {
+            "outputs": outputs,
+            "feerate": feerate,
+            "minconf": minconf,
+            "utxos": utxos,
+        }
+        payload.update({k: v for k, v in kwargs.items()})
+        return self.call("multiwithdraw", payload)
 
     def newaddr(self, addresstype=None):
         """Get a new address of type {addresstype} of the internal wallet.
@@ -872,6 +965,36 @@ class LightningRpc(UnixDomainSocketRpc):
             "description": description,
         }
         return self.call("pay", payload)
+
+    def openchannel_init(self, node_id, channel_amount, psbt, feerate=None, funding_feerate=None, announce=True, close_to=None, *args, **kwargs):
+        """Initiate an openchannel with a peer """
+        payload = {
+            "id": node_id,
+            "amount": channel_amount,
+            "initialpsbt": psbt,
+            "commitment_feerate": feerate,
+            "funding_feerate": funding_feerate,
+            "announce": announce,
+            "close_to": close_to,
+        }
+        return self.call("openchannel_init", payload)
+
+    def openchannel_signed(self, channel_id, signed_psbt, *args, **kwargs):
+        """ Send the funding transaction signatures to the peer, finish
+            the channel open """
+        payload = {
+            "channel_id": channel_id,
+            "signed_psbt": signed_psbt,
+        }
+        return self.call("openchannel_signed", payload)
+
+    def openchannel_update(self, channel_id, psbt, *args, **kwargs):
+        """Update an openchannel with a peer """
+        payload = {
+            "channel_id": channel_id,
+            "psbt": psbt,
+        }
+        return self.call("openchannel_update", payload)
 
     def paystatus(self, bolt11=None):
         """Detail status of attempts to pay {bolt11} or any."""

@@ -4,6 +4,7 @@
 #include <ccan/tal/str/str.h>
 #include <ccan/utf8/utf8.h>
 #include <common/features.h>
+#include <common/json_helpers.h>
 #include <common/utils.h>
 #include <common/version.h>
 #include <lightningd/json.h>
@@ -17,7 +18,7 @@
 #include <sys/types.h>
 
 /* Only this file can include this generated header! */
-# include <gen_list_of_builtin_plugins.h>
+# include <plugins/list_of_builtin_plugins_gen.h>
 
 /* How many seconds may the plugin take to reply to the `getmanifest`
  * call? This is the maximum delay to `lightningd --help` and until
@@ -276,15 +277,14 @@ static const char *plugin_log_handle(struct plugin *plugin,
 			       "a string \"message\" field");
 	}
 
-	if (!leveltok || json_tok_streq(plugin->buffer, leveltok, "info"))
+	if (!leveltok)
 		level = LOG_INFORM;
-	else if (json_tok_streq(plugin->buffer, leveltok, "debug"))
-		level = LOG_DBG;
-	else if (json_tok_streq(plugin->buffer, leveltok, "warn"))
-		level = LOG_UNUSUAL;
-	else if (json_tok_streq(plugin->buffer, leveltok, "error"))
-		level = LOG_BROKEN;
-	else {
+	else if (!log_level_parse(plugin->buffer + leveltok->start,
+				  leveltok->end - leveltok->start,
+				  &level)
+		 /* FIXME: Allow io logging? */
+		 || level == LOG_IO_IN
+		 || level == LOG_IO_OUT) {
 		return tal_fmt(plugin,
 			       "Unknown log-level %.*s, valid values are "
 			       "\"debug\", \"info\", \"warn\", or \"error\".",
@@ -296,6 +296,35 @@ static const char *plugin_log_handle(struct plugin *plugin,
 	/* FIXME: Let plugin specify node_id? */
 	log_(plugin->log, level, NULL, call_notifier, "%.*s", msgtok->end - msgtok->start,
 	     plugin->buffer + msgtok->start);
+	return NULL;
+}
+
+static const char *plugin_notify_handle(struct plugin *plugin,
+					const jsmntok_t *methodtok,
+					const jsmntok_t *paramstok)
+{
+	const jsmntok_t *idtok;
+	u64 id;
+	struct jsonrpc_request *request;
+
+	/* id inside params tells us which id to redirect to. */
+	idtok = json_get_member(plugin->buffer, paramstok, "id");
+	if (!idtok || !json_to_u64(plugin->buffer, idtok, &id)) {
+		return tal_fmt(plugin,
+			       "JSON-RPC notify \"id\"-field is not a u64");
+	}
+
+	request = uintmap_get(&plugin->plugins->pending_requests, id);
+	if (!request) {
+		return tal_fmt(
+			plugin,
+			"Received a JSON-RPC notify for non-existent request");
+	}
+
+	/* Ignore if they don't have a callback */
+	if (request->notify_cb)
+		request->notify_cb(plugin->buffer, methodtok, paramstok, idtok,
+				   request->response_cb_arg);
 	return NULL;
 }
 
@@ -326,6 +355,9 @@ static const char *plugin_notification_handle(struct plugin *plugin,
 	 * register notification handlers in a variety of places. */
 	if (json_tok_streq(plugin->buffer, methtok, "log")) {
 		return plugin_log_handle(plugin, paramstok);
+	} else if (json_tok_streq(plugin->buffer, methtok, "message")
+		   || json_tok_streq(plugin->buffer, methtok, "progress")) {
+		return plugin_notify_handle(plugin, methtok, paramstok);
 	} else {
 		return tal_fmt(plugin, "Unknown notification method %.*s",
 			       json_tok_full_len(methtok),
@@ -491,30 +523,42 @@ static struct io_plan *plugin_read_json(struct io_conn *conn,
 					struct plugin *plugin)
 {
 	bool success;
+	bool have_full;
 
 	log_io(plugin->log, LOG_IO_IN, NULL, "",
 	       plugin->buffer + plugin->used, plugin->len_read);
+
+	/* Our JSON parser is pretty good at incremental parsing, but
+	 * `getrawblock` gives a giant 2MB token, which forces it to re-parse
+	 * every time until we have all of it. However, we can't complete a
+	 * JSON object without a '}', so we do a cheaper check here.
+	 */
+	have_full = memchr(plugin->buffer + plugin->used, '}',
+			   plugin->len_read);
 
 	plugin->used += plugin->len_read;
 	if (plugin->used == tal_count(plugin->buffer))
 		tal_resize(&plugin->buffer, plugin->used * 2);
 
 	/* Read and process all messages from the connection */
-	do {
-		bool destroyed;
-		const char *err;
-		err = plugin_read_json_one(plugin, &success, &destroyed);
+	if (have_full) {
+		do {
+			bool destroyed;
+			const char *err;
+			err =
+			    plugin_read_json_one(plugin, &success, &destroyed);
 
-		/* If it's destroyed, conn is already freed! */
-		if (destroyed)
-			return io_close(NULL);
+			/* If it's destroyed, conn is already freed! */
+			if (destroyed)
+				return io_close(NULL);
 
-		if (err) {
-			plugin_kill(plugin, err);
-			/* plugin_kill frees plugin */
-			return io_close(NULL);
-		}
-	} while (success);
+			if (err) {
+				plugin_kill(plugin, err);
+				/* plugin_kill frees plugin */
+				return io_close(NULL);
+			}
+		} while (success);
+	}
 
 	/* Now read more from the connection */
 	return io_read_partial(plugin->stdout_conn,
@@ -762,14 +806,6 @@ static void json_stream_forward_change_id(struct json_stream *stream,
 	json_stream_append(stream, new_id, strlen(new_id));
 	json_stream_append(stream, buffer + idtok->end + offset,
 			   toks->end - idtok->end - offset);
-
-	/* We promise it will end in '\n\n' */
-	/* It's an object (with an id!): definitely can't be less that "{}" */
-	assert(toks->end - toks->start >= 2);
-	if (buffer[toks->end-1] != '\n')
-		json_stream_append(stream, "\n\n", 2);
-	else if (buffer[toks->end-2] != '\n')
-		json_stream_append(stream, "\n", 1);
 }
 
 static void plugin_rpcmethod_cb(const char *buffer,
@@ -782,10 +818,36 @@ static void plugin_rpcmethod_cb(const char *buffer,
 
 	response = json_stream_raw_for_cmd(cmd);
 	json_stream_forward_change_id(response, buffer, toks, idtok, cmd->id);
+	json_stream_double_cr(response);
 	command_raw_complete(cmd, response);
 
 	list_del(&call->list);
 	tal_free(call);
+}
+
+static void plugin_notify_cb(const char *buffer,
+			     const jsmntok_t *methodtok,
+			     const jsmntok_t *paramtoks,
+			     const jsmntok_t *idtok,
+			     struct plugin_rpccall *call)
+{
+	struct command *cmd = call->cmd;
+	struct json_stream *response;
+
+	if (!cmd->jcon || !cmd->send_notifications)
+		return;
+
+	response = json_stream_raw_for_cmd(cmd);
+	json_object_start(response, NULL);
+	json_add_string(response, "jsonrpc", "2.0");
+	json_add_tok(response, "method", methodtok, buffer);
+	json_stream_append(response, ",\"params\":", strlen(",\"params\":"));
+	json_stream_forward_change_id(response, buffer,
+				      paramtoks, idtok, cmd->id);
+	json_object_end(response);
+
+	json_stream_double_cr(response);
+	json_stream_flush(response);
 }
 
 struct plugin *find_plugin_for_command(struct lightningd *ld,
@@ -831,6 +893,7 @@ static struct command_result *plugin_rpcmethod_dispatch(struct command *cmd,
 	call->cmd = cmd;
 
 	req = jsonrpc_request_start(plugin, NULL, plugin->log,
+				    plugin_notify_cb,
 				    plugin_rpcmethod_cb, call);
 	call->request = req;
 	call->plugin = plugin;
@@ -839,6 +902,7 @@ static struct command_result *plugin_rpcmethod_dispatch(struct command *cmd,
 	snprintf(id, ARRAY_SIZE(id), "%"PRIu64, req->id);
 
 	json_stream_forward_change_id(req->stream, buffer, toks, idtok, id);
+	json_stream_double_cr(req->stream);
 	plugin_request_send(plugin, req);
 	req->stream = NULL;
 
@@ -1210,24 +1274,10 @@ char *add_plugin_dir(struct plugins *plugins, const char *dir, bool error_ok)
 	struct plugin *p;
 
 	if (!d) {
-		if (deprecated_apis && !path_is_abs(dir)) {
-			dir = path_join(tmpctx,
-					plugins->ld->original_directory, dir);
-			d = opendir(dir);
-			if (d) {
-				log_unusual(plugins->log, "DEPRECATED WARNING:"
-					    " plugin-dir is now relative to"
-					    " lightning-dir, please change to"
-					    " plugin-dir=%s",
-					    dir);
-			}
-		}
-		if (!d) {
-			if (!error_ok && errno == ENOENT)
-				return NULL;
-			return tal_fmt(NULL, "Failed to open plugin-dir %s: %s",
-				       dir, strerror(errno));
-		}
+		if (!error_ok && errno == ENOENT)
+			return NULL;
+		return tal_fmt(NULL, "Failed to open plugin-dir %s: %s",
+			       dir, strerror(errno));
 	}
 
 	while ((di = readdir(d)) != NULL) {
@@ -1282,7 +1332,7 @@ void plugins_add_default_dir(struct plugins *plugins)
 const char *plugin_send_getmanifest(struct plugin *p)
 {
 	char **cmd;
-	int stdin, stdout;
+	int stdinfd, stdoutfd;
 	struct jsonrpc_request *req;
 	bool debug = false;
 
@@ -1295,7 +1345,7 @@ const char *plugin_send_getmanifest(struct plugin *p)
 	cmd[0] = p->cmd;
 	if (debug)
 		cmd[1] = "--debugger";
-	p->pid = pipecmdarr(&stdin, &stdout, &pipecmd_preserve, cmd);
+	p->pid = pipecmdarr(&stdinfd, &stdoutfd, &pipecmd_preserve, cmd);
 	if (p->pid == -1)
 		return tal_fmt(p, "opening pipe: %s", strerror(errno));
 
@@ -1306,10 +1356,10 @@ const char *plugin_send_getmanifest(struct plugin *p)
 
 	/* Create two connections, one read-only on top of p->stdout, and one
 	 * write-only on p->stdin */
-	p->stdout_conn = io_new_conn(p, stdout, plugin_stdout_conn_init, p);
-	p->stdin_conn = io_new_conn(p, stdin, plugin_stdin_conn_init, p);
+	p->stdout_conn = io_new_conn(p, stdoutfd, plugin_stdout_conn_init, p);
+	p->stdin_conn = io_new_conn(p, stdinfd, plugin_stdin_conn_init, p);
 	req = jsonrpc_request_start(p, "getmanifest", p->log,
-				    plugin_manifest_cb, p);
+				    NULL, plugin_manifest_cb, p);
 	/* Adding allow-deprecated-apis is part of the deprecation cycle! */
 	if (!deprecated_apis)
 		json_add_bool(req->stream, "allow-deprecated-apis", deprecated_apis);
@@ -1440,6 +1490,11 @@ plugin_populate_init_request(struct plugin *plugin, struct jsonrpc_request *req)
 	json_add_string(req->stream, "rpc-file", ld->rpc_filename);
 	json_add_bool(req->stream, "startup", plugin->plugins->startup);
 	json_add_string(req->stream, "network", chainparams->network_name);
+	if (ld->proxyaddr) {
+		json_add_address(req->stream, "proxy", ld->proxyaddr);
+		json_add_bool(req->stream, "torv3-enabled", ld->config.use_v3_autotor);
+		json_add_bool(req->stream, "use_proxy_always", ld->use_proxy_always);
+	}
 	json_object_start(req->stream, "feature_set");
 	for (enum feature_place fp = 0; fp < NUM_FEATURE_PLACE; fp++) {
 		if (feature_place_names[fp]) {
@@ -1458,7 +1513,7 @@ plugin_config(struct plugin *plugin)
 	struct jsonrpc_request *req;
 
 	req = jsonrpc_request_start(plugin, "init", plugin->log,
-	                            plugin_config_cb, plugin);
+	                            NULL, plugin_config_cb, plugin);
 	plugin_populate_init_request(plugin, req);
 	jsonrpc_request_end(req);
 	plugin_request_send(plugin, req);
@@ -1541,18 +1596,8 @@ void json_add_opt_plugins_array(struct json_stream *response,
 void json_add_opt_plugins(struct json_stream *response,
 			  const struct plugins *plugins)
 {
-	struct plugin *p;
-
 	json_add_opt_plugins_array(response, "plugins", plugins, false);
 	json_add_opt_plugins_array(response, "important-plugins", plugins, true);
-
-	/* DEPRECATED: duplicated JSON "plugin" entries */
-	if (deprecated_apis) {
-		list_for_each(&plugins->plugins, p, list) {
-			json_add_string(response, p->important ? "important-plugin" : "plugin", p->cmd);
-		}
-	}
-
 }
 
 void json_add_opt_disable_plugins(struct json_stream *response,

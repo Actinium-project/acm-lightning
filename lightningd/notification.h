@@ -7,9 +7,11 @@
 #include <ccan/json_escape/json_escape.h>
 #include <ccan/time/time.h>
 #include <common/amount.h>
+#include <common/channel_id.h>
 #include <common/coin_mvt.h>
 #include <common/errcode.h>
 #include <common/node_id.h>
+#include <lightningd/channel_state.h>
 #include <lightningd/htlc_end.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/lightningd.h>
@@ -17,9 +19,11 @@
 #include <lightningd/pay.h>
 #include <lightningd/plugin.h>
 #include <wallet/wallet.h>
-#include <wire/gen_onion_wire.h>
+#include <wally_psbt.h>
+#include <wire/onion_wire.h>
 
 struct onionreply;
+struct wally_psbt;
 
 bool notifications_have_topic(const char *topic);
 
@@ -55,6 +59,13 @@ void notify_channel_opened(struct lightningd *ld, struct node_id *node_id,
 			   struct amount_sat *funding_sat, struct bitcoin_txid *funding_txid,
 			   bool *funding_locked);
 
+void notify_channel_state_changed(struct lightningd *ld,
+				  struct node_id *peer_id,
+				  struct channel_id *cid,
+				  struct short_channel_id *scid,
+				  enum channel_state old_state,
+				  enum channel_state new_state);
+
 void notify_forward_event(struct lightningd *ld,
 			  const struct htlc_in *in,
 			  /* May be NULL if we don't know. */
@@ -62,7 +73,7 @@ void notify_forward_event(struct lightningd *ld,
 			  /* May be NULL. */
 			  const struct amount_msat *amount_out,
 			  enum forward_status state,
-			  enum onion_type failcode,
+			  enum onion_wire failcode,
 			  struct timeabs *resolved_time);
 
 void notify_sendpay_success(struct lightningd *ld,
@@ -77,4 +88,8 @@ void notify_sendpay_failure(struct lightningd *ld,
 
 void notify_coin_mvt(struct lightningd *ld,
 		     const struct coin_mvt *mvt);
+
+void notify_openchannel_peer_sigs(struct lightningd *ld,
+				  const struct channel_id *cid,
+				  const struct wally_psbt *psbt);
 #endif /* LIGHTNING_LIGHTNINGD_NOTIFICATION_H */

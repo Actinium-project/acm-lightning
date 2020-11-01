@@ -1317,7 +1317,7 @@ static struct command_result *json_pay(struct command *cmd,
 		return command_param_failed();
 
 	b11 = bolt11_decode(cmd, b11str, plugin_feature_set(cmd->plugin),
-			    NULL, &fail);
+			    NULL, chainparams, &fail);
 	if (!b11) {
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 				    "Invalid bolt11: %s", fail);
@@ -1719,7 +1719,8 @@ static void add_amount_sent(struct plugin *p,
 
 	/* If this is an unannotated partial payment we drop out estimate for
 	 * all parts. */
-	if (msattok == NULL) {
+	/* FIXME: with deprecated_apis, amount_msat can be 'null' */
+	if (msattok == NULL || !json_to_msat(buf, msattok, &recv)) {
 		mpp->amount = tal_free(mpp->amount);
 		return;
 	}
@@ -1730,7 +1731,6 @@ static void add_amount_sent(struct plugin *p,
 	if (mpp->amount == NULL)
 		return;
 
-	json_to_msat(buf, msattok, &recv);
 	if (!amount_msat_add(mpp->amount, *mpp->amount, recv))
 		plugin_log(p, LOG_BROKEN,
 			   "Cannot add amount_msat for %s: %s + %s",
@@ -1915,9 +1915,10 @@ struct payment_modifier *paymod_mods[] = {
 	&exemptfee_pay_mod,
 	&directpay_pay_mod,
 	&shadowroute_pay_mod,
-	/* NOTE: The order in which these two paymods are executed is
+	/* NOTE: The order in which these three paymods are executed is
 	 * significant!
-	 * routehints *must* execute first before presplit.
+	 * routehints *must* execute first before payee_incoming_limit
+	 * which *must* execute bfore presplit.
 	 *
 	 * FIXME: Giving an ordered list of paymods to the paymod
 	 * system is the wrong interface, given that the order in
@@ -1932,6 +1933,7 @@ struct payment_modifier *paymod_mods[] = {
 	 * use.
 	 */
 	&routehints_pay_mod,
+	&payee_incoming_limit_pay_mod,
 	&presplit_pay_mod,
 	&waitblockheight_pay_mod,
 	&retry_pay_mod,
@@ -1958,8 +1960,6 @@ static struct command_result *json_paymod(struct command *cmd,
 	bool *use_shadow;
 #endif
 
-	p = payment_new(NULL, cmd, NULL /* No parent */, paymod_mods);
-
 	/* If any of the modifiers need to add params to the JSON-RPC call we
 	 * would add them to the `param()` call below, and have them be
 	 * initialized directly that way. */
@@ -1980,8 +1980,10 @@ static struct command_result *json_paymod(struct command *cmd,
 		      NULL))
 		return command_param_failed();
 
+	p = payment_new(cmd, cmd, NULL /* No parent */, paymod_mods);
+
 	b11 = bolt11_decode(cmd, b11str, plugin_feature_set(cmd->plugin),
-			    NULL, &fail);
+			    NULL, chainparams, &fail);
 	if (!b11)
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 				    "Invalid bolt11: %s", fail);
@@ -2021,6 +2023,7 @@ static struct command_result *json_paymod(struct command *cmd,
 	p->json_buffer = tal_steal(p, buf);
 	p->json_toks = params;
 	p->destination = &b11->receiver_id;
+	p->destination_has_tlv = feature_offered(b11->features, OPT_VAR_ONION);
 	p->payment_hash = tal_dup(p, struct sha256, &b11->payment_hash);
 	p->payment_secret = b11->payment_secret
 				? tal_dup(p, struct secret, b11->payment_secret)
@@ -2054,6 +2057,8 @@ static struct command_result *json_paymod(struct command *cmd,
 	p->label = tal_steal(p, label);
 	payment_start(p);
 	list_add_tail(&payments, &p->list);
+	/* We're keeping this around now */
+	tal_steal(cmd->plugin, p);
 
 	return command_still_pending(cmd);
 }

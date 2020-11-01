@@ -1,10 +1,10 @@
-from bitcoin.core import COIN
-from bitcoin.rpc import RawProxy as BitcoinProxy
+from bitcoin.core import COIN  # type: ignore
+from bitcoin.rpc import RawProxy as BitcoinProxy  # type: ignore
 from pyln.client import RpcError
 from pyln.testing.btcproxy import BitcoinRpcProxy
 from collections import OrderedDict
 from decimal import Decimal
-from ephemeral_port_reserve import reserve
+from ephemeral_port_reserve import reserve  # type: ignore
 from pyln.client import LightningRpc
 from pyln.client import Millisatoshi
 
@@ -20,6 +20,7 @@ import sqlite3
 import string
 import struct
 import subprocess
+import sys
 import threading
 import time
 import warnings
@@ -202,15 +203,22 @@ class TailableProc(object):
         for line in iter(self.proc.stdout.readline, ''):
             if len(line) == 0:
                 break
-            if self.log_filter(line.decode('ASCII')):
+
+            line = line.decode('ASCII').rstrip()
+
+            if self.log_filter(line):
                 continue
+
             if self.verbose:
-                logging.debug("%s: %s", self.prefix, line.decode().rstrip())
+                sys.stdout.write("{}: {}\n".format(self.prefix, line))
+
             with self.logs_cond:
-                self.logs.append(str(line.rstrip()))
+                self.logs.append(line)
                 self.logs_cond.notifyAll()
+
         self.running = False
         self.proc.stdout.close()
+
         if self.proc.stderr:
             for line in iter(self.proc.stderr.readline, ''):
                 if len(line) == 0:
@@ -341,6 +349,7 @@ class BitcoinD(TailableProc):
             '-logtimestamps',
             '-nolisten',
             '-txindex',
+            '-wallet="test"',
             '-addresstype=bech32'
         ]
         # For up to and including 0.16.1, this needs to be in main section.
@@ -584,11 +593,13 @@ class LightningNode(object):
             # Don't run --version on every subdaemon if we're valgrinding and slow.
             if SLOW_MACHINE and VALGRIND:
                 self.daemon.opts["dev-no-version-checks"] = None
-            self.daemon.env["LIGHTNINGD_DEV_MEMLEAK"] = "1"
             if os.getenv("DEBUG_SUBD"):
                 self.daemon.opts["dev-debugger"] = os.getenv("DEBUG_SUBD")
             if valgrind:
                 self.daemon.env["LIGHTNINGD_DEV_NO_BACKTRACE"] = "1"
+            else:
+                # Under valgrind, scanning can access uninitialized mem.
+                self.daemon.env["LIGHTNINGD_DEV_MEMLEAK"] = "1"
             if not may_reconnect:
                 self.daemon.opts["dev-no-reconnect"] = None
 
@@ -739,30 +750,47 @@ class LightningNode(object):
         self.start()
 
     def fund_channel(self, l2, amount, wait_for_active=True, announce_channel=True):
+        warnings.warn("LightningNode.fund_channel is deprecated in favor of "
+                      "LightningNode.fundchannel", category=DeprecationWarning)
+        return self.fundchannel(l2, amount, wait_for_active, announce_channel)
 
+    def fundchannel(self, l2, amount, wait_for_active=True,
+                    announce_channel=True, **kwargs):
         # Give yourself some funds to work with
         addr = self.rpc.newaddr()['bech32']
+
+        def has_funds_on_addr(addr):
+            """Check if the given address has funds in the internal wallet.
+            """
+            outs = self.rpc.listfunds()['outputs']
+            addrs = [o['address'] for o in outs]
+            return addr in addrs
+
+        # We should not have funds on that address yet, we just generated it.
+        assert(not has_funds_on_addr(addr))
+
         self.bitcoin.rpc.sendtoaddress(addr, (amount + 1000000) / 10**8)
-        numfunds = len(self.rpc.listfunds()['outputs'])
         self.bitcoin.generate_block(1)
-        wait_for(lambda: len(self.rpc.listfunds()['outputs']) > numfunds)
+
+        # Now we should.
+        wait_for(lambda: has_funds_on_addr(addr))
 
         # Now go ahead and open a channel
-        num_tx = len(self.bitcoin.rpc.getrawmempool())
-        tx = self.rpc.fundchannel(l2.info['id'], amount, announce=announce_channel)['tx']
-
-        wait_for(lambda: len(self.bitcoin.rpc.getrawmempool()) == num_tx + 1)
+        res = self.rpc.fundchannel(l2.info['id'], amount,
+                                   announce=announce_channel,
+                                   **kwargs)
+        wait_for(lambda: res['txid'] in self.bitcoin.rpc.getrawmempool())
         self.bitcoin.generate_block(1)
 
         # Hacky way to find our output.
         scid = "{}x1x{}".format(self.bitcoin.rpc.getblockcount(),
-                                get_tx_p2wsh_outnum(self.bitcoin, tx, amount))
+                                get_tx_p2wsh_outnum(self.bitcoin, res['tx'], amount))
 
         if wait_for_active:
             self.wait_channel_active(scid)
             l2.wait_channel_active(scid)
 
-        return scid
+        return scid, res
 
     def subd_pid(self, subd, peerid=None):
         """Get the process id of the given subdaemon, eg channeld or gossipd"""
@@ -799,6 +827,15 @@ class LightningNode(object):
             return None
         channel = peers[0]['channels'][0]
         return channel['short_channel_id']
+
+    def get_channel_id(self, other):
+        """Get the channel_id for the channel to the other node.
+        """
+        peers = self.rpc.listpeers(other.info['id'])['peers']
+        if not peers or 'channels' not in peers[0]:
+            return None
+        channel = peers[0]['channels'][0]
+        return channel['channel_id']
 
     def is_channel_active(self, chanid):
         channels = self.rpc.listchannels(chanid)['channels']

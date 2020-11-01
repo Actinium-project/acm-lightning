@@ -8,7 +8,6 @@
 *.gcno
 *.dSYM
 *.rej
-*.po
 *.pyc
 .cppcheck-suppress
 .mypy_cache
@@ -16,7 +15,8 @@ TAGS
 tags
 ccan/tools/configurator/configurator
 ccan/ccan/cdump/tools/cdump-enumstr
-gen_*
+*_gen.c
+*_gen.h
 cli/lightning-cli
 tools/check-bolt
 tools/hsmtool
@@ -38,6 +38,8 @@ test/test_protocol
 test/test_sphinx
 tests/.pytest.restart
 tests/plugins/test_libplugin
+tests/fuzz/fuzz-*
+!tests/fuzz/fuzz-*.c
 gossip_store
 .pytest_cache
 tools/headerversions
@@ -50,4 +52,6 @@ contrib/pyln-*/dist/
 contrib/pyln-*/pyln_*.egg-info/
 plugins/keysend
 release/
-*_wiregen.[ch]
+
+devtools/route
+devtools/topology

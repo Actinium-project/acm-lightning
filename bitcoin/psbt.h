@@ -17,6 +17,16 @@ struct bitcoin_signature;
 struct bitcoin_txid;
 struct pubkey;
 
+/** psbt_destroy - Destroy a PSBT that is not tal-allocated
+ *
+ * @psbt - the PSBT to destroy
+ *
+ * WARNING Do NOT call this function directly if you got the
+ * PSBT from create_psbt, new_psbt, psbt_from_bytes,
+ * psbt_from_b64, or fromwire_wally_psbt.
+ * Those functions register this function as a `tal_destructor`
+ * automatically.
+ */
 void psbt_destroy(struct wally_psbt *psbt);
 
 /**
@@ -52,14 +62,39 @@ bool psbt_is_finalized(const struct wally_psbt *psbt);
 
 /**
  * psbt_txid - get the txid of the psbt (what it would be after finalization)
+ * @ctx: the context to allocate wtx off, if *@wtx isn't NULL.
  * @psbt: the psbt.
  * @txid: the transaction id (output)
  * @wtx: if non-NULL, returns a copy of the transaction (caller must wally_tx_free).
  */
-void psbt_txid(const struct wally_psbt *psbt, struct bitcoin_txid *txid,
+void psbt_txid(const tal_t *ctx,
+	       const struct wally_psbt *psbt, struct bitcoin_txid *txid,
 	       struct wally_tx **wtx);
 
-struct wally_tx *psbt_finalize(struct wally_psbt *psbt, bool finalize_in_place);
+/* psbt_elements_normalize_fees - Figure out the fee output for a PSET
+ *
+ * Adds a fee output if not present, or updates it to include the diff
+ * between inputs - outputs. Unlike bitcoin, elements requires every
+ * satoshi to be accounted for in an output.
+ */
+void psbt_elements_normalize_fees(struct wally_psbt *psbt);
+
+/**
+ * psbt_finalize - finalize this psbt.
+ *
+ * Returns false if we can't, otherwise returns true and psbt_is_finalized()
+ * is true.
+ */
+bool psbt_finalize(struct wally_psbt *psbt);
+
+/**
+ * psbt_final_tx - extract transaction from finalized psbt.
+ * @ctx: context to tallocate return
+ * @psbt: psbt to extract.
+ *
+ * If @psbt isn't final, or we can't extract tx, returns NULL.
+ */
+struct wally_tx *psbt_final_tx(const tal_t *ctx, const struct wally_psbt *psbt);
 
 /* psbt_make_key - Create a new, proprietary c-lightning key
  *
@@ -80,10 +115,21 @@ struct wally_psbt_input *psbt_append_input(struct wally_psbt *psbt,
 					   const struct bitcoin_txid *txid,
 					   u32 outnum, u32 sequence,
 					   const u8 *scriptSig,
-					   struct amount_sat amount,
-					   const u8 *scriptPubkey,
 					   const u8 *input_wscript,
 					   const u8 *redeemscript);
+
+/* psbt_input_set_wit_utxo - Set the witness_utxo field for this PSBT */
+void psbt_input_set_wit_utxo(struct wally_psbt *psbt, size_t in,
+			     const u8 *scriptPubkey, struct amount_sat amt);
+
+/* psbt_input_set_utxo - Set the non-witness utxo field for this PSBT input */
+void psbt_input_set_utxo(struct wally_psbt *psbt, size_t in,
+			 const struct wally_tx *prev_tx);
+
+/* psbt_elements_input_set_asset - Set the asset/value fields for an
+ * 				   Elements PSBT (PSET, technically */
+void psbt_elements_input_set_asset(struct wally_psbt *psbt, size_t in,
+				   struct amount_asset *asset);
 
 void psbt_rm_input(struct wally_psbt *psbt,
 		   size_t remove_at);
@@ -102,6 +148,10 @@ struct wally_psbt_output *psbt_add_output(struct wally_psbt *psbt,
 struct wally_psbt_output *psbt_append_output(struct wally_psbt *psbt,
 					     const u8 *script,
 					     struct amount_sat amount);
+struct wally_psbt_output *psbt_insert_output(struct wally_psbt *psbt,
+					     const u8 *script,
+					     struct amount_sat amount,
+					     size_t insert_at);
 
 void psbt_rm_output(struct wally_psbt *psbt,
 		    size_t remove_at);
@@ -113,13 +163,7 @@ WARN_UNUSED_RESULT bool psbt_input_set_signature(struct wally_psbt *psbt, size_t
 						 const struct pubkey *pubkey,
 						 const struct bitcoin_signature *sig);
 
-void psbt_input_set_prev_utxo(struct wally_psbt *psbt,
-			      size_t in,
-			      const u8 *wscript,
-			      struct amount_sat amt);
-void psbt_input_set_prev_utxo_wscript(struct wally_psbt *psbt, size_t in,
-			              const u8 *wscript,
-				      struct amount_sat amt);
+void psbt_input_set_witscript(struct wally_psbt *psbt, size_t in, const u8 *wscript);
 void psbt_elements_input_init(struct wally_psbt *psbt, size_t in,
 			      const u8 *scriptPubkey,
 			      struct amount_asset *asset,
@@ -130,13 +174,15 @@ void psbt_elements_input_init_witness(struct wally_psbt *psbt, size_t in,
 				      const u8 *nonce);
 bool psbt_input_set_redeemscript(struct wally_psbt *psbt, size_t in,
 				 const u8 *redeemscript);
-/* psbt_input_add_unknown - Add the given Key-Value to the psbt's input keymap
- * @in - psbt input to add key-value to
+/* psbt_input_set_unknown - Set the given Key-Value in the psbt's input keymap
+ * @ctx - tal context for allocations
+ * @in - psbt input to set key-value on
  * @key - key for key-value pair
- * @value - value to add
+ * @value - value to set
  * @value_len - length of {@value}
  */
-void psbt_input_add_unknown(struct wally_psbt_input *in,
+void psbt_input_set_unknown(const tal_t *ctx,
+			    struct wally_psbt_input *in,
 			    const u8 *key,
 			    const void *value,
 			    size_t value_len);
@@ -162,14 +208,16 @@ void *psbt_get_lightning(const struct wally_map *map,
 			 const u8 proprietary_type,
 			 size_t *val_len);
 
-/* psbt_output_add_unknown - Add the given Key-Value to the psbt's output keymap
+/* psbt_output_set_unknown - Set the given Key-Value in the psbt's output keymap
  *
- * @out - psbt output to add key-value to
+ * @ctx - tal context for allocations
+ * @out - psbt output to set key-value on
  * @key - key for key-value pair
- * @value - value to add
+ * @value - value to set
  * @value_len - length of {@value}
  */
-void psbt_output_add_unknown(struct wally_psbt_output *out,
+void psbt_output_set_unknown(const tal_t *ctx,
+			     struct wally_psbt_output *out,
 			     const u8 *key, const void *value,
 			     size_t value_len);
 
@@ -178,7 +226,7 @@ void psbt_output_add_unknown(struct wally_psbt_output *out,
  * @psbt - psbt
  * @in - index of input whose value you're returning
  * */
-struct amount_sat psbt_input_get_amount(struct wally_psbt *psbt,
+struct amount_sat psbt_input_get_amount(const struct wally_psbt *psbt,
 					size_t in);
 
 /* psbt_output_get_amount - Returns the value of this output
@@ -186,7 +234,7 @@ struct amount_sat psbt_input_get_amount(struct wally_psbt *psbt,
  * @psbt - psbt
  * @out -index of output whose value you're returning
  */
-struct amount_sat psbt_output_get_amount(struct wally_psbt *psbt,
+struct amount_sat psbt_output_get_amount(const struct wally_psbt *psbt,
 					 size_t out);
 
 /* psbt_has_input - Is this input present on this psbt
@@ -195,8 +243,8 @@ struct amount_sat psbt_output_get_amount(struct wally_psbt *psbt,
  * @txid - txid of input
  * @outnum - output index of input
  */
-bool psbt_has_input(struct wally_psbt *psbt,
-		    struct bitcoin_txid *txid,
+bool psbt_has_input(const struct wally_psbt *psbt,
+		    const struct bitcoin_txid *txid,
 		    u32 outnum);
 
 struct wally_psbt *psbt_from_b64(const tal_t *ctx,

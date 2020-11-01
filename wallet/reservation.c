@@ -1,21 +1,24 @@
 /* Dealing with reserving UTXOs */
+#include <bitcoin/psbt.h>
+#include <bitcoin/script.h>
+#include <ccan/mem/mem.h>
 #include <common/json_command.h>
 #include <common/json_helpers.h>
 #include <common/jsonrpc_errors.h>
-#include <common/wallet_tx.h>
+#include <common/key_derive.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/lightningd.h>
 #include <wallet/wallet.h>
 #include <wallet/walletrpc.h>
 
 static bool was_reserved(enum output_status oldstatus,
-			 const u32 *reserved_til,
+			 u32 reserved_til,
 			 u32 current_height)
 {
-	if (oldstatus != output_state_reserved)
+	if (oldstatus != OUTPUT_STATE_RESERVED)
 		return false;
 
-	return *reserved_til > current_height;
+	return reserved_til > current_height;
 }
 
 static void json_add_reservestatus(struct json_stream *response,
@@ -28,12 +31,12 @@ static void json_add_reservestatus(struct json_stream *response,
 	json_add_txid(response, "txid", &utxo->txid);
 	json_add_u32(response, "vout", utxo->outnum);
 	json_add_bool(response, "was_reserved",
-		      was_reserved(oldstatus, &old_res, current_height));
+		      was_reserved(oldstatus, old_res, current_height));
 	json_add_bool(response, "reserved",
-		      is_reserved(utxo, current_height));
-	if (utxo->reserved_til)
+		      utxo_is_reserved(utxo, current_height));
+	if (utxo_is_reserved(utxo, current_height))
 		json_add_u32(response, "reserved_to_block",
-			     *utxo->reserved_til);
+			     utxo->reserved_til);
 	json_object_end(response);
 }
 
@@ -49,7 +52,7 @@ static void reserve_and_report(struct json_stream *response,
 		u32 old_res;
 
 		oldstatus = utxos[i]->status;
-		old_res = utxos[i]->reserved_til ? *utxos[i]->reserved_til : 0;
+		old_res = utxos[i]->reserved_til;
 
 		if (!wallet_reserve_utxo(wallet,
 					 utxos[i],
@@ -93,7 +96,7 @@ static struct command_result *json_reserveinputs(struct command *cmd,
 				       &txid, psbt->tx->inputs[i].index);
 		if (!utxo)
 			continue;
-		if (*exclusive && is_reserved(utxo, current_height)) {
+		if (*exclusive && utxo_is_reserved(utxo, current_height)) {
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "%s:%u already reserved",
 					    type_to_string(tmpctx,
@@ -101,7 +104,7 @@ static struct command_result *json_reserveinputs(struct command *cmd,
 							   &utxo->txid),
 					    utxo->outnum);
 		}
-		if (utxo->status == output_state_spent)
+		if (utxo->status == OUTPUT_STATE_SPENT)
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "%s:%u already spent",
 					    type_to_string(tmpctx,
@@ -138,6 +141,28 @@ static struct command_result *json_unreserveinputs(struct command *cmd,
 		   NULL))
 		return command_param_failed();
 
+	/* We should also add the utxo info for these inputs!
+	 * (absolutely required for using this psbt in a dual-funded
+	 * round) */
+	for (size_t i = 0; i < psbt->num_inputs; i++) {
+		struct bitcoin_tx *utxo_tx;
+		struct bitcoin_txid txid;
+
+		wally_tx_input_get_txid(&psbt->tx->inputs[i], &txid);
+		utxo_tx = wallet_transaction_get(psbt, cmd->ld->wallet,
+						 &txid);
+		if (utxo_tx) {
+			tal_wally_start();
+			wally_psbt_input_set_utxo(&psbt->inputs[i],
+						  utxo_tx->wtx);
+			tal_wally_end(psbt);
+		} else
+			log_broken(cmd->ld->log,
+				   "No transaction found for UTXO %s",
+				   type_to_string(tmpctx, struct bitcoin_txid,
+						  &txid));
+	}
+
 	response = json_stream_success(cmd);
 	json_array_start(response, "reservations");
 	for (size_t i = 0; i < psbt->tx->num_inputs; i++) {
@@ -149,11 +174,11 @@ static struct command_result *json_unreserveinputs(struct command *cmd,
 		wally_tx_input_get_txid(&psbt->tx->inputs[i], &txid);
 		utxo = wallet_utxo_get(cmd, cmd->ld->wallet,
 				       &txid, psbt->tx->inputs[i].index);
-		if (!utxo || utxo->status != output_state_reserved)
+		if (!utxo || utxo->status != OUTPUT_STATE_RESERVED)
 			continue;
 
 		oldstatus = utxo->status;
-		old_res = *utxo->reserved_til;
+		old_res = utxo->reserved_til;
 
 		wallet_unreserve_utxo(cmd->ld->wallet,
 				      utxo,
@@ -208,6 +233,86 @@ static bool inputs_sufficient(struct amount_sat input,
 	return false;
 }
 
+static struct wally_psbt *psbt_using_utxos(const tal_t *ctx,
+					   struct wallet *wallet,
+					   struct utxo **utxos,
+					   const struct ext_key *bip32_base,
+					   u32 nlocktime,
+					   u32 nsequence)
+{
+	struct pubkey key;
+	u8 *scriptSig, *scriptPubkey, *redeemscript;
+	struct wally_psbt *psbt;
+
+	psbt = create_psbt(ctx, tal_count(utxos), 0, nlocktime);
+
+	for (size_t i = 0; i < tal_count(utxos); i++) {
+		u32 this_nsequence;
+		struct bitcoin_tx *tx;
+
+		if (utxos[i]->is_p2sh) {
+			bip32_pubkey(bip32_base, &key, utxos[i]->keyindex);
+			scriptSig = bitcoin_scriptsig_p2sh_p2wpkh(tmpctx, &key);
+			redeemscript = bitcoin_redeem_p2sh_p2wpkh(tmpctx, &key);
+			scriptPubkey = scriptpubkey_p2sh(tmpctx, redeemscript);
+
+			/* Make sure we've got the right info! */
+			if (utxos[i]->scriptPubkey)
+				assert(memeq(utxos[i]->scriptPubkey,
+					     tal_bytelen(utxos[i]->scriptPubkey),
+					     scriptPubkey, tal_bytelen(scriptPubkey)));
+		} else {
+			scriptSig = NULL;
+			redeemscript = NULL;
+			scriptPubkey = utxos[i]->scriptPubkey;
+		}
+
+		/* BOLT-a12da24dd0102c170365124782b46d9710950ac1 #3:
+		 * #### `to_remote` Output
+		 * ...
+		 * The output is spent by a transaction with `nSequence` field
+		 * set to `1` and witness:
+		 */
+		if (utxos[i]->close_info
+		    && utxos[i]->close_info->option_anchor_outputs)
+			this_nsequence = 1;
+		else
+			this_nsequence = nsequence;
+
+		psbt_append_input(psbt, &utxos[i]->txid, utxos[i]->outnum,
+				  this_nsequence, scriptSig,
+				  NULL, redeemscript);
+
+		psbt_input_set_wit_utxo(psbt, i, scriptPubkey, utxos[i]->amount);
+		if (is_elements(chainparams)) {
+			struct amount_asset asset;
+			/* FIXME: persist asset tags */
+			asset = amount_sat_to_asset(&utxos[i]->amount,
+						    chainparams->fee_asset_tag);
+			/* FIXME: persist nonces */
+			psbt_elements_input_set_asset(psbt,
+						      psbt->num_inputs - 1,
+						      &asset);
+		}
+
+		/* FIXME: as of 17 sept 2020, elementsd is *at most* at par
+		 * with v0.18.0 of bitcoind, which doesn't support setting
+		 * non-witness and witness utxo data for an input; remove this
+		 * check once elementsd can be updated */
+		if (!is_elements(chainparams)) {
+			/* If we have the transaction for this utxo,
+			 * add it to the PSBT as the non-witness-utxo field.
+			 * Dual-funded channels and some hardware wallets
+			 * require this */
+			tx = wallet_transaction_get(ctx, wallet, &utxos[i]->txid);
+			if (tx)
+				psbt_input_set_utxo(psbt, i, tx->wtx);
+		}
+	}
+
+	return psbt;
+}
+
 static struct command_result *finish_psbt(struct command *cmd,
 					  struct utxo **utxos,
 					  u32 feerate_per_kw,
@@ -217,7 +322,7 @@ static struct command_result *finish_psbt(struct command *cmd,
 					  u32 *locktime)
 {
 	struct json_stream *response;
-	struct bitcoin_tx *tx;
+	struct wally_psbt *psbt;
 	u32 current_height = get_block_height(cmd->ld->topology);
 
 	/* Setting the locktime to the next block to be mined has multiple
@@ -238,16 +343,18 @@ static struct command_result *finish_psbt(struct command *cmd,
 			*locktime -= pseudorand(100);
 	}
 
-	/* FIXME: tx_spending_utxos does more than we need, but there
-	 * are other users right now. */
-	tx = tx_spending_utxos(cmd, chainparams,
-			       cast_const2(const struct utxo **, utxos),
-			       cmd->ld->wallet->bip32_base,
-			       false, 0, *locktime,
-			       BITCOIN_TX_RBF_SEQUENCE);
+	psbt = psbt_using_utxos(cmd, cmd->ld->wallet, utxos,
+				cmd->ld->wallet->bip32_base,
+				*locktime, BITCOIN_TX_RBF_SEQUENCE);
 
+	/* Add a fee output if this is elements */
+	if (is_elements(chainparams)) {
+		struct amount_sat est_fee =
+			amount_tx_fee(feerate_per_kw, weight);
+		psbt_append_output(psbt, NULL, est_fee);
+	}
 	response = json_stream_success(cmd);
-	json_add_psbt(response, "psbt", tx->psbt);
+	json_add_psbt(response, "psbt", psbt);
 	json_add_num(response, "feerate_per_kw", feerate_per_kw);
 	json_add_num(response, "estimated_final_weight", weight);
 	json_add_amount_sat_only(response, "excess_msat", excess);
@@ -255,6 +362,21 @@ static struct command_result *finish_psbt(struct command *cmd,
 		reserve_and_report(response, cmd->ld->wallet, current_height,
 				   utxos);
 	return command_success(cmd, response);
+}
+
+static inline u32 minconf_to_maxheight(u32 minconf, struct lightningd *ld)
+{
+	/* No confirmations is special, we need to disable the check in the
+	 * selection */
+	if (minconf == 0)
+		return 0;
+
+	/* Avoid wrapping around and suddenly allowing any confirmed
+	 * outputs. Since we can't have a coinbase output, and 0 is taken for
+	 * the disable case, we can just clamp to 1. */
+	if (minconf >= ld->topology->tip->height)
+		return 1;
+	return ld->topology->tip->height - minconf + 1;
 }
 
 static struct command_result *json_fundpsbt(struct command *cmd,
@@ -310,34 +432,43 @@ static struct command_result *json_fundpsbt(struct command *cmd,
 		}
 
 		/* If they said "all", we expect to run out of utxos. */
-		if (all) {
-			/* If we have none at all though, fail */
-			if (!tal_count(utxos))
-				return command_fail(cmd, FUND_CANNOT_AFFORD,
-						    "No available UTXOs");
+		if (all && tal_count(utxos))
 			break;
-		}
+
+		/* Since it's possible the lack of utxos is because we haven't
+		 * finished syncing yet, report a sync timing error first */
+		if (!topology_synced(cmd->ld->topology))
+			return command_fail(cmd,
+					    FUNDING_STILL_SYNCING_BITCOIN,
+					    "Cannot afford: still syncing with bitcoin network...");
 
 		return command_fail(cmd, FUND_CANNOT_AFFORD,
 				    "Could not afford %s using all %zu available UTXOs: %s short",
-				    type_to_string(tmpctx,
-						   struct amount_sat,
-						   amount),
+				    all ? "all"
+				    : type_to_string(tmpctx,
+						     struct amount_sat,
+						     amount),
 				    tal_count(utxos),
-				    type_to_string(tmpctx,
-						   struct amount_sat,
-						   &diff));
+				    all ? "all"
+				    : type_to_string(tmpctx,
+						     struct amount_sat,
+						     &diff));
 	}
 
 	if (all) {
 		/* Anything above 0 is "excess" */
 		if (!inputs_sufficient(input, AMOUNT_SAT(0),
 				       *feerate_per_kw, *weight,
-				       &diff))
+				       &diff)) {
+			if (!topology_synced(cmd->ld->topology))
+				return command_fail(cmd,
+						    FUNDING_STILL_SYNCING_BITCOIN,
+						    "Cannot afford: still syncing with bitcoin network...");
 			return command_fail(cmd, FUND_CANNOT_AFFORD,
 					    "All %zu inputs could not afford"
 					    " fees",
 					    tal_count(utxos));
+		}
 	}
 
 	return finish_psbt(cmd, utxos, *feerate_per_kw, *weight, diff, *reserve,
@@ -397,7 +528,7 @@ static struct command_result *param_txout(struct command *cmd,
 							   &txid),
 					    outnum);
 		}
-		if (utxo->status == output_state_spent) {
+		if (utxo->status == OUTPUT_STATE_SPENT) {
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "Already spent UTXO %s:%u",
 					    type_to_string(tmpctx,
@@ -447,7 +578,7 @@ static struct command_result *json_utxopsbt(struct command *cmd,
 	for (size_t i = 0; i < tal_count(utxos); i++) {
 		const struct utxo *utxo = utxos[i];
 
-		if (!*reserved_ok && is_reserved(utxo, current_height))
+		if (!*reserved_ok && utxo_is_reserved(utxo, current_height))
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "UTXO %s:%u already reserved",
 					    type_to_string(tmpctx,

@@ -91,7 +91,7 @@ static void filter_block_txs(struct chain_topology *topo, struct block *b)
 		}
 
 		owned = AMOUNT_SAT(0);
-		bitcoin_txid(tx, &txid);
+		txid = b->txids[i];
 		if (txfilter_match(topo->bitcoind->ld->owned_txfilter, tx)) {
 			wallet_extract_owned_outputs(topo->bitcoind->ld->wallet,
 						     tx->wtx, &b->height, &owned);
@@ -108,6 +108,7 @@ static void filter_block_txs(struct chain_topology *topo, struct block *b)
 		txwatch_inform(topo, &txid, tx);
 	}
 	b->full_txs = tal_free(b->full_txs);
+	b->txids = tal_free(b->txids);
 }
 
 size_t get_tx_depth(const struct chain_topology *topo,
@@ -218,10 +219,12 @@ static void broadcast_done(struct bitcoind *bitcoind,
 	}
 }
 
-void broadcast_tx(struct chain_topology *topo,
-		  struct channel *channel, const struct bitcoin_tx *tx,
-		  void (*failed_or_success)(struct channel *channel,
-					    bool success, const char *err))
+void broadcast_tx_ahf(struct chain_topology *topo,
+		      struct channel *channel, const struct bitcoin_tx *tx,
+		      bool allowhighfees,
+		      void (*failed)(struct channel *channel,
+				     bool success,
+				     const char *err))
 {
 	/* Channel might vanish: topo owns it to start with. */
 	struct outgoing_tx *otx = tal(topo, struct outgoing_tx);
@@ -230,7 +233,7 @@ void broadcast_tx(struct chain_topology *topo,
 	otx->channel = channel;
 	bitcoin_txid(tx, &otx->txid);
 	otx->hextx = tal_hex(otx, rawtx);
-	otx->failed_or_success = failed_or_success;
+	otx->failed_or_success = failed;
 	tal_free(rawtx);
 	tal_add_destructor2(channel, clear_otx_channel, otx);
 
@@ -238,8 +241,18 @@ void broadcast_tx(struct chain_topology *topo,
 		  type_to_string(tmpctx, struct bitcoin_txid, &otx->txid));
 
 	wallet_transaction_add(topo->ld->wallet, tx->wtx, 0, 0);
-	bitcoind_sendrawtx(topo->bitcoind, otx->hextx, broadcast_done, otx);
+	bitcoind_sendrawtx_ahf(topo->bitcoind, otx->hextx, allowhighfees,
+			       broadcast_done, otx);
 }
+void broadcast_tx(struct chain_topology *topo,
+		  struct channel *channel, const struct bitcoin_tx *tx,
+		  void (*failed)(struct channel *channel,
+				 bool success,
+				 const char *err))
+{
+	return broadcast_tx_ahf(topo, channel, tx, false, failed);
+}
+
 
 static enum watch_result closeinfo_txid_confirmed(struct lightningd *ld,
 						  struct channel *channel,
@@ -350,7 +363,7 @@ static void add_feerate_history(struct chain_topology *topo,
 /* Did the the feerate change since we last estimated it ? */
 static bool feerate_changed(struct chain_topology *topo, u32 old_feerates[])
 {
-	for (enum feerate f = 0; f < NUM_FEERATES; f++) {
+	for (int f = 0; f < NUM_FEERATES; f++) {
 		if (try_get_feerate(topo, f) != old_feerates[f])
 			return true;
 	}
@@ -741,14 +754,14 @@ log_fee:
  */
 static void topo_update_spends(struct chain_topology *topo, struct block *b)
 {
-	const struct short_channel_id *scid;
+	const struct short_channel_id *spent_scids;
 	for (size_t i = 0; i < tal_count(b->full_txs); i++) {
 		const struct bitcoin_tx *tx = b->full_txs[i];
 		bool our_tx = true, includes_our_spend = false;
 		struct bitcoin_txid txid;
 		struct amount_sat inputs_total = AMOUNT_SAT(0);
 
-		bitcoin_txid(tx, &txid);
+		txid = b->txids[i];
 
 		for (size_t j = 0; j < tx->wtx->num_inputs; j++) {
 			const struct wally_tx_input *input = &tx->wtx->inputs[j];
@@ -757,15 +770,9 @@ static void topo_update_spends(struct chain_topology *topo, struct block *b)
 
 			bitcoin_tx_input_get_txid(tx, j, &outpoint_txid);
 
-			scid = wallet_outpoint_spend(topo->ld->wallet, tmpctx,
-						     b->height, &outpoint_txid,
-						     input->index,
-						     &our_spend);
-			if (scid) {
-				gossipd_notify_spend(topo->bitcoind->ld, scid);
-				tal_free(scid);
-			}
-
+			our_spend = wallet_outpoint_spend(
+			    topo->ld->wallet, tmpctx, b->height, &outpoint_txid,
+			    input->index);
 			our_tx &= our_spend;
 			includes_our_spend |= our_spend;
 			if (our_spend) {
@@ -783,6 +790,15 @@ static void topo_update_spends(struct chain_topology *topo, struct block *b)
 			record_tx_outs_and_fees(topo->ld, tx, &txid,
 						b->height, inputs_total, our_tx);
 	}
+	/* Retrieve all potential channel closes from the UTXO set and
+	 * tell gossipd about them. */
+	spent_scids =
+	    wallet_utxoset_get_spent(tmpctx, topo->ld->wallet, b->height);
+
+	for (size_t i=0; i<tal_count(spent_scids); i++) {
+		gossipd_notify_spend(topo->bitcoind->ld, &spent_scids[i]);
+	}
+	tal_free(spent_scids);
 }
 
 static void topo_add_utxos(struct chain_topology *topo, struct block *b)
@@ -843,6 +859,7 @@ static struct block *new_block(struct chain_topology *topo,
 	b->hdr = blk->hdr;
 
 	b->full_txs = tal_steal(b, blk->tx);
+	b->txids = tal_steal(b, blk->txids);
 
 	return b;
 }
