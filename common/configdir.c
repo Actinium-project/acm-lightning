@@ -447,12 +447,6 @@ void initial_config_opts(const tal_t *ctx,
 	opt_register_early_noarg("--signet",
 				 opt_restricted_toplevel_noarg, NULL,
 				 "Alias for --network=signet");
-<<<<<<< HEAD
-	opt_register_early_noarg("--mainnet",
-				 opt_restricted_toplevel_noarg, NULL,
-				 "Alias for --network=actinium");
-=======
->>>>>>> d151d554b37e8cbf117d3a85f1503588830da8a8
 
 	/* They can set this later, it's just less effective. */
 	opt_register_early_arg("--allow-deprecated-apis",
