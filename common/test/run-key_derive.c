@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <ccan/str/hex/hex.h>
 #include <common/amount.h>
+#include <common/setup.h>
 #include <common/utils.h>
 #include <stdio.h>
 #include <wire/wire.h>
@@ -76,6 +77,9 @@ u64 fromwire_u64(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
 /* Generated stub for fromwire_u8 */
 u8 fromwire_u8(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
 { fprintf(stderr, "fromwire_u8 called!\n"); abort(); }
+/* Generated stub for fromwire_u8_array */
+void fromwire_u8_array(const u8 **cursor UNNEEDED, size_t *max UNNEEDED, u8 *arr UNNEEDED, size_t num UNNEEDED)
+{ fprintf(stderr, "fromwire_u8_array called!\n"); abort(); }
 /* Generated stub for towire */
 void towire(u8 **pptr UNNEEDED, const void *data UNNEEDED, size_t len UNNEEDED)
 { fprintf(stderr, "towire called!\n"); abort(); }
@@ -118,17 +122,13 @@ static struct secret secret_from_hex(const char *hex)
 	return s;
 }
 
-int main(void)
+int main(int argc, char *argv[])
 {
-	setup_locale();
-
 	struct privkey privkey;
 	struct secret base_secret, per_commitment_secret;
 	struct pubkey base_point, per_commitment_point, pubkey, pubkey2;
 
-	setup_tmpctx();
-	secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY
-						 | SECP256K1_CONTEXT_SIGN);
+	common_setup(argv[0]);
 
 	base_secret = secret_from_hex("0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
 	per_commitment_secret = secret_from_hex("0x1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100");
@@ -178,8 +178,5 @@ int main(void)
 	pubkey_from_privkey(&privkey, &pubkey2);
 	assert(pubkey_eq(&pubkey, &pubkey2));
 
-	/* No memory leaks please */
-	secp256k1_context_destroy(secp256k1_ctx);
-	tal_free(tmpctx);
-	return 0;
+	common_shutdown();
 }

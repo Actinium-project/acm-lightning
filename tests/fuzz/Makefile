@@ -21,7 +21,9 @@ FUZZ_COMMON_OBJS := \
 	common/daemon.o					\
 	common/daemon_conn.o				\
 	common/derive_basepoints.o			\
+	common/descriptor_checksum.o			\
 	common/fee_states.o				\
+	common/hsm_encryption.o				\
 	common/htlc_state.o				\
 	common/permute_tx.o				\
 	common/initial_channel.o			\
@@ -45,6 +47,7 @@ FUZZ_COMMON_OBJS := \
 	wire/onion_wiregen.o				\
 	wire/peer_wire.o				\
 	wire/peer_wiregen.o				\
+	wire/tlvstream.o				\
 	wire/towire.o					\
 	wire/wire_io.o					\
 	wire/wire_sync.o

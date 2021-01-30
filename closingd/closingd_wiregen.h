@@ -56,4 +56,4 @@ bool fromwire_closingd_complete(const void *p);
 
 
 #endif /* LIGHTNING_CLOSINGD_CLOSINGD_WIREGEN_H */
-// SHA256STAMP:c9a8c207d4b03e4a8a63e24b8cf04bdcdce031f05ce238c23d66861736d38093
+// SHA256STAMP:196786d8f37f20c93162a33692b7caddc638a48d4ec15c1a9bc09bbec41da360

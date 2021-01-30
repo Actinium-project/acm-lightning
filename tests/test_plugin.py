@@ -1,4 +1,5 @@
 from collections import OrderedDict
+from datetime import datetime
 from fixtures import *  # noqa: F401,F403
 from flaky import flaky  # noqa: F401
 from hashlib import sha256
@@ -51,7 +52,6 @@ def test_option_passthrough(node_factory, directory):
     n.stop()
 
 
-@unittest.skipIf(DEPRECATED_APIS, "We test the new API.")
 def test_option_types(node_factory):
     """Ensure that desired types of options are
        respected in output """
@@ -120,23 +120,14 @@ def test_option_types(node_factory):
     assert not n.daemon.running
     assert n.daemon.is_in_stderr("--flag_opt: doesn't allow an argument")
 
-    plugin_path = os.path.join(os.getcwd(), 'tests/plugins/options.py')
     n = node_factory.get_node(options={
         'plugin': plugin_path,
-        'str_opt': 'ok',
-        'int_opt': 22,
-        'bool_opt': 1,
-        'flag_opt': None,
-        'allow-deprecated-apis': True
+        'str_optm': ['ok', 'ok2'],
+        'int_optm': [11, 12, 13],
     })
 
-    # because of how the python json parser works, since we're adding the deprecated
-    # string option after the 'typed' option in the JSON, the string option overwrites
-    # the earlier typed option in JSON parsing, resulting in a option set of only strings
-    assert n.daemon.is_in_log(r"option str_opt ok <class 'str'>")
-    assert n.daemon.is_in_log(r"option int_opt 22 <class 'str'>")
-    assert n.daemon.is_in_log(r"option bool_opt 1 <class 'str'>")
-    assert n.daemon.is_in_log(r"option flag_opt True <class 'bool'>")
+    assert n.daemon.is_in_log(r"option str_optm \['ok', 'ok2'\] <class 'list'>")
+    assert n.daemon.is_in_log(r"option int_optm \[11, 12, 13\] <class 'list'>")
     n.stop()
 
 
@@ -266,7 +257,7 @@ def test_plugin_command(node_factory):
 
     # Test that we can add a directory with more than one new plugin in it.
     try:
-        n.rpc.plugin_startdir(os.path.join(os.getcwd(), "tests/plugins"))
+        n.rpc.plugin_startdir(os.path.join(os.getcwd(), "contrib/plugins"))
     except RpcError:
         pass
 
@@ -395,7 +386,7 @@ def test_pay_plugin(node_factory):
 
     # Make sure usage messages are present.
     msg = 'pay bolt11 [msatoshi] [label] [riskfactor] [maxfeepercent] '\
-          '[retry_for] [maxdelay] [exemptfee]'
+          '[retry_for] [maxdelay] [exemptfee] [localofferid]'
     if DEVELOPER:
         msg += ' [use_shadow]'
     assert only_one(l1.rpc.help('pay')['help'])['command'] == msg
@@ -418,7 +409,7 @@ def test_plugin_connected_hook(node_factory):
     l1.daemon.wait_for_log(r"{} is in reject list".format(l3.info['id']))
 
     # FIXME: this error occurs *after* connection, so we connect then drop.
-    l3.daemon.wait_for_log(r"openingd-chan#1: peer_in WIRE_ERROR")
+    l3.daemon.wait_for_log(r"chan#1: peer_in WIRE_ERROR")
     l3.daemon.wait_for_log(r"You are in reject list")
 
     def check_disconnect():
@@ -457,6 +448,32 @@ def test_db_hook(node_factory, executor):
     """This tests the db hook."""
     dbfile = os.path.join(node_factory.directory, "dblog.sqlite3")
     l1 = node_factory.get_node(options={'plugin': os.path.join(os.getcwd(), 'tests/plugins/dblog.py'),
+                                        'dblog-file': dbfile})
+
+    # It should see the db being created, and sometime later actually get
+    # initted.
+    # This precedes startup, so needle already past
+    assert l1.daemon.is_in_log(r'plugin-dblog.py: deferring \d+ commands')
+    l1.daemon.logsearch_start = 0
+    l1.daemon.wait_for_log('plugin-dblog.py: replaying pre-init data:')
+    l1.daemon.wait_for_log('plugin-dblog.py: CREATE TABLE version \\(version INTEGER\\)')
+    l1.daemon.wait_for_log("plugin-dblog.py: initialized.* 'startup': True")
+
+    l1.stop()
+
+    # Databases should be identical.
+    db1 = sqlite3.connect(os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, 'lightningd.sqlite3'))
+    db2 = sqlite3.connect(dbfile)
+
+    assert [x for x in db1.iterdump()] == [x for x in db2.iterdump()]
+
+
+@unittest.skipIf(os.getenv('TEST_DB_PROVIDER', 'sqlite3') != 'sqlite3', "Only sqlite3 implements the db_write_hook currently")
+def test_db_hook_multiple(node_factory, executor):
+    """This tests the db hook for multiple-plugin case."""
+    dbfile = os.path.join(node_factory.directory, "dblog.sqlite3")
+    l1 = node_factory.get_node(options={'plugin': os.path.join(os.getcwd(), 'tests/plugins/dblog.py'),
+                                        'important-plugin': os.path.join(os.getcwd(), 'tests/plugins/dbdummy.py'),
                                         'dblog-file': dbfile})
 
     # It should see the db being created, and sometime later actually get
@@ -544,18 +561,39 @@ def test_openchannel_hook(node_factory, bitcoind):
     l1.rpc.fundchannel(l2.info['id'], 100000)
 
     # Make sure plugin got all the vars we expect
-    l2.daemon.wait_for_log('reject_odd_funding_amounts.py: 11 VARS')
-    l2.daemon.wait_for_log('reject_odd_funding_amounts.py: channel_flags=1')
-    l2.daemon.wait_for_log('reject_odd_funding_amounts.py: channel_reserve_satoshis=1000000msat')
-    l2.daemon.wait_for_log('reject_odd_funding_amounts.py: dust_limit_satoshis=546000msat')
-    l2.daemon.wait_for_log('reject_odd_funding_amounts.py: feerate_per_kw=7500')
-    l2.daemon.wait_for_log('reject_odd_funding_amounts.py: funding_satoshis=100000000msat')
-    l2.daemon.wait_for_log('reject_odd_funding_amounts.py: htlc_minimum_msat=0msat')
-    l2.daemon.wait_for_log('reject_odd_funding_amounts.py: id={}'.format(l1.info['id']))
-    l2.daemon.wait_for_log('reject_odd_funding_amounts.py: max_accepted_htlcs=483')
-    l2.daemon.wait_for_log('reject_odd_funding_amounts.py: max_htlc_value_in_flight_msat=18446744073709551615msat')
-    l2.daemon.wait_for_log('reject_odd_funding_amounts.py: push_msat=0msat')
-    l2.daemon.wait_for_log('reject_odd_funding_amounts.py: to_self_delay=5')
+    expected = {
+        'channel_flags': '1',
+        'dust_limit_satoshis': '546000msat',
+        'htlc_minimum_msat': '0msat',
+        'id': l1.info['id'],
+        'max_accepted_htlcs': '483',
+        'max_htlc_value_in_flight_msat': '18446744073709551615msat',
+        'to_self_delay': '5',
+    }
+
+    if l2.config('experimental-dual-fund'):
+        # openchannel2 var checks
+        expected.update({
+            'commitment_feerate_per_kw': '750',
+            'feerate_our_max': '150000',
+            'feerate_our_min': '1875',
+            'funding_feerate_best': '7500',
+            'funding_feerate_max': '150000',
+            'funding_feerate_min': '1875',
+            'locktime': '.*',
+            'their_funding': '100000000msat',
+        })
+    else:
+        expected.update({
+            'channel_reserve_satoshis': '1000000msat',
+            'feerate_per_kw': '7500',
+            'funding_satoshis': '100000000msat',
+            'push_msat': '0msat',
+        })
+
+    l2.daemon.wait_for_log('reject_odd_funding_amounts.py: {} VARS'.format(len(expected)))
+    for k, v in expected.items():
+        assert l2.daemon.is_in_log('reject_odd_funding_amounts.py: {}={}'.format(k, v))
 
     # Close it.
     txid = l1.rpc.close(l2.info['id'])['txid']
@@ -585,9 +623,9 @@ def test_openchannel_hook_error_handling(node_factory, bitcoind):
     l1.fundwallet(10**6)
 
     # next fundchannel should fail fatal() for l2
-    with pytest.raises(RpcError, match=r'Owning subdaemon openingd died'):
+    with pytest.raises(RpcError, match=r'Owning subdaemon (openingd|dualopend) died'):
         l1.rpc.fundchannel(l2.info['id'], 100004)
-    assert l2.daemon.is_in_log("BROKEN.*Plugin rejected openchannel but also set close_to")
+    assert l2.daemon.is_in_log("BROKEN.*Plugin rejected openchannel[2]? but also set close_to")
 
 
 def test_openchannel_hook_chaining(node_factory, bitcoind):
@@ -606,24 +644,17 @@ def test_openchannel_hook_chaining(node_factory, bitcoind):
     l1, l2 = node_factory.line_graph(2, fundchannel=False, opts=opts)
     l1.fundwallet(10**6)
 
-    hook_msg = "openchannel_hook rejects and says '"
+    hook_msg = "openchannel2?_hook rejects and says '"
     # 100005sat fundchannel should fail fatal() for l2
     # because hook_accepter.py rejects on that amount 'for a reason'
     with pytest.raises(RpcError, match=r'They sent error channel'):
         l1.rpc.fundchannel(l2.info['id'], 100005)
 
-    # Note: hook chain order is currently undefined, because hooks are registerd
-    #       as a result of the getmanifest call, which may take some random time.
-    #       We need to workaround that fact, so test can be stable
-    correct_order = l2.daemon.is_in_log(hook_msg + "reject for a reason")
-    if correct_order:
-        assert l2.daemon.wait_for_log(hook_msg + "reject for a reason")
-        # the other plugin must not be called
-        assert not l2.daemon.is_in_log("reject on principle")
-    else:
-        assert l2.daemon.wait_for_log(hook_msg + "reject on principle")
-        # the other plugin must not be called
-        assert not l2.daemon.is_in_log("reject for a reason")
+    assert l2.daemon.wait_for_log(hook_msg + "reject for a reason")
+    # first plugin in the chain was called
+    assert l2.daemon.is_in_log("accept on principle")
+    # the third plugin must now not be called anymore
+    assert not l2.daemon.is_in_log("reject on principle")
 
     # 100000sat is good for hook_accepter, so it should fail 'on principle'
     # at third hook openchannel_reject.py
@@ -632,120 +663,278 @@ def test_openchannel_hook_chaining(node_factory, bitcoind):
     assert l2.daemon.wait_for_log(hook_msg + "reject on principle")
 
 
-def test_channel_state_changed(node_factory, bitcoind):
-    opts = [{}, {"plugin": os.path.join(os.getcwd(), "tests/plugins/misc_notifications.py")}]
+def test_channel_state_changed_bilateral(node_factory, bitcoind):
+    """ We open and close a channel and check notifications both sides.
+
+    The misc_notifications.py plugin logs `channel_state_changed` events.
+    """
+    opts = {"plugin": os.path.join(os.getcwd(), "tests/plugins/misc_notifications.py")}
     l1, l2 = node_factory.line_graph(2, opts=opts)
 
-    peer_id = l1.rpc.getinfo()["id"]
+    l1_id = l1.rpc.getinfo()["id"]
+    l2_id = l2.rpc.getinfo()["id"]
     cid = l1.get_channel_id(l2)
     scid = l1.get_channel_scid(l2)
 
-    msg = l2.daemon.wait_for_log("channel_state_changed.*new_state.*")
-    event = ast.literal_eval(re.findall(".*({.*}).*", msg)[0])
-    assert(event['peer_id'] == peer_id)
-    assert(event['channel_id'] == cid)
-    assert(event['short_channel_id'] == scid)
-    assert(event['old_state'] == "CHANNELD_AWAITING_LOCKIN")
-    assert(event['new_state'] == "CHANNELD_NORMAL")
+    # a helper that gives us the next channel_state_changed log entry
+    def wait_for_event(node):
+        msg = node.daemon.wait_for_log("channel_state_changed.*new_state.*")
+        event = ast.literal_eval(re.findall(".*({.*}).*", msg)[0])
+        return event
+
+    # check channel 'opener' and 'closer' within this testcase ...
+    assert(l1.rpc.listpeers()['peers'][0]['channels'][0]['opener'] == 'local')
+    assert(l2.rpc.listpeers()['peers'][0]['channels'][0]['opener'] == 'remote')
+    # the 'closer' should be null initially
+    assert(l2.rpc.listpeers()['peers'][0]['channels'][0]['closer'] is None)
+    assert(l2.rpc.listpeers()['peers'][0]['channels'][0]['closer'] is None)
+
+    event1 = wait_for_event(l1)
+    event2 = wait_for_event(l2)
+    if l1.config('experimental-dual-fund'):
+        # Dual funded channels have an extra state change
+        assert(event1['peer_id'] == l2_id)  # we only test these IDs the first time
+        assert(event1['channel_id'] == cid)
+        assert(event1['short_channel_id'] is None)
+        assert(event1['old_state'] == "DUALOPEND_OPEN_INIT")
+        assert(event1['new_state'] == "DUALOPEND_AWAITING_LOCKIN")
+        assert(event1['cause'] == "user")
+        assert(event1['message'] == "Sigs exchanged, waiting for lock-in")
+        event1 = wait_for_event(l1)
+        assert(event2['peer_id'] == l1_id)  # we only test these IDs the first time
+        assert(event2['channel_id'] == cid)
+        assert(event2['short_channel_id'] is None)
+        assert(event2['old_state'] == "DUALOPEND_OPEN_INIT")
+        assert(event2['new_state'] == "DUALOPEND_AWAITING_LOCKIN")
+        assert(event2['cause'] == "remote")
+        assert(event2['message'] == "Sigs exchanged, waiting for lock-in")
+        event2 = wait_for_event(l2)
+
+    assert(event1['peer_id'] == l2_id)  # we only test these IDs the first time
+    assert(event1['channel_id'] == cid)
+    assert(event1['short_channel_id'] == scid)
+    if l1.config('experimental-dual-fund'):
+        assert(event1['old_state'] == "DUALOPEND_AWAITING_LOCKIN")
+    else:
+        assert(event1['old_state'] == "CHANNELD_AWAITING_LOCKIN")
+    assert(event1['new_state'] == "CHANNELD_NORMAL")
+    assert(event1['cause'] == "user")
+    assert(event1['message'] == "Lockin complete")
+
+    assert(event2['peer_id'] == l1_id)
+    assert(event2['channel_id'] == cid)
+    assert(event2['short_channel_id'] == scid)
+    if l1.config('experimental-dual-fund'):
+        assert(event2['old_state'] == "DUALOPEND_AWAITING_LOCKIN")
+    else:
+        assert(event2['old_state'] == "CHANNELD_AWAITING_LOCKIN")
+    assert(event2['new_state'] == "CHANNELD_NORMAL")
+    assert(event2['cause'] == "remote")
+    assert(event2['message'] == "Lockin complete")
+
+    # also test the correctness of timestamps once
+    assert(datetime.strptime(event1['timestamp'], '%Y-%m-%dT%H:%M:%S.%fZ'))
+    assert(datetime.strptime(event2['timestamp'], '%Y-%m-%dT%H:%M:%S.%fZ'))
 
     # close channel and look for stateful events
     l1.rpc.close(scid)
-    msg = l2.daemon.wait_for_log("channel_state_changed.*new_state.*")
-    event = ast.literal_eval(re.findall(".*({.*}).*", msg)[0])
-    assert(event['peer_id'] == peer_id)
-    assert(event['channel_id'] == cid)
-    assert(event['short_channel_id'] == scid)
-    assert(event['old_state'] == "CHANNELD_NORMAL")
-    assert(event['new_state'] == "CHANNELD_SHUTTING_DOWN")
 
-    msg = l2.daemon.wait_for_log("channel_state_changed.*new_state.*")
-    event = ast.literal_eval(re.findall(".*({.*}).*", msg)[0])
-    assert(event['peer_id'] == peer_id)
-    assert(event['channel_id'] == cid)
-    assert(event['short_channel_id'] == scid)
-    assert(event['old_state'] == "CHANNELD_SHUTTING_DOWN")
-    assert(event['new_state'] == "CLOSINGD_SIGEXCHANGE")
+    event1 = wait_for_event(l1)
+    assert(event1['old_state'] == "CHANNELD_NORMAL")
+    assert(event1['new_state'] == "CHANNELD_SHUTTING_DOWN")
+    assert(event1['cause'] == "user")
+    assert(event1['message'] == "User or plugin invoked close command")
+    event2 = wait_for_event(l2)
+    assert(event2['old_state'] == "CHANNELD_NORMAL")
+    assert(event2['new_state'] == "CHANNELD_SHUTTING_DOWN")
+    assert(event2['cause'] == "remote")
+    assert(event2['message'] == "Peer closes channel")
 
-    msg = l2.daemon.wait_for_log("channel_state_changed.*new_state.*")
-    event = ast.literal_eval(re.findall(".*({.*}).*", msg)[0])
-    assert(event['peer_id'] == peer_id)
-    assert(event['channel_id'] == cid)
-    assert(event['short_channel_id'] == scid)
-    assert(event['old_state'] == "CLOSINGD_SIGEXCHANGE")
-    assert(event['new_state'] == "CLOSINGD_COMPLETE")
+    # 'closer' should now be set accordingly ...
+    assert(l1.rpc.listpeers()['peers'][0]['channels'][0]['closer'] == 'local')
+    assert(l2.rpc.listpeers()['peers'][0]['channels'][0]['closer'] == 'remote')
 
-    bitcoind.generate_block(100)  # so it gets settled
+    event1 = wait_for_event(l1)
+    assert(event1['old_state'] == "CHANNELD_SHUTTING_DOWN")
+    assert(event1['new_state'] == "CLOSINGD_SIGEXCHANGE")
+    assert(event1['cause'] == "user")
+    assert(event1['message'] == "Start closingd")
+    event2 = wait_for_event(l2)
+    assert(event2['old_state'] == "CHANNELD_SHUTTING_DOWN")
+    assert(event2['new_state'] == "CLOSINGD_SIGEXCHANGE")
+    assert(event2['cause'] == "remote")
+    assert(event2['message'] == "Start closingd")
 
-    msg = l2.daemon.wait_for_log("channel_state_changed.*new_state.*")
-    event = ast.literal_eval(re.findall(".*({.*}).*", msg)[0])
-    assert(event['peer_id'] == peer_id)
-    assert(event['channel_id'] == cid)
-    assert(event['short_channel_id'] == scid)
-    assert(event['old_state'] == "CLOSINGD_COMPLETE")
-    assert(event['new_state'] == "FUNDING_SPEND_SEEN")
+    event1 = wait_for_event(l1)
+    assert(event1['old_state'] == "CLOSINGD_SIGEXCHANGE")
+    assert(event1['new_state'] == "CLOSINGD_COMPLETE")
+    assert(event1['cause'] == "user")
+    assert(event1['message'] == "Closing complete")
+    event2 = wait_for_event(l2)
+    assert(event2['old_state'] == "CLOSINGD_SIGEXCHANGE")
+    assert(event2['new_state'] == "CLOSINGD_COMPLETE")
+    assert(event2['cause'] == "remote")
+    assert(event2['message'] == "Closing complete")
 
-    msg = l2.daemon.wait_for_log("channel_state_changed.*new_state.*")
-    event = ast.literal_eval(re.findall(".*({.*}).*", msg)[0])
-    assert(event['peer_id'] == peer_id)
-    assert(event['channel_id'] == cid)
-    assert(event['short_channel_id'] == scid)
-    assert(event['old_state'] == "FUNDING_SPEND_SEEN")
-    assert(event['new_state'] == "ONCHAIN")
+    bitcoind.generate_block(100, wait_for_mempool=1)  # so it gets settled
+
+    event1 = wait_for_event(l1)
+    assert(event1['old_state'] == "CLOSINGD_COMPLETE")
+    assert(event1['new_state'] == "FUNDING_SPEND_SEEN")
+    assert(event1['cause'] == "user")
+    assert(event1['message'] == "Onchain funding spend")
+    event2 = wait_for_event(l2)
+    assert(event2['old_state'] == "CLOSINGD_COMPLETE")
+    assert(event2['new_state'] == "FUNDING_SPEND_SEEN")
+    assert(event2['cause'] == "remote")
+    assert(event2['message'] == "Onchain funding spend")
+
+    event1 = wait_for_event(l1)
+    assert(event1['old_state'] == "FUNDING_SPEND_SEEN")
+    assert(event1['new_state'] == "ONCHAIN")
+    assert(event1['cause'] == "user")
+    assert(event1['message'] == "Onchain init reply")
+    event2 = wait_for_event(l2)
+    assert(event2['old_state'] == "FUNDING_SPEND_SEEN")
+    assert(event2['new_state'] == "ONCHAIN")
+    assert(event2['cause'] == "remote")
+    assert(event2['message'] == "Onchain init reply")
 
 
 def test_channel_state_changed_unilateral(node_factory, bitcoind):
-    opts = [{}, {"plugin": os.path.join(os.getcwd(), "tests/plugins/misc_notifications.py")}]
+    """ We open, disconnect, force-close a channel and check for notifications.
+
+    The misc_notifications.py plugin logs `channel_state_changed` events.
+    """
+    opts = {"plugin": os.path.join(os.getcwd(), "tests/plugins/misc_notifications.py")}
     l1, l2 = node_factory.line_graph(2, opts=opts)
 
-    peer_id = l1.rpc.getinfo()["id"]
+    l1_id = l1.rpc.getinfo()["id"]
     cid = l1.get_channel_id(l2)
     scid = l1.get_channel_scid(l2)
 
-    msg = l2.daemon.wait_for_log("channel_state_changed.*new_state.*")
-    event = ast.literal_eval(re.findall(".*({.*}).*", msg)[0])
-    assert(event['peer_id'] == peer_id)
-    assert(event['channel_id'] == cid)
-    assert(event['short_channel_id'] == scid)
-    assert(event['old_state'] == "CHANNELD_AWAITING_LOCKIN")
-    assert(event['new_state'] == "CHANNELD_NORMAL")
+    # a helper that gives us the next channel_state_changed log entry
+    def wait_for_event(node):
+        msg = node.daemon.wait_for_log("channel_state_changed.*new_state.*")
+        event = ast.literal_eval(re.findall(".*({.*}).*", msg)[0])
+        return event
+
+    event2 = wait_for_event(l2)
+    if l2.config('experimental-dual-fund'):
+        assert(event2['peer_id'] == l1_id)
+        assert(event2['channel_id'] == cid)
+        assert(event2['short_channel_id'] is None)
+        assert(event2['old_state'] == "DUALOPEND_OPEN_INIT")
+        assert(event2['new_state'] == "DUALOPEND_AWAITING_LOCKIN")
+        assert(event2['cause'] == "remote")
+        assert(event2['message'] == "Sigs exchanged, waiting for lock-in")
+        event2 = wait_for_event(l2)
+
+    assert(event2['peer_id'] == l1_id)  # we only test these IDs the first time
+    assert(event2['channel_id'] == cid)
+    assert(event2['short_channel_id'] == scid)
+    if l2.config('experimental-dual-fund'):
+        assert(event2['old_state'] == "DUALOPEND_AWAITING_LOCKIN")
+    else:
+        assert(event2['old_state'] == "CHANNELD_AWAITING_LOCKIN")
+    assert(event2['new_state'] == "CHANNELD_NORMAL")
+    assert(event2['cause'] == "remote")
+    assert(event2['message'] == "Lockin complete")
 
     # close channel unilaterally and look for stateful events
     l1.rpc.stop()
     wait_for(lambda: not only_one(l2.rpc.listpeers()['peers'])['connected'])
-    l2.rpc.close(scid, 1)  # 1sec timeout
-    msg = l2.daemon.wait_for_log("channel_state_changed.*new_state.*")
-    event = ast.literal_eval(re.findall(".*({.*}).*", msg)[0])
-    assert(event['peer_id'] == peer_id)
-    assert(event['channel_id'] == cid)
-    assert(event['short_channel_id'] == scid)
-    assert(event['old_state'] == "CHANNELD_NORMAL")
-    assert(event['new_state'] == "CHANNELD_SHUTTING_DOWN")
+    l2.rpc.close(scid, 1)  # force close after 1sec timeout
 
-    msg = l2.daemon.wait_for_log("channel_state_changed.*new_state.*")
-    event = ast.literal_eval(re.findall(".*({.*}).*", msg)[0])
-    assert(event['peer_id'] == peer_id)
-    assert(event['channel_id'] == cid)
-    assert(event['short_channel_id'] == scid)
-    assert(event['old_state'] == "CHANNELD_SHUTTING_DOWN")
-    assert(event['new_state'] == "AWAITING_UNILATERAL")
+    event2 = wait_for_event(l2)
+    assert(event2['old_state'] == "CHANNELD_NORMAL")
+    assert(event2['new_state'] == "CHANNELD_SHUTTING_DOWN")
+    assert(event2['cause'] == "user")
+    assert(event2['message'] == "User or plugin invoked close command")
+    event2 = wait_for_event(l2)
+    assert(event2['old_state'] == "CHANNELD_SHUTTING_DOWN")
+    assert(event2['new_state'] == "AWAITING_UNILATERAL")
+    assert(event2['cause'] == "user")
+    assert(event2['message'] == "Forcibly closed by `close` command timeout")
 
+    # restart l1 early, as the test gets flaky when done after generate_block(100)
+    l1.restart()
+    wait_for(lambda: len(l1.rpc.listpeers()['peers']) == 1)
+    # check 'closer' on l2 while the peer is not yet forgotten
+    assert(l2.rpc.listpeers()['peers'][0]['channels'][0]['closer'] == 'local')
+
+    # settle the channel closure
+    bitcoind.generate_block(100)
+
+    event2 = wait_for_event(l2)
+    assert(event2['old_state'] == "AWAITING_UNILATERAL")
+    assert(event2['new_state'] == "FUNDING_SPEND_SEEN")
+    assert(event2['cause'] == "user")
+    assert(event2['message'] == "Onchain funding spend")
+    event2 = wait_for_event(l2)
+    assert(event2['old_state'] == "FUNDING_SPEND_SEEN")
+    assert(event2['new_state'] == "ONCHAIN")
+    assert(event2['cause'] == "user")
+    assert(event2['message'] == "Onchain init reply")
+
+    # Check 'closer' on l1 while the peer is not yet forgotten
+    event1 = wait_for_event(l1)
+    assert(l1.rpc.listpeers()['peers'][0]['channels'][0]['closer'] == 'remote')
+
+    # check if l1 sees ONCHAIN reasons for his channel
+    assert(event1['old_state'] == "CHANNELD_NORMAL")
+    assert(event1['new_state'] == "AWAITING_UNILATERAL")
+    assert(event1['cause'] == "onchain")
+    assert(event1['message'] == "Funding transaction spent")
+    event1 = wait_for_event(l1)
+    assert(event1['old_state'] == "AWAITING_UNILATERAL")
+    assert(event1['new_state'] == "FUNDING_SPEND_SEEN")
+    assert(event1['cause'] == "onchain")
+    assert(event1['message'] == "Onchain funding spend")
+    event1 = wait_for_event(l1)
+    assert(event1['old_state'] == "FUNDING_SPEND_SEEN")
+    assert(event1['new_state'] == "ONCHAIN")
+    assert(event1['cause'] == "onchain")
+    assert(event1['message'] == "Onchain init reply")
+
+
+def test_channel_state_change_history(node_factory, bitcoind):
+    """ We open and close a channel and check for state_canges entries.
+
+    """
+    l1, l2 = node_factory.line_graph(2)
+    scid = l1.get_channel_scid(l2)
+
+    l1.rpc.close(scid)
+    bitcoind.generate_block(100)  # so it gets settled
     bitcoind.generate_block(100)  # so it gets settled
 
-    msg = l2.daemon.wait_for_log("channel_state_changed.*new_state.*")
-    event = ast.literal_eval(re.findall(".*({.*}).*", msg)[0])
-    assert(event['peer_id'] == peer_id)
-    assert(event['channel_id'] == cid)
-    assert(event['short_channel_id'] == scid)
-    assert(event['old_state'] == "AWAITING_UNILATERAL")
-    assert(event['new_state'] == "FUNDING_SPEND_SEEN")
-
-    msg = l2.daemon.wait_for_log("channel_state_changed.*new_state.*")
-    event = ast.literal_eval(re.findall(".*({.*}).*", msg)[0])
-    assert(event['peer_id'] == peer_id)
-    assert(event['channel_id'] == cid)
-    assert(event['short_channel_id'] == scid)
-    assert(event['old_state'] == "FUNDING_SPEND_SEEN")
-    assert(event['new_state'] == "ONCHAIN")
+    history = l1.rpc.listpeers()['peers'][0]['channels'][0]['state_changes']
+    if l1.config('experimental-dual-fund'):
+        assert(history[0]['cause'] == "user")
+        assert(history[0]['old_state'] == "DUALOPEND_OPEN_INIT")
+        assert(history[0]['new_state'] == "DUALOPEND_AWAITING_LOCKIN")
+        assert(history[1]['cause'] == "user")
+        assert(history[1]['old_state'] == "DUALOPEND_AWAITING_LOCKIN")
+        assert(history[1]['new_state'] == "CHANNELD_NORMAL")
+        assert(history[2]['cause'] == "user")
+        assert(history[2]['new_state'] == "CHANNELD_SHUTTING_DOWN")
+        assert(history[3]['cause'] == "user")
+        assert(history[3]['new_state'] == "CLOSINGD_SIGEXCHANGE")
+        assert(history[4]['cause'] == "user")
+        assert(history[4]['new_state'] == "CLOSINGD_COMPLETE")
+        assert(history[4]['message'] == "Closing complete")
+    else:
+        assert(history[0]['cause'] == "user")
+        assert(history[0]['old_state'] == "CHANNELD_AWAITING_LOCKIN")
+        assert(history[0]['new_state'] == "CHANNELD_NORMAL")
+        assert(history[1]['cause'] == "user")
+        assert(history[1]['new_state'] == "CHANNELD_SHUTTING_DOWN")
+        assert(history[2]['cause'] == "user")
+        assert(history[2]['new_state'] == "CLOSINGD_SIGEXCHANGE")
+        assert(history[3]['cause'] == "user")
+        assert(history[3]['new_state'] == "CLOSINGD_COMPLETE")
+        assert(history[3]['message'] == "Closing complete")
 
 
 @unittest.skipIf(not DEVELOPER, "without DEVELOPER=1, gossip v slow")
@@ -971,9 +1160,9 @@ def test_forward_event_notification(node_factory, bitcoind, executor):
         {'disconnect': disconnects}])
 
     node_factory.join_nodes([l1, l2, l3], wait_for_announce=True)
-    l2.openchannel(l4, 10**6, wait_for_announce=False)
-    l2.openchannel(l5, 10**6, wait_for_announce=True)
-
+    l2.openchannel(l4, wait_for_announce=False)
+    l2.openchannel(l5, wait_for_announce=True)
+    sync_blockheight(bitcoind, [l1, l2, l3, l4, l5])
     bitcoind.generate_block(5)
 
     wait_for(lambda: len(l1.rpc.listchannels()['channels']) == 8)
@@ -1227,10 +1416,14 @@ def test_plugin_feature_announce(node_factory):
         wait_for_announce=True
     )
 
+    extra = []
+    if l1.config('experimental-dual-fund'):
+        extra.append(223)
+
     # Check the featurebits we've set in the `init` message from
     # feature-test.py.
     assert l1.daemon.is_in_log(r'\[OUT\] 001000022200....{}'
-                               .format(expected_peer_features(extra=[201])))
+                               .format(expected_peer_features(extra=[201] + extra)))
 
     # Check the invoice featurebit we set in feature-test.py
     inv = l1.rpc.invoice(123, 'lbl', 'desc')['bolt11']
@@ -1239,7 +1432,7 @@ def test_plugin_feature_announce(node_factory):
 
     # Check the featurebit set in the `node_announcement`
     node = l1.rpc.listnodes(l1.info['id'])['nodes'][0]
-    assert node['features'] == expected_node_features(extra=[203])
+    assert node['features'] == expected_node_features(extra=[203] + extra)
 
 
 def test_hook_chaining(node_factory):
@@ -1462,8 +1655,10 @@ def test_feature_set(node_factory):
     l1 = node_factory.get_node(options={"plugin": plugin})
 
     fs = l1.rpc.call('getfeatureset')
-    assert fs['init'] == expected_peer_features()
-    assert fs['node'] == expected_node_features()
+    extra = [233] if l1.config('experimental-dual-fund') else []
+
+    assert fs['init'] == expected_peer_features(extra=extra)
+    assert fs['node'] == expected_node_features(extra=extra)
     assert fs['channel'] == expected_channel_features()
     assert 'invoice' in fs
 
@@ -1665,6 +1860,19 @@ def test_coin_movement_notices(node_factory, bitcoind, chainparams):
         {'may_reconnect': True, 'plugin': os.path.join(os.getcwd(), 'tests/plugins/coin_movements.py')},
         {'may_reconnect': True},
     ], wait_for_announce=True)
+
+    # Special case for dual-funded channel opens
+    if l2.config('experimental-dual-fund'):
+        l2_wallet_mvts = [
+            {'type': 'chain_mvt', 'credit': 2000000000, 'debit': 0, 'tag': 'deposit'},
+            {'type': 'chain_mvt', 'credit': 0, 'debit': 0, 'tag': 'spend_track'},
+            {'type': 'chain_mvt', 'credit': 0, 'debit': 995410000, 'tag': 'withdrawal'},
+            {'type': 'chain_mvt', 'credit': 0, 'debit': 1000000000, 'tag': 'withdrawal'},
+            {'type': 'chain_mvt', 'credit': 0, 'debit': 4590000, 'tag': 'chain_fees'},
+            {'type': 'chain_mvt', 'credit': 995410000, 'debit': 0, 'tag': 'deposit'},
+            {'type': 'chain_mvt', 'credit': 100001000, 'debit': 0, 'tag': 'deposit'},
+            {'type': 'chain_mvt', 'credit': 945785000, 'debit': 0, 'tag': 'deposit'},
+        ]
 
     bitcoind.generate_block(5)
     wait_for(lambda: len(l1.rpc.listchannels()['channels']) == 4)
@@ -1874,7 +2082,7 @@ def test_htlc_accepted_hook_crash(node_factory, executor):
         allow_broken_log=True
     )
     l1.connect(l2)
-    l1.fundchannel(l2, 10**6)
+    l1.fundchannel(l2)
 
     i = l2.rpc.invoice(500, "crashpls", "crashpls")['bolt11']
 
@@ -1913,15 +2121,18 @@ def test_notify(node_factory):
             assert out[2 + i].endswith("|\n")
         else:
             assert out[2 + i].endswith("|\r")
-    assert out[102] == '\r'
+
+    assert out[102] == '# Beginning stage 2\n'
+    assert out[103] == '\r'
+
     for i in range(10):
-        assert out[103 + i].startswith("# Stage 2/2 {:>2}/10 |".format(1 + i))
+        assert out[104 + i].startswith("# Stage 2/2 {:>2}/10 |".format(1 + i))
         if i == 9:
-            assert out[103 + i].endswith("|\n")
+            assert out[104 + i].endswith("|\n")
         else:
-            assert out[103 + i].endswith("|\r")
-    assert out[113] == '"This worked"\n'
-    assert len(out) == 114
+            assert out[104 + i].endswith("|\r")
+    assert out[114] == '"This worked"\n'
+    assert len(out) == 115
 
     # At debug level, we get the second prompt.
     out = subprocess.check_output(['cli/lightning-cli',
@@ -1990,3 +2201,151 @@ def test_htlc_accepted_hook_failcodes(node_factory):
         inv = l2.rpc.invoice(42, 'failcode{}'.format(failcode), '')['bolt11']
         with pytest.raises(RpcError, match=r'failcodename.: .{}.'.format(expected)):
             l1.rpc.pay(inv)
+
+
+def test_hook_dep(node_factory):
+    dep_a = os.path.join(os.path.dirname(__file__), 'plugins/dep_a.py')
+    dep_b = os.path.join(os.path.dirname(__file__), 'plugins/dep_b.py')
+    dep_c = os.path.join(os.path.dirname(__file__), 'plugins/dep_c.py')
+    l1, l2, l3 = node_factory.line_graph(3, opts=[{},
+                                                  {'plugin': dep_b},
+                                                  {'plugin': [dep_a, dep_b]}])
+
+    # l2 complains about the two unknown plugins, only.
+    # (Could be already past)
+    l2.daemon.logsearch_start = 0
+    l2.daemon.wait_for_logs(["unknown plugin dep_a.py",
+                             "unknown plugin dep_c.py"])
+    assert not l2.daemon.is_in_log("unknown plugin (?!dep_a.py|dep_c.py)")
+    logstart = l2.daemon.logsearch_start
+
+    # l3 complains about the dep_c, only.
+    assert l3.daemon.is_in_log("unknown plugin dep_c.py")
+    assert not l3.daemon.is_in_log("unknown plugin (?!dep_c.py)")
+
+    # A says it has to be before B.
+    l2.rpc.plugin_start(plugin=dep_a)
+    l2.daemon.wait_for_log(r"started.*dep_a.py")
+    # Still doesn't know about c.
+    assert l2.daemon.is_in_log("unknown plugin dep_c.py", logstart)
+
+    l1.pay(l2, 100000)
+    # They must be called in this order!
+    l2.daemon.wait_for_log(r"dep_a.py: htlc_accepted called")
+    l2.daemon.wait_for_log(r"dep_b.py: htlc_accepted called")
+
+    # But depc will not load, due to cyclical dep
+    with pytest.raises(RpcError, match=r'Cannot meet required hook dependencies'):
+        l2.rpc.plugin_start(plugin=dep_c)
+
+    l1.rpc.plugin_start(plugin=dep_c)
+    l1.daemon.wait_for_log(r"started.*dep_c.py")
+
+    # Complaints about unknown plugin a, but nothing else
+    assert l1.daemon.is_in_log("unknown plugin dep_a.py")
+    assert not l1.daemon.is_in_log("unknown plugin (?!dep_a.py)")
+
+
+def test_hook_dep_stable(node_factory):
+    # Load in order A, D, E, B.
+    # A says it has to be before B, D says it has to be before E.
+    # It should load in the order specified.
+
+    dep_a = os.path.join(os.path.dirname(__file__), 'plugins/dep_a.py')
+    dep_b = os.path.join(os.path.dirname(__file__), 'plugins/dep_b.py')
+    dep_d = os.path.join(os.path.dirname(__file__), 'plugins/dep_d.py')
+    dep_e = os.path.join(os.path.dirname(__file__), 'plugins/dep_e.py')
+    l1, l2 = node_factory.line_graph(2, opts=[{},
+                                              {'plugin': [dep_a, dep_d, dep_e, dep_b]}])
+
+    # dep_a mentions deb_c, but nothing else should be unknown.
+    # (Could be already past)
+    l2.daemon.logsearch_start = 0
+    l2.daemon.wait_for_log("unknown plugin dep_c.py")
+    assert not l2.daemon.is_in_log("unknown plugin (?!|dep_c.py)")
+
+    l1.pay(l2, 100000)
+    # They must be called in this order!
+    l2.daemon.wait_for_log(r"dep_a.py: htlc_accepted called")
+    l2.daemon.wait_for_log(r"dep_d.py: htlc_accepted called")
+    l2.daemon.wait_for_log(r"dep_e.py: htlc_accepted called")
+    l2.daemon.wait_for_log(r"dep_b.py: htlc_accepted called")
+
+
+def test_htlc_accepted_hook_failonion(node_factory):
+    plugin = os.path.join(os.path.dirname(__file__), 'plugins/htlc_accepted-failonion.py')
+    l1, l2 = node_factory.line_graph(2, opts=[{}, {'plugin': plugin}])
+
+    # an invalid onion
+    l2.rpc.setfailonion('0' * (292 * 2))
+    inv = l2.rpc.invoice(42, 'failonion000', '')['bolt11']
+    with pytest.raises(RpcError):
+        l1.rpc.pay(inv)
+
+
+def test_dynamic_args(node_factory):
+    plugin_path = os.path.join(os.getcwd(), 'contrib/plugins/helloworld.py')
+
+    l1 = node_factory.get_node()
+    l1.rpc.plugin_start(plugin_path, greeting='Test arg parsing')
+
+    assert l1.rpc.call("hello") == "Test arg parsing world"
+    plugin = only_one([p for p in l1.rpc.listconfigs()['plugins'] if p['path'] == plugin_path])
+    assert plugin['options']['greeting'] == 'Test arg parsing'
+
+    l1.rpc.plugin_stop(plugin_path)
+
+    assert [p for p in l1.rpc.listconfigs()['plugins'] if p['path'] == plugin_path] == []
+
+
+def test_pyln_request_notify(node_factory):
+    """Test that pyln-client plugins can send notifications.
+    """
+    plugin_path = os.path.join(
+        os.path.dirname(__file__), 'plugins/countdown.py'
+    )
+    l1 = node_factory.get_node(options={'plugin': plugin_path})
+    notifications = []
+
+    def n(*args, message, **kwargs):
+        print("Got a notification:", message)
+        notifications.append(message)
+
+    with l1.rpc.notify(n):
+        l1.rpc.countdown(10)
+
+    expected = ['{}/10'.format(i) for i in range(10)]
+    assert expected == notifications
+
+    # Calling without the context manager we should not get any notifications
+    notifications = []
+    l1.rpc.countdown(10)
+    assert notifications == []
+
+
+def test_self_disable(node_factory):
+    """Test that plugin can disable itself without penalty.
+    """
+    # This disables in response to getmanifest.
+    p1 = os.path.join(
+        os.path.dirname(__file__), 'plugins/test_selfdisable_after_getmanifest'
+    )
+    # This disables in response to init.
+    p2 = os.path.join(os.getcwd(), "tests/plugins/test_libplugin")
+    l1 = node_factory.get_node(options={'important-plugin': [p1, p2], 'selfdisable': None})
+
+    # Could happen before it gets set up.
+    l1.daemon.logsearch_start = 0
+    l1.daemon.wait_for_logs(['test_selfdisable_after_getmanifest: disabled itself: "Self-disable test after getmanifest"',
+                             'test_libplugin: disabled itself at init: Disabled via selfdisable option'])
+
+    assert p1 not in [p['name'] for p in l1.rpc.plugin_list()['plugins']]
+    assert p2 not in [p['name'] for p in l1.rpc.plugin_list()['plugins']]
+
+    # Also works with dynamic load attempts
+    with pytest.raises(RpcError, match="Self-disable test after getmanifest"):
+        l1.rpc.plugin_start(p1)
+
+    # Also works with dynamic load attempts
+    with pytest.raises(RpcError, match="Disabled via selfdisable option"):
+        l1.rpc.plugin_start(p2, selfdisable=True)

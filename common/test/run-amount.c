@@ -1,4 +1,5 @@
 #include "../amount.c"
+#include <common/setup.h>
 #include <common/utils.h>
 #include <stdio.h>
 #include <wire/wire.h>
@@ -36,6 +37,9 @@ u64 fromwire_u64(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
 /* Generated stub for fromwire_u8 */
 u8 fromwire_u8(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
 { fprintf(stderr, "fromwire_u8 called!\n"); abort(); }
+/* Generated stub for fromwire_u8_array */
+void fromwire_u8_array(const u8 **cursor UNNEEDED, size_t *max UNNEEDED, u8 *arr UNNEEDED, size_t num UNNEEDED)
+{ fprintf(stderr, "fromwire_u8_array called!\n"); abort(); }
 /* Generated stub for towire */
 void towire(u8 **pptr UNNEEDED, const void *data UNNEEDED, size_t len UNNEEDED)
 { fprintf(stderr, "towire called!\n"); abort(); }
@@ -82,13 +86,12 @@ void towire_u8_array(u8 **pptr UNNEEDED, const u8 *arr UNNEEDED, size_t num UNNE
 		assert((satp)->satoshis == val);			\
 	} while (0)
 
-int main(void)
+int main(int argc, char *argv[])
 {
 	struct amount_msat msat;
 	struct amount_sat sat;
 
-	setup_locale();
-	setup_tmpctx();
+	common_setup(argv[0]);
 
 	/* Grossly malformed */
 	FAIL_MSAT(&msat, "x");
@@ -186,8 +189,8 @@ int main(void)
 		const char *with, *without;
 
 		msat.millisatoshis = i;
-		with = fmt_amount_msat_btc(tmpctx, &msat, true);
-		without = fmt_amount_msat_btc(tmpctx, &msat, false);
+		with = fmt_amount_msat_btc(tmpctx, msat, true);
+		without = fmt_amount_msat_btc(tmpctx, msat, false);
 		assert(strends(with, "btc"));
 		assert(strlen(with) == strlen(without) + 3);
 		assert(strncmp(with, without, strlen(without)) == 0);
@@ -196,7 +199,7 @@ int main(void)
 		assert(parse_amount_msat(&msat, with, strlen(with)));
 		assert(msat.millisatoshis == i);
 
-		with = fmt_amount_msat(tmpctx, &msat);
+		with = fmt_amount_msat(tmpctx, msat);
 		without = tal_fmt(tmpctx, "%"PRIu64, msat.millisatoshis);
 		assert(strends(with, "msat"));
 		assert(strlen(with) == strlen(without) + 4);
@@ -212,8 +215,8 @@ int main(void)
 		const char *with, *without;
 
 		sat.satoshis = i;
-		with = fmt_amount_sat_btc(tmpctx, &sat, true);
-		without = fmt_amount_sat_btc(tmpctx, &sat, false);
+		with = fmt_amount_sat_btc(tmpctx, sat, true);
+		without = fmt_amount_sat_btc(tmpctx, sat, false);
 		assert(strends(with, "btc"));
 		assert(strlen(with) == strlen(without) + 3);
 		assert(strncmp(with, without, strlen(without)) == 0);
@@ -222,7 +225,7 @@ int main(void)
 		assert(parse_amount_sat(&sat, with, strlen(with)));
 		assert(sat.satoshis == i);
 
-		with = fmt_amount_sat(tmpctx, &sat);
+		with = fmt_amount_sat(tmpctx, sat);
 		without = tal_fmt(tmpctx, "%"PRIu64, sat.satoshis);
 		assert(strends(with, "sat"));
 		assert(strlen(with) == strlen(without) + 3);
@@ -233,5 +236,5 @@ int main(void)
 		assert(sat.satoshis == i);
 	}
 
-	tal_free(tmpctx);
+	common_shutdown();
 }

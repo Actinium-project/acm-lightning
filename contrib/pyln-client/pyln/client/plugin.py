@@ -57,6 +57,16 @@ class Method(object):
         self.desc = desc
         self.long_desc = long_desc
         self.deprecated = deprecated
+        self.before: List[str] = []
+        self.after: List[str] = []
+
+
+class RpcException(Exception):
+    # -32600 == "Invalid Request"
+    def __init__(self, message: str, code: int = -32600):
+        self.code = code
+        self.message = message
+        super().__init__("RpcException: {}".format(message))
 
 
 class Request(dict):
@@ -100,7 +110,7 @@ class Request(dict):
         self.state = RequestState.FINISHED
         self.termination_tb = "".join(traceback.extract_stack().format()[:-1])
 
-    def set_exception(self, exc: Exception) -> None:
+    def set_exception(self, exc: Union[Exception, RpcException]) -> None:
         if self.state != RequestState.PENDING:
             assert(self.termination_tb is not None)
             raise ValueError(
@@ -108,13 +118,19 @@ class Request(dict):
                 "current state is {state}. Request previously terminated at\n"
                 "{tb}".format(state=self.state, tb=self.termination_tb))
         self.exc = exc
+        if isinstance(exc, RpcException):
+            code = exc.code
+            message = exc.message
+        else:
+            code = -32600  # "Invalid Request"
+            message = ("Error while processing {method}: {exc}"
+                       .format(method=self.method, exc=str(exc)))
         self._write_result({
             'jsonrpc': '2.0',
             'id': self.id,
             "error": {
-                "code": -32600,  # "Invalid Request"
-                "message": "Error while processing {method}: {exc}"
-                           .format(method=self.method, exc=str(exc)),
+                "code": code,
+                "message": message,
                 # 'data' field "may be omitted."
                 "traceback": traceback.format_exc(),
             },
@@ -124,6 +140,47 @@ class Request(dict):
 
     def _write_result(self, result: dict) -> None:
         self.plugin._write_locked(result)
+
+    def _notify(self, method: str, params: JSONType) -> None:
+        """Send a notification to the caller.
+
+        Can contain a variety of things, but is usually used to report
+        progress or command status.
+
+        """
+        self._write_result({
+            'jsonrpc': '2.0',
+            'params': params,
+            "method": method,
+        })
+
+    def notify(self, message: str, level: str = 'info') -> None:
+        """Send a message notification to the caller.
+        """
+        self._notify(
+            "message",
+            params={
+                'id': self.id,
+                'level': level,
+                'message': message,
+            }
+        )
+
+    def progress(self,
+                 progress: int,
+                 total: int,
+                 stage: Optional[int] = None,
+                 stage_total: Optional[int] = None
+                 ) -> None:
+        d: Dict[str, JSONType] = {
+            "id": self.id,
+            "num": progress,
+            "total": total,
+        }
+        if stage is not None and stage_total is not None:
+            d['stage'] = {"num": stage, "total": stage_total}
+
+        self._notify("progress", d)
 
 
 # If a hook call fails we need to coerce it into something the main daemon can
@@ -324,7 +381,8 @@ class Plugin(object):
 
     def add_option(self, name: str, default: Optional[str],
                    description: Optional[str],
-                   opt_type: str = "string", deprecated: bool = False) -> None:
+                   opt_type: str = "string", deprecated: bool = False,
+                   multi: bool = False) -> None:
         """Add an option that we'd like to register with lightningd.
 
         Needs to be called before `Plugin.run`, otherwise we might not
@@ -347,6 +405,7 @@ class Plugin(object):
             'description': description,
             'type': opt_type,
             'value': None,
+            'multi': multi,
             'deprecated': deprecated,
         }
 
@@ -405,7 +464,9 @@ class Plugin(object):
         return decorator
 
     def add_hook(self, name: str, func: Callable[..., JSONType],
-                 background: bool = False) -> None:
+                 background: bool = False,
+                 before: Optional[List[str]] = None,
+                 after: Optional[List[str]] = None) -> None:
         """Register a hook that is called synchronously by lightningd on events
         """
         if name in self.methods:
@@ -427,15 +488,23 @@ class Plugin(object):
 
         method = Method(name, func, MethodType.HOOK)
         method.background = background
+        method.before = []
+        if before:
+            method.before = before
+        method.after = []
+        if after:
+            method.after = after
         self.methods[name] = method
 
-    def hook(self, method_name: str) -> JsonDecoratorType:
+    def hook(self, method_name: str,
+             before: List[str] = None,
+             after: List[str] = None) -> JsonDecoratorType:
         """Decorator to add a plugin hook to the dispatch table.
 
         Internally uses add_hook.
         """
         def decorator(f: Callable[..., JSONType]) -> Callable[..., JSONType]:
-            self.add_hook(method_name, f, background=False)
+            self.add_hook(method_name, f, background=False, before=before, after=after)
             return f
         return decorator
 
@@ -611,22 +680,14 @@ class Plugin(object):
     def notify_message(self, request: Request, message: str,
                        level: str = 'info') -> None:
         """Send a notification message to sender of this request"""
-        self.notify("message", {"id": request.id,
-                                "level": level,
-                                "message": message})
+        request.notify(message=message)
 
     def notify_progress(self, request: Request,
                         progress: int, progress_total: int,
                         stage: Optional[int] = None,
                         stage_total: Optional[int] = None) -> None:
-        """Send a progerss message to sender of this request: if more than one stage, set stage and stage_total"""
-        d: Dict[str, Any] = {"id": request.id,
-                             "num": progress,
-                             "total": progress_total}
-        if stage_total is not None:
-            d['stage'] = {"num": stage, "total": stage_total}
-
-        self.notify("progress", d)
+        """Send a progress message to sender of this request: if more than one stage, set stage and stage_total"""
+        request.progress(progress, progress_total, stage, stage_total)
 
     def _parse_request(self, jsrequest: Dict[str, JSONType]) -> Request:
         i = jsrequest.get('id', None)
@@ -689,7 +750,9 @@ class Plugin(object):
                 continue
 
             if method.mtype == MethodType.HOOK:
-                hooks.append(method.name)
+                hooks.append({'name': method.name,
+                              'before': method.before,
+                              'after': method.after})
                 continue
 
             doc = inspect.getdoc(method.func)

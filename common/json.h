@@ -5,6 +5,7 @@
 #include <ccan/short_types/short_types.h>
 #include <ccan/tal/tal.h>
 #include <common/errcode.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -25,6 +26,18 @@ int json_tok_full_len(const jsmntok_t *t);
 
 /* Is this a string equal to str? */
 bool json_tok_streq(const char *buffer, const jsmntok_t *tok, const char *str);
+
+/* Is this a string equal to str of length len? */
+bool json_tok_strneq(const char *buffer, const jsmntok_t *tok,
+		     const char *str, size_t len);
+
+/* Does this string token start with prefix? */
+bool json_tok_startswith(const char *buffer, const jsmntok_t *tok,
+			 const char *prefix);
+
+/* Does this string token end with suffix? */
+bool json_tok_endswith(const char *buffer, const jsmntok_t *tok,
+		       const char *suffix);
 
 /* Allocate a tal string copy */
 char *json_strdup(const tal_t *ctx, const char *buffer, const jsmntok_t *tok);
@@ -82,6 +95,10 @@ const jsmntok_t *json_next(const jsmntok_t *tok);
 const jsmntok_t *json_get_member(const char *buffer, const jsmntok_t tok[],
 				 const char *label);
 
+/* Get top-level member, with explicit label length */
+const jsmntok_t *json_get_membern(const char *buffer, const jsmntok_t tok[],
+				  const char *label, size_t len);
+
 /* Get index'th array member. */
 const jsmntok_t *json_get_arr(const jsmntok_t tok[], size_t index);
 
@@ -135,10 +152,37 @@ jsmntok_t *json_tok_copy(const tal_t *ctx, const jsmntok_t *tok);
 void json_tok_remove(jsmntok_t **tokens,
 		     jsmntok_t *obj_or_array, const jsmntok_t *tok, size_t num);
 
-/* Guide is a string with . for members, [] around indexes. */
-const jsmntok_t *json_delve(const char *buffer,
-			    const jsmntok_t *tok,
-			    const char *guide);
+/* Guide is % for a token: each must be followed by JSON_SCAN().
+ * Returns NULL on error (asserts() on bad guide). */
+const char *json_scan(const tal_t *ctx,
+		      const char *buffer,
+		      const jsmntok_t *tok,
+		      const char *guide,
+		      ...);
+
+/* eg. JSON_SCAN(json_to_bool, &boolvar) */
+#define JSON_SCAN(fmt, var)						\
+	json_scan,							\
+	stringify(fmt),							\
+	((var) + 0*sizeof(fmt((const char *)NULL,			\
+			      (const jsmntok_t *)NULL, var) == true)),	\
+	(fmt)
+
+/* eg. JSON_SCAN_TAL(tmpctx, json_strdup, &charvar) */
+#define JSON_SCAN_TAL(ctx, fmt, var)					\
+	(ctx),								\
+	stringify(fmt),							\
+	((var) + 0*sizeof((*var) = fmt((ctx),				\
+				       (const char *)NULL,		\
+				       (const jsmntok_t *)NULL))),	\
+	(fmt)
+
+/* Already-have-varargs version */
+const char *json_scanv(const tal_t *ctx,
+		       const char *buffer,
+		       const jsmntok_t *tok,
+		       const char *guide,
+		       va_list ap);
 
 /* Iterator macro for array: i is counter, t is token ptr, arr is JSMN_ARRAY */
 #define json_for_each_arr(i, t, arr) \
@@ -154,6 +198,13 @@ const jsmntok_t *json_delve(const char *buffer,
  * any non-printable chars into JSON escapes, but leaves existing escapes alone.
  */
 void json_add_string(struct json_stream *result, const char *fieldname, const char *value);
+
+/* '"fieldname" : "value[:value_len]"' or '"value[:value_len]"' if
+ * fieldname is NULL.  Turns any non-printable chars into JSON
+ * escapes, but leaves existing escapes alone.
+ */
+void json_add_stringn(struct json_stream *result, const char *fieldname,
+		      const char *value TAKES, size_t value_len);
 
 /* '"fieldname" : "value"' or '"value"' if fieldname is NULL.  String must
  * already be JSON escaped as necessary. */
@@ -201,6 +252,11 @@ void json_add_timeabs(struct json_stream *result, const char *fieldname,
 void json_add_time(struct json_stream *result, const char *fieldname,
 			  struct timespec ts);
 
+/* Add ISO_8601 timestamp string, i.e. "2019-09-07T15:50+01:00" */
+void json_add_timeiso(struct json_stream *result,
+		      const char *fieldname,
+		      struct timeabs *time);
+
 /* Add any json token */
 void json_add_tok(struct json_stream *result, const char *fieldname,
                   const jsmntok_t *tok, const char *buffer);
@@ -209,5 +265,7 @@ void json_add_tok(struct json_stream *result, const char *fieldname,
 void json_add_errcode(struct json_stream *result, const char *fieldname,
 		      errcode_t code);
 
+/* Add "bolt11" or "bolt12" field, depending on invstring. */
+void json_add_invstring(struct json_stream *result, const char *invstring);
 
 #endif /* LIGHTNING_COMMON_JSON_H */

@@ -1,6 +1,8 @@
 #include <bitcoin/preimage.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/tal/str/str.h>
+#include <common/gossmap.h>
+#include <common/type_to_string.h>
 #include <plugins/libplugin-pay.h>
 #include <plugins/libplugin.h>
 #include <wire/onion_wire.h>
@@ -54,6 +56,24 @@ static struct keysend_data *keysend_init(struct payment *p)
 static void keysend_cb(struct keysend_data *d, struct payment *p) {
 	struct createonion_hop *last_payload;
 	size_t hopcount;
+	struct gossmap_node *node;
+	bool enabled;
+	const struct gossmap *gossmap = get_gossmap(p->plugin);
+
+	/* On the root payment we perform the featurebit check. */
+	if (p->parent == NULL && p->step == PAYMENT_STEP_INITIALIZED) {
+		node = gossmap_find_node(gossmap, p->destination);
+
+		enabled = gossmap_node_get_feature(gossmap, node,
+						   KEYSEND_FEATUREBIT) != -1;
+		if (!enabled)
+			return payment_fail(
+			    p,
+			    "Recipient %s does not support keysend payments "
+			    "(feature bit %d missing in node announcement)",
+			    node_id_to_hexstr(tmpctx, p->destination),
+			    KEYSEND_FEATUREBIT);
+	}
 
 	if (p->step != PAYMENT_STEP_ONION_PAYLOAD)
 		return payment_continue(p);
@@ -72,21 +92,18 @@ REGISTER_PAYMENT_MODIFIER(keysend, struct keysend_data *, keysend_init,
  * End of keysend modifier
  *****************************************************************************/
 
-static void init(struct plugin *p, const char *buf UNUSED,
-		 const jsmntok_t *config UNUSED)
+static const char *init(struct plugin *p, const char *buf UNUSED,
+			const jsmntok_t *config UNUSED)
 {
-	const char *field;
+	rpc_scan(p, "getinfo", take(json_out_obj(NULL, NULL, NULL)),
+		 "{id:%}", JSON_SCAN(json_to_node_id, &my_id));
 
-	field = rpc_delve(tmpctx, p, "getinfo",
-			  take(json_out_obj(NULL, NULL, NULL)), ".id");
-	if (!node_id_from_hexstr(field, strlen(field), &my_id))
-		plugin_err(p, "getinfo didn't contain valid id: '%s'", field);
+	rpc_scan(p, "listconfigs",
+		 take(json_out_obj(NULL, "config", "max-locktime-blocks")),
+		 "{max-locktime-blocks:%}",
+		 JSON_SCAN(json_to_number, &maxdelay_default));
 
-	field =
-	    rpc_delve(tmpctx, p, "listconfigs",
-		      take(json_out_obj(NULL, "config", "max-locktime-blocks")),
-		      ".max-locktime-blocks");
-	maxdelay_default = atoi(field);
+	return NULL;
 }
 
 struct payment_modifier *pay_mods[8] = {
@@ -137,8 +154,10 @@ static struct command_result *json_keysend(struct command *cmd, const char *buf,
 	p->destination_has_tlv = true;
 	p->payment_secret = NULL;
 	p->amount = *msat;
-	p->invoice = NULL;
-	p->bolt11 = NULL;
+	p->routes = NULL;
+	p->min_final_cltv_expiry = DEFAULT_FINAL_CLTV_DELTA;
+	p->features = NULL;
+	p->invstring = NULL;
 	p->why = "Initial attempt";
 	p->constraints.cltv_budget = *maxdelay;
 	p->deadline = timeabs_add(time_now(), time_from_sec(*retryfor));
@@ -223,24 +242,26 @@ static struct command_result *htlc_accepted_call(struct command *cmd,
 						 const char *buf,
 						 const jsmntok_t *params)
 {
-	const jsmntok_t *payloadt = json_delve(buf, params, ".onion.payload");
-	const jsmntok_t *payment_hash_tok = json_delve(buf, params, ".htlc.payment_hash");
 	const u8 *rawpayload;
+	struct sha256 payment_hash;
 	size_t max;
 	struct tlv_tlv_payload *payload;
 	struct tlv_field *preimage_field = NULL;
-	char *hexpreimage, *hexpaymenthash;
 	bigsize_t s;
 	bool unknown_even_type = false;
 	struct tlv_field *field;
 	struct keysend_in *ki;
 	struct out_req *req;
 	struct timeabs now = time_now();
+	const char *err;
 
-	if (!payloadt)
+	err = json_scan(tmpctx, buf, params,
+			"{onion:{payload:%},htlc:{payment_hash:%}}",
+			JSON_SCAN_TAL(cmd, json_tok_bin_from_hex, &rawpayload),
+			JSON_SCAN(json_to_sha256, &payment_hash));
+	if (err)
 		return htlc_accepted_continue(cmd, NULL);
 
-	rawpayload = json_tok_bin_from_hex(cmd, buf, payloadt);
 	max = tal_bytelen(rawpayload);
 	payload = tlv_tlv_payload_new(cmd);
 
@@ -251,7 +272,8 @@ static struct command_result *htlc_accepted_call(struct command *cmd,
 	if (!fromwire_tlv_payload(&rawpayload, &max, payload)) {
 		plugin_log(
 		    cmd->plugin, LOG_UNUSUAL, "Malformed TLV payload %.*s",
-		    payloadt->end - payloadt->start, buf + payloadt->start);
+		    json_tok_full_len(params),
+		    json_tok_full(buf, params));
 		return htlc_accepted_continue(cmd, NULL);
 	}
 
@@ -297,20 +319,18 @@ static struct command_result *htlc_accepted_call(struct command *cmd,
 	ki->payload = tal_steal(ki, payload);
 	ki->preimage_field = preimage_field;
 
-	hexpreimage = tal_hex(cmd, preimage_field->value);
-
 	/* If the preimage doesn't hash to the payment_hash we must continue,
 	 * maybe someone else knows how to handle these. */
 	sha256(&ki->payment_hash, preimage_field->value, preimage_field->length);
-	hexpaymenthash = tal_hexstr(cmd, &ki->payment_hash, sizeof(ki->payment_hash));
-	if (!json_tok_streq(buf, payment_hash_tok, hexpaymenthash)) {
+	if (!sha256_eq(&ki->payment_hash, &payment_hash)) {
 		plugin_log(
 		    cmd->plugin, LOG_UNUSUAL,
 		    "Preimage provided by the sender does not match the "
-		    "payment_hash: SHA256(%s)=%s != %.*s. Ignoring keysend.",
-		    hexpreimage, hexpaymenthash,
-		    payment_hash_tok->end - payment_hash_tok->start,
-		    buf + payment_hash_tok->start);
+		    "payment_hash: SHA256(%s)=%s != %s. Ignoring keysend.",
+		    tal_hexstr(tmpctx,
+			       preimage_field->value, preimage_field->length),
+		    type_to_string(tmpctx, struct sha256, &ki->payment_hash),
+		    type_to_string(tmpctx, struct sha256, &payment_hash));
 		tal_free(ki);
 		return htlc_accepted_continue(cmd, NULL);
 	}
@@ -327,7 +347,7 @@ static struct command_result *htlc_accepted_call(struct command *cmd,
 				    &htlc_accepted_invoice_created,
 				    ki);
 
-	plugin_log(cmd->plugin, LOG_INFORM, "Inserting a new invoice for keysend with payment_hash %s", hexpaymenthash);
+	plugin_log(cmd->plugin, LOG_INFORM, "Inserting a new invoice for keysend with payment_hash %s", type_to_string(tmpctx, struct sha256, &payment_hash));
 	json_add_string(req->js, "msatoshi", "any");
 	json_add_string(req->js, "label", ki->label);
 	json_add_string(req->js, "description", "Spontaneous incoming payment through keysend");

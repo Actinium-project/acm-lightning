@@ -33,7 +33,6 @@
 #include <common/peer_failed.h>
 #include <common/peer_status_wiregen.h>
 #include <common/penalty_base.h>
-#include <common/pseudorand.h>
 #include <common/read_peer_msg.h>
 #include <common/status.h>
 #include <common/subdaemon.h>
@@ -120,31 +119,6 @@ struct state {
 	struct feature_set *our_features;
 };
 
-static u8 *no_upfront_shutdown_script(const tal_t *ctx, struct state *state)
-{
-#if DEVELOPER
-	/* This is a hack, for feature testing */
-	const char *e = getenv("DEV_OPENINGD_UPFRONT_SHUTDOWN_SCRIPT");
-	if (e)
-		return tal_hexdata(ctx, e, strlen(e));
-#endif
-
-	/* BOLT #2:
-	 *
-	 * - if both nodes advertised the `option_upfront_shutdown_script`
-	 *   feature:
-	 *   - MUST include `upfront_shutdown_script` with either a valid
-	 *     `shutdown_scriptpubkey` as required by `shutdown`
-	 *     `scriptpubkey`, or a zero-length `shutdown_scriptpubkey`
-	 *     (ie. `0x0000`).
-	 */
-	if (feature_negotiated(state->our_features, state->their_features,
-			       OPT_UPFRONT_SHUTDOWN_SCRIPT))
-		return tal_arr(ctx, u8, 0);
-
-	return NULL;
-}
-
 /*~ If we can't agree on parameters, we fail to open the channel.  If we're
  * the opener, we need to tell lightningd, otherwise it never really notices. */
 static void negotiation_aborted(struct state *state, bool am_opener,
@@ -212,22 +186,6 @@ static void set_reserve(struct state *state, const struct amount_sat dust_limit)
 			       state->localconf.channel_reserve))
 		state->localconf.channel_reserve
 			= dust_limit;
-}
-
-/* BOLT #2:
- *
- * The sending node:
- *...
- *  - MUST ensure `temporary_channel_id` is unique from any other channel ID
- *    with the same peer.
- */
-static void temporary_channel_id(struct channel_id *channel_id)
-{
-	size_t i;
-
-	/* Randomness FTW. */
-	for (i = 0; i < sizeof(*channel_id); i++)
-		channel_id->id[i] = pseudorand(256);
 }
 
 /*~ Handle random messages we might get during opening negotiation, (eg. gossip)
@@ -388,7 +346,10 @@ static u8 *funder_channel_start(struct state *state, u8 channel_flags)
 		return NULL;
 
 	if (!state->upfront_shutdown_script[LOCAL])
-		state->upfront_shutdown_script[LOCAL] = no_upfront_shutdown_script(state, state);
+		state->upfront_shutdown_script[LOCAL]
+			= no_upfront_shutdown_script(state,
+						     state->our_features,
+						     state->their_features);
 
 	open_tlvs = tlv_open_channel_tlvs_new(tmpctx);
 	open_tlvs->upfront_shutdown_script
@@ -972,7 +933,10 @@ static u8 *fundee_channel(struct state *state, const u8 *open_channel_msg)
 	}
 
 	if (!state->upfront_shutdown_script[LOCAL])
-		state->upfront_shutdown_script[LOCAL] = no_upfront_shutdown_script(state, state);
+		state->upfront_shutdown_script[LOCAL]
+			= no_upfront_shutdown_script(state,
+						     state->our_features,
+						     state->their_features);
 
 	/* OK, we accept! */
 	accept_tlvs = tlv_accept_channel_tlvs_new(tmpctx);

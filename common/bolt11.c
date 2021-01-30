@@ -173,20 +173,24 @@ static void decode_p(struct bolt11 *b11,
  * `d` (13): `data_length` variable.  Short description of purpose of payment
  * (UTF-8), e.g. '1 cup of coffee' or 'ナンセンス 1杯'
  */
-static void decode_d(struct bolt11 *b11,
-		     struct hash_u5 *hu5,
-		     u5 **data, size_t *data_len,
-		     size_t data_length, bool *have_d)
+static char *decode_d(struct bolt11 *b11,
+		      struct hash_u5 *hu5,
+		      u5 **data, size_t *data_len,
+		      size_t data_length, bool *have_d)
 {
-	if (*have_d) {
-		unknown_field(b11, hu5, data, data_len, 'd', data_length);
-		return;
-	}
+	u8 *desc;
+	if (*have_d)
+		return unknown_field(b11, hu5, data, data_len, 'd', data_length);
 
-	b11->description = tal_arrz(b11, char, num_u8(data_length) + 1);
-	pull_bits_certain(hu5, data, data_len, (u8 *)b11->description,
-			  data_length*5, false);
+	desc = tal_arr(NULL, u8, data_length * 5 / 8);
+	pull_bits_certain(hu5, data, data_len, desc, data_length*5, false);
+
 	*have_d = true;
+	b11->description = utf8_str(b11, take(desc), tal_bytelen(desc));
+	if (b11->description)
+		return NULL;
+
+	return tal_fmt(b11, "d: invalid utf8");
 }
 
 /* BOLT #11:
@@ -293,8 +297,7 @@ static char *decode_n(struct bolt11 *b11,
 			  data_length * 5, false);
 	if (!node_id_valid(&b11->receiver_id))
 		return tal_fmt(b11, "n: invalid pubkey %s",
-			       type_to_string(tmpctx, struct node_id,
-					      &b11->receiver_id));
+			       node_id_to_hexstr(tmpctx, &b11->receiver_id));
 
 	*have_n = true;
 	return NULL;
@@ -546,24 +549,25 @@ struct bolt11 *new_bolt11(const tal_t *ctx,
 	return b11;
 }
 
-/* Decodes and checks signature; returns NULL on error. */
-struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
-			     const struct feature_set *our_features,
-			     const char *description,
-			     const struct chainparams *must_be_chain,
-			     char **fail)
+/* Extracts signature but does not check it. */
+struct bolt11 *bolt11_decode_nosig(const tal_t *ctx, const char *str,
+				   const struct feature_set *our_features,
+				   const char *description,
+				   const struct chainparams *must_be_chain,
+				   struct sha256 *hash,
+				   u5 **sig,
+				   bool *have_n,
+				   char **fail)
 {
 	char *hrp, *amountstr, *prefix;
 	u5 *data;
 	size_t data_len;
 	struct bolt11 *b11 = new_bolt11(ctx, NULL);
-	u8 sig_and_recid[65];
-	secp256k1_ecdsa_recoverable_signature sig;
 	struct hash_u5 hu5;
-	struct sha256 hash;
-	bool have_p = false, have_n = false, have_d = false, have_h = false,
+	bool have_p = false, have_d = false, have_h = false,
 		have_x = false, have_c = false, have_s = false;
 
+	*have_n = false;
 	b11->routes = tal_arr(b11, struct route_info *, 0);
 
 	/* BOLT #11:
@@ -721,8 +725,8 @@ struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
 			break;
 
 		case 'd':
-			decode_d(b11, &hu5, &data, &data_len, data_length,
-				 &have_d);
+			problem = decode_d(b11, &hu5, &data, &data_len,
+					   data_length, &have_d);
 			break;
 
 		case 'h':
@@ -733,7 +737,7 @@ struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
 		case 'n':
 			problem = decode_n(b11, &hu5, &data,
 					   &data_len, data_length,
-					   &have_n);
+					   have_n);
 			break;
 
 		case 'x':
@@ -791,7 +795,31 @@ struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
 					   "h: does not match description");
 	}
 
-	hash_u5_done(&hu5, &hash);
+	hash_u5_done(&hu5, hash);
+	*sig = tal_dup_arr(ctx, u5, data, data_len, 0);
+	return b11;
+}
+
+/* Decodes and checks signature; returns NULL on error. */
+struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
+			     const struct feature_set *our_features,
+			     const char *description,
+			     const struct chainparams *must_be_chain,
+			     char **fail)
+{
+	u5 *sigdata;
+	size_t data_len;
+	u8 sig_and_recid[65];
+	secp256k1_ecdsa_recoverable_signature sig;
+	struct bolt11 *b11;
+	struct sha256 hash;
+	bool have_n;
+
+	b11 = bolt11_decode_nosig(ctx, str, our_features, description,
+				  must_be_chain, &hash, &sigdata, &have_n,
+				  fail);
+	if (!b11)
+		return NULL;
 
 	/* BOLT #11:
 	 *
@@ -803,7 +831,8 @@ struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
 	 * boundary, with a trailing byte containing the recovery ID
 	 * (0, 1, 2, or 3).
 	 */
-	if (!pull_bits(NULL, &data, &data_len, sig_and_recid, 520, false))
+	data_len = tal_count(sigdata);
+	if (!pull_bits(NULL, &sigdata, &data_len, sig_and_recid, 520, false))
 		return decode_fail(b11, fail, "signature truncated");
 
 	assert(data_len == 0);

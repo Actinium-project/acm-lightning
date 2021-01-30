@@ -361,7 +361,7 @@ def test_gossip_weirdalias(node_factory, bitcoind):
                                .format(normal_name))
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
-    l2.daemon.wait_for_log('openingd-chan#1: Handed peer, entering loop')
+    l2.daemon.wait_for_log('Handed peer, entering loop')
     l2.fundchannel(l1, 10**6)
     bitcoind.generate_block(6)
 
@@ -426,8 +426,9 @@ def test_gossip_persistence(node_factory, bitcoind):
     # Now spend the funding tx, generate a block and see others deleting the
     # channel from their network view
     l1.rpc.dev_fail(l2.info['id'])
-    time.sleep(1)
-    bitcoind.generate_block(1)
+
+    # We need to wait for the unilateral close to hit the mempool
+    bitcoind.generate_block(1, wait_for_mempool=1)
 
     wait_for(lambda: active(l1) == [scid23, scid23])
     wait_for(lambda: active(l2) == [scid23, scid23])
@@ -505,13 +506,20 @@ def test_gossip_no_empty_announcements(node_factory, bitcoind):
 def test_routing_gossip(node_factory, bitcoind):
     nodes = node_factory.get_nodes(5)
 
+    sync_blockheight(bitcoind, nodes)
     for i in range(len(nodes) - 1):
         src, dst = nodes[i], nodes[i + 1]
         src.rpc.connect(dst.info['id'], 'localhost', dst.port)
-        src.openchannel(dst, 25000)
+        src.openchannel(dst, 25000, confirm=False, wait_for_announce=False)
+        sync_blockheight(bitcoind, nodes)
+
+    # Avoid "bad gossip" caused by future announcements (a node below
+    # confirmation height receiving and ignoring the announcement,
+    # thus marking followup messages as bad).
+    sync_blockheight(bitcoind, nodes)
 
     # Allow announce messages.
-    bitcoind.generate_block(5)
+    bitcoind.generate_block(6)
 
     # Deep check that all channels are in there
     comb = []
@@ -700,8 +708,8 @@ def test_gossip_query_channel_range(node_factory, bitcoind, chainparams):
                            0, 1000000,
                            filters=['0109'])
     # It should definitely have split
-    l2.daemon.wait_for_log('queue_channel_ranges full: splitting')
-    # Turns out it sends: 0+53, 53+26, 79+13, 92+7, 99+3, 102+2, 104+1, 105+999895
+    l2.daemon.wait_for_log('reply_channel_range: splitting 0-1 of 2')
+
     start = 0
     scids = '00'
     for m in msgs:
@@ -719,12 +727,12 @@ def test_gossip_query_channel_range(node_factory, bitcoind, chainparams):
                              stdout=subprocess.PIPE).stdout.strip().decode()
     assert scids == encoded
 
-    # Test overflow case doesn't split forever; should still only get 8 for this
+    # Test overflow case doesn't split forever; should still only get 2 for this
     msgs = l2.query_gossip('query_channel_range',
                            genesis_blockhash,
                            1, 429496000,
                            filters=['0109'])
-    assert len(msgs) == 8
+    assert len(msgs) == 2
 
     # This should actually be large enough for zlib to kick in!
     scid34, _ = l3.fundchannel(l4, 10**5)
@@ -1028,6 +1036,8 @@ def test_node_reannounce(node_factory, bitcoind):
     assert only_one(l2.rpc.listnodes(l1.info['id'])['nodes'])['alias'].startswith('JUNIORBEAM')
 
     lfeatures = expected_node_features()
+    if l1.config('experimental-dual-fund'):
+        lfeatures = expected_node_features(extra=[223])
 
     # Make sure it gets features correct.
     assert only_one(l2.rpc.listnodes(l1.info['id'])['nodes'])['features'] == lfeatures

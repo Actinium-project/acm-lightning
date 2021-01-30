@@ -163,6 +163,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    struct amount_msat push,
 			    struct amount_sat our_funds,
 			    bool remote_funding_locked,
+			    bool remote_tx_sigs,
 			    /* NULL or stolen */
 			    struct short_channel_id *scid,
 			    struct channel_id *cid,
@@ -195,7 +196,9 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    const u8 *remote_upfront_shutdown_script,
 			    bool option_static_remotekey,
 			    bool option_anchor_outputs,
-			    struct wally_psbt *psbt STEALS)
+			    struct wally_psbt *psbt STEALS,
+			    enum side closer,
+			    enum state_change reason)
 {
 	struct channel *channel = tal(peer->ld, struct channel);
 
@@ -204,6 +207,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 	channel->dbid = dbid;
 	channel->error = NULL;
 	channel->htlc_timeout = NULL;
+	channel->openchannel_signed_cmd = NULL;
 	if (their_shachain)
 		channel->their_shachain = *their_shachain;
 	else {
@@ -236,6 +240,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 	channel->push = push;
 	channel->our_funds = our_funds;
 	channel->remote_funding_locked = remote_funding_locked;
+	channel->remote_tx_sigs = remote_tx_sigs;
 	channel->scid = tal_steal(channel, scid);
 	channel->cid = *cid;
 	channel->our_msat = our_msat;
@@ -288,6 +293,9 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 	list_add_tail(&peer->channels, &channel->list);
 	channel->rr_number = peer->ld->rr_counter++;
 	tal_add_destructor(channel, destroy_channel);
+
+	channel->closer = closer;
+	channel->state_change_cause = reason;
 
 	/* Make sure we see any spends using this key */
 	txfilter_add_scriptpubkey(peer->ld->owned_txfilter,
@@ -351,12 +359,20 @@ struct channel *active_channel_by_id(struct lightningd *ld,
 struct channel *active_channel_by_scid(struct lightningd *ld,
 				       const struct short_channel_id *scid)
 {
+	struct channel *chan = any_channel_by_scid(ld, scid);
+	if (chan && !channel_active(chan))
+		chan = NULL;
+	return chan;
+}
+
+struct channel *any_channel_by_scid(struct lightningd *ld,
+				    const struct short_channel_id *scid)
+{
 	struct peer *p;
 	struct channel *chan;
 	list_for_each(&ld->peers, p, list) {
 		list_for_each(&p->channels, chan, list) {
-			if (channel_active(chan)
-			    && chan->scid
+			if (chan->scid
 			    && short_channel_id_eq(scid, chan->scid))
 				return chan;
 		}
@@ -420,9 +436,25 @@ void channel_set_last_tx(struct channel *channel,
 
 void channel_set_state(struct channel *channel,
 		       enum channel_state old_state,
-		       enum channel_state state)
+		       enum channel_state state,
+		       enum state_change reason,
+		       char *why)
 {
-	struct channel_id cid;
+	struct timeabs timestamp;
+
+	/* set closer, if known */
+	if (state > CHANNELD_NORMAL && channel->closer == NUM_SIDES) {
+		if (reason == REASON_LOCAL)   channel->closer = LOCAL;
+		if (reason == REASON_USER)    channel->closer = LOCAL;
+		if (reason == REASON_REMOTE)  channel->closer = REMOTE;
+		if (reason == REASON_ONCHAIN) channel->closer = REMOTE;
+	}
+
+	/* use or update state_change_cause, if known */
+	if (reason != REASON_UNKNOWN)
+		channel->state_change_cause = reason;
+	else
+		reason = channel->state_change_cause;
 
 	log_info(channel->log, "State changed from %s to %s",
 		 channel_state_name(channel), channel_state_str(state));
@@ -435,19 +467,45 @@ void channel_set_state(struct channel *channel,
 	/* TODO(cdecker) Selectively save updated fields to DB */
 	wallet_channel_save(channel->peer->ld->wallet, channel);
 
-	/* plugin notification channel_state_changed */
+	/* plugin notification channel_state_changed and DB entry */
 	if (state != old_state) {  /* see issue #4029 */
-		derive_channel_id(&cid, &channel->funding_txid, channel->funding_outnum);
+		timestamp = time_now();
+		wallet_state_change_add(channel->peer->ld->wallet,
+					channel->dbid,
+					&timestamp,
+					old_state,
+					state,
+					reason,
+					why);
 		notify_channel_state_changed(channel->peer->ld,
 					     &channel->peer->id,
-					     &cid,
+					     &channel->cid,
 					     channel->scid,
+					     &timestamp,
 					     old_state,
-					     state);
+					     state,
+					     reason,
+					     why);
 	}
 }
 
-void channel_fail_permanent(struct channel *channel, const char *fmt, ...)
+const char *channel_change_state_reason_str(enum state_change reason)
+{
+	switch (reason) {
+		case REASON_UNKNOWN:  return "unknown";
+		case REASON_LOCAL:    return "local";
+		case REASON_USER:     return "user";
+		case REASON_REMOTE:   return "remote";
+		case REASON_PROTOCOL: return "protocol";
+		case REASON_ONCHAIN:  return "onchain";
+	}
+	abort();
+}
+
+void channel_fail_permanent(struct channel *channel,
+			    enum state_change reason,
+			    const char *fmt,
+			    ...)
 {
 	struct lightningd *ld = channel->peer->ld;
 	va_list ap;
@@ -470,7 +528,11 @@ void channel_fail_permanent(struct channel *channel, const char *fmt, ...)
 	drop_to_chain(ld, channel, false);
 
 	if (channel_active(channel))
-		channel_set_state(channel, channel->state, AWAITING_UNILATERAL);
+		channel_set_state(channel,
+				  channel->state,
+				  AWAITING_UNILATERAL,
+				  reason,
+				  why);
 
 	tal_free(why);
 }
@@ -512,9 +574,9 @@ void channel_internal_error(struct channel *channel, const char *fmt, ...)
 
 	/* Don't expose internal error causes to remove unless doing dev */
 #if DEVELOPER
-	channel_fail_permanent(channel, "Internal error: %s", why);
+	channel_fail_permanent(channel, REASON_LOCAL, "Internal error: %s", why);
 #else
-	channel_fail_permanent(channel, "Internal error");
+	channel_fail_permanent(channel, REASON_LOCAL, "Internal error");
 #endif
 	tal_free(why);
 }
@@ -545,7 +607,9 @@ static void err_and_reconnect(struct channel *channel,
 
 #if DEVELOPER
 	if (dev_disconnect_permanent(channel->peer->ld)) {
-		channel_fail_permanent(channel, "dev_disconnect permfail");
+		channel_fail_permanent(channel,
+				       REASON_LOCAL,
+				       "dev_disconnect permfail");
 		return;
 	}
 #endif

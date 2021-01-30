@@ -4,7 +4,6 @@
 #include <bitcoin/psbt.h>
 #include <bitcoin/script.h>
 #include <bitcoin/tx.h>
-#include <ccan/cast/cast.h>
 #include <ccan/crypto/sha256/sha256.h>
 #include <ccan/endian/endian.h>
 #include <ccan/mem/mem.h>
@@ -257,6 +256,7 @@ bool bitcoin_tx_check(const struct bitcoin_tx *tx)
 	if (written != tal_bytelen(newtx))
 		return false;
 
+	tal_free(newtx);
 	return true;
 }
 
@@ -353,18 +353,9 @@ void bitcoin_tx_input_set_witness(struct bitcoin_tx *tx, int innum,
 	tal_wally_end(tx->wtx);
 
 	/* Also add to the psbt */
-	if (stack) {
-		tal_wally_start();
-		wally_psbt_input_set_final_witness(&tx->psbt->inputs[innum], stack);
-		tal_wally_end(tx->psbt);
-	} else {
-		/* FIXME: libwally-psbt doesn't allow 'unsetting' of witness via
-		 * the set method at the moment, so we do it manually*/
-		struct wally_psbt_input *in = &tx->psbt->inputs[innum];
-		if (in->final_witness)
-			wally_tx_witness_stack_free(in->final_witness);
-		in->final_witness = NULL;
-	}
+	tal_wally_start();
+	wally_psbt_input_set_final_witness(&tx->psbt->inputs[innum], stack);
+	tal_wally_end(tx->psbt);
 
 	if (taken(witness))
 		tal_free(witness);
@@ -841,13 +832,13 @@ size_t bitcoin_tx_input_sig_weight(void)
 	return 1 + 71;
 }
 
-/* We only do segwit inputs, and we assume witness is sig + key  */
-size_t bitcoin_tx_simple_input_weight(bool p2sh)
+/* Input weight */
+size_t bitcoin_tx_input_weight(bool p2sh, size_t witness_weight)
 {
-	size_t weight;
+	size_t weight = witness_weight;
 
 	/* Input weight: txid + index + sequence */
-	weight = (32 + 4 + 4) * 4;
+	weight += (32 + 4 + 4) * 4;
 
 	/* We always encode the length of the script, even if empty */
 	weight += 1 * 4;
@@ -856,14 +847,24 @@ size_t bitcoin_tx_simple_input_weight(bool p2sh)
 	if (p2sh)
 		weight += 23 * 4;
 
-	/* Account for witness (1 byte count + sig + key) */
-	weight += 1 + (bitcoin_tx_input_sig_weight() + 1 + 33);
-
 	/* Elements inputs have 6 bytes of blank proofs attached. */
 	if (chainparams->is_elements)
 		weight += 6;
 
 	return weight;
+}
+
+size_t bitcoin_tx_simple_input_witness_weight(void)
+{
+	/* Account for witness (1 byte count + sig + key) */
+	return 1 + (bitcoin_tx_input_sig_weight() + 1 + 33);
+}
+
+/* We only do segwit inputs, and we assume witness is sig + key  */
+size_t bitcoin_tx_simple_input_weight(bool p2sh)
+{
+	return bitcoin_tx_input_weight(p2sh,
+				       bitcoin_tx_simple_input_witness_weight());
 }
 
 struct amount_sat change_amount(struct amount_sat excess, u32 feerate_perkw)

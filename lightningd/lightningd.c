@@ -59,6 +59,7 @@
 #include <common/daemon.h>
 #include <common/ecdh_hsmd.h>
 #include <common/features.h>
+#include <common/hsm_encryption.h>
 #include <common/memleak.h>
 #include <common/timeout.h>
 #include <common/utils.h>
@@ -195,7 +196,6 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	list_head_init(&ld->waitsendpay_commands);
 	list_head_init(&ld->sendpay_commands);
 	list_head_init(&ld->close_commands);
-	list_head_init(&ld->open_commands);
 	list_head_init(&ld->ping_commands);
 	list_head_init(&ld->waitblockheight_commands);
 
@@ -878,7 +878,7 @@ int main(int argc, char *argv[])
 	/*~ If hsm_secret is encrypted, we don't need its encryption key
 	 * anymore. Note that sodium_munlock() also zeroes the memory.*/
 	if (ld->config.keypass)
-		sodium_munlock(ld->config.keypass->data, sizeof(ld->config.keypass->data));
+		discard_key(take(ld->config.keypass));
 
 	/*~ Our default color and alias are derived from our node id, so we
 	 * can only set those now (if not set by config options). */
@@ -1021,12 +1021,13 @@ int main(int argc, char *argv[])
 	assert(io_loop_ret == ld);
 	ld->state = LD_STATE_SHUTDOWN;
 
+	stop_fd = -1;
+	stop_response = NULL;
+
 	/* Were we exited via `lightningd_exit`?  */
 	if (ld->exit_code) {
 		exit_code = *ld->exit_code;
-		stop_fd = -1;
-		stop_response = NULL;
-	} else {
+	} else if (ld->stop_conn) {
 		/* Keep this fd around, to write final response at the end. */
 		stop_fd = io_conn_fd(ld->stop_conn);
 		io_close_taken_fd(ld->stop_conn);

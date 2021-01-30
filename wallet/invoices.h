@@ -52,7 +52,8 @@ bool invoices_create(struct invoices *invoices,
 		     const char *description,
 		     const u8 *features,
 		     const struct preimage *r,
-		     const struct sha256 *rhash);
+		     const struct sha256 *rhash,
+		     const struct sha256 *local_offer_id);
 
 /**
  * invoices_find_by_label - Search for an invoice by label
@@ -174,10 +175,9 @@ const struct invoice_details *invoices_iterator_deref(
  * @invoice - the invoice to mark as paid.
  * @received - the actual amount received.
  *
- * Precondition: the invoice must not yet be expired (invoices
- * does not check).
+ * If the invoice is not UNPAID, returns false.
  */
-void invoices_resolve(struct invoices *invoices,
+bool invoices_resolve(struct invoices *invoices,
 		      struct invoice invoice,
 		      struct amount_msat received);
 

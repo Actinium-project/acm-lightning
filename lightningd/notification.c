@@ -90,6 +90,7 @@ static void warning_notification_serialize(struct json_stream *stream,
 	/* unsuaul/broken event is rare, plugin pay more attentions on
 	 * the absolute time, like when channels failed. */
 	json_add_time(stream, "time", l->time.ts);
+	json_add_timeiso(stream, "timestamp", &l->time);
 	json_add_string(stream, "source", l->prefix);
 	json_add_string(stream, "log", l->log);
 	json_object_end(stream); /* .warning */
@@ -214,8 +215,11 @@ static void channel_state_changed_notification_serialize(struct json_stream *str
 							 struct node_id *peer_id,
 							 struct channel_id *cid,
 							 struct short_channel_id *scid,
+							 struct timeabs *timestamp,
 							 enum channel_state old_state,
-							 enum channel_state new_state)
+							 enum channel_state new_state,
+							 enum state_change cause,
+							 char *message)
 {
 	json_object_start(stream, "channel_state_changed");
 	json_add_node_id(stream, "peer_id", peer_id);
@@ -224,8 +228,14 @@ static void channel_state_changed_notification_serialize(struct json_stream *str
 		json_add_short_channel_id(stream, "short_channel_id", scid);
 	else
 		json_add_null(stream, "short_channel_id");
+	json_add_timeiso(stream, "timestamp", timestamp);
 	json_add_string(stream, "old_state", channel_state_str(old_state));
 	json_add_string(stream, "new_state", channel_state_str(new_state));
+	json_add_string(stream, "cause", channel_change_state_reason_str(cause));
+	if (message != NULL)
+		json_add_string(stream, "message", message);
+	else
+		json_add_null(stream, "message");
 	json_object_end(stream);
 }
 
@@ -237,19 +247,25 @@ void notify_channel_state_changed(struct lightningd *ld,
 				  struct node_id *peer_id,
 				  struct channel_id *cid,
 				  struct short_channel_id *scid,
+				  struct timeabs *timestamp,
 				  enum channel_state old_state,
-				  enum channel_state new_state)
+				  enum channel_state new_state,
+				  enum state_change cause,
+				  char *message)
 {
 	void (*serialize)(struct json_stream *,
 			  struct node_id *,
 			  struct channel_id *,
 			  struct short_channel_id *,
+			  struct timeabs *timestamp,
 			  enum channel_state,
-			  enum channel_state) = channel_state_changed_notification_gen.serialize;
+			  enum channel_state,
+			  enum state_change,
+			  char *message) = channel_state_changed_notification_gen.serialize;
 
 	struct jsonrpc_notification *n
 		= jsonrpc_notification_start(NULL, channel_state_changed_notification_gen.topic);
-	serialize(n->stream, peer_id, cid, scid, old_state, new_state);
+	serialize(n->stream, peer_id, cid, scid, timestamp, old_state, new_state, cause, message);
 	jsonrpc_notification_end(n);
 	plugins_notify(ld->plugins, take(n));
 }
@@ -492,6 +508,30 @@ void notify_openchannel_peer_sigs(struct lightningd *ld,
 	struct jsonrpc_notification *n =
 		jsonrpc_notification_start(NULL, "openchannel_peer_sigs");
 	serialize(n->stream, cid, psbt);
+	jsonrpc_notification_end(n);
+	plugins_notify(ld->plugins, take(n));
+}
+
+static void channel_open_failed_serialize(struct json_stream *stream,
+					  const struct channel_id *cid)
+{
+	json_object_start(stream, "channel_open_failed");
+	json_add_channel_id(stream, "channel_id", cid);
+	json_object_end(stream);
+}
+
+REGISTER_NOTIFICATION(channel_open_failed,
+		      channel_open_failed_serialize);
+
+void notify_channel_open_failed(struct lightningd *ld,
+				const struct channel_id *cid)
+{
+	void (*serialize)(struct json_stream *,
+			  const struct channel_id *) = channel_open_failed_notification_gen.serialize;
+
+	struct jsonrpc_notification *n =
+		jsonrpc_notification_start(NULL, "channel_open_failed");
+	serialize(n->stream, cid);
 	jsonrpc_notification_end(n);
 	plugins_notify(ld->plugins, take(n));
 }

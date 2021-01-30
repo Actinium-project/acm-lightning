@@ -71,8 +71,8 @@ struct plugin {
 	struct plugin_option *opts;
 
 	/* Anything special to do at init ? */
-	void (*init)(struct plugin *p,
-		     const char *buf, const jsmntok_t *);
+	const char *(*init)(struct plugin *p,
+			    const char *buf, const jsmntok_t *);
 	/* Has the manifest been sent already ? */
 	bool manifested;
 	/* Has init been received ? */
@@ -490,18 +490,20 @@ static struct json_out *start_json_request(const tal_t *ctx,
 	return jout;
 }
 
-/* Synchronous routine to send command and extract single field from response */
-const char *rpc_delve(const tal_t *ctx,
-		      struct plugin *plugin,
-		      const char *method,
-		      const struct json_out *params TAKES,
-		      const char *guide)
+/* Synchronous routine to send command and extract fields from response */
+void rpc_scan(struct plugin *plugin,
+	      const char *method,
+	      const struct json_out *params TAKES,
+	      const char *guide,
+	      ...)
 {
 	bool error;
-	const jsmntok_t *contents, *t;
+	const char *err;
+	const jsmntok_t *contents;
 	int reqlen;
-	const char *ret;
+	const char *p;
 	struct json_out *jout;
+	va_list ap;
 
 	jout = start_json_request(tmpctx, 0, method, params);
 	finish_and_send_json(plugin->rpc_conn->fd, jout);
@@ -511,14 +513,16 @@ const char *rpc_delve(const tal_t *ctx,
 		plugin_err(plugin, "Got error reply to %s: '%.*s'",
 		     method, reqlen, membuf_elems(&plugin->rpc_conn->mb));
 
-	t = json_delve(membuf_elems(&plugin->rpc_conn->mb), contents, guide);
-	if (!t)
-		plugin_err(plugin, "Could not find %s in reply to %s: '%.*s'",
-			   guide, method, reqlen, membuf_elems(&plugin->rpc_conn->mb));
+	p = membuf_consume(&plugin->rpc_conn->mb, reqlen);
 
-	ret = json_strdup(ctx, membuf_elems(&plugin->rpc_conn->mb), t);
-	membuf_consume(&plugin->rpc_conn->mb, reqlen);
-	return ret;
+	va_start(ap, guide);
+	err = json_scanv(tmpctx, p, contents, guide, ap);
+	va_end(ap);
+
+	if (err)
+		plugin_err(plugin, "Could not parse %s in reply to %s: %s: '%.*s'",
+			   guide, method, err,
+			   reqlen, membuf_elems(&plugin->rpc_conn->mb));
 }
 
 static void handle_rpc_reply(struct plugin *plugin, const jsmntok_t *toks)
@@ -628,8 +632,25 @@ handle_getmanifest(struct command *getmanifest_cmd,
 	json_array_end(params);
 
 	json_array_start(params, "hooks");
-	for (size_t i = 0; i < p->num_hook_subs; i++)
-		json_add_string(params, NULL, p->hook_subs[i].name);
+	for (size_t i = 0; i < p->num_hook_subs; i++) {
+		json_object_start(params, NULL);
+		json_add_string(params, "name", p->hook_subs[i].name);
+		if (p->hook_subs[i].before) {
+			json_array_start(params, "before");
+			for (size_t j = 0; p->hook_subs[i].before[j]; j++)
+				json_add_string(params, NULL,
+						p->hook_subs[i].before[j]);
+			json_array_end(params);
+		}
+		if (p->hook_subs[i].after) {
+			json_array_start(params, "after");
+			for (size_t j = 0; p->hook_subs[i].after[j]; j++)
+				json_add_string(params, NULL,
+						p->hook_subs[i].after[j]);
+			json_array_end(params);
+		}
+		json_object_end(params);
+	}
 	json_array_end(params);
 
 	if (p->our_features != NULL) {
@@ -785,34 +806,38 @@ static struct command_result *handle_init(struct command *cmd,
 					  const char *buf,
 					  const jsmntok_t *params)
 {
-	const jsmntok_t *configtok, *rpctok, *dirtok, *opttok, *nettok, *fsettok,
-		*t;
+	const jsmntok_t *configtok, *opttok, *t;
 	struct sockaddr_un addr;
 	size_t i;
 	char *dir, *network;
 	struct plugin *p = cmd->plugin;
 	bool with_rpc = p->rpc_conn != NULL;
+	const char *err;
 
-	configtok = json_delve(buf, params, ".configuration");
+	configtok = json_get_member(buf, params, "configuration");
+	err = json_scan(tmpctx, buf, configtok,
+			"{lightning-dir:%"
+			",network:%"
+			",feature_set:%"
+			",rpc-file:%}",
+			JSON_SCAN_TAL(tmpctx, json_strdup, &dir),
+			JSON_SCAN_TAL(tmpctx, json_strdup, &network),
+			JSON_SCAN_TAL(p, json_to_feature_set, &p->our_features),
+			JSON_SCAN_TAL(p, json_strdup, &p->rpc_location));
+	if (err)
+		plugin_err(p, "cannot scan init params: %s: %.*s",
+			   err, json_tok_full_len(params),
+			   json_tok_full(buf, params));
 
 	/* Move into lightning directory: other files are relative */
-	dirtok = json_delve(buf, configtok, ".lightning-dir");
-	dir = json_strdup(tmpctx, buf, dirtok);
 	if (chdir(dir) != 0)
 		plugin_err(p, "chdir to %s: %s", dir, strerror(errno));
 
-	nettok = json_delve(buf, configtok, ".network");
-	network = json_strdup(tmpctx, buf, nettok);
 	chainparams = chainparams_for_network(network);
-
-	fsettok = json_delve(buf, configtok, ".feature_set");
-	p->our_features = json_to_feature_set(p, buf, fsettok);
 
 	/* Only attempt to connect if the plugin has configured the rpc_conn
 	 * already, if that's not the case we were told to run without an RPC
 	 * connection, so don't even log an error. */
-	rpctok = json_delve(buf, configtok, ".rpc-file");
-	p->rpc_location = json_strdup(p, buf, rpctok);
 	/* FIXME: Move this to its own function so we can initialize at a
 	 * later point in time. */
 	if (p->rpc_conn != NULL) {
@@ -820,9 +845,7 @@ static struct command_result *handle_init(struct command *cmd,
 		if (strlen(p->rpc_location) + 1 > sizeof(addr.sun_path))
 			plugin_err(p, "rpc filename '%s' too long",
 				   p->rpc_location);
-		memcpy(addr.sun_path, buf + rpctok->start,
-		       rpctok->end - rpctok->start);
-		addr.sun_path[rpctok->end - rpctok->start] = '\0';
+		strcpy(addr.sun_path, p->rpc_location);
 		addr.sun_family = AF_UNIX;
 
 		if (connect(p->rpc_conn->fd, (struct sockaddr *)&addr,
@@ -855,8 +878,12 @@ static struct command_result *handle_init(struct command *cmd,
 		tal_free(opt);
 	}
 
-	if (p->init)
-		p->init(p, buf, configtok);
+	if (p->init) {
+		const char *disable = p->init(p, buf, configtok);
+		if (disable)
+			return command_success(cmd, json_out_obj(cmd, "disable",
+								 disable));
+	}
 
 	if (with_rpc)
 		io_new_conn(p, p->rpc_conn->fd, rpc_conn_init, p);
@@ -1273,8 +1300,9 @@ static struct io_plan *stdout_conn_init(struct io_conn *conn,
 }
 
 static struct plugin *new_plugin(const tal_t *ctx,
-				 void (*init)(struct plugin *p,
-					      const char *buf, const jsmntok_t *),
+				 const char *(*init)(struct plugin *p,
+						     const char *buf,
+						     const jsmntok_t *),
 				 const enum plugin_restartability restartability,
 				 bool init_rpc,
 				 struct feature_set *features,
@@ -1342,8 +1370,8 @@ static struct plugin *new_plugin(const tal_t *ctx,
 }
 
 void plugin_main(char *argv[],
-		 void (*init)(struct plugin *p,
-			      const char *buf, const jsmntok_t *),
+		 const char *(*init)(struct plugin *p,
+				     const char *buf, const jsmntok_t *),
 		 const enum plugin_restartability restartability,
 		 bool init_rpc,
 		 struct feature_set *features,
@@ -1577,4 +1605,12 @@ struct route_hop *json_to_route(const tal_t *ctx, const char *buffer,
 			return tal_free(hops);
 	}
 	return hops;
+}
+
+struct command_result *WARN_UNUSED_RESULT
+command_hook_success(struct command *cmd)
+{
+	struct json_stream *response = jsonrpc_stream_success(cmd);
+	json_add_string(response, "result", "continue");
+	return command_finished(cmd, response);
 }

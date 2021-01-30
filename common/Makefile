@@ -6,9 +6,14 @@ COMMON_SRC_NOGEN :=				\
 	common/bech32.c				\
 	common/bech32_util.c			\
 	common/bigsize.c			\
+	common/billboard.c			\
 	common/bip32.c				\
 	common/blinding.c			\
+	common/blindedpath.c			\
 	common/bolt11.c				\
+	common/bolt11_json.c			\
+	common/bolt12.c				\
+	common/bolt12_merkle.c			\
 	common/channel_config.c			\
 	common/channel_id.c			\
 	common/coin_mvt.c			\
@@ -21,6 +26,7 @@ COMMON_SRC_NOGEN :=				\
 	common/daemon_conn.c			\
 	common/decode_array.c			\
 	common/derive_basepoints.c		\
+	common/descriptor_checksum.c		\
 	common/dev_disconnect.c			\
 	common/dijkstra.c			\
 	common/ecdh_hsmd.c			\
@@ -30,6 +36,7 @@ COMMON_SRC_NOGEN :=				\
 	common/gossip_store.c			\
 	common/hash_u5.c			\
 	common/hmac.c				\
+	common/hsm_encryption.c			\
 	common/htlc_state.c			\
 	common/htlc_trim.c			\
 	common/htlc_tx.c			\
@@ -91,6 +98,7 @@ COMMON_HEADERS_NOGEN := $(COMMON_SRC_NOGEN:.c=.h)	\
 	common/errcode.h				\
 	common/gossip_constants.h			\
 	common/htlc.h					\
+	common/iso4217.h				\
 	common/json_command.h				\
 	common/jsonrpc_errors.h				\
 	common/overflows.h				\

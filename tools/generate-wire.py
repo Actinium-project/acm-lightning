@@ -204,6 +204,7 @@ class Type(FieldSet):
         'bool',
         'secp256k1_ecdsa_signature',
         'secp256k1_ecdsa_recoverable_signature',
+        'utf8',
         'wirestring',
         'errcode_t',
         'bigsize',
@@ -318,9 +319,10 @@ class Type(FieldSet):
 
         return prefix + self.struct_name()
 
-    # We only accelerate the u8 case: it's common and trivial.
+    # We accelerate the u8 case: it's common and trivial.
+    # We handle the utf8 case so we can be sure it's actually a UTF-8 string.
     def has_array_helper(self):
-        return self.name in ['u8']
+        return self.name in ['u8', 'utf8']
 
     def struct_name(self):
         if self.is_tlv():
@@ -522,7 +524,7 @@ class Master(object):
         stuff = {}
         stuff['top_comments'] = self.top_comments
         stuff['options'] = options
-        stuff['idem'] = re.sub(r'[^A-Z]+', '_', options.header_filename.upper())
+        stuff['idem'] = re.sub(r'[^A-Z0-9]+', '_', options.header_filename.upper())
         stuff['header_filename'] = options.header_filename
         stuff['includes'] = self.inclusions
         stuff['enum_sets'] = enum_sets

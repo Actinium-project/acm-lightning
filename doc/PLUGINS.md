@@ -93,10 +93,10 @@ example:
     "disconnect"
   ],
   "hooks": [
-    "openchannel",
-    "htlc_accepted"
+    { "name": "openchannel", "before": ["another_plugin"] },
+    { "name": "htlc_accepted" }
   ],
-  "features": {
+  "featurebits": {
     "node": "D0000000",
     "channel": "D0000000",
     "init": "0E000000",
@@ -128,6 +128,10 @@ The `dynamic` indicates if the plugin can be managed after `lightningd`
 has been started. Critical plugins that should not be stopped should set it
 to false.
 
+If a `disable` member exists, the plugin will be disabled and the contents
+of this member is the reason why.  This allows plugins to disable themselves
+if they are not supported in this configuration.
+
 The `featurebits` object allows the plugin to register featurebits that should be
 announced in a number of places in [the protocol][bolt9]. They can be used to signal
 support for custom protocol extensions to direct peers, remote nodes and in
@@ -156,6 +160,10 @@ There are currently four supported option 'types':
   - bool: a boolean
   - int: parsed as a signed integer (64-bit)
   - flag: no-arg flag option. Is boolean under the hood. Defaults to false.
+
+In addition, string and int types can specify `"multi": true` to indicate
+they can be specified multiple times.  These will always be represented in
+`init` as a (possibly empty) JSON array.
 
 Nota bene: if a `flag` type option is not set, it will not appear
 in the options set that is passed to the plugin.
@@ -187,6 +195,13 @@ Here's an example option set, as sent in response to `getmanifest`
       "type": "int",
       "default": 6666,
       "description": "Port to use to connect to 3rd-party service"
+    },
+    {
+      "name": "number",
+      "type": "int",
+      "default": 0,
+      "description": "Another number to add",
+	  "multi": true
     }
   ],
 ```
@@ -201,7 +216,8 @@ simple JSON object containing the options:
 ```json
 {
   "options": {
-    "greeting": "World"
+    "greeting": "World",
+	"number": [0]
   },
   "configuration": {
     "lightning-dir": "/home/user/.lightning/testnet",
@@ -225,10 +241,11 @@ simple JSON object containing the options:
 }
 ```
 
-The plugin must respond to `init` calls, however the response can be
-arbitrary and will currently be discarded by `lightningd`. JSON-RPC
-commands were chosen over notifications in order not to force plugins
-to implement notifications which are not that well supported.
+The plugin must respond to `init` calls.  The response should be a
+valid JSON-RPC response to the `init`, but this is not currently
+enforced.  If the response is an object containing `result` which
+contains `disable` then the plugin will be disabled and the contents
+of this member is the reason why.
 
 The `startup` field allows a plugin to detect if it was started at
 `lightningd` startup (true), or at runtime (false).
@@ -325,8 +342,8 @@ into a block.
 ### `channel_state_changed`
 
 A notification for topic `channel_state_changed` is sent every time a channel
-changes its state. The notification includes the peer and channel ids as well
-as the old and the new channel states.
+changes its state. The notification includes the `peer_id` and `channel_id`, the
+old and new channel states, the type of `cause` and a `message`.
 
 ```json
 {
@@ -335,10 +352,34 @@ as the old and the new channel states.
         "channel_id": "a2d0851832f0e30a0cf778a826d72f077ca86b69f72677e0267f23f63a0599b4",
         "short_channel_id" : "561820x1020x1",
         "old_state": "CHANNELD_NORMAL",
-        "new_state": "CHANNELD_SHUTTING_DOWN"
+        "new_state": "CHANNELD_SHUTTING_DOWN",
+        "cause" : "remote",
+        "message" : "Peer closes channel"
     }
 }
 ```
+
+A `cause` can have the following values:
+ - "unknown"   Anything other than the reasons below. Should not happen.
+ - "local"     Unconscious internal reasons, e.g. dev fail of a channel.
+ - "user"      The operator or a plugin opened or closed a channel by intention.
+ - "remote"    The remote closed or funded a channel with us by intention.
+ - "protocol"  We need to close a channel because of bad signatures and such.
+ - "onchain"   A channel was closed onchain, while we were offline.
+
+Most state changes are caused subsequentially for a prior state change, e.g.
+"CLOSINGD_COMPLETE" is followed by "FUNDING_SPEND_SEEN". Because of this, the
+`cause` reflects the last known reason in terms of local or remote user
+interaction, protocol reasons, etc. More specifically, a `new_state`
+"FUNDING_SPEND_SEEN" will likely _not_ have "onchain" as a `cause` but some
+value such as "REMOTE" or "LOCAL" depending on who initiated the closing of a
+channel.
+
+Note: If the channel is not closed or being closed yet, the `cause` will reflect
+which side "remote" or "local" opened the channel.
+
+Note: If the cause is "onchain" this was very likely a conscious decision of the
+remote peer, but we have been offline.
 
 ### `connect`
 
@@ -678,14 +719,25 @@ declares that it'd like to be consulted on what to do next for certain
 events in the daemon. A hook can then decide how `lightningd` should
 react to the given event.
 
+When hooks are registered, they can optionally specify "before" and
+"after" arrays of plugin names, which control what order they will be
+called in.  If a plugin name is unknown, it is ignored, otherwise if the
+hook calls cannot be ordered to satisfy the specifications of all
+plugin hooks, the plugin registration will fail.
+
 The call semantics of the hooks, i.e., when and how hooks are called, depend
 on the hook type. Most hooks are currently set to `single`-mode. In this mode
 only a single plugin can register the hook, and that plugin will get called
 for each event of that type. If a second plugin attempts to register the hook
-it gets killed and a corresponding log entry will be added to the logs. In
-`chain`-mode multiple plugins can register for the hook type and they are
-called sequentially if a matching event is triggered. Each plugin can then
-handle the event or defer by returning a `continue` result like the following:
+it gets killed and a corresponding log entry will be added to the logs.
+
+In `chain`-mode multiple plugins can register for the hook type and
+they are called in any order they are loaded (i.e. cmdline order
+first, configuration order file second: though note that the order of
+plugin directories is implementation-dependent), overriden only by
+`before` and `after` requirements the plugin's hook registrations specify.
+Each plugin can then handle the event or defer by returning a
+`continue` result like the following:
 
 ```json
 {
@@ -862,6 +914,14 @@ to error without
 committing to the database!
 This is the expected way to halt and catch fire.
 
+`db_write` is a parallel-chained hook, i.e., multiple plugins can
+register it, and all of them will be invoked simultaneously without
+regard for order of registration.
+The hook is considered handled if all registered plugins return
+`{"result": "continue"}`.
+If any plugin returns anything else, `lightningd` will error without
+committing to the database.
+
 ### `invoice_payment`
 
 This hook is called whenever a valid payment for an unpaid invoice has arrived.
@@ -944,10 +1004,10 @@ The payload of the hook call has the following format:
     "type": "legacy",
     "short_channel_id": "1x2x3",
     "forward_amount": "42msat",
-    "outgoing_cltv_value": 500014
+    "outgoing_cltv_value": 500014,
+    "shared_secret": "0000000000000000000000000000000000000000000000000000000000000000",
+    "next_onion": "[1365bytes of serialized onion]"
   },
-  "next_onion": "[1365bytes of serialized onion]",
-  "shared_secret": "0000000000000000000000000000000000000000000000000000000000000000",
   "htlc": {
     "amount": "43msat",
     "cltv_expiry": 500028,
@@ -959,23 +1019,24 @@ The payload of the hook call has the following format:
 
 For detailed information about each field please refer to [BOLT 04 of the specification][bolt4], the following is just a brief summary:
 
- - `onion.payload` contains the unparsed payload that was sent to us from the
+ - `onion`:
+   - `payload` contains the unparsed payload that was sent to us from the
    sender of the payment.
- - `onion.type` is `legacy` for realm 0 payments, `tlv` for realm > 1.
- - `short_channel_id` determines the channel that the sender is hinting
-     should be used next.  Not present if we're the final destination.
- - `forward_amount` is the amount we should be forwarding to the next hop,
-     and should match the incoming funds in case we are the recipient.
- - `outgoing_cltv_value` determines what the CLTV value for the HTLC that we
-     forward to the next hop should be.
- - `total_msat` specifies the total amount to pay, if present.
- - `payment_secret` specifies the payment secret (which the payer should have obtained from the invoice), if present.
- - `next_onion` is the fully processed onion that we should be sending to the
-   next hop as part of the outgoing HTLC. Processed in this case means that we
-   took the incoming onion, decrypted it, extracted the payload destined for
-   us, and serialized the resulting onion again.
- - `shared_secret` is the shared secret we used to decrypt the incoming
-   onion. It is shared with the sender that constructed the onion.
+   - `type` is `legacy` for realm 0 payments, `tlv` for realm > 1.
+   - `short_channel_id` determines the channel that the sender is hinting
+       should be used next.  Not present if we're the final destination.
+   - `forward_amount` is the amount we should be forwarding to the next hop,
+       and should match the incoming funds in case we are the recipient.
+   - `outgoing_cltv_value` determines what the CLTV value for the HTLC that we
+       forward to the next hop should be.
+   - `total_msat` specifies the total amount to pay, if present.
+   - `payment_secret` specifies the payment secret (which the payer should have obtained from the invoice), if present.
+   - `next_onion` is the fully processed onion that we should be sending to the
+     next hop as part of the outgoing HTLC. Processed in this case means that we
+     took the incoming onion, decrypted it, extracted the payload destined for
+     us, and serialized the resulting onion again.
+   - `shared_secret` is the shared secret we used to decrypt the incoming
+     onion. It is shared with the sender that constructed the onion.
  - `htlc`:
    - `amount` is the amount that we received with the HTLC. This amount minus
      the `forward_amount` is the fee that will stay with us.
@@ -1017,7 +1078,25 @@ onion fields which a plugin doesn't want lightningd to consider.
 ```
 
 `fail` will tell `lightningd` to fail the HTLC with a given hex-encoded
-`failure_message` (please refer to the [spec][bolt4-failure-messages] for details: `incorrect_or_unknown_payment_details` is the most common).
+`failure_message` (please refer to the [spec][bolt4-failure-messages] for
+details: `incorrect_or_unknown_payment_details` is the most common).
+
+
+```json
+{
+  "result": "fail",
+  "failure_onion": "[serialized error packet]"
+}
+```
+
+Instead of `failure_message` the response can contain a hex-encoded
+`failure_onion` that will be used instead (please refer to the
+[spec][bolt4-failure-onion] for details). This can be used, for example,
+if you're writing a bridge between two Lightning Networks. Note that
+`lightningd` will apply the obfuscation step to the value returned here
+with its own shared secret (and key type `ammag`) before returning it to
+the previous hop.
+
 
 ```json
 {
@@ -1139,12 +1218,46 @@ ignored by nodes (see ["it's ok to be odd" in the specification][oddok] for
 details). The plugin must implement the parsing of the message, including the
 type prefix, since c-lightning does not know how to parse the message.
 
-The result for this hook is currently being discarded. For future uses of the
-result we suggest just returning `{'result': 'continue'}`.
-This will ensure backward
-compatibility should the semantics be changed in future.
+Because this is a chained hook, the daemon expects the result to be
+`{'result': 'continue'}`. It will fail if something else is returned.
 
+### `onion_message` and `onion_message_blinded`
 
+**(WARNING: experimental-offers only)**
+
+These two hooks are almost identical, in that they are called when an
+onion message is received.  The former is only used for unblinded
+messages (where the source knows that it is sending to this node), and
+the latter for blinded messages (where the source doesn't know that
+this node is the destination).  The latter hook will have a
+"blinding_in" field, the former never will.
+
+These hooks are separate, because blinded messages must ensure the
+sender used the correct "blinding_in", otherwise it should ignore the
+message: this avoids the source trying to probe for responses without
+using the designated delivery path.
+
+The payload for a call follows this format:
+
+```json
+{
+    "onion_message": {
+        "blinding_in": "02df5ffe895c778e10f7742a6c5b8a0cefbe9465df58b92fadeb883752c8107c8f",
+		"reply_path": [ {"id": "02df5ffe895c778e10f7742a6c5b8a0cefbe9465df58b92fadeb883752c8107c8f",
+                         "enctlv": "0a020d0d",
+                         "blinding": "02df5ffe895c778e10f7742a6c5b8a0cefbe9465df58b92fadeb883752c8107c8f"} ],
+        "invoice_request": "0a020d0d",
+		"invoice": "0a020d0d",
+		"invoice_error": "0a020d0d",
+		"unknown_fields": [ {"number": 12345, "value": "0a020d0d"} ]
+	}
+}
+```
+
+All fields shown here are optional.
+
+We suggest just returning `{'result': 'continue'}`; any other result
+will cause the message not to be handed to any other hooks.
 
 ## Bitcoin backend
 
@@ -1227,6 +1340,7 @@ The plugin must broadcast it and respond with the following fields:
 [jsonrpc-notification-spec]: https://www.jsonrpc.org/specification#notification
 [bolt4]: https://github.com/lightningnetwork/lightning-rfc/blob/master/04-onion-routing.md
 [bolt4-failure-messages]: https://github.com/lightningnetwork/lightning-rfc/blob/master/04-onion-routing.md#failure-messages
+[bolt4-failure-onion]: https://github.com/lightningnetwork/lightning-rfc/blob/master/04-onion-routing.md#returning-errors
 [bolt2-open-channel]: https://github.com/lightningnetwork/lightning-rfc/blob/master/02-peer-protocol.md#the-open_channel-message
 [sendcustommsg]: lightning-dev-sendcustommsg.7.html
 [oddok]: https://github.com/lightningnetwork/lightning-rfc/blob/master/00-introduction.md#its-ok-to-be-odd

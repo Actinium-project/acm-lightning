@@ -740,6 +740,14 @@ int main(int argc, char *argv[])
 		tal_append_fmt(&cmd, "] }");
 	}
 
+	toks = json_parse_simple(ctx, cmd, strlen(cmd));
+	if (toks == NULL)
+		errx(ERROR_USAGE,
+		     "Some parameters are malformed, cannot create a valid "
+		     "JSON-RPC request: %s",
+		     cmd);
+	tal_free(toks);
+
 	if (!write_all(fd, cmd, strlen(cmd)))
 		err(ERROR_TALKING_TO_LIGHTNINGD, "Writing command");
 
@@ -823,8 +831,9 @@ int main(int argc, char *argv[])
 		     "Missing 'id' in response '%s'", resp);
 	if (!json_tok_streq(resp, id, idstr))
 		errx(ERROR_TALKING_TO_LIGHTNINGD,
-		     "Incorrect 'id' in response: %.*s",
-		     json_tok_full_len(id), json_tok_full(resp, id));
+		     "Incorrect 'id' (%.*s) in response: %.*s",
+		     json_tok_full_len(id), json_tok_full(resp, id),
+		     json_tok_full_len(toks), json_tok_full(resp, toks));
 
 	if (!error || json_tok_is_null(resp, error)) {
 		switch (format) {

@@ -6,6 +6,7 @@
 #include <common/errcode.h>
 #include <secp256k1_recovery.h>
 #include <stdlib.h>
+#include <wire/tlvstream.h>
 
 struct ripemd160;
 struct sha256;
@@ -13,6 +14,7 @@ struct siphash_seed;
 
 /* Makes generate-wire.py work */
 typedef char wirestring;
+typedef char utf8;
 
 /* Read the type; returns -1 if not long enough.  cursor is a tal ptr. */
 int fromwire_peektype(const u8 *cursor);
@@ -37,6 +39,7 @@ void towire_bool(u8 **pptr, bool v);
 void towire_errcode_t(u8 **pptr, errcode_t v);
 
 void towire_u8_array(u8 **pptr, const u8 *arr, size_t num);
+void towire_utf8_array(u8 **pptr, const char *arr, size_t num);
 
 void towire_wirestring(u8 **pptr, const char *str);
 void towire_siphash_seed(u8 **cursor, const struct siphash_seed *seed);
@@ -61,6 +64,7 @@ void fromwire_ripemd160(const u8 **cursor, size_t *max, struct ripemd160 *ripemd
 void fromwire_pad(const u8 **cursor, size_t *max, size_t num);
 
 void fromwire_u8_array(const u8 **cursor, size_t *max, u8 *arr, size_t num);
+void fromwire_utf8_array(const u8 **cursor, size_t *max, char *arr, size_t num);
 u8 *fromwire_tal_arrn(const tal_t *ctx,
 		       const u8 **cursor, size_t *max, size_t num);
 char *fromwire_wirestring(const tal_t *ctx, const u8 **cursor, size_t *max);
@@ -71,14 +75,8 @@ void fromwire_siphash_seed(const u8 **cursor, size_t *max,
 /* Stubs, as this subtype is only defined when EXPERIMENTAL_FEATURES */
 struct onionmsg_path;
 
-static inline void towire_onionmsg_path(u8 **p, const struct onionmsg_path *onionmsg_path)
-{
-}
-
-static inline struct onionmsg_path *
-fromwire_onionmsg_path(const tal_t *ctx, const u8 **cursor, size_t *plen)
-{
-	return NULL;
-}
+void towire_onionmsg_path(u8 **p, const struct onionmsg_path *onionmsg_path);
+struct onionmsg_path *
+fromwire_onionmsg_path(const tal_t *ctx, const u8 **cursor, size_t *plen);
 #endif /* EXPERIMENTAL_FEATURES */
 #endif /* LIGHTNING_WIRE_WIRE_H */

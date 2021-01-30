@@ -127,6 +127,8 @@ void bitcoin_tx_hash_for_sig(const struct bitcoin_tx *tx, unsigned int in,
 	input_amt = psbt_input_get_amount(tx->psbt, in);
 	input_val_sats = input_amt.satoshis; /* Raw: type conversion */
 
+	/* Wally can allocate here, iff tx doesn't fit on stack */
+	tal_wally_start();
 	if (is_elements(chainparams)) {
 		ret = wally_tx_confidential_value_from_satoshi(input_val_sats, value, sizeof(value));
 		assert(ret == WALLY_OK);
@@ -141,6 +143,7 @@ void bitcoin_tx_hash_for_sig(const struct bitcoin_tx *tx, unsigned int in,
 		    sighash_type, flags, dest->sha.u.u8, sizeof(*dest));
 		assert(ret == WALLY_OK);
 	}
+	tal_wally_end(tx->wtx);
 }
 
 void sign_tx_input(const struct bitcoin_tx *tx,
@@ -307,8 +310,7 @@ bool signature_from_der(const u8 *der, size_t len, struct bitcoin_signature *sig
 	return true;
 }
 
-static char *signature_to_hexstr(const tal_t *ctx,
-				 const secp256k1_ecdsa_signature *sig)
+char *fmt_signature(const tal_t *ctx, const secp256k1_ecdsa_signature *sig)
 {
 	u8 der[72];
 	size_t len = 72;
@@ -318,7 +320,7 @@ static char *signature_to_hexstr(const tal_t *ctx,
 
 	return tal_hexstr(ctx, der, len);
 }
-REGISTER_TYPE_TO_STRING(secp256k1_ecdsa_signature, signature_to_hexstr);
+REGISTER_TYPE_TO_STRING(secp256k1_ecdsa_signature, fmt_signature);
 
 static char *bitcoin_signature_to_hexstr(const tal_t *ctx,
 					 const struct bitcoin_signature *sig)
@@ -345,3 +347,52 @@ void towire_bitcoin_signature(u8 **pptr, const struct bitcoin_signature *sig)
 	towire_secp256k1_ecdsa_signature(pptr, &sig->s);
 	towire_u8(pptr, sig->sighash_type);
 }
+
+void towire_bip340sig(u8 **pptr, const struct bip340sig *bip340sig)
+{
+	towire_u8_array(pptr, bip340sig->u8, sizeof(bip340sig->u8));
+}
+
+void fromwire_bip340sig(const u8 **cursor, size_t *max,
+			struct bip340sig *bip340sig)
+{
+	fromwire_u8_array(cursor, max, bip340sig->u8, sizeof(bip340sig->u8));
+}
+
+char *fmt_bip340sig(const tal_t *ctx, const struct bip340sig *bip340sig)
+{
+	return tal_hexstr(ctx, bip340sig->u8, sizeof(bip340sig->u8));
+}
+
+REGISTER_TYPE_TO_HEXSTR(bip340sig);
+
+/* BIP-340:
+ *
+ * This proposal suggests to include the tag by prefixing the hashed
+ * data with ''SHA256(tag) || SHA256(tag)''. Because this is a 64-byte
+ * long context-specific constant and the ''SHA256'' block size is
+ * also 64 bytes, optimized implementations are possible (identical to
+ * SHA256 itself, but with a modified initial state). Using SHA256 of
+ * the tag name itself is reasonably simple and efficient for
+ * implementations that don't choose to use the optimization.
+ */
+
+/* For caller convenience, we hand in tag in parts (any can be "") */
+void bip340_sighash_init(struct sha256_ctx *sctx,
+			 const char *tag1,
+			 const char *tag2,
+			 const char *tag3)
+{
+	struct sha256 taghash;
+
+	sha256_init(sctx);
+	sha256_update(sctx, memcheck(tag1, strlen(tag1)), strlen(tag1));
+	sha256_update(sctx, memcheck(tag2, strlen(tag2)), strlen(tag2));
+	sha256_update(sctx, memcheck(tag3, strlen(tag3)), strlen(tag3));
+	sha256_done(sctx, &taghash);
+
+	sha256_init(sctx);
+	sha256_update(sctx, &taghash, sizeof(taghash));
+	sha256_update(sctx, &taghash, sizeof(taghash));
+}
+

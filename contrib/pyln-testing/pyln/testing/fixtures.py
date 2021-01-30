@@ -1,6 +1,6 @@
 from concurrent import futures
 from pyln.testing.db import SqliteDbProvider, PostgresDbProvider
-from pyln.testing.utils import NodeFactory, BitcoinD, ElementsD, env, DEVELOPER, LightningNode, TEST_DEBUG
+from pyln.testing.utils import NodeFactory, BitcoinD, ElementsD, env, DEVELOPER, LightningNode, TEST_DEBUG, Throttler
 from typing import Dict
 
 import logging
@@ -90,7 +90,7 @@ def directory(request, test_base_dir, test_name):
     if not failed:
         try:
             shutil.rmtree(directory)
-        except Exception:
+        except (OSError, Exception):
             files = [os.path.join(dp, f) for dp, dn, fn in os.walk(directory) for f in fn]
             print("Directory still contains files:", files)
             raise
@@ -127,9 +127,15 @@ def bitcoind(directory, teardown_checks):
 
     info = bitcoind.rpc.getnetworkinfo()
 
-    if info['version'] < 160000:
+    # FIXME: include liquid-regtest in this check after elementsd has been
+    # updated
+    if info['version'] < 200100 and env('TEST_NETWORK') != 'liquid-regtest':
         bitcoind.rpc.stop()
-        raise ValueError("bitcoind is too old. At least version 16000 (v0.16.0)"
+        raise ValueError("bitcoind is too old. At least version 20100 (v0.20.1)"
+                         " is needed, current version is {}".format(info['version']))
+    elif info['version'] < 160000:
+        bitcoind.rpc.stop()
+        raise ValueError("elementsd is too old. At least version 160000 (v0.16.0)"
                          " is needed, current version is {}".format(info['version']))
 
     info = bitcoind.rpc.getblockchaininfo()
@@ -192,7 +198,12 @@ def teardown_checks(request):
 
 
 @pytest.fixture
-def node_factory(request, directory, test_name, bitcoind, executor, db_provider, teardown_checks, node_cls):
+def throttler(test_base_dir):
+    yield Throttler(test_base_dir)
+
+
+@pytest.fixture
+def node_factory(request, directory, test_name, bitcoind, executor, db_provider, teardown_checks, node_cls, throttler):
     nf = NodeFactory(
         request,
         test_name,
@@ -200,7 +211,8 @@ def node_factory(request, directory, test_name, bitcoind, executor, db_provider,
         executor,
         directory=directory,
         db_provider=db_provider,
-        node_cls=node_cls
+        node_cls=node_cls,
+        throttler=throttler,
     )
 
     yield nf

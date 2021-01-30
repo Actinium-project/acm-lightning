@@ -3,6 +3,7 @@
 #include <ccan/err/err.h>
 #include <ccan/mem/mem.h>
 #include <ccan/str/hex/hex.h>
+#include <common/setup.h>
 #include <common/utils.h>
 #include <stdio.h>
 #include <wally_core.h>
@@ -74,6 +75,9 @@ u64 fromwire_u64(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
 /* Generated stub for fromwire_u8 */
 u8 fromwire_u8(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
 { fprintf(stderr, "fromwire_u8 called!\n"); abort(); }
+/* Generated stub for fromwire_u8_array */
+void fromwire_u8_array(const u8 **cursor UNNEEDED, size_t *max UNNEEDED, u8 *arr UNNEEDED, size_t num UNNEEDED)
+{ fprintf(stderr, "fromwire_u8_array called!\n"); abort(); }
 /* Generated stub for towire */
 void towire(u8 **pptr UNNEEDED, const void *data UNNEEDED, size_t len UNNEEDED)
 { fprintf(stderr, "towire called!\n"); abort(); }
@@ -182,6 +186,8 @@ static void test_feature_set_or(void)
 static void test_feature_set_sub(void)
 {
 	struct feature_set *f1, *f2, *control;
+
+	/* cppcheck-suppress uninitvar - false positive on f1->bits */
 	for (size_t i = 0; i < ARRAY_SIZE(f1->bits); i++) {
 		f1 = talz(tmpctx, struct feature_set);
 		f2 = talz(tmpctx, struct feature_set);
@@ -214,6 +220,8 @@ static void test_feature_set_sub(void)
 static void test_feature_trim(void)
 {
 	struct feature_set *f;
+
+	/* cppcheck-suppress uninitvar - false positive on f->bits */
 	for (size_t i = 0; i < ARRAY_SIZE(f->bits); i++) {
 		f = talz(tmpctx, struct feature_set);
 
@@ -244,15 +252,12 @@ static void test_feature_trim(void)
 	}
 }
 
-int main(void)
+int main(int argc, char *argv[])
 {
 	u8 *bits;
 	struct feature_set *fset;
 
-	setup_locale();
-	wally_init(0);
-	secp256k1_ctx = wally_get_secp_context();
-	setup_tmpctx();
+	common_setup(argv[0]);
 
 	/* Just some bits to set. */
 	fset = feature_set_for_feature(tmpctx,
@@ -333,8 +338,6 @@ int main(void)
 	test_feature_trim();
 	test_feature_set_sub();
 
-	wally_cleanup(0);
-	tal_free(tmpctx);
-	take_cleanup();
+	common_shutdown();
 	return 0;
 }

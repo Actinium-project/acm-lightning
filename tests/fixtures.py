@@ -1,5 +1,5 @@
 from utils import DEVELOPER, TEST_NETWORK  # noqa: F401,F403
-from pyln.testing.fixtures import directory, test_base_dir, test_name, chainparams, node_factory, bitcoind, teardown_checks, db_provider, executor, setup_logging  # noqa: F401,F403
+from pyln.testing.fixtures import directory, test_base_dir, test_name, chainparams, node_factory, bitcoind, teardown_checks, throttler, db_provider, executor, setup_logging  # noqa: F401,F403
 from pyln.testing import utils
 from utils import COMPAT
 
@@ -19,7 +19,7 @@ class LightningNode(utils.LightningNode):
 
         # If we opted into checking the DB statements we will attach the dblog
         # plugin before starting the node
-        check_dblog = os.environ.get("TEST_CHECK_DBSTMTS", None) is not None
+        check_dblog = os.environ.get("TEST_CHECK_DBSTMTS", None) == "1"
         db = os.environ.get("TEST_DB_PROVIDER", "sqlite3")
         if db == 'sqlite3' and check_dblog:
             dblog = os.path.join(os.path.dirname(__file__), 'plugins', 'dblog.py')

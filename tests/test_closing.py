@@ -304,18 +304,15 @@ def test_closing_negotiation_reconnect(node_factory, bitcoind):
     assert bitcoind.rpc.getmempoolinfo()['size'] == 0
 
     l1.rpc.close(l2.info['id'])
+    l1.daemon.wait_for_log(r'State changed from CHANNELD_NORMAL to CHANNELD_SHUTTING_DOWN')
+    l2.daemon.wait_for_log(r'State changed from CHANNELD_NORMAL to CHANNELD_SHUTTING_DOWN')
 
-    l1.daemon.wait_for_log(' to CHANNELD_SHUTTING_DOWN')
-    l2.daemon.wait_for_log(' to CHANNELD_SHUTTING_DOWN')
-
-    l1.daemon.wait_for_log(' to CLOSINGD_SIGEXCHANGE')
-    l2.daemon.wait_for_log(' to CLOSINGD_SIGEXCHANGE')
-
-    # And should put closing into mempool (happens async, so
-    # CLOSINGD_COMPLETE may come first).
-    l1.daemon.wait_for_logs(['sendrawtx exit 0', ' to CLOSINGD_COMPLETE'])
-    l2.daemon.wait_for_logs(['sendrawtx exit 0', ' to CLOSINGD_COMPLETE'])
-    assert bitcoind.rpc.getmempoolinfo()['size'] == 1
+    # Now verify that the closing tx is in the mempool.
+    bitcoind.generate_block(6, wait_for_mempool=1)
+    sync_blockheight(bitcoind, [l1, l2])
+    for n in [l1, l2]:
+        # Ensure we actually got a mutual close.
+        n.daemon.wait_for_log(r'Resolved FUNDING_TRANSACTION/FUNDING_OUTPUT by MUTUAL_CLOSE')
 
 
 @unittest.skipIf(not DEVELOPER, "needs DEVELOPER=1")
@@ -415,10 +412,14 @@ def closing_negotiation_step(node_factory, bitcoind, chainparams, opts):
 
     def get_fee_from_status(node, peer_id, i):
         nonlocal fees_from_status
-        status = only_one(only_one(node.rpc.listpeers(peer_id)['peers'][0]['channels'])['status'])
+        peer = only_one(node.rpc.listpeers(peer_id)['peers'])
+        channel = only_one(peer['channels'])
+        status = channel['status'][0]
+
         m = status_agreed_regex.search(status)
         if not m:
             return False
+
         fees_from_status[i] = int(m.group(1))
         return True
 
@@ -984,12 +985,12 @@ def test_penalty_htlc_tx_timeout(node_factory, bitcoind, chainparams):
     l2.daemon.wait_for_log('Propose handling OUR_HTLC_SUCCESS_TX/DELAYED_OUTPUT_TO_US by OUR_DELAYED_RETURN_TO_WALLET .* after 5 blocks')
 
     # after 5 blocks, l2 reclaims both their DELAYED_OUTPUT_TO_US and their delayed output
-    bitcoind.generate_block(5)
+    bitcoind.generate_block(5, wait_for_mempool=0)
     sync_blockheight(bitcoind, [l2])
     l2.daemon.wait_for_logs(['Broadcasting OUR_DELAYED_RETURN_TO_WALLET .* to resolve OUR_HTLC_SUCCESS_TX/DELAYED_OUTPUT_TO_US',
                              'Broadcasting OUR_DELAYED_RETURN_TO_WALLET .* to resolve OUR_UNILATERAL/DELAYED_OUTPUT_TO_US'])
 
-    bitcoind.generate_block(10)
+    bitcoind.generate_block(10, wait_for_mempool=2)
     l2.wait_for_onchaind_broadcast('OUR_HTLC_TIMEOUT_TX',
                                    'OUR_UNILATERAL/OUR_HTLC')
 
@@ -1013,7 +1014,7 @@ def test_penalty_htlc_tx_timeout(node_factory, bitcoind, chainparams):
                              'by THEIR_DELAYED_CHEAT',
                              'Resolved THEIR_REVOKED_UNILATERAL/THEIR_HTLC by THEIR_HTLC_TIMEOUT_TO_THEM',
                              'Propose handling THEIR_HTLC_TIMEOUT_TO_THEM/DELAYED_CHEAT_OUTPUT_TO_THEM by OUR_PENALTY_TX'])
-    bitcoind.generate_block(1)
+    bitcoind.generate_block(1, wait_for_mempool=2)  # OUR_PENALTY_TX + OUR_HTLC_TIMEOUT_TO_US
     l3.daemon.wait_for_log('Resolved THEIR_HTLC_TIMEOUT_TO_THEM/DELAYED_CHEAT_OUTPUT_TO_THEM '
                            'by our proposal OUR_PENALTY_TX')
     l2.daemon.wait_for_log('Unknown spend of OUR_HTLC_TIMEOUT_TX/DELAYED_OUTPUT_TO_US')
@@ -1516,7 +1517,7 @@ def test_onchain_timeout(node_factory, bitcoind, executor):
 
     # It should fail.
     with pytest.raises(RpcError, match=r'WIRE_PERMANENT_CHANNEL_FAILURE: timed out'):
-        payfuture.result(5)
+        payfuture.result(TIMEOUT)
 
     # 2 later, l1 spends HTLC (5 blocks total).
     bitcoind.generate_block(2)
@@ -1677,6 +1678,7 @@ def test_onchain_middleman_their_unilateral_in(node_factory, bitcoind):
     t.start()
 
     # l1 will drop to chain.
+    l1.daemon.wait_for_log(' to AWAITING_UNILATERAL')
     l1.daemon.wait_for_log('sendrawtx exit 0')
     l1.bitcoin.generate_block(1)
     l2.daemon.wait_for_log(' to ONCHAIN')
@@ -1746,6 +1748,7 @@ def test_onchain_their_unilateral_out(node_factory, bitcoind):
     t.start()
 
     # l2 will drop to chain.
+    l2.daemon.wait_for_log(' to AWAITING_UNILATERAL')
     l2.daemon.wait_for_log('sendrawtx exit 0')
     l2.bitcoin.generate_block(1)
     l1.daemon.wait_for_log(' to ONCHAIN')
@@ -2365,7 +2368,7 @@ def test_permfail_htlc_out(node_factory, bitcoind, executor):
                                feerates=(7500, 7500, 7500, 7500))
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
-    l2.daemon.wait_for_log('openingd-chan#1: Handed peer, entering loop'.format(l1.info['id']))
+    l2.daemon.wait_for_log('Handed peer, entering loop')
     l2.fundchannel(l1, 10**6)
 
     # This will fail at l2's end.

@@ -6,13 +6,17 @@ from flaky import flaky  # noqa: F401
 from pyln.client import RpcError, Millisatoshi
 from utils import (
     only_one, wait_for, sync_blockheight, EXPERIMENTAL_FEATURES,
-    VALGRIND, check_coin_moves
+    VALGRIND, check_coin_moves, TailableProc
 )
 
 import os
 import pytest
 import subprocess
+import sys
 import unittest
+
+
+WAIT_TIMEOUT = 60  # Wait timeout for processes
 
 
 @unittest.skipIf(TEST_NETWORK != 'regtest', "Test relies on a number of example addresses valid only in regtest")
@@ -946,6 +950,7 @@ def test_transaction_annotations(node_factory, bitcoind):
 
 
 @unittest.skipIf(VALGRIND, "It does not play well with prompt and key derivation.")
+@unittest.skipIf(not sys.stdout.isatty(), "Cannot")
 def test_hsm_secret_encryption(node_factory):
     l1 = node_factory.get_node(may_fail=True)  # May fail when started without key
     password = "reckful\n"
@@ -956,8 +961,9 @@ def test_hsm_secret_encryption(node_factory):
     l1.stop()
     l1.daemon.opts.update({"encrypted-hsm": None})
     l1.daemon.start(stdin=slave_fd, wait_for_initialized=False)
-    l1.daemon.wait_for_log(r'The hsm_secret is encrypted')
-
+    l1.daemon.wait_for_log(r'Enter hsm_secret password')
+    os.write(master_fd, password.encode("utf-8"))
+    l1.daemon.wait_for_log(r'Confirm hsm_secret password')
     os.write(master_fd, password.encode("utf-8"))
     l1.daemon.wait_for_log("Server started with public key")
     id = l1.rpc.getinfo()["id"]
@@ -972,17 +978,29 @@ def test_hsm_secret_encryption(node_factory):
     l1.daemon.opts.update({"encrypted-hsm": None})
     l1.daemon.start(stdin=slave_fd, stderr=subprocess.STDOUT,
                     wait_for_initialized=False)
-    l1.daemon.wait_for_log(r'The hsm_secret is encrypted')
+    l1.daemon.wait_for_log(r'Enter hsm_secret password')
     os.write(master_fd, password[2:].encode("utf-8"))
-    assert(l1.daemon.proc.wait() == 1)
+    l1.daemon.wait_for_log(r'Confirm hsm_secret password')
+    os.write(master_fd, password[2:].encode("utf-8"))
+    assert(l1.daemon.proc.wait(WAIT_TIMEOUT) == 1)
     assert(l1.daemon.is_in_log("Wrong password for encrypted hsm_secret."))
 
     # Test we can restore the same wallet with the same password
     l1.daemon.start(stdin=slave_fd, wait_for_initialized=False)
     l1.daemon.wait_for_log(r'The hsm_secret is encrypted')
     os.write(master_fd, password.encode("utf-8"))
+    l1.daemon.wait_for_log(r'Confirm hsm_secret password')
+    os.write(master_fd, password.encode("utf-8"))
     l1.daemon.wait_for_log("Server started with public key")
     assert id == l1.rpc.getinfo()["id"]
+
+
+class HsmTool(TailableProc):
+    """Helper for testing the hsmtool as a subprocess"""
+    def __init__(self, *args):
+        TailableProc.__init__(self)
+        assert hasattr(self, "env")
+        self.cmd_line = ["tools/hsmtool", *args]
 
 
 @unittest.skipIf(VALGRIND, "It does not play well with prompt and key derivation.")
@@ -997,20 +1015,31 @@ def test_hsmtool_secret_decryption(node_factory):
     l1.stop()
     l1.daemon.opts.update({"encrypted-hsm": None})
     l1.daemon.start(stdin=slave_fd, wait_for_initialized=False)
-    l1.daemon.wait_for_log(r'The hsm_secret is encrypted')
+    l1.daemon.wait_for_log(r'Enter hsm_secret password')
+    os.write(master_fd, password.encode("utf-8"))
+    l1.daemon.wait_for_log(r'Confirm hsm_secret password')
     os.write(master_fd, password.encode("utf-8"))
     l1.daemon.wait_for_log("Server started with public key")
     node_id = l1.rpc.getinfo()["id"]
     l1.stop()
 
     # We can't use a wrong password !
-    cmd_line = ["tools/hsmtool", "decrypt", hsm_path, "A wrong pass"]
-    with pytest.raises(subprocess.CalledProcessError):
-        subprocess.check_call(cmd_line)
+    master_fd, slave_fd = os.openpty()
+    hsmtool = HsmTool("decrypt", hsm_path)
+    hsmtool.start(stdin=slave_fd,
+                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    hsmtool.wait_for_log(r"Enter hsm_secret password:")
+    os.write(master_fd, "A wrong pass\n\n".encode("utf-8"))
+    hsmtool.proc.wait(WAIT_TIMEOUT)
+    hsmtool.is_in_log(r"Wrong password")
 
     # Decrypt it with hsmtool
-    cmd_line[3] = password[:-1]
-    subprocess.check_call(cmd_line)
+    master_fd, slave_fd = os.openpty()
+    hsmtool.start(stdin=slave_fd,
+                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    hsmtool.wait_for_log(r"Enter hsm_secret password:")
+    os.write(master_fd, password.encode("utf-8"))
+    assert hsmtool.proc.wait(WAIT_TIMEOUT) == 0
     # Then test we can now start it without password
     l1.daemon.opts.pop("encrypted-hsm")
     l1.daemon.start(stdin=slave_fd, wait_for_initialized=True)
@@ -1018,11 +1047,17 @@ def test_hsmtool_secret_decryption(node_factory):
     l1.stop()
 
     # Test we can encrypt it offline
-    cmd_line[1] = "encrypt"
-    subprocess.check_call(cmd_line)
+    master_fd, slave_fd = os.openpty()
+    hsmtool = HsmTool("encrypt", hsm_path)
+    hsmtool.start(stdin=slave_fd,
+                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    hsmtool.wait_for_log(r"Enter hsm_secret password:")
+    os.write(master_fd, password.encode("utf-8"))
+    hsmtool.wait_for_log(r"Confirm hsm_secret password:")
+    os.write(master_fd, password.encode("utf-8"))
+    assert hsmtool.proc.wait(WAIT_TIMEOUT) == 0
     # Now we need to pass the encrypted-hsm startup option
     l1.stop()
-
     with pytest.raises(subprocess.CalledProcessError, match=r'returned non-zero exit status 1'):
         subprocess.check_call(l1.daemon.cmd_line)
 
@@ -1033,16 +1068,87 @@ def test_hsmtool_secret_decryption(node_factory):
 
     l1.daemon.wait_for_log(r'The hsm_secret is encrypted')
     os.write(master_fd, password.encode("utf-8"))
+    l1.daemon.wait_for_log(r'Confirm hsm_secret password')
+    os.write(master_fd, password.encode("utf-8"))
     l1.daemon.wait_for_log("Server started with public key")
+    print(node_id, l1.rpc.getinfo()["id"])
     assert node_id == l1.rpc.getinfo()["id"]
     l1.stop()
 
     # And finally test that we can also decrypt if encrypted with hsmtool
-    cmd_line[1] = "decrypt"
-    subprocess.check_call(cmd_line)
+    master_fd, slave_fd = os.openpty()
+    hsmtool = HsmTool("decrypt", hsm_path)
+    hsmtool.start(stdin=slave_fd,
+                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    hsmtool.wait_for_log(r"Enter hsm_secret password:")
+    os.write(master_fd, password.encode("utf-8"))
+    assert hsmtool.proc.wait(WAIT_TIMEOUT) == 0
     l1.daemon.opts.pop("encrypted-hsm")
     l1.daemon.start(stdin=slave_fd, wait_for_initialized=True)
     assert node_id == l1.rpc.getinfo()["id"]
+
+
+@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', '')
+def test_hsmtool_dump_descriptors(node_factory, bitcoind):
+    l1 = node_factory.get_node()
+    l1.fundwallet(10**6)
+
+    # Get a tpub descriptor of lightningd's wallet
+    hsm_path = os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, "hsm_secret")
+    cmd_line = ["tools/hsmtool", "dumponchaindescriptors", hsm_path, "testnet"]
+    out = subprocess.check_output(cmd_line).decode("utf8").split("\n")
+    descriptor = [l for l in out if l.startswith("wpkh(tpub")][0]
+
+    # Import the descriptor to bitcoind
+    # FIXME: if we update the testsuite to use the upcoming 0.21 we could use
+    # importdescriptors instead.
+    bitcoind.rpc.importmulti([{
+        "desc": descriptor,
+        # No need to rescan, we'll transact afterward
+        "timestamp": "now",
+        # The default
+        "range": [0, 99]
+    }])
+
+    # Funds sent to lightningd can be retrieved by bitcoind
+    addr = l1.rpc.newaddr()["bech32"]
+    txid = l1.rpc.withdraw(addr, 10**3)["txid"]
+    bitcoind.generate_block(1, txid)
+    assert len(bitcoind.rpc.listunspent(1, 1, [addr])) == 1
+
+
+@unittest.skipIf(VALGRIND, "It does not play well with prompt and key derivation.")
+def test_hsmtool_generatehsm(node_factory):
+    l1 = node_factory.get_node()
+    l1.stop()
+    hsm_path = os.path.join(l1.daemon.lightning_dir, TEST_NETWORK,
+                            "hsm_secret")
+
+    hsmtool = HsmTool("generatehsm", hsm_path)
+
+    # You cannot re-generate an already existing hsm_secret
+    master_fd, slave_fd = os.openpty()
+    hsmtool.start(stdin=slave_fd, stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE)
+    assert hsmtool.proc.wait(WAIT_TIMEOUT) == 2
+    os.remove(hsm_path)
+
+    # We can generate a valid hsm_secret from a wordlist and a "passphrase"
+    master_fd, slave_fd = os.openpty()
+    hsmtool.start(stdin=slave_fd, stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE)
+    hsmtool.wait_for_log(r"Select your language:")
+    os.write(master_fd, "0\n".encode("utf-8"))
+    hsmtool.wait_for_log(r"Introduce your BIP39 word list")
+    os.write(master_fd, "ritual idle hat sunny universe pluck key alpha wing "
+                        "cake have wedding\n".encode("utf-8"))
+    hsmtool.wait_for_log(r"Enter your passphrase:")
+    os.write(master_fd, "This is actually not a passphrase\n".encode("utf-8"))
+    hsmtool.proc.wait(WAIT_TIMEOUT)
+    hsmtool.is_in_log(r"New hsm_secret file created")
+
+    # We can start the node with this hsm_secret
+    l1.start()
 
 
 # this test does a 'listtransactions' on a yet unconfirmed channel
@@ -1143,3 +1249,55 @@ def test_multiwithdraw_simple(node_factory, bitcoind):
     assert only_one(funds3)["address"] == addr3
     assert only_one(funds3)["status"] == "confirmed"
     assert only_one(funds3)["amount_msat"] == amount3
+
+
+@unittest.skipIf(
+    TEST_NETWORK == 'liquid-regtest',
+    'Blinded elementsd addresses are not recognized')
+def test_repro_4258(node_factory, bitcoind):
+    """Reproduces issue #4258, invalid output encoding for txprepare.
+    """
+    l1 = node_factory.get_node()
+    addr = l1.rpc.newaddr()['bech32']
+    bitcoind.rpc.sendtoaddress(addr, 1)
+    bitcoind.generate_block(1)
+
+    wait_for(lambda: l1.rpc.listfunds()['outputs'] != [])
+    out = l1.rpc.listfunds()['outputs'][0]
+
+    addr = bitcoind.rpc.getnewaddress()
+
+    # Missing array parentheses for outputs
+    with pytest.raises(RpcError, match=r"Expected an array of outputs"):
+        l1.rpc.txprepare(
+            outputs="{addr}:all".format(addr=addr),
+            feerate="slow",
+            minconf=1,
+            utxos=["{txid}:{output}".format(**out)]
+        )
+
+    # Missing parentheses on the utxos array
+    with pytest.raises(RpcError, match=r"Could not decode the outpoint array for utxos"):
+        l1.rpc.txprepare(
+            outputs=[{addr: "all"}],
+            feerate="slow",
+            minconf=1,
+            utxos="{txid}:{output}".format(**out)
+        )
+
+    tx = l1.rpc.txprepare(
+        outputs=[{addr: "all"}],
+        feerate="slow",
+        minconf=1,
+        utxos=["{txid}:{output}".format(**out)]
+    )
+
+    tx = bitcoind.rpc.decoderawtransaction(tx['unsigned_tx'])
+
+    assert(len(tx['vout']) == 1)
+    o0 = tx['vout'][0]
+    assert(o0['scriptPubKey']['addresses'] == [addr])
+
+    assert(len(tx['vin']) == 1)
+    i0 = tx['vin'][0]
+    assert([i0['txid'], i0['vout']] == [out['txid'], out['output']])

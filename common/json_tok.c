@@ -313,39 +313,26 @@ struct command_result *param_feerate_val(struct command *cmd,
 					 const jsmntok_t *tok,
 					 u32 **feerate_per_kw)
 {
-	jsmntok_t base = *tok, suffix = *tok;
+	jsmntok_t base = *tok;
 	enum feerate_style style;
 	unsigned int num;
 
-	/* We have to split the number and suffix. */
-	suffix.start = suffix.end;
-	while (suffix.start > base.start && !isdigit(buffer[suffix.start-1])) {
-		suffix.start--;
-		base.end--;
-	}
+	if (json_tok_endswith(buffer, tok,
+			      feerate_style_name(FEERATE_PER_KBYTE))) {
+		style = FEERATE_PER_KBYTE;
+		base.end -= strlen(feerate_style_name(FEERATE_PER_KBYTE));
+	} else if (json_tok_endswith(buffer, tok,
+				     feerate_style_name(FEERATE_PER_KSIPA))) {
+		style = FEERATE_PER_KSIPA;
+		base.end -= strlen(feerate_style_name(FEERATE_PER_KSIPA));
+	} else
+		style = FEERATE_PER_KBYTE;
 
 	if (!json_to_number(buffer, &base, &num)) {
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				    "'%s' prefix should be an integer, not '%.*s'",
+				    "'%s' should be an integer with optional perkw/perkb, not '%.*s'",
 				    name, base.end - base.start,
 				    buffer + base.start);
-	}
-
-	if (suffix.end == suffix.start
-	    || json_tok_streq(buffer, &suffix,
-			      feerate_style_name(FEERATE_PER_KBYTE))) {
-		style = FEERATE_PER_KBYTE;
-	} else if (json_tok_streq(buffer, &suffix,
-				feerate_style_name(FEERATE_PER_KSIPA))) {
-		style = FEERATE_PER_KSIPA;
-	} else {
-		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				    "'%s' suffix should be '%s' or '%s', not '%.*s'",
-				    name,
-				    feerate_style_name(FEERATE_PER_KSIPA),
-				    feerate_style_name(FEERATE_PER_KBYTE),
-				    suffix.end - suffix.start,
-				    buffer + suffix.start);
 	}
 
 	*feerate_per_kw = tal(cmd, u32);
@@ -513,4 +500,31 @@ struct command_result *param_psbt(struct command *cmd,
 
 	return command_fail_badparam(cmd, name, buffer, tok,
 				     "Expected a PSBT");
+}
+
+struct command_result *param_outpoint_arr(struct command *cmd,
+					  const char *name,
+					  const char *buffer,
+					  const jsmntok_t *tok,
+					  struct bitcoin_outpoint **outpoints)
+{
+	size_t i;
+	const jsmntok_t *curr;
+	if (tok->type != JSMN_ARRAY) {
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Could not decode the outpoint array for %s: "
+				    "\"%s\" is not a valid outpoint array.",
+				    name, json_strdup(tmpctx, buffer, tok));
+	}
+
+	*outpoints = tal_arr(cmd, struct bitcoin_outpoint, tok->size);
+
+	json_for_each_arr(i, curr, tok) {
+		if (!json_to_outpoint(buffer, curr, &(*outpoints)[i]))
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "Could not decode outpoint \"%.*s\", "
+					    "expected format: txid:output",
+					    json_tok_full_len(curr), json_tok_full(buffer, curr));
+	}
+	return NULL;
 }

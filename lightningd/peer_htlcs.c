@@ -324,6 +324,9 @@ static void fail_out_htlc(struct htlc_out *hout,
 							      hout->failmsg);
 			fail_in_htlc(hout->in, failonion);
 		}
+	} else {
+		if (taken(failmsg_needs_update))
+			tal_free(failmsg_needs_update);
 	}
 }
 
@@ -675,7 +678,7 @@ static void forward_htlc(struct htlc_in *hin,
 			 struct amount_msat amt_to_forward,
 			 u32 outgoing_cltv_value,
 			 const struct short_channel_id *scid,
-			 const u8 next_onion[TOTAL_PACKET_SIZE],
+			 const u8 next_onion[TOTAL_PACKET_SIZE(ROUTING_INFO_SIZE)],
 			 const struct pubkey *next_blinding)
 {
 	const u8 *failmsg;
@@ -889,7 +892,7 @@ static bool htlc_accepted_hook_deserialize(struct htlc_accepted_hook_payload *re
 	struct lightningd *ld = request->ld;
 	struct preimage payment_preimage;
 	const jsmntok_t *resulttok, *paykeytok, *payloadtok;
-	u8 *payload;
+	u8 *payload, *failonion;
 
 	if (!toks || !buffer)
 		return true;
@@ -929,9 +932,29 @@ static bool htlc_accepted_hook_deserialize(struct htlc_accepted_hook_payload *re
 
 	if (json_tok_streq(buffer, resulttok, "fail")) {
 		u8 *failmsg;
-		const jsmntok_t *failmsgtok, *failcodetok;
+		const jsmntok_t *failoniontok, *failmsgtok, *failcodetok;
 
+		failoniontok = json_get_member(buffer, toks, "failure_onion");
 		failmsgtok = json_get_member(buffer, toks, "failure_message");
+
+		if (failoniontok) {
+			failonion = json_tok_bin_from_hex(tmpctx, buffer,
+							  failoniontok);
+			if (!failonion)
+				fatal("Bad failure_onion for htlc_accepted"
+				      " hook: %.*s",
+				      failoniontok->end -  failoniontok->start,
+				      buffer + failoniontok->start);
+
+			if (failmsgtok)
+				log_broken(ld->log, "Both 'failure_onion' and"
+					   "'failure_message' provided."
+					   " Ignoring 'failure_message'.");
+
+			fail_in_htlc(hin, take(new_onionreply(NULL,
+							      failonion)));
+			return false;
+		}
 		if (failmsgtok) {
 			failmsg = json_tok_bin_from_hex(NULL, buffer,
 							failmsgtok);
@@ -940,6 +963,8 @@ static bool htlc_accepted_hook_deserialize(struct htlc_accepted_hook_payload *re
 				      " hook: %.*s",
 				      failmsgtok->end - failmsgtok->start,
 				      buffer + failmsgtok->start);
+			local_fail_in_htlc(hin, take(failmsg));
+			return false;
 		} else if (deprecated_apis
 			   && (failcodetok = json_get_member(buffer, toks,
 							     "failure_code"))) {
@@ -951,10 +976,13 @@ static bool htlc_accepted_hook_deserialize(struct htlc_accepted_hook_payload *re
 				      - failcodetok->start,
 				      buffer + failcodetok->start);
 			failmsg = convert_failcode(NULL, ld, failcode);
-		} else
+			local_fail_in_htlc(hin, take(failmsg));
+			return false;
+		} else {
 			failmsg = towire_temporary_node_failure(NULL);
-		local_fail_in_htlc(hin, take(failmsg));
-		return false;
+			local_fail_in_htlc(hin, take(failmsg));
+			return false;
+		}
 	} else if (json_tok_streq(buffer, resulttok, "resolve")) {
 		paykeytok = json_get_member(buffer, toks, "payment_key");
 		if (!paykeytok)
@@ -1057,12 +1085,6 @@ htlc_accepted_hook_final(struct htlc_accepted_hook_payload *request STEALS)
 	tal_free(request);
 }
 
-REGISTER_PLUGIN_HOOK(htlc_accepted,
-		     htlc_accepted_hook_deserialize,
-		     htlc_accepted_hook_final,
-		     htlc_accepted_hook_serialize,
-		     struct htlc_accepted_hook_payload *);
-
 /* Apply tweak to ephemeral key if blinding is non-NULL, then do ECDH */
 static bool ecdh_maybe_blinding(const struct pubkey *ephemeral_key,
 				const struct pubkey *blinding,
@@ -1092,6 +1114,14 @@ static bool ecdh_maybe_blinding(const struct pubkey *ephemeral_key,
 	return true;
 }
 
+/* AUTODATA wants a different line number */
+REGISTER_PLUGIN_HOOK(htlc_accepted,
+		     htlc_accepted_hook_deserialize,
+		     htlc_accepted_hook_final,
+		     htlc_accepted_hook_serialize,
+		     struct htlc_accepted_hook_payload *);
+
+
 /**
  * Everyone is committed to this htlc of theirs
  *
@@ -1113,7 +1143,7 @@ static bool peer_accepted_htlc(const tal_t *ctx,
 {
 	struct htlc_in *hin;
 	struct route_step *rs;
-	struct onionpacket op;
+	struct onionpacket *op;
 	struct lightningd *ld = channel->peer->ld;
 	struct htlc_accepted_hook_payload *hook_payload;
 
@@ -1167,10 +1197,10 @@ static bool peer_accepted_htlc(const tal_t *ctx,
 	 * a subset of the cltv check done in handle_localpay and
 	 * forward_htlc. */
 
-	*badonion = parse_onionpacket(hin->onion_routing_packet,
-				      sizeof(hin->onion_routing_packet),
-				      &op);
-	if (*badonion) {
+	op = parse_onionpacket(tmpctx, hin->onion_routing_packet,
+			       sizeof(hin->onion_routing_packet),
+			       badonion);
+	if (!op) {
 		log_debug(channel->log,
 			  "Rejecting their htlc %"PRIu64
 			  " since onion is unparsable %s",
@@ -1179,7 +1209,7 @@ static bool peer_accepted_htlc(const tal_t *ctx,
 		goto fail;
 	}
 
-	rs = process_onionpacket(tmpctx, &op, hin->shared_secret,
+	rs = process_onionpacket(tmpctx, op, hin->shared_secret,
 				 hin->payment_hash.u.u8,
 				 sizeof(hin->payment_hash), true);
 	if (!rs) {
@@ -1765,7 +1795,7 @@ static bool channel_added_their_htlc(struct channel *channel,
 	struct lightningd *ld = channel->peer->ld;
 	struct htlc_in *hin;
 	struct secret shared_secret;
-	struct onionpacket op;
+	struct onionpacket *op;
 	enum onion_wire failcode;
 
 	/* BOLT #2:
@@ -1789,11 +1819,11 @@ static bool channel_added_their_htlc(struct channel *channel,
 
 	/* Do the work of extracting shared secret now if possible. */
 	/* FIXME: We do this *again* in peer_accepted_htlc! */
-	failcode = parse_onionpacket(added->onion_routing_packet,
-				     sizeof(added->onion_routing_packet),
-				     &op);
-	if (!failcode) {
-		if (!ecdh_maybe_blinding(&op.ephemeralkey,
+	op = parse_onionpacket(tmpctx, added->onion_routing_packet,
+			       sizeof(added->onion_routing_packet),
+			       &failcode);
+	if (op) {
+		if (!ecdh_maybe_blinding(&op->ephemeralkey,
 					 added->blinding, &added->blinding_ss,
 					 &shared_secret)) {
 			log_debug(channel->log, "htlc %"PRIu64
@@ -1806,7 +1836,7 @@ static bool channel_added_their_htlc(struct channel *channel,
 	 * part of the current commitment. */
 	hin = new_htlc_in(channel, channel, added->id, added->amount,
 			  added->cltv_expiry, &added->payment_hash,
-			  failcode ? NULL : &shared_secret,
+			  op ? &shared_secret : NULL,
 			  added->blinding, &added->blinding_ss,
 			  added->onion_routing_packet);
 
@@ -2099,10 +2129,11 @@ void peer_got_revoke(struct channel *channel, const u8 *msg)
 				      shachain_index(revokenum),
 				      &per_commitment_secret)) {
 		channel_fail_permanent(channel,
-				    "Bad per_commitment_secret %s for %"PRIu64,
-				    type_to_string(msg, struct secret,
-						   &per_commitment_secret),
-				    revokenum);
+				       REASON_PROTOCOL,
+				       "Bad per_commitment_secret %s for %"PRIu64,
+				       type_to_string(msg, struct secret,
+						      &per_commitment_secret),
+				       revokenum);
 		return;
 	}
 
@@ -2320,11 +2351,12 @@ void htlcs_notify_new_block(struct lightningd *ld, u32 height)
 				continue;
 
 			channel_fail_permanent(hout->key.channel,
-					    "Offered HTLC %"PRIu64
-					    " %s cltv %u hit deadline",
-					    hout->key.id,
-					    htlc_state_name(hout->hstate),
-					    hout->cltv_expiry);
+					       REASON_PROTOCOL,
+					       "Offered HTLC %"PRIu64
+					       " %s cltv %u hit deadline",
+					       hout->key.id,
+					       htlc_state_name(hout->hstate),
+					       hout->cltv_expiry);
 			removed = true;
 		}
 	/* Iteration while removing is safe, but can skip entries! */
@@ -2368,11 +2400,12 @@ void htlcs_notify_new_block(struct lightningd *ld, u32 height)
 				continue;
 
 			channel_fail_permanent(channel,
-					    "Fulfilled HTLC %"PRIu64
-					    " %s cltv %u hit deadline",
-					    hin->key.id,
-					    htlc_state_name(hin->hstate),
-					    hin->cltv_expiry);
+					       REASON_PROTOCOL,
+					       "Fulfilled HTLC %"PRIu64
+					       " %s cltv %u hit deadline",
+					       hin->key.id,
+					       htlc_state_name(hin->hstate),
+					       hin->cltv_expiry);
 			removed = true;
 		}
 	/* Iteration while removing is safe, but can skip entries! */

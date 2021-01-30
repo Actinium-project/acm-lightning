@@ -76,6 +76,9 @@ enum hsmd_wire {
         /*  lightningd needs to get a scriptPubkey for a utxo with closeinfo */
         WIRE_HSMD_GET_OUTPUT_SCRIPTPUBKEY = 24,
         WIRE_HSMD_GET_OUTPUT_SCRIPTPUBKEY_REPLY = 124,
+        /*  Sign a bolt12-style merkle hash */
+        WIRE_HSMD_SIGN_BOLT12 = 25,
+        WIRE_HSMD_SIGN_BOLT12_REPLY = 125,
 };
 
 const char *hsmd_wire_name(int e);
@@ -101,8 +104,8 @@ u8 *towire_hsmd_init(const tal_t *ctx, const struct bip32_key_version *bip32_key
 bool fromwire_hsmd_init(const tal_t *ctx, const void *p, struct bip32_key_version *bip32_key_version, const struct chainparams **chainparams, struct secret **hsm_encryption_key, struct privkey **dev_force_privkey, struct secret **dev_force_bip32_seed, struct secrets **dev_force_channel_secrets, struct sha256 **dev_force_channel_secrets_shaseed);
 
 /* WIRE: HSMD_INIT_REPLY */
-u8 *towire_hsmd_init_reply(const tal_t *ctx, const struct node_id *node_id, const struct ext_key *bip32);
-bool fromwire_hsmd_init_reply(const void *p, struct node_id *node_id, struct ext_key *bip32);
+u8 *towire_hsmd_init_reply(const tal_t *ctx, const struct node_id *node_id, const struct ext_key *bip32, const struct pubkey32 *bolt12);
+bool fromwire_hsmd_init_reply(const void *p, struct node_id *node_id, struct ext_key *bip32, struct pubkey32 *bolt12);
 
 /* WIRE: HSMD_CLIENT_HSMFD */
 /*  Get a new HSM FD */
@@ -269,6 +272,15 @@ bool fromwire_hsmd_get_output_scriptpubkey(const tal_t *ctx, const void *p, u64 
 u8 *towire_hsmd_get_output_scriptpubkey_reply(const tal_t *ctx, const u8 *script);
 bool fromwire_hsmd_get_output_scriptpubkey_reply(const tal_t *ctx, const void *p, u8 **script);
 
+/* WIRE: HSMD_SIGN_BOLT12 */
+/*  Sign a bolt12-style merkle hash */
+u8 *towire_hsmd_sign_bolt12(const tal_t *ctx, const wirestring *messagename, const wirestring *fieldname, const struct sha256 *merkleroot, const u8 *publictweak);
+bool fromwire_hsmd_sign_bolt12(const tal_t *ctx, const void *p, wirestring **messagename, wirestring **fieldname, struct sha256 *merkleroot, u8 **publictweak);
+
+/* WIRE: HSMD_SIGN_BOLT12_REPLY */
+u8 *towire_hsmd_sign_bolt12_reply(const tal_t *ctx, const struct bip340sig *sig);
+bool fromwire_hsmd_sign_bolt12_reply(const void *p, struct bip340sig *sig);
+
 
 #endif /* LIGHTNING_HSMD_HSMD_WIREGEN_H */
-// SHA256STAMP:9b185bdbec96768d072ab4f9aef455ff824ae1df85a4f036eb3e1dfe25a53482
+// SHA256STAMP:b419989953cbf50796fc237b5d7e2043f96cb838a1356dbdb27943b341f611a8

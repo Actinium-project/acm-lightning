@@ -21,8 +21,6 @@ const char *channeld_wire_name(int e)
 
 	switch ((enum channeld_wire)e) {
 	case WIRE_CHANNELD_INIT: return "WIRE_CHANNELD_INIT";
-	case WIRE_CHANNELD_FUNDING_SIGS: return "WIRE_CHANNELD_FUNDING_SIGS";
-	case WIRE_CHANNELD_SEND_TX_SIGS: return "WIRE_CHANNELD_SEND_TX_SIGS";
 	case WIRE_CHANNELD_FUNDING_DEPTH: return "WIRE_CHANNELD_FUNDING_DEPTH";
 	case WIRE_CHANNELD_OFFER_HTLC: return "WIRE_CHANNELD_OFFER_HTLC";
 	case WIRE_CHANNELD_OFFER_HTLC_REPLY: return "WIRE_CHANNELD_OFFER_HTLC_REPLY";
@@ -48,9 +46,6 @@ const char *channeld_wire_name(int e)
 	case WIRE_CHANNELD_GOT_ANNOUNCEMENT: return "WIRE_CHANNELD_GOT_ANNOUNCEMENT";
 	case WIRE_CHANNELD_SEND_ERROR: return "WIRE_CHANNELD_SEND_ERROR";
 	case WIRE_CHANNELD_SEND_ERROR_REPLY: return "WIRE_CHANNELD_SEND_ERROR_REPLY";
-	case WIRE_GOT_ONIONMSG_TO_US: return "WIRE_GOT_ONIONMSG_TO_US";
-	case WIRE_GOT_ONIONMSG_FORWARD: return "WIRE_GOT_ONIONMSG_FORWARD";
-	case WIRE_SEND_ONIONMSG: return "WIRE_SEND_ONIONMSG";
 	}
 
 	snprintf(invalidbuf, sizeof(invalidbuf), "INVALID %i", e);
@@ -61,8 +56,6 @@ bool channeld_wire_is_defined(u16 type)
 {
 	switch ((enum channeld_wire)type) {
 	case WIRE_CHANNELD_INIT:;
-	case WIRE_CHANNELD_FUNDING_SIGS:;
-	case WIRE_CHANNELD_SEND_TX_SIGS:;
 	case WIRE_CHANNELD_FUNDING_DEPTH:;
 	case WIRE_CHANNELD_OFFER_HTLC:;
 	case WIRE_CHANNELD_OFFER_HTLC_REPLY:;
@@ -88,9 +81,6 @@ bool channeld_wire_is_defined(u16 type)
 	case WIRE_CHANNELD_GOT_ANNOUNCEMENT:;
 	case WIRE_CHANNELD_SEND_ERROR:;
 	case WIRE_CHANNELD_SEND_ERROR_REPLY:;
-	case WIRE_GOT_ONIONMSG_TO_US:;
-	case WIRE_GOT_ONIONMSG_FORWARD:;
-	case WIRE_SEND_ONIONMSG:;
 	      return true;
 	}
 	return false;
@@ -102,7 +92,7 @@ bool channeld_wire_is_defined(u16 type)
 
 /* WIRE: CHANNELD_INIT */
 /* Begin!  (passes gossipd-client fd) */
-u8 *towire_channeld_init(const tal_t *ctx, const struct chainparams *chainparams, const struct feature_set *our_features, const struct channel_id *channel_id, const struct bitcoin_txid *funding_txid, u16 funding_txout, struct amount_sat funding_satoshi, u32 minimum_depth, const struct channel_config *our_config, const struct channel_config *their_config, const struct fee_states *fee_states, u32 feerate_min, u32 feerate_max, u32 feerate_penalty, const struct bitcoin_signature *first_commit_sig, const struct per_peer_state *per_peer_state, const struct pubkey *remote_fundingkey, const struct basepoints *remote_basepoints, const struct pubkey *remote_per_commit, const struct pubkey *old_remote_per_commit, enum side opener, u32 fee_base, u32 fee_proportional, struct amount_msat local_msatoshi, const struct basepoints *our_basepoints, const struct pubkey *our_funding_pubkey, const struct node_id *local_node_id, const struct node_id *remote_node_id, u32 commit_msec, u16 cltv_delta, bool last_was_revoke, const struct changed_htlc *last_sent_commit, u64 next_index_local, u64 next_index_remote, u64 revocations_received, u64 next_htlc_id, const struct existing_htlc **htlcs, bool local_funding_locked, bool remote_funding_locked, const struct short_channel_id *funding_short_id, bool reestablish, bool send_shutdown, bool remote_shutdown_received, const u8 *final_scriptpubkey, u8 flags, const u8 *init_peer_pkt, bool reached_announce_depth, const struct secret *last_remote_secret, const u8 *their_features, const u8 *upfront_shutdown_script, const secp256k1_ecdsa_signature *remote_ann_node_sig, const secp256k1_ecdsa_signature *remote_ann_bitcoin_sig, bool option_static_remotekey, bool option_anchor_outputs, bool dev_fast_gossip, bool dev_fail_process_onionpacket, const struct penalty_base *pbases, const struct wally_psbt *psbt)
+u8 *towire_channeld_init(const tal_t *ctx, const struct chainparams *chainparams, const struct feature_set *our_features, const struct channel_id *channel_id, const struct bitcoin_txid *funding_txid, u16 funding_txout, struct amount_sat funding_satoshi, u32 minimum_depth, const struct channel_config *our_config, const struct channel_config *their_config, const struct fee_states *fee_states, u32 feerate_min, u32 feerate_max, u32 feerate_penalty, const struct bitcoin_signature *first_commit_sig, const struct per_peer_state *per_peer_state, const struct pubkey *remote_fundingkey, const struct basepoints *remote_basepoints, const struct pubkey *remote_per_commit, const struct pubkey *old_remote_per_commit, enum side opener, u32 fee_base, u32 fee_proportional, struct amount_msat local_msatoshi, const struct basepoints *our_basepoints, const struct pubkey *our_funding_pubkey, const struct node_id *local_node_id, const struct node_id *remote_node_id, u32 commit_msec, u16 cltv_delta, bool last_was_revoke, const struct changed_htlc *last_sent_commit, u64 next_index_local, u64 next_index_remote, u64 revocations_received, u64 next_htlc_id, const struct existing_htlc **htlcs, bool local_funding_locked, bool remote_funding_locked, const struct short_channel_id *funding_short_id, bool reestablish, bool send_shutdown, bool remote_shutdown_received, const u8 *final_scriptpubkey, u8 flags, const u8 *init_peer_pkt, bool reached_announce_depth, const struct secret *last_remote_secret, const u8 *their_features, const u8 *upfront_shutdown_script, const secp256k1_ecdsa_signature *remote_ann_node_sig, const secp256k1_ecdsa_signature *remote_ann_bitcoin_sig, bool option_static_remotekey, bool option_anchor_outputs, bool dev_fast_gossip, bool dev_fail_process_onionpacket, const struct penalty_base *pbases)
 {
 	u16 num_last_sent_commit = tal_count(last_sent_commit);
 	u16 num_existing_htlcs = tal_count(htlcs);
@@ -190,11 +180,10 @@ u8 *towire_channeld_init(const tal_t *ctx, const struct chainparams *chainparams
 	towire_u32(&p, num_penalty_bases);
 	for (size_t i = 0; i < num_penalty_bases; i++)
 		towire_penalty_base(&p, pbases + i);
-	towire_wally_psbt(&p, psbt);
 
 	return memcheck(p, tal_count(p));
 }
-bool fromwire_channeld_init(const tal_t *ctx, const void *p, const struct chainparams **chainparams, struct feature_set **our_features, struct channel_id *channel_id, struct bitcoin_txid *funding_txid, u16 *funding_txout, struct amount_sat *funding_satoshi, u32 *minimum_depth, struct channel_config *our_config, struct channel_config *their_config, struct fee_states **fee_states, u32 *feerate_min, u32 *feerate_max, u32 *feerate_penalty, struct bitcoin_signature *first_commit_sig, struct per_peer_state **per_peer_state, struct pubkey *remote_fundingkey, struct basepoints *remote_basepoints, struct pubkey *remote_per_commit, struct pubkey *old_remote_per_commit, enum side *opener, u32 *fee_base, u32 *fee_proportional, struct amount_msat *local_msatoshi, struct basepoints *our_basepoints, struct pubkey *our_funding_pubkey, struct node_id *local_node_id, struct node_id *remote_node_id, u32 *commit_msec, u16 *cltv_delta, bool *last_was_revoke, struct changed_htlc **last_sent_commit, u64 *next_index_local, u64 *next_index_remote, u64 *revocations_received, u64 *next_htlc_id, struct existing_htlc ***htlcs, bool *local_funding_locked, bool *remote_funding_locked, struct short_channel_id *funding_short_id, bool *reestablish, bool *send_shutdown, bool *remote_shutdown_received, u8 **final_scriptpubkey, u8 *flags, u8 **init_peer_pkt, bool *reached_announce_depth, struct secret *last_remote_secret, u8 **their_features, u8 **upfront_shutdown_script, secp256k1_ecdsa_signature **remote_ann_node_sig, secp256k1_ecdsa_signature **remote_ann_bitcoin_sig, bool *option_static_remotekey, bool *option_anchor_outputs, bool *dev_fast_gossip, bool *dev_fail_process_onionpacket, struct penalty_base **pbases, struct wally_psbt **psbt)
+bool fromwire_channeld_init(const tal_t *ctx, const void *p, const struct chainparams **chainparams, struct feature_set **our_features, struct channel_id *channel_id, struct bitcoin_txid *funding_txid, u16 *funding_txout, struct amount_sat *funding_satoshi, u32 *minimum_depth, struct channel_config *our_config, struct channel_config *their_config, struct fee_states **fee_states, u32 *feerate_min, u32 *feerate_max, u32 *feerate_penalty, struct bitcoin_signature *first_commit_sig, struct per_peer_state **per_peer_state, struct pubkey *remote_fundingkey, struct basepoints *remote_basepoints, struct pubkey *remote_per_commit, struct pubkey *old_remote_per_commit, enum side *opener, u32 *fee_base, u32 *fee_proportional, struct amount_msat *local_msatoshi, struct basepoints *our_basepoints, struct pubkey *our_funding_pubkey, struct node_id *local_node_id, struct node_id *remote_node_id, u32 *commit_msec, u16 *cltv_delta, bool *last_was_revoke, struct changed_htlc **last_sent_commit, u64 *next_index_local, u64 *next_index_remote, u64 *revocations_received, u64 *next_htlc_id, struct existing_htlc ***htlcs, bool *local_funding_locked, bool *remote_funding_locked, struct short_channel_id *funding_short_id, bool *reestablish, bool *send_shutdown, bool *remote_shutdown_received, u8 **final_scriptpubkey, u8 *flags, u8 **init_peer_pkt, bool *reached_announce_depth, struct secret *last_remote_secret, u8 **their_features, u8 **upfront_shutdown_script, secp256k1_ecdsa_signature **remote_ann_node_sig, secp256k1_ecdsa_signature **remote_ann_bitcoin_sig, bool *option_static_remotekey, bool *option_anchor_outputs, bool *dev_fast_gossip, bool *dev_fail_process_onionpacket, struct penalty_base **pbases)
 {
 	u16 num_last_sent_commit;
 	u16 num_existing_htlcs;
@@ -299,51 +288,6 @@ bool fromwire_channeld_init(const tal_t *ctx, const void *p, const struct chainp
 	*pbases = num_penalty_bases ? tal_arr(ctx, struct penalty_base, num_penalty_bases) : NULL;
 	for (size_t i = 0; i < num_penalty_bases; i++)
 		fromwire_penalty_base(&cursor, &plen, *pbases + i);
- 	*psbt = fromwire_wally_psbt(ctx, &cursor, &plen);
-	return cursor != NULL;
-}
-
-/* WIRE: CHANNELD_FUNDING_SIGS */
-/* channeld->master received tx_sigs from peer */
-u8 *towire_channeld_funding_sigs(const tal_t *ctx, const struct wally_psbt *signed_psbt)
-{
-	u8 *p = tal_arr(ctx, u8, 0);
-
-	towire_u16(&p, WIRE_CHANNELD_FUNDING_SIGS);
-	towire_wally_psbt(&p, signed_psbt);
-
-	return memcheck(p, tal_count(p));
-}
-bool fromwire_channeld_funding_sigs(const tal_t *ctx, const void *p, struct wally_psbt **signed_psbt)
-{
-	const u8 *cursor = p;
-	size_t plen = tal_count(p);
-
-	if (fromwire_u16(&cursor, &plen) != WIRE_CHANNELD_FUNDING_SIGS)
-		return false;
- 	*signed_psbt = fromwire_wally_psbt(ctx, &cursor, &plen);
-	return cursor != NULL;
-}
-
-/* WIRE: CHANNELD_SEND_TX_SIGS */
-/* master->channeld send our tx_sigs to peer */
-u8 *towire_channeld_send_tx_sigs(const tal_t *ctx, const struct wally_psbt *signed_psbt)
-{
-	u8 *p = tal_arr(ctx, u8, 0);
-
-	towire_u16(&p, WIRE_CHANNELD_SEND_TX_SIGS);
-	towire_wally_psbt(&p, signed_psbt);
-
-	return memcheck(p, tal_count(p));
-}
-bool fromwire_channeld_send_tx_sigs(const tal_t *ctx, const void *p, struct wally_psbt **signed_psbt)
-{
-	const u8 *cursor = p;
-	size_t plen = tal_count(p);
-
-	if (fromwire_u16(&cursor, &plen) != WIRE_CHANNELD_SEND_TX_SIGS)
-		return false;
- 	*signed_psbt = fromwire_wally_psbt(ctx, &cursor, &plen);
 	return cursor != NULL;
 }
 
@@ -1102,138 +1046,4 @@ bool fromwire_channeld_send_error_reply(const void *p)
 		return false;
 	return cursor != NULL;
 }
-
-/* WIRE: GOT_ONIONMSG_TO_US */
-/* Tell lightningd we got a onion message (for us */
-u8 *towire_got_onionmsg_to_us(const tal_t *ctx, const struct pubkey *reply_blinding, const struct onionmsg_path **reply_path)
-{
-	u16 reply_path_len = tal_count(reply_path);
-	u8 *p = tal_arr(ctx, u8, 0);
-
-	towire_u16(&p, WIRE_GOT_ONIONMSG_TO_US);
-	if (!reply_blinding)
-		towire_bool(&p, false);
-	else {
-		towire_bool(&p, true);
-		towire_pubkey(&p, reply_blinding);
-	}
-	towire_u16(&p, reply_path_len);
-	for (size_t i = 0; i < reply_path_len; i++)
-		towire_onionmsg_path(&p, reply_path[i]);
-
-	return memcheck(p, tal_count(p));
-}
-bool fromwire_got_onionmsg_to_us(const tal_t *ctx, const void *p, struct pubkey **reply_blinding, struct onionmsg_path ***reply_path)
-{
-	u16 reply_path_len;
-
-	const u8 *cursor = p;
-	size_t plen = tal_count(p);
-
-	if (fromwire_u16(&cursor, &plen) != WIRE_GOT_ONIONMSG_TO_US)
-		return false;
- 	if (!fromwire_bool(&cursor, &plen))
-		*reply_blinding = NULL;
-	else {
-		*reply_blinding = tal(ctx, struct pubkey);
-		fromwire_pubkey(&cursor, &plen, *reply_blinding);
-	}
- 	reply_path_len = fromwire_u16(&cursor, &plen);
- 	// 2nd case reply_path
-	*reply_path = reply_path_len ? tal_arr(ctx, struct onionmsg_path *, reply_path_len) : NULL;
-	for (size_t i = 0; i < reply_path_len; i++)
-		(*reply_path)[i] = fromwire_onionmsg_path(*reply_path, &cursor, &plen);
-	return cursor != NULL;
-}
-
-/* WIRE: GOT_ONIONMSG_FORWARD */
-u8 *towire_got_onionmsg_forward(const tal_t *ctx, const struct short_channel_id *next_scid, const struct node_id *next_node_id, const struct pubkey *next_blinding, const u8 next_onion[1366])
-{
-	u8 *p = tal_arr(ctx, u8, 0);
-
-	towire_u16(&p, WIRE_GOT_ONIONMSG_FORWARD);
-	if (!next_scid)
-		towire_bool(&p, false);
-	else {
-		towire_bool(&p, true);
-		towire_short_channel_id(&p, next_scid);
-	}
-	if (!next_node_id)
-		towire_bool(&p, false);
-	else {
-		towire_bool(&p, true);
-		towire_node_id(&p, next_node_id);
-	}
-	if (!next_blinding)
-		towire_bool(&p, false);
-	else {
-		towire_bool(&p, true);
-		towire_pubkey(&p, next_blinding);
-	}
-	towire_u8_array(&p, next_onion, 1366);
-
-	return memcheck(p, tal_count(p));
-}
-bool fromwire_got_onionmsg_forward(const tal_t *ctx, const void *p, struct short_channel_id **next_scid, struct node_id **next_node_id, struct pubkey **next_blinding, u8 next_onion[1366])
-{
-	const u8 *cursor = p;
-	size_t plen = tal_count(p);
-
-	if (fromwire_u16(&cursor, &plen) != WIRE_GOT_ONIONMSG_FORWARD)
-		return false;
- 	if (!fromwire_bool(&cursor, &plen))
-		*next_scid = NULL;
-	else {
-		*next_scid = tal(ctx, struct short_channel_id);
-		fromwire_short_channel_id(&cursor, &plen, *next_scid);
-	}
- 	if (!fromwire_bool(&cursor, &plen))
-		*next_node_id = NULL;
-	else {
-		*next_node_id = tal(ctx, struct node_id);
-		fromwire_node_id(&cursor, &plen, *next_node_id);
-	}
- 	if (!fromwire_bool(&cursor, &plen))
-		*next_blinding = NULL;
-	else {
-		*next_blinding = tal(ctx, struct pubkey);
-		fromwire_pubkey(&cursor, &plen, *next_blinding);
-	}
- 	fromwire_u8_array(&cursor, &plen, next_onion, 1366);
-	return cursor != NULL;
-}
-
-/* WIRE: SEND_ONIONMSG */
-/* Lightningd tells us to send a onion message. */
-u8 *towire_send_onionmsg(const tal_t *ctx, const u8 onion[1366], const struct pubkey *blinding)
-{
-	u8 *p = tal_arr(ctx, u8, 0);
-
-	towire_u16(&p, WIRE_SEND_ONIONMSG);
-	towire_u8_array(&p, onion, 1366);
-	if (!blinding)
-		towire_bool(&p, false);
-	else {
-		towire_bool(&p, true);
-		towire_pubkey(&p, blinding);
-	}
-
-	return memcheck(p, tal_count(p));
-}
-bool fromwire_send_onionmsg(const tal_t *ctx, const void *p, u8 onion[1366], struct pubkey **blinding)
-{
-	const u8 *cursor = p;
-	size_t plen = tal_count(p);
-
-	if (fromwire_u16(&cursor, &plen) != WIRE_SEND_ONIONMSG)
-		return false;
- 	fromwire_u8_array(&cursor, &plen, onion, 1366);
- 	if (!fromwire_bool(&cursor, &plen))
-		*blinding = NULL;
-	else {
-		*blinding = tal(ctx, struct pubkey);
-		fromwire_pubkey(&cursor, &plen, *blinding);
-	}
-	return cursor != NULL;
-}
-// SHA256STAMP:0ddc4d686d50049ed4c8500919e415dde43baea52adc651b8a606765b09ab001
+// SHA256STAMP:8b6491f5aa25f4c067f4aedff32620ddb8b39cc78f95c70cb2d0b5366026871a

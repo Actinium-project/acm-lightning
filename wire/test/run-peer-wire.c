@@ -13,8 +13,10 @@
 #include <common/amount.h>
 #include <common/bigsize.h>
 #include <bitcoin/chainparams.h>
+#include <common/setup.h>
 #include <common/sphinx.h>
 #include <wire/peer_wire.h>
+#include <wire/tlvstream.c>
 
 extern secp256k1_context *secp256k1_ctx;
 
@@ -216,7 +218,7 @@ struct msg_update_add_htlc {
 	struct amount_msat amount_msat;
 	u32 expiry;
 	struct sha256 payment_hash;
-	u8 onion_routing_packet[TOTAL_PACKET_SIZE];
+	u8 onion_routing_packet[TOTAL_PACKET_SIZE(ROUTING_INFO_SIZE)];
 };
 struct msg_update_fee {
 	struct channel_id channel_id;
@@ -955,10 +957,8 @@ static bool node_announcement_eq(const struct msg_node_announcement *a,
 #define test_corruption_tlv(a, b, type) \
 	test_bitflip_and_short(a, b, type, false)
 
-int main(void)
+int main(int argc, char *argv[])
 {
-	setup_locale();
-
 	struct msg_channel_announcement ca, *ca2;
 	struct msg_funding_locked fl, *fl2;
 	struct msg_announcement_signatures as, *as2;
@@ -984,8 +984,7 @@ int main(void)
 	u8 *msg;
 	const struct chainparams **chains;
 
-	secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY
-						 | SECP256K1_CONTEXT_SIGN);
+	common_setup(argv[0]);
 
 	memset(&ca, 2, sizeof(ca));
 	set_node_id(&ca.node_id_1);
@@ -1170,8 +1169,7 @@ int main(void)
 	assert(node_announcement_eq(&na, na2));
 	test_corruption(&na, na2, node_announcement);
 
-	/* No memory leaks please */
-	secp256k1_context_destroy(secp256k1_ctx);
 	tal_free(ctx);
+	common_shutdown();
 	return 0;
 }

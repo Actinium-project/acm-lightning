@@ -50,6 +50,9 @@ struct plugin {
 
 	enum plugin_state plugin_state;
 
+	/* Our unique index, which is default hook ordering. */
+	u64 index;
+
 	/* If this plugin can be restarted without restarting lightningd */
 	bool dynamic;
 
@@ -85,6 +88,10 @@ struct plugin {
 	/* If set, the plugin is so important that if it terminates early,
 	 * C-lightning should terminate as well.  */
 	bool important;
+
+	/* Parameters for dynamically-started plugins. */
+	const char *parambuf;
+	const jsmntok_t *params;
 };
 
 /**
@@ -113,6 +120,9 @@ struct plugins {
 	/* Whether we are shutting down (`plugins_free` is called) */
 	bool shutdown;
 
+	/* Index to show what order they were added in */
+	u64 plugin_idx;
+
 #if DEVELOPER
 	/* Whether builtin plugins should be overridden as unimportant.  */
 	bool dev_builtin_plugins_unimportant;
@@ -125,8 +135,8 @@ struct plugins {
  */
 struct plugin_opt_value {
 	char *as_str;
-	s64 *as_int;
-	bool *as_bool;
+	s64 as_int;
+	bool as_bool;
 };
 
 /**
@@ -138,7 +148,10 @@ struct plugin_opt {
 	const char *name;
 	const char *type;
 	const char *description;
-	struct plugin_opt_value *value;
+	struct plugin_opt_value **values;
+	/* Might be NULL if no default */
+	struct plugin_opt_value *def;
+	bool multi;
 	bool deprecated;
 };
 
@@ -191,6 +204,8 @@ void plugins_free(struct plugins *plugins);
  * @param path: The path of the executable for this plugin
  * @param start_cmd: The optional JSON command which caused this.
  * @param important: The plugin is important.
+ * @param parambuf: NULL, or the JSON buffer for extra parameters.
+ * @param params: NULL, or the tokens for extra parameters.
  *
  * If @start_cmd, then plugin_cmd_killed or plugin_cmd_succeeded will be called
  * on it eventually.
@@ -198,7 +213,10 @@ void plugins_free(struct plugins *plugins);
 struct plugin *plugin_register(struct plugins *plugins,
 			       const char* path TAKES,
 			       struct command *start_cmd,
-			       bool important);
+			       bool important,
+			       const char *parambuf STEALS,
+			       const jsmntok_t *params STEALS);
+
 
 /**
  * Returns true if the provided name matches a plugin command
@@ -298,12 +316,16 @@ void json_add_opt_disable_plugins(struct json_stream *response,
 				  const struct plugins *plugins);
 
 /**
- * Used by db hooks which can't have any other I/O while talking to plugin.
+ * Used by db hooks which can't have any other I/O while talking to
+ * hooked plugins.
  *
- * Returns output of io_loop() (ie. whatever gets passed to io_break()
+ * @param plugins - a `tal`-allocated array of plugins that are the
+ * only ones we talk to.
+ *
+ * @return output of io_loop() (ie. whatever gets passed to io_break()
  * to end exclusive loop).
  */
-void *plugin_exclusive_loop(struct plugin *plugin);
+void *plugins_exclusive_loop(struct plugin **plugins);
 
 /**
  * Add a directory to the plugin path to automatically load plugins.

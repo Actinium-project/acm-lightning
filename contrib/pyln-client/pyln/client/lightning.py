@@ -1,12 +1,13 @@
-from decimal import Decimal
-from math import floor, log10
-from typing import Optional, Union
 import json
 import logging
 import os
 import socket
 import warnings
+from contextlib import contextmanager
+from decimal import Decimal
 from json import JSONEncoder
+from math import floor, log10
+from typing import Optional, Union
 
 
 def _patched_default(self, obj):
@@ -49,25 +50,29 @@ class Millisatoshi:
         """
         if isinstance(v, str):
             if v.endswith("msat"):
-                self.millisatoshis = int(v[0:-4])
+                parsed = Decimal(v[0:-4])
             elif v.endswith("sat"):
-                self.millisatoshis = int(v[0:-3]) * 1000
+                parsed = Decimal(v[0:-3]) * 1000
             elif v.endswith("btc"):
-                self.millisatoshis = int(v[0:-3]) * 1000 * 10**8
+                parsed = Decimal(v[0:-3]) * 1000 * 10**8
             else:
                 raise TypeError(
                     "Millisatoshi must be string with msat/sat/btc suffix or"
                     " int"
                 )
-            if self.millisatoshis != int(self.millisatoshis):
+            if parsed != int(parsed):
                 raise ValueError("Millisatoshi must be a whole number")
-            self.millisatoshis = int(self.millisatoshis)
+            self.millisatoshis = int(parsed)
 
         elif isinstance(v, Millisatoshi):
             self.millisatoshis = v.millisatoshis
 
         elif int(v) == v:
             self.millisatoshis = int(v)
+
+        elif isinstance(v, float):
+            raise TypeError("Millisatoshi by float is currently not supported")
+
         else:
             raise TypeError(
                 "Millisatoshi must be string with msat/sat/btc suffix or int"
@@ -87,6 +92,13 @@ class Millisatoshi:
         Return a Decimal representing the number of satoshis.
         """
         return Decimal(self.millisatoshis) / 1000
+
+    def to_whole_satoshi(self) -> int:
+        """
+        Return an int respresenting the number of satoshis;
+        rounded up to the nearest satoshi
+        """
+        return (self.millisatoshis + 999) // 1000
 
     def to_btc(self) -> Decimal:
         """
@@ -176,14 +188,20 @@ class Millisatoshi:
     def __sub__(self, other: 'Millisatoshi') -> 'Millisatoshi':
         return Millisatoshi(int(self) - int(other))
 
-    def __mul__(self, other: int) -> 'Millisatoshi':
-        return Millisatoshi(self.millisatoshis * other)
+    def __mul__(self, other: Union[int, float]) -> 'Millisatoshi':
+        if isinstance(other, Millisatoshi):
+            raise TypeError("Resulting unit msat^2 is not supported")
+        return Millisatoshi(floor(self.millisatoshis * other))
 
-    def __truediv__(self, other: Union[int, float]) -> 'Millisatoshi':
-        return Millisatoshi(int(self.millisatoshis / other))
+    def __truediv__(self, other: Union[int, float, 'Millisatoshi']) -> Union['Millisatoshi', float]:
+        if isinstance(other, Millisatoshi):
+            return self.millisatoshis / other.millisatoshis
+        return Millisatoshi(floor(self.millisatoshis / other))
 
-    def __floordiv__(self, other: Union[int, float]) -> 'Millisatoshi':
-        return Millisatoshi(int(self.millisatoshis // float(other)))
+    def __floordiv__(self, other: Union[int, float, 'Millisatoshi']) -> Union['Millisatoshi', int]:
+        if isinstance(other, Millisatoshi):
+            return self.millisatoshis // other.millisatoshis
+        return Millisatoshi(floor(self.millisatoshis // float(other)))
 
     def __mod__(self, other: Union[float, int]) -> 'Millisatoshi':
         return Millisatoshi(int(self.millisatoshis % other))
@@ -266,8 +284,9 @@ class UnixDomainSocketRpc(object):
         self.decoder = decoder
         self.executor = executor
         self.logger = logger
+        self._notify = None
 
-        self.next_id = 0
+        self.next_id = 1
 
     def _writeobj(self, sock, obj):
         s = json.dumps(obj, ensure_ascii=False, cls=self.encoder_cls)
@@ -317,18 +336,44 @@ class UnixDomainSocketRpc(object):
         # FIXME: we open a new socket for every readobj call...
         sock = UnixSocket(self.socket_path)
         this_id = self.next_id
-        self._writeobj(sock, {
+        self.next_id += 0
+        buf = b''
+
+        if self._notify is not None:
+            # Opt into the notifications support
+            self._writeobj(sock, {
+                "jsonrpc": "2.0",
+                "method": "notifications",
+                "id": 0,
+                "params": {
+                    "enable": True
+                },
+            })
+            _, buf = self._readobj(sock, buf)
+
+        request = {
             "jsonrpc": "2.0",
             "method": method,
             "params": payload,
             "id": this_id,
-        })
-        self.next_id += 1
-        buf = b''
+        }
+
+        self._writeobj(sock, request)
         while True:
             resp, buf = self._readobj(sock, buf)
-            # FIXME: We should offer a callback for notifications.
-            if 'method' not in resp or 'id' in resp:
+            id = resp.get("id", None)
+            meth = resp.get("method", None)
+
+            if meth == 'message' and self._notify is not None:
+                n = resp['params']
+                self._notify(
+                    message=n.get('message', None),
+                    progress=n.get('progress', None),
+                    request=request
+                )
+                continue
+
+            if meth is None or id is None:
                 break
 
         self.logger.debug("Received response for %s call: %r", method, resp)
@@ -343,6 +388,31 @@ class UnixDomainSocketRpc(object):
         elif "result" not in resp:
             raise ValueError("Malformed response, \"result\" missing.")
         return resp["result"]
+
+    @contextmanager
+    def notify(self, fn):
+        """Register a notification callback to use for a set of RPC calls.
+
+        This is a context manager and should be used like this:
+
+        ```python
+        def fn(message, progress, request, **kwargs):
+            print(message)
+
+        with rpc.notify(fn):
+            rpc.somemethod()
+        ```
+
+        The `fn` function will be called once for each notification
+        the is sent by `somemethod`. This is a context manager,
+        meaning that multiple commands can share the same context, and
+        the same notification function.
+
+        """
+        old = self._notify
+        self._notify = fn
+        yield
+        self._notify = old
 
 
 class LightningRpc(UnixDomainSocketRpc):
@@ -802,7 +872,7 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("help", payload)
 
-    def invoice(self, msatoshi, label, description, expiry=None, fallbacks=None, preimage=None, exposeprivatechannels=None):
+    def invoice(self, msatoshi, label, description, expiry=None, fallbacks=None, preimage=None, exposeprivatechannels=None, cltv=None):
         """
         Create an invoice for {msatoshi} with {label} and {description} with
         optional {expiry} seconds (default 1 week).
@@ -814,7 +884,8 @@ class LightningRpc(UnixDomainSocketRpc):
             "expiry": expiry,
             "fallbacks": fallbacks,
             "preimage": preimage,
-            "exposeprivatechannels": exposeprivatechannels
+            "exposeprivatechannels": exposeprivatechannels,
+            "cltv": cltv,
         }
         return self.call("invoice", payload)
 
@@ -841,11 +912,16 @@ class LightningRpc(UnixDomainSocketRpc):
         """
         return self.call("listforwards")
 
-    def listfunds(self):
+    def listfunds(self, spent=False):
         """
-        Show funds available for opening channels.
+        Show funds available for opening channels
+        or both unspent and spent funds if {spent} is True.
         """
-        return self.call("listfunds")
+
+        payload = {
+            "spent": spent
+        }
+        return self.call("listfunds", payload)
 
     def listtransactions(self):
         """
@@ -853,12 +929,17 @@ class LightningRpc(UnixDomainSocketRpc):
         """
         return self.call("listtransactions")
 
-    def listinvoices(self, label=None):
-        """
-        Show invoice {label} (or all, if no {label)).
+    def listinvoices(self, label=None, payment_hash=None, invstring=None):
+        """Query invoices
+
+        Show invoice matching {label} {payment_hash} or {invstring} (or
+        all, if no filters are present).
+
         """
         payload = {
-            "label": label
+            "label": label,
+            "payment_hash": payment_hash,
+            "invstring": invstring,
         }
         return self.call("listinvoices", payload)
 
@@ -1014,14 +1095,15 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("ping", payload)
 
-    def plugin_start(self, plugin):
+    def plugin_start(self, plugin, **kwargs):
         """
         Adds a plugin to lightningd.
         """
         payload = {
             "subcommand": "start",
-            "plugin": plugin
+            "plugin": plugin,
         }
+        payload.update({k: v for k, v in kwargs.items()})
         return self.call("plugin", payload)
 
     def plugin_startdir(self, directory):
@@ -1172,19 +1254,7 @@ class LightningRpc(UnixDomainSocketRpc):
 
         return self.call("withdraw", payload)
 
-    def _deprecated_txprepare(self, destination, satoshi, feerate=None, minconf=None):
-        warnings.warn("txprepare now takes output arg: expect removal"
-                      " in Mid-2020",
-                      DeprecationWarning)
-        payload = {
-            "destination": destination,
-            "satoshi": satoshi,
-            "feerate": feerate,
-            "minconf": minconf,
-        }
-        return self.call("txprepare", payload)
-
-    def txprepare(self, *args, **kwargs):
+    def txprepare(self, outputs, feerate=None, minconf=None, utxos=None):
         """
         Prepare a Bitcoin transaction which sends to [outputs].
         The format of output is like [{address1: amount1},
@@ -1194,22 +1264,13 @@ class LightningRpc(UnixDomainSocketRpc):
         Outputs will be reserved until you call txdiscard or txsend, or
         lightningd restarts.
         """
-        if 'destination' in kwargs or 'satoshi' in kwargs:
-            return self._deprecated_txprepare(*args, **kwargs)
-
-        if len(args) and not isinstance(args[0], list):
-            return self._deprecated_txprepare(*args, **kwargs)
-
-        def _txprepare(outputs, feerate=None, minconf=None, utxos=None):
-            payload = {
-                "outputs": outputs,
-                "feerate": feerate,
-                "minconf": minconf,
-                "utxos": utxos,
-            }
-            return self.call("txprepare", payload)
-
-        return _txprepare(*args, **kwargs)
+        payload = {
+            "outputs": outputs,
+            "feerate": feerate,
+            "minconf": minconf,
+            "utxos": utxos,
+        }
+        return self.call("txprepare", payload)
 
     def txdiscard(self, txid):
         """
@@ -1249,7 +1310,7 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("unreserveinputs", payload)
 
-    def fundpsbt(self, satoshi, feerate, startweight, minconf=None, reserve=True, locktime=None):
+    def fundpsbt(self, satoshi, feerate, startweight, minconf=None, reserve=True, locktime=None, min_witness_weight=None):
         """
         Create a PSBT with inputs sufficient to give an output of satoshi.
         """
@@ -1260,10 +1321,11 @@ class LightningRpc(UnixDomainSocketRpc):
             "minconf": minconf,
             "reserve": reserve,
             "locktime": locktime,
+            "min_witness_weight": min_witness_weight,
         }
         return self.call("fundpsbt", payload)
 
-    def utxopsbt(self, satoshi, feerate, startweight, utxos, reserve=True, reservedok=False, locktime=None):
+    def utxopsbt(self, satoshi, feerate, startweight, utxos, reserve=True, reservedok=False, locktime=None, min_witness_weight=None):
         """
         Create a PSBT with given inputs, to give an output of satoshi.
         """
@@ -1275,6 +1337,7 @@ class LightningRpc(UnixDomainSocketRpc):
             "reserve": reserve,
             "reservedok": reservedok,
             "locktime": locktime,
+            "min_witness_weight": min_witness_weight,
         }
         return self.call("utxopsbt", payload)
 

@@ -45,12 +45,17 @@ LIGHTNINGD_SRC += lightningd/dual_open_control.c
 endif
 
 LIGHTNINGD_SRC_NOHDR :=				\
+	lightningd/offer.c			\
 	lightningd/signmessage.c
 
 LIGHTNINGD_HEADERS :=				\
 	$(LIGHTNINGD_SRC:.c=.h)			\
 	lightningd/channel_state.h		\
 	lightningd/channel_state_names_gen.h
+
+ifeq ($(EXPERIMENTAL_FEATURES),1)
+LIGHTNINGD_HEADERS += lightningd/dual_open_control.h
+endif
 
 LIGHTNINGD_OBJS := $(LIGHTNINGD_SRC:.c=.o) $(LIGHTNINGD_SRC_NOHDR:.c=.o)
 $(LIGHTNINGD_OBJS): $(LIGHTNINGD_HEADERS) $(LIGHTNINGD_CONTROL_HEADERS)
@@ -72,6 +77,9 @@ LIGHTNINGD_COMMON_OBJS :=			\
 	common/bip32.o				\
 	common/blinding.o			\
 	common/bolt11.o				\
+	common/bolt11_json.o			\
+	common/bolt12.o				\
+	common/bolt12_merkle.o			\
 	common/channel_id.o			\
 	common/channel_config.o			\
 	common/coin_mvt.o			\
@@ -88,6 +96,7 @@ LIGHTNINGD_COMMON_OBJS :=			\
 	common/gossip_rcvd_filter.o		\
 	common/hash_u5.o			\
 	common/hmac.o				\
+	common/hsm_encryption.o			\
 	common/htlc_state.o			\
 	common/htlc_trim.o			\
 	common/htlc_wire.o			\

@@ -45,6 +45,7 @@ enum peer_wire {
         WIRE_QUERY_CHANNEL_RANGE = 263,
         WIRE_REPLY_CHANNEL_RANGE = 264,
         WIRE_GOSSIP_TIMESTAMP_FILTER = 265,
+        WIRE_ONION_MESSAGE = 385,
 };
 
 const char *peer_wire_name(int e);
@@ -148,6 +149,14 @@ struct tlv_reply_channel_range_tlvs {
         struct tlv_reply_channel_range_tlvs_timestamps_tlv *timestamps_tlv;
 	struct channel_update_checksums *checksums_tlv;
 };
+struct tlv_onion_message_tlvs {
+        /* Raw fields including unknown ones. */
+        struct tlv_field *fields;
+
+	/* TODO The following explicit fields could just point into the
+	 * tlv_field entries above to save on memory. */
+	struct pubkey *blinding;
+};
 
 struct tlv_init_tlvs *tlv_init_tlvs_new(const tal_t *ctx);
 
@@ -170,7 +179,7 @@ bool fromwire_init_tlvs(const u8 **cursor, size_t *max,
  * ensures that the resulting stream is valid according to
  * `init_tlvs_is_valid`.
  */
-void towire_init_tlvs(u8 **pptr, const void *record);
+void towire_init_tlvs(u8 **pptr, const struct tlv_init_tlvs *record);
 
 /**
  * Check that the TLV stream is valid.
@@ -207,7 +216,7 @@ bool fromwire_n1(const u8 **cursor, size_t *max,
  * ensures that the resulting stream is valid according to
  * `n1_is_valid`.
  */
-void towire_n1(u8 **pptr, const void *record);
+void towire_n1(u8 **pptr, const struct tlv_n1 *record);
 
 /**
  * Check that the TLV stream is valid.
@@ -223,7 +232,7 @@ void towire_n1(u8 **pptr, const void *record);
 bool n1_is_valid(const struct tlv_n1 *record,
 			  size_t *err_index);
 
-#define TLVS_N1_ARRAY_SIZE 4
+#define TLVS_ARRAY_SIZE_n1 4
 extern const struct tlv_record_type tlvs_n1[];
 
 
@@ -257,7 +266,7 @@ bool fromwire_n2(const u8 **cursor, size_t *max,
  * ensures that the resulting stream is valid according to
  * `n2_is_valid`.
  */
-void towire_n2(u8 **pptr, const void *record);
+void towire_n2(u8 **pptr, const struct tlv_n2 *record);
 
 /**
  * Check that the TLV stream is valid.
@@ -273,7 +282,7 @@ void towire_n2(u8 **pptr, const void *record);
 bool n2_is_valid(const struct tlv_n2 *record,
 			  size_t *err_index);
 
-#define TLVS_N2_ARRAY_SIZE 2
+#define TLVS_ARRAY_SIZE_n2 2
 extern const struct tlv_record_type tlvs_n2[];
 
 
@@ -305,7 +314,7 @@ bool fromwire_open_channel_tlvs(const u8 **cursor, size_t *max,
  * ensures that the resulting stream is valid according to
  * `open_channel_tlvs_is_valid`.
  */
-void towire_open_channel_tlvs(u8 **pptr, const void *record);
+void towire_open_channel_tlvs(u8 **pptr, const struct tlv_open_channel_tlvs *record);
 
 /**
  * Check that the TLV stream is valid.
@@ -342,7 +351,7 @@ bool fromwire_accept_channel_tlvs(const u8 **cursor, size_t *max,
  * ensures that the resulting stream is valid according to
  * `accept_channel_tlvs_is_valid`.
  */
-void towire_accept_channel_tlvs(u8 **pptr, const void *record);
+void towire_accept_channel_tlvs(u8 **pptr, const struct tlv_accept_channel_tlvs *record);
 
 /**
  * Check that the TLV stream is valid.
@@ -379,7 +388,7 @@ bool fromwire_query_short_channel_ids_tlvs(const u8 **cursor, size_t *max,
  * ensures that the resulting stream is valid according to
  * `query_short_channel_ids_tlvs_is_valid`.
  */
-void towire_query_short_channel_ids_tlvs(u8 **pptr, const void *record);
+void towire_query_short_channel_ids_tlvs(u8 **pptr, const struct tlv_query_short_channel_ids_tlvs *record);
 
 /**
  * Check that the TLV stream is valid.
@@ -416,7 +425,7 @@ bool fromwire_query_channel_range_tlvs(const u8 **cursor, size_t *max,
  * ensures that the resulting stream is valid according to
  * `query_channel_range_tlvs_is_valid`.
  */
-void towire_query_channel_range_tlvs(u8 **pptr, const void *record);
+void towire_query_channel_range_tlvs(u8 **pptr, const struct tlv_query_channel_range_tlvs *record);
 
 /**
  * Check that the TLV stream is valid.
@@ -453,7 +462,7 @@ bool fromwire_reply_channel_range_tlvs(const u8 **cursor, size_t *max,
  * ensures that the resulting stream is valid according to
  * `reply_channel_range_tlvs_is_valid`.
  */
-void towire_reply_channel_range_tlvs(u8 **pptr, const void *record);
+void towire_reply_channel_range_tlvs(u8 **pptr, const struct tlv_reply_channel_range_tlvs *record);
 
 /**
  * Check that the TLV stream is valid.
@@ -467,6 +476,43 @@ void towire_reply_channel_range_tlvs(u8 **pptr, const void *record);
  * detected.
  */
 bool reply_channel_range_tlvs_is_valid(const struct tlv_reply_channel_range_tlvs *record,
+			  size_t *err_index);
+
+struct tlv_onion_message_tlvs *tlv_onion_message_tlvs_new(const tal_t *ctx);
+
+/**
+ * Deserialize a TLV stream for the onion_message_tlvs namespace.
+ *
+ * This function will parse any TLV stream, as long as the type, length and
+ * value fields are formatted correctly. Fields that are not known in the
+ * current namespace are stored in the `fields` member. Validity can be
+ * checked using onion_message_tlvs_is_valid.
+ */
+bool fromwire_onion_message_tlvs(const u8 **cursor, size_t *max,
+			  struct tlv_onion_message_tlvs * record);
+
+/**
+ * Serialize a TLV stream for the onion_message_tlvs namespace.
+ *
+ * This function only considers known fields from the onion_message_tlvs namespace,
+ * and will ignore any fields that may be stored in the `fields` member. This
+ * ensures that the resulting stream is valid according to
+ * `onion_message_tlvs_is_valid`.
+ */
+void towire_onion_message_tlvs(u8 **pptr, const struct tlv_onion_message_tlvs *record);
+
+/**
+ * Check that the TLV stream is valid.
+ *
+ * Enforces the followin validity rules:
+ * - Types must be in monotonic non-repeating order
+ * - We must understand all even types
+ *
+ * Returns false if an error was detected, otherwise returns true. If err_index
+ * is non-null and we detect an error it is set to the index of the first error
+ * detected.
+ */
+bool onion_message_tlvs_is_valid(const struct tlv_onion_message_tlvs *record,
 			  size_t *err_index);
 
 /* SUBTYPE: CHANNEL_UPDATE_CHECKSUMS */
@@ -589,10 +635,14 @@ bool fromwire_reply_channel_range(const tal_t *ctx, const void *p, struct bitcoi
 u8 *towire_gossip_timestamp_filter(const tal_t *ctx, const struct bitcoin_blkid *chain_hash, u32 first_timestamp, u32 timestamp_range);
 bool fromwire_gossip_timestamp_filter(const void *p, struct bitcoin_blkid *chain_hash, u32 *first_timestamp, u32 *timestamp_range);
 
+/* WIRE: ONION_MESSAGE */
+u8 *towire_onion_message(const tal_t *ctx, const u8 *onionmsg, const struct tlv_onion_message_tlvs *onion_message_tlvs);
+bool fromwire_onion_message(const tal_t *ctx, const void *p, u8 **onionmsg, struct tlv_onion_message_tlvs *onion_message_tlvs);
+
 /* WIRE: CHANNEL_UPDATE_OPTION_CHANNEL_HTLC_MAX */
 u8 *towire_channel_update_option_channel_htlc_max(const tal_t *ctx, const secp256k1_ecdsa_signature *signature, const struct bitcoin_blkid *chain_hash, const struct short_channel_id *short_channel_id, u32 timestamp, u8 message_flags, u8 channel_flags, u16 cltv_expiry_delta, struct amount_msat htlc_minimum_msat, u32 fee_base_msat, u32 fee_proportional_millionths, struct amount_msat htlc_maximum_msat);
 bool fromwire_channel_update_option_channel_htlc_max(const void *p, secp256k1_ecdsa_signature *signature, struct bitcoin_blkid *chain_hash, struct short_channel_id *short_channel_id, u32 *timestamp, u8 *message_flags, u8 *channel_flags, u16 *cltv_expiry_delta, struct amount_msat *htlc_minimum_msat, u32 *fee_base_msat, u32 *fee_proportional_millionths, struct amount_msat *htlc_maximum_msat);
 
 
 #endif /* LIGHTNING_WIRE_PEER_WIREGEN_H */
-// SHA256STAMP:cb418f8296955fdcd26b9f06259a0c120007b543bc167f486989ac289a48c4af
+// SHA256STAMP:9f70670271b0856273026df920106d9c2ef2b60a1fa7c9c687e83a38d7d85a00

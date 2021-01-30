@@ -20,7 +20,6 @@
 
 #define BLINDING_FACTOR_SIZE 32
 
-#define NUM_STREAM_BYTES (2*ROUTING_INFO_SIZE)
 #define ONION_REPLY_SIZE 256
 
 #define RHO_KEYTYPE "rho"
@@ -131,7 +130,7 @@ u8 *serialize_onionpacket(
 	const tal_t *ctx,
 	const struct onionpacket *m)
 {
-	u8 *dst = tal_arr(ctx, u8, TOTAL_PACKET_SIZE);
+	u8 *dst = tal_arr(ctx, u8, TOTAL_PACKET_SIZE(tal_bytelen(m->routinginfo)));
 
 	u8 der[PUBKEY_CMPR_LEN];
 	int p = 0;
@@ -139,43 +138,45 @@ u8 *serialize_onionpacket(
 	pubkey_to_der(der, &m->ephemeralkey);
 	write_buffer(dst, &m->version, 1, &p);
 	write_buffer(dst, der, sizeof(der), &p);
-	write_buffer(dst, m->routinginfo, ROUTING_INFO_SIZE, &p);
+	write_buffer(dst, m->routinginfo, tal_bytelen(m->routinginfo), &p);
 	write_buffer(dst, m->hmac.bytes, sizeof(m->hmac.bytes), &p);
 	return dst;
 }
 
-enum onion_wire parse_onionpacket(const u8 *src,
-				  const size_t srclen,
-				  struct onionpacket *dest)
+struct onionpacket *parse_onionpacket(const tal_t *ctx,
+				      const u8 *src,
+				      const size_t srclen,
+				      enum onion_wire *failcode)
 {
+	struct onionpacket *dest = tal(ctx, struct onionpacket);
 	const u8 *cursor = src;
 	size_t max = srclen;
-
-	assert(srclen == TOTAL_PACKET_SIZE);
 
 	dest->version = fromwire_u8(&cursor, &max);
 	if (dest->version != 0x00) {
 		// FIXME add logging
-		return WIRE_INVALID_ONION_VERSION;
+		*failcode = WIRE_INVALID_ONION_VERSION;
+		return tal_free(dest);
 	}
 
 	fromwire_pubkey(&cursor, &max, &dest->ephemeralkey);
 	if (cursor == NULL) {
-		return WIRE_INVALID_ONION_KEY;
+		*failcode = WIRE_INVALID_ONION_KEY;
+		return tal_free(dest);
 	}
 
-	fromwire_u8_array(&cursor, &max, dest->routinginfo, ROUTING_INFO_SIZE);
+	/* If max underflows, this returns NULL and fromwire fails. */
+	dest->routinginfo = fromwire_tal_arrn(dest, &cursor, &max,
+					      max - HMAC_SIZE);
 	fromwire_hmac(&cursor, &max, &dest->hmac);
+
 	assert(max == 0);
-	return 0;
-}
+	if (cursor == NULL) {
+		*failcode = WIRE_INVALID_REALM;
+		return tal_free(dest);
+	}
 
-static void xorbytes(uint8_t *d, const uint8_t *a, const uint8_t *b, size_t len)
-{
-	size_t i;
-
-	for (i = 0; i < len; i++)
-		d[i] = a[i] ^ b[i];
+	return dest;
 }
 
 /*
@@ -197,11 +198,57 @@ static void xor_cipher_stream(void *dst, const struct secret *k, size_t dstlen)
 	crypto_stream_chacha20_xor(dst, dst, dstlen, nonce, k->data);
 }
 
-static void compute_hmac(const u8 *src, size_t slen,
-			 const struct secret *key,
-			 struct hmac *h)
+#define CHACHA20_BLOCK_BYTES 64
+
+static void xor_cipher_stream_off(const struct secret *k,
+				  size_t off,
+				  void *dst, size_t dstlen)
 {
-	hmac(src, slen, key->data, sizeof(key->data), h);
+	const u8 nonce[8] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+	u8 block[CHACHA20_BLOCK_BYTES];
+	size_t block_off;
+	size_t ic = off / CHACHA20_BLOCK_BYTES;
+
+	/* From https://libsodium.gitbook.io/doc/advanced/stream_ciphers/chacha20:
+	 *
+	 * The crypto_stream_chacha20_xor_ic() function is similar to
+	 * crypto_stream_chacha20_xor() but adds the ability to set
+	 * the initial value of the block counter to a non-zero value,
+	 * ic.
+	 *
+	 * This permits direct access to any block without having to
+	 * compute the previous ones.
+	 */
+	block_off = (off % CHACHA20_BLOCK_BYTES);
+	if (block_off != 0) {
+		size_t rem = CHACHA20_BLOCK_BYTES - block_off;
+		if (rem > dstlen)
+			rem = dstlen;
+		memcpy(block + block_off, dst, rem);
+		crypto_stream_chacha20_xor_ic(block, block, block_off + rem,
+					      nonce,
+					      ic,
+					      k->data);
+		ic++;
+		memcpy(dst, block + block_off, rem);
+		dst = (char *)dst + rem;
+		dstlen -= rem;
+	}
+	crypto_stream_chacha20_xor_ic(dst, dst, dstlen, nonce, ic, k->data);
+}
+
+/* Convenience function: s2/s2len can be NULL/0 if unwanted */
+static void compute_hmac(const struct secret *key,
+			 const u8 *s1, size_t s1len,
+			 const u8 *s2, size_t s2len,
+			 struct hmac *hmac)
+{
+	crypto_auth_hmacsha256_state state;
+
+	hmac_start(&state, key->data, sizeof(key->data));
+	hmac_update(&state, s1, s1len);
+	hmac_update(&state, s2, s2len);
+	hmac_done(&state, hmac);
 }
 
 static void compute_packet_hmac(const struct onionpacket *packet,
@@ -209,21 +256,17 @@ static void compute_packet_hmac(const struct onionpacket *packet,
 				const struct secret *mukey,
 				struct hmac *hmac)
 {
-	u8 mactemp[ROUTING_INFO_SIZE + assocdatalen];
-	int pos = 0;
-
-	write_buffer(mactemp, packet->routinginfo, ROUTING_INFO_SIZE, &pos);
-	write_buffer(mactemp, assocdata, assocdatalen, &pos);
-	assert(pos == sizeof(mactemp));
-
-	compute_hmac(mactemp, sizeof(mactemp), mukey, hmac);
+	compute_hmac(mukey,
+		     packet->routinginfo, tal_bytelen(packet->routinginfo),
+		     assocdata, assocdatalen,
+		     hmac);
 }
 
 static void generate_header_padding(void *dst, size_t dstlen,
+				    size_t fixed_size,
 				    const struct sphinx_path *path,
 				    struct hop_params *params)
 {
-	u8 stream[2 * ROUTING_INFO_SIZE];
 	struct secret key;
 	size_t fillerStart, fillerEnd, fillerSize;
 
@@ -231,32 +274,30 @@ static void generate_header_padding(void *dst, size_t dstlen,
 	for (int i = 0; i < tal_count(path->hops) - 1; i++) {
 		subkey_from_hmac("rho", &params[i].secret, &key);
 
-		generate_cipher_stream(stream, &key, sizeof(stream));
-
 		/* Sum up how many bytes have been used by previous hops,
 		 * that gives us the start in the stream */
 		fillerSize = 0;
 		for (int j = 0; j < i; j++)
 			fillerSize += sphinx_hop_size(&path->hops[j]);
-		fillerStart = ROUTING_INFO_SIZE - fillerSize;
+		fillerStart = fixed_size - fillerSize;
 
 		/* The filler will dangle off of the end by the current
 		 * hop-size, we'll make sure to copy it into the correct
 		 * position in the next step. */
-		fillerEnd = ROUTING_INFO_SIZE + sphinx_hop_size(&path->hops[i]);
+		fillerEnd = fixed_size + sphinx_hop_size(&path->hops[i]);
 
 		/* Apply the cipher-stream to the part of the filler that'll
 		 * be added by this hop */
-		xorbytes(dst, dst, stream + fillerStart,
-			 fillerEnd - fillerStart);
+		xor_cipher_stream_off(&key, fillerStart,
+				      dst, fillerEnd - fillerStart);
 	}
 }
 
 static void generate_prefill(void *dst, size_t dstlen,
+			     size_t fixed_size,
 			     const struct sphinx_path *path,
 			     struct hop_params *params)
 {
-	u8 stream[2 * ROUTING_INFO_SIZE];
 	struct secret key;
 	size_t fillerStart, fillerSize;
 
@@ -264,18 +305,16 @@ static void generate_prefill(void *dst, size_t dstlen,
 	for (int i = 0; i < tal_count(path->hops); i++) {
 		subkey_from_hmac("rho", &params[i].secret, &key);
 
-		generate_cipher_stream(stream, &key, sizeof(stream));
-
 		/* Sum up how many bytes have been used by previous hops,
 		 * that gives us the start in the stream */
 		fillerSize = 0;
 		for (int j = 0; j < i; j++)
 			fillerSize += sphinx_hop_size(&path->hops[j]);
-		fillerStart = ROUTING_INFO_SIZE - fillerSize - dstlen;
+		fillerStart = fixed_size - fillerSize - dstlen;
 
 		/* Apply the cipher-stream to the part of the filler that'll
 		 * be added by this hop */
-		xorbytes(dst, dst, stream + fillerStart, dstlen);
+		xor_cipher_stream_off(&key, fillerStart, dst, dstlen);
 	}
 }
 
@@ -416,23 +455,23 @@ static void sphinx_prefill_stream_xor(u8 *dst, size_t dstlen,
 }
 
 static void sphinx_prefill(u8 *routinginfo, const struct sphinx_path *sp,
-			   size_t prefill_size, struct hop_params *params)
+			   size_t prefill_size, struct hop_params *params,
+			   size_t fixed_size)
 {
 	int num_hops = tal_count(sp->hops);
 	size_t fillerSize = sphinx_path_payloads_size(sp) -
 			    sphinx_hop_size(&sp->hops[num_hops - 1]);
 	size_t last_hop_size = sphinx_hop_size(&sp->hops[num_hops - 1]);
 	int prefill_offset =
-	    ROUTING_INFO_SIZE - fillerSize - last_hop_size - prefill_size;
-	u8 prefill[prefill_size];
+	    fixed_size - fillerSize - last_hop_size - prefill_size;
 	struct secret shared_secret;
 
 	/* Generate the prefill stream, which cancels out the layers of
 	 * encryption that will be applied while wrapping the onion. This
 	 * leaves the middle, unused, section with all 0x00 bytes after
 	 * encrypting. */
-	generate_prefill(prefill, prefill_size, sp, params);
-	memcpy(routinginfo + prefill_offset, prefill, prefill_size);
+	generate_prefill(routinginfo + prefill_offset, prefill_size,
+			 fixed_size, sp, params);
 
 	/* Now fill in the obfuscation stream, which can be regenerated by the
 	 * node processing this onion. */
@@ -443,6 +482,7 @@ static void sphinx_prefill(u8 *routinginfo, const struct sphinx_path *sp,
 struct onionpacket *create_onionpacket(
 	const tal_t *ctx,
 	struct sphinx_path *sp,
+	size_t fixed_size,
 	struct secret **path_secrets
 	)
 {
@@ -450,20 +490,21 @@ struct onionpacket *create_onionpacket(
 	int i, num_hops = tal_count(sp->hops);
 	size_t fillerSize = sphinx_path_payloads_size(sp) -
 			      sphinx_hop_size(&sp->hops[num_hops - 1]);
-	u8 filler[fillerSize];
+	u8 *filler;
 	struct keyset keys;
 	struct secret padkey;
 	struct hmac nexthmac;
 	struct hop_params *params;
 	struct secret *secrets = tal_arr(ctx, struct secret, num_hops);
 	size_t payloads_size = sphinx_path_payloads_size(sp);
-	size_t max_prefill  = ROUTING_INFO_SIZE - payloads_size;
+	size_t max_prefill = fixed_size - payloads_size;
 
-	if (sphinx_path_payloads_size(sp) > ROUTING_INFO_SIZE) {
+	if (sphinx_path_payloads_size(sp) > fixed_size) {
 		tal_free(packet);
 		tal_free(secrets);
 		return NULL;
 	}
+	packet->routinginfo = tal_arr(packet, u8, fixed_size);
 
 	if (sp->session_key == NULL) {
 		sp->session_key = tal(sp, struct secret);
@@ -487,14 +528,16 @@ struct onionpacket *create_onionpacket(
 	/* Note that this is just hop_payloads: the rest of the packet is
 	 * overwritten below or above anyway. */
 	subkey_from_hmac("pad", sp->session_key, &padkey);
-	generate_cipher_stream(packet->routinginfo, &padkey, ROUTING_INFO_SIZE);
+	generate_cipher_stream(packet->routinginfo, &padkey, fixed_size);
 
-	generate_header_padding(filler, sizeof(filler), sp, params);
+	filler = tal_arr(tmpctx, u8, fillerSize);
+	generate_header_padding(filler, tal_bytelen(filler), fixed_size, sp, params);
 
 	if (sp->rendezvous_id != NULL)
 		/* FIXME: Fuzz this or expose to the caller to hide encoded
 		 * route length. */
-		sphinx_prefill(packet->routinginfo, sp, max_prefill, params);
+		sphinx_prefill(packet->routinginfo, sp, max_prefill, params,
+			       fixed_size);
 
 	for (i = num_hops - 1; i >= 0; i--) {
 		sp->hops[i].hmac = nexthmac;
@@ -503,13 +546,13 @@ struct onionpacket *create_onionpacket(
 		/* Rightshift mix-header by FRAME_SIZE */
 		size_t shiftSize = sphinx_hop_size(&sp->hops[i]);
 		memmove(packet->routinginfo + shiftSize, packet->routinginfo,
-			ROUTING_INFO_SIZE-shiftSize);
+			fixed_size - shiftSize);
 		sphinx_write_frame(packet->routinginfo, &sp->hops[i]);
 		xor_cipher_stream(packet->routinginfo, &keys.rho,
-				  ROUTING_INFO_SIZE);
+				  fixed_size);
 
 		if (i == num_hops - 1) {
-			memcpy(packet->routinginfo + ROUTING_INFO_SIZE - fillerSize, filler, fillerSize);
+			memcpy(packet->routinginfo + fixed_size - fillerSize, filler, fillerSize);
 		}
 
 		compute_packet_hmac(packet, sp->associated_data, tal_bytelen(sp->associated_data), &keys.mu,
@@ -547,7 +590,7 @@ struct route_step *process_onionpacket(
 	struct hmac hmac;
 	struct keyset keys;
 	u8 blind[BLINDING_FACTOR_SIZE];
-	u8 paddedheader[2*ROUTING_INFO_SIZE];
+	u8 *paddedheader;
 	size_t payload_size;
 	bigsize_t shift_size;
 	bool valid;
@@ -565,15 +608,17 @@ struct route_step *process_onionpacket(
 	}
 
 	//FIXME:store seen secrets to avoid replay attacks
-	memset(paddedheader, 0, sizeof(paddedheader));
-	memcpy(paddedheader, msg->routinginfo, ROUTING_INFO_SIZE);
-	xor_cipher_stream(paddedheader, &keys.rho, sizeof(paddedheader));
+	paddedheader = tal_arrz(step, u8, tal_bytelen(msg->routinginfo)*2);
+	memcpy(paddedheader, msg->routinginfo, tal_bytelen(msg->routinginfo));
+	xor_cipher_stream(paddedheader, &keys.rho, tal_bytelen(paddedheader));
 
 	compute_blinding_factor(&msg->ephemeralkey, shared_secret, blind);
 	if (!blind_group_element(&step->next->ephemeralkey, &msg->ephemeralkey, blind))
 		return tal_free(step);
 
-	payload_size = onion_payload_length(paddedheader, ROUTING_INFO_SIZE, has_realm,
+	payload_size = onion_payload_length(paddedheader,
+					    tal_bytelen(msg->routinginfo),
+					    has_realm,
 					    &valid, NULL);
 
 	/* Can't decode?  Treat it as terminal. */
@@ -581,7 +626,7 @@ struct route_step *process_onionpacket(
 		shift_size = payload_size;
 		memset(step->next->hmac.bytes, 0, sizeof(step->next->hmac.bytes));
 	} else {
-		assert(payload_size <= ROUTING_INFO_SIZE - HMAC_SIZE);
+		assert(payload_size <= tal_bytelen(msg->routinginfo) - HMAC_SIZE);
 		/* Copy hmac */
 		shift_size = payload_size + HMAC_SIZE;
 		memcpy(step->next->hmac.bytes,
@@ -590,8 +635,10 @@ struct route_step *process_onionpacket(
 	step->raw_payload = tal_dup_arr(step, u8, paddedheader, payload_size, 0);
 
 	/* Left shift the current payload out and make the remainder the new onion */
-	memcpy(&step->next->routinginfo, paddedheader + shift_size,
-	       ROUTING_INFO_SIZE);
+	step->next->routinginfo = tal_dup_arr(step->next,
+					      u8,
+					      paddedheader + shift_size,
+					      tal_bytelen(msg->routinginfo), 0);
 
 	if (memeqzero(step->next->hmac.bytes, sizeof(step->next->hmac.bytes))) {
 		step->nextcase = ONION_END;
@@ -599,6 +646,7 @@ struct route_step *process_onionpacket(
 		step->nextcase = ONION_FORWARD;
 	}
 
+	tal_free(paddedheader);
 	return step;
 }
 
@@ -648,7 +696,7 @@ struct onionreply *create_onionreply(const tal_t *ctx,
 	 */
 	subkey_from_hmac("um", shared_secret, &key);
 
-	compute_hmac(payload, tal_count(payload), &key, &hmac);
+	compute_hmac(&key, payload, tal_count(payload), NULL, 0, &hmac);
 	reply->contents = tal_arr(reply, u8, 0),
 	towire_hmac(&reply->contents, &hmac);
 
@@ -708,9 +756,9 @@ u8 *unwrap_onionreply(const tal_t *ctx,
 		/* Check if the HMAC matches, this means that this is
 		 * the origin */
 		subkey_from_hmac("um", &shared_secrets[i], &key);
-		compute_hmac(r->contents + sizeof(hmac.bytes),
+		compute_hmac(&key, r->contents + sizeof(hmac.bytes),
 			     tal_count(r->contents) - sizeof(hmac.bytes),
-			     &key, &hmac);
+			     NULL, 0, &hmac);
 		if (memcmp(hmac.bytes, r->contents, sizeof(hmac.bytes)) == 0) {
 			*origin_index = i;
 			break;
@@ -749,7 +797,7 @@ struct onionpacket *sphinx_decompress(const tal_t *ctx,
 	/* Decompress routinginfo by copying the unmodified prefix, setting
 	 * the compressed suffix to 0x00 bytes and then xoring the obfuscation
 	 * stream in place. */
-	memset(res->routinginfo, 0, ROUTING_INFO_SIZE);
+	res->routinginfo = tal_arrz(res, u8, ROUTING_INFO_SIZE);
 	memcpy(res->routinginfo, src->routinginfo, srclen);
 	sphinx_prefill_stream_xor(res->routinginfo + srclen, prefill_size,
 				  shared_secret);
@@ -807,7 +855,7 @@ sphinx_compressed_onion_deserialize(const tal_t *ctx, const u8 *src)
 	    tal(ctx, struct sphinx_compressed_onion);
 
 	/* This is not a compressed onion, so let's not parse it. */
-	if (max > TOTAL_PACKET_SIZE)
+	if (max > TOTAL_PACKET_SIZE(ROUTING_INFO_SIZE))
 		return tal_free(dst);
 
 	dst->version = fromwire_u8(&cursor, &max);

@@ -1,5 +1,6 @@
 #include <ccan/array_size/array_size.h>
 #include <ccan/list/list.h>
+#include <ccan/mem/mem.h>
 #include <ccan/opt/opt.h>
 #include <ccan/tal/str/str.h>
 #include <ccan/utf8/utf8.h>
@@ -58,6 +59,7 @@ struct plugins *plugins_new(const tal_t *ctx, struct log_book *log_book,
 	p->json_cmds = tal_arr(p, struct command *, 0);
 	p->blacklist = tal_arr(p, const char *, 0);
 	p->shutdown = false;
+	p->plugin_idx = 0;
 #if DEVELOPER
 	p->dev_builtin_plugins_unimportant = false;
 #endif /* DEVELOPER */
@@ -83,24 +85,46 @@ void plugins_free(struct plugins *plugins)
 	tal_free(plugins);
 }
 
-static void check_plugins_resolved(struct plugins *plugins)
+/* Once they've all replied with their manifests, we can order them. */
+static void check_plugins_manifests(struct plugins *plugins)
 {
-	/* As startup, we break out once all getmanifest are returned */
-	if (plugins->startup) {
-		if (!plugins_any_in_state(plugins, AWAITING_GETMANIFEST_RESPONSE))
-			io_break(plugins);
-	/* Otherwise we wait until all finished. */
-	} else if (plugins_all_in_state(plugins, INIT_COMPLETE)) {
-		struct command **json_cmds;
+	struct plugin **depfail;
 
-		/* Clear commands first, in case callbacks add new ones.
-		 * Paranoia, but wouldn't that be a nasty bug to find? */
-		json_cmds = plugins->json_cmds;
-		plugins->json_cmds = tal_arr(plugins, struct command *, 0);
-		for (size_t i = 0; i < tal_count(json_cmds); i++)
-			plugin_cmd_all_complete(plugins, json_cmds[i]);
-		tal_free(json_cmds);
+	if (plugins_any_in_state(plugins, AWAITING_GETMANIFEST_RESPONSE))
+		return;
+
+	/* Now things are settled, try to order hooks. */
+	depfail = plugin_hooks_make_ordered(tmpctx);
+	for (size_t i = 0; i < tal_count(depfail); i++) {
+		/* Only complain and free plugins! */
+		if (depfail[i]->plugin_state != NEEDS_INIT)
+			continue;
+		plugin_kill(depfail[i],
+			    "Cannot meet required hook dependencies");
 	}
+
+	/* As startup, we break out once all getmanifest are returned */
+	if (plugins->startup)
+		io_break(plugins);
+	else
+		/* Otherwise we go straight into configuring them */
+		plugins_config(plugins);
+}
+
+static void check_plugins_initted(struct plugins *plugins)
+{
+	struct command **json_cmds;
+
+	if (!plugins_all_in_state(plugins, INIT_COMPLETE))
+		return;
+
+	/* Clear commands first, in case callbacks add new ones.
+	 * Paranoia, but wouldn't that be a nasty bug to find? */
+	json_cmds = plugins->json_cmds;
+	plugins->json_cmds = tal_arr(plugins, struct command *, 0);
+	for (size_t i = 0; i < tal_count(json_cmds); i++)
+		plugin_cmd_all_complete(plugins, json_cmds[i]);
+	tal_free(json_cmds);
 }
 
 struct command_result *plugin_register_all_complete(struct lightningd *ld,
@@ -117,7 +141,6 @@ static void destroy_plugin(struct plugin *p)
 {
 	struct plugin_rpccall *call;
 
-	plugin_hook_unregister_all(p);
 	list_del(&p->list);
 
 	/* Terminate all pending RPC calls with an error. */
@@ -126,10 +149,16 @@ static void destroy_plugin(struct plugin *p)
 		    call->cmd, PLUGIN_TERMINATED,
 		    "Plugin terminated before replying to RPC call."));
 	}
+	/* Reset, so calls below don't try to fail it again! */
+	list_head_init(&p->pending_rpccalls);
 
-	/* Don't call this if we're still parsing options! */
-	if (p->plugin_state != UNCONFIGURED)
-		check_plugins_resolved(p->plugins);
+	/* If this was last one manifests were waiting for, handle deps */
+	if (p->plugin_state == AWAITING_GETMANIFEST_RESPONSE)
+		check_plugins_manifests(p->plugins);
+
+	/* If this was the last one init was waiting for, handle cmd replies */
+	if (p->plugin_state == AWAITING_INIT_RESPONSE)
+		check_plugins_initted(p->plugins);
 
 	/* If we are shutting down, do not continue to checking if
 	 * the dying plugin is important.  */
@@ -146,7 +175,9 @@ static void destroy_plugin(struct plugin *p)
 }
 
 struct plugin *plugin_register(struct plugins *plugins, const char* path TAKES,
-			       struct command *start_cmd, bool important)
+			       struct command *start_cmd, bool important,
+			       const char *parambuf STEALS,
+			       const jsmntok_t *params STEALS)
 {
 	struct plugin *p, *p_temp;
 
@@ -172,6 +203,7 @@ struct plugin *plugin_register(struct plugins *plugins, const char* path TAKES,
 	p->used = 0;
 	p->subscriptions = NULL;
 	p->dynamic = false;
+	p->index = plugins->plugin_idx++;
 
 	p->log = new_log(p, plugins->log_book, NULL, "plugin-%s",
 			 path_basename(tmpctx, p->cmd));
@@ -183,6 +215,8 @@ struct plugin *plugin_register(struct plugins *plugins, const char* path TAKES,
 	list_head_init(&p->pending_rpccalls);
 
 	p->important = important;
+	p->parambuf = tal_steal(p, parambuf);
+	p->params = tal_steal(p, params);
 	return p;
 }
 
@@ -617,49 +651,72 @@ struct io_plan *plugin_stdout_conn_init(struct io_conn *conn,
 			       plugin_read_json, plugin);
 }
 
+
+/* Returns NULL if invalid value for that type */
+static struct plugin_opt_value *plugin_opt_value(const tal_t *ctx,
+						 const char *type,
+						 const char *arg)
+{
+	struct plugin_opt_value *v = tal(ctx, struct plugin_opt_value);
+
+	v->as_str = tal_strdup(v, arg);
+	if (streq(type, "int")) {
+		long long l;
+		char *endp;
+
+		errno = 0;
+		l = strtoll(arg, &endp, 0);
+		if (errno || *endp)
+			return tal_free(v);
+		v->as_int = l;
+
+		/* Check if the number did not fit in `s64` (in case `long long`
+		 * is a bigger type). */
+		if (v->as_int != l)
+			return tal_free(v);
+	} else if (streq(type, "bool")) {
+		/* valid values are 'true', 'True', '1', '0', 'false', 'False', or '' */
+		if (streq(arg, "true") || streq(arg, "True") || streq(arg, "1")) {
+			v->as_bool = true;
+		} else if (streq(arg, "false") || streq(arg, "False")
+				|| streq(arg, "0")) {
+			v->as_bool = false;
+		} else
+			return tal_free(v);
+	} else if (streq(type, "flag")) {
+		v->as_bool = true;
+	}
+
+	return v;
+}
+
 char *plugin_opt_flag_set(struct plugin_opt *popt)
 {
 	/* A set flag is a true */
-	*popt->value->as_bool = true;
+	tal_free(popt->values);
+	popt->values = tal_arr(popt, struct plugin_opt_value *, 1);
+	popt->values[0] = plugin_opt_value(popt->values, popt->type, "true");
 	return NULL;
 }
 
 char *plugin_opt_set(const char *arg, struct plugin_opt *popt)
 {
-	char *endp;
-	long long l;
+	struct plugin_opt_value *v;
 
 	/* Warn them that this is deprecated */
 	if (popt->deprecated && !deprecated_apis)
 		return tal_fmt(tmpctx, "deprecated option (will be removed!)");
 
-	tal_free(popt->value->as_str);
-
-	popt->value->as_str = tal_strdup(popt, arg);
-	if (streq(popt->type, "int")) {
-		errno = 0;
-		l = strtoll(arg, &endp, 0);
-		if (errno || *endp)
-			return tal_fmt(tmpctx, "%s does not parse as type %s",
-				       popt->value->as_str, popt->type);
-		*popt->value->as_int = l;
-
-		/* Check if the number did not fit in `s64` (in case `long long`
-		 * is a bigger type). */
-		if (*popt->value->as_int != l)
-			return tal_fmt(tmpctx, "%s does not parse as type %s (overflowed)",
-				       popt->value->as_str, popt->type);
-	} else if (streq(popt->type, "bool")) {
-		/* valid values are 'true', 'True', '1', '0', 'false', 'False', or '' */
-		if (streq(arg, "true") || streq(arg, "True") || streq(arg, "1")) {
-			*popt->value->as_bool = true;
-		} else if (streq(arg, "false") || streq(arg, "False")
-				|| streq(arg, "0")) {
-			*popt->value->as_bool = false;
-		} else
-			return tal_fmt(tmpctx, "%s does not parse as type %s",
-				       popt->value->as_str, popt->type);
+	if (!popt->multi) {
+		tal_free(popt->values);
+		popt->values = tal_arr(popt, struct plugin_opt_value *, 0);
 	}
+
+	v = plugin_opt_value(popt->values, popt->type, arg);
+	if (!v)
+		return tal_fmt(tmpctx, "%s does not parse as type %s",
+			       arg, popt->type);
+	tal_arr_expand(&popt->values, v);
 
 	return NULL;
 }
@@ -676,13 +733,14 @@ static void destroy_plugin_opt(struct plugin_opt *opt)
 static const char *plugin_opt_add(struct plugin *plugin, const char *buffer,
 				  const jsmntok_t *opt)
 {
-	const jsmntok_t *nametok, *typetok, *defaulttok, *desctok, *deptok;
+	const jsmntok_t *nametok, *typetok, *defaulttok, *desctok, *deptok, *multitok;
 	struct plugin_opt *popt;
 	nametok = json_get_member(buffer, opt, "name");
 	typetok = json_get_member(buffer, opt, "type");
 	desctok = json_get_member(buffer, opt, "description");
 	defaulttok = json_get_member(buffer, opt, "default");
 	deptok = json_get_member(buffer, opt, "deprecated");
+	multitok = json_get_member(buffer, opt, "multi");
 
 	if (!typetok || !nametok || !desctok) {
 		return tal_fmt(plugin,
@@ -690,7 +748,7 @@ static const char *plugin_opt_add(struct plugin *plugin, const char *buffer,
 	}
 
 	popt = tal(plugin, struct plugin_opt);
-	popt->value = talz(popt, struct plugin_opt_value);
+	popt->values = tal_arr(popt, struct plugin_opt_value *, 0);
 
 	popt->name = tal_fmt(popt, "--%.*s", nametok->end - nametok->start,
 			     buffer + nametok->start);
@@ -705,43 +763,44 @@ static const char *plugin_opt_add(struct plugin *plugin, const char *buffer,
 	} else
 		popt->deprecated = false;
 
+	if (multitok) {
+		if (!json_to_bool(buffer, multitok, &popt->multi))
+			return tal_fmt(plugin,
+				       "%s: invalid \"multi\" field %.*s",
+				       popt->name,
+				       multitok->end - multitok->start,
+				       buffer + multitok->start);
+	} else
+		popt->multi = false;
+
+	popt->def = NULL;
 	if (json_tok_streq(buffer, typetok, "string")) {
 		popt->type = "string";
-		if (defaulttok) {
-			popt->value->as_str = json_strdup(popt, buffer, defaulttok);
-			popt->description = tal_fmt(
-					popt, "%.*s (default: %s)", desctok->end - desctok->start,
-					buffer + desctok->start, popt->value->as_str);
-		}
 	} else if (json_tok_streq(buffer, typetok, "int")) {
 		popt->type = "int";
-		popt->value->as_int = talz(popt->value, s64);
-		if (defaulttok) {
-			json_to_s64(buffer, defaulttok, popt->value->as_int);
-			popt->value->as_str = tal_fmt(popt->value, "%"PRIu64, *popt->value->as_int);
-			popt->description = tal_fmt(
-					popt, "%.*s (default: %"PRIu64")", desctok->end - desctok->start,
-					buffer + desctok->start, *popt->value->as_int);
-		}
-	} else if (json_tok_streq(buffer, typetok, "bool")) {
-		popt->type = "bool";
-		popt->value->as_bool = talz(popt->value, bool);
-		if (defaulttok) {
-			json_to_bool(buffer, defaulttok, popt->value->as_bool);
-			popt->value->as_str = tal_fmt(popt->value, *popt->value->as_bool ? "true" : "false");
-			popt->description = tal_fmt(
-					popt, "%.*s (default: %s)", desctok->end - desctok->start,
-					buffer + desctok->start, *popt->value->as_bool ? "true" : "false");
-		}
-	} else if (json_tok_streq(buffer, typetok, "flag")) {
-		popt->type = "flag";
-		popt->value->as_bool = talz(popt->value, bool);
+	} else if (json_tok_streq(buffer, typetok, "bool")
+		   || json_tok_streq(buffer, typetok, "flag")) {
+		popt->type = json_strdup(popt, buffer, typetok);
+		if (popt->multi)
+			return tal_fmt(plugin,
+				       "%s type \"%s\" cannot have multi",
+				       popt->name, popt->type);
 		/* We default flags to false, the default token is ignored */
-		*popt->value->as_bool = false;
-
+		if (json_tok_streq(buffer, typetok, "flag"))
+			defaulttok = NULL;
 	} else {
 		return tal_fmt(plugin,
 			       "Only \"string\", \"int\", \"bool\", and \"flag\" options are supported");
+	}
+
+	if (defaulttok) {
+		popt->def = plugin_opt_value(popt, popt->type,
+					     json_strdup(tmpctx, buffer, defaulttok));
+		if (!popt->def)
+			return tal_fmt(tmpctx, "default %.*s is not a valid %s",
+				       json_tok_full_len(defaulttok),
+				       json_tok_full(buffer, defaulttok),
+				       popt->type);
 	}
 
 	if (!popt->description)
@@ -1057,21 +1116,87 @@ static const char *plugin_subscriptions_add(struct plugin *plugin,
 static const char *plugin_hooks_add(struct plugin *plugin, const char *buffer,
 				    const jsmntok_t *resulttok)
 {
-	const jsmntok_t *hookstok = json_get_member(buffer, resulttok, "hooks");
+	const jsmntok_t *t, *hookstok, *beforetok, *aftertok;
+	size_t i;
+
+	hookstok = json_get_member(buffer, resulttok, "hooks");
 	if (!hookstok)
 		return NULL;
 
-	for (int i = 0; i < hookstok->size; i++) {
-		char *name = json_strdup(tmpctx, plugin->buffer,
-					 json_get_arr(hookstok, i));
-		if (!plugin_hook_register(plugin, name)) {
+	json_for_each_arr(i, t, hookstok) {
+		char *name;
+		struct plugin_hook *hook;
+
+		if (t->type == JSMN_OBJECT) {
+			const jsmntok_t *nametok;
+
+			nametok = json_get_member(buffer, t, "name");
+			if (!nametok)
+				return tal_fmt(plugin, "no name in hook obj %.*s",
+					       json_tok_full_len(t),
+					       json_tok_full(buffer, t));
+			name = json_strdup(tmpctx, buffer, nametok);
+			beforetok = json_get_member(buffer, t, "before");
+			aftertok = json_get_member(buffer, t, "after");
+		} else {
+			/* FIXME: deprecate in 3 releases after v0.9.2! */
+			name = json_strdup(tmpctx, plugin->buffer, t);
+			beforetok = aftertok = NULL;
+		}
+
+		hook = plugin_hook_register(plugin, name);
+		if (!hook) {
 			return tal_fmt(plugin,
 				    "could not register hook '%s', either the "
 				    "name doesn't exist or another plugin "
 				    "already registered it.",
 				    name);
 		}
+
+		plugin_hook_add_deps(hook, plugin, buffer, beforetok, aftertok);
 		tal_free(name);
+	}
+	return NULL;
+}
+
+static struct plugin_opt *plugin_opt_find(struct plugin *plugin,
+					  const char *name, size_t namelen)
+{
+	struct plugin_opt *opt;
+
+	list_for_each(&plugin->plugin_opts, opt, list) {
+		/* Trim the `--` that we added before */
+		if (memeqstr(name, namelen, opt->name + 2))
+			return opt;
+	}
+	return NULL;
+}
+
+/* start command might have included plugin-specific parameters */
+static const char *plugin_add_params(struct plugin *plugin)
+{
+	size_t i;
+	const jsmntok_t *t;
+
+	if (!plugin->params)
+		return NULL;
+
+	json_for_each_obj(i, t, plugin->params) {
+		struct plugin_opt *popt;
+		char *err;
+
+		popt = plugin_opt_find(plugin,
+				       plugin->parambuf + t->start,
+				       t->end - t->start);
+		if (!popt) {
+			return tal_fmt(plugin, "unknown parameter %.*s",
+				       json_tok_full_len(t),
+				       json_tok_full(plugin->parambuf, t));
+		}
+		err = plugin_opt_set(json_strdup(tmpctx, plugin->parambuf,
+						 t + 1), popt);
+		if (err)
+			return err;
 	}
 	return NULL;
 }
@@ -1103,6 +1228,17 @@ static const char *plugin_parse_getmanifest_response(const char *buffer,
 		return tal_fmt(plugin, "Invalid/missing result tok in '%.*s'",
 			       json_tok_full_len(toks),
 			       json_tok_full(buffer, toks));
+
+	/* Plugin can disable itself: returns why it's disabled. */
+	tok = json_get_member(buffer, resulttok, "disable");
+	if (tok) {
+		log_debug(plugin->log, "disabled itself: %.*s",
+			  json_tok_full_len(tok),
+			  json_tok_full(buffer, tok));
+		/* Don't get upset if this was a built-in! */
+		plugin->important = false;
+		return json_strdup(plugin, buffer, tok);
+	}
 
 	dynamictok = json_get_member(buffer, resulttok, "dynamic");
 	if (dynamictok && !json_to_bool(buffer, dynamictok, &plugin->dynamic)) {
@@ -1165,6 +1301,8 @@ static const char *plugin_parse_getmanifest_response(const char *buffer,
 		err = plugin_subscriptions_add(plugin, buffer, resulttok);
 	if (!err)
 		err = plugin_hooks_add(plugin, buffer, resulttok);
+	if (!err)
+		err = plugin_add_params(plugin);
 
 	plugin->plugin_state = NEEDS_INIT;
 	return err;
@@ -1192,9 +1330,6 @@ bool plugins_all_in_state(const struct plugins *plugins, enum plugin_state state
 	return true;
 }
 
-/* FIXME: Forward declaration to reduce patch noise */
-static void plugin_config(struct plugin *plugin);
-
 /**
  * Callback for the plugin_manifest request.
  */
@@ -1211,20 +1346,13 @@ static void plugin_manifest_cb(const char *buffer,
 		return;
 	}
 
-	/* At startup, we want to io_break once all getmanifests are done */
-	check_plugins_resolved(plugin->plugins);
+	/* Reset timer, it'd kill us otherwise. */
+	plugin->timeout_timer = tal_free(plugin->timeout_timer);
 
-	if (plugin->plugins->startup) {
-		/* Reset timer, it'd kill us otherwise. */
-		plugin->timeout_timer = tal_free(plugin->timeout_timer);
-	} else {
-		/* Note: here 60 second timer continues through init */
-		/* After startup, automatically call init after getmanifest */
-		if (!plugin->dynamic)
-			plugin_kill(plugin, "Not a dynamic plugin");
-		else
-			plugin_config(plugin);
-	}
+	if (!plugin->plugins->startup && !plugin->dynamic)
+		plugin_kill(plugin, "Not a dynamic plugin");
+	else
+		check_plugins_manifests(plugin->plugins);
 }
 
 /* If this is a valid plugin return full path name, otherwise NULL */
@@ -1292,7 +1420,8 @@ char *add_plugin_dir(struct plugins *plugins, const char *dir, bool error_ok)
 			log_info(plugins->log, "%s: disabled via disable-plugin",
 				 fullpath);
 		} else {
-			p = plugin_register(plugins, fullpath, NULL, false);
+			p = plugin_register(plugins, fullpath, NULL, false,
+					    NULL, NULL);
 			if (!p && !error_ok)
 				return tal_fmt(NULL, "Failed to register %s: %s",
 				               fullpath, strerror(errno));
@@ -1326,6 +1455,27 @@ void plugins_add_default_dir(struct plugins *plugins)
 			                                  di->d_name), true);
 		}
 		closedir(d);
+	}
+}
+
+static void plugin_set_timeout(struct plugin *p)
+{
+	bool debug = false;
+
+#if DEVELOPER
+	if (p->plugins->ld->dev_debug_subprocess
+	    && strends(p->cmd, p->plugins->ld->dev_debug_subprocess))
+		debug = true;
+#endif
+
+	/* Don't timeout if they're running a debugger. */
+	if (debug)
+		p->timeout_timer = NULL;
+	else {
+		p->timeout_timer
+			= new_reltimer(p->plugins->ld->timers, p,
+				       time_from_sec(PLUGIN_MANIFEST_TIMEOUT),
+				       plugin_manifest_timeout, p);
 	}
 }
 
@@ -1367,16 +1517,7 @@ const char *plugin_send_getmanifest(struct plugin *p)
 	plugin_request_send(p, req);
 	p->plugin_state = AWAITING_GETMANIFEST_RESPONSE;
 
-	/* Don't timeout if they're running a debugger. */
-	if (debug)
-		p->timeout_timer = NULL;
-	else {
-		p->timeout_timer
-			= new_reltimer(p->plugins->ld->timers, p,
-				       time_from_sec(PLUGIN_MANIFEST_TIMEOUT),
-				       plugin_manifest_timeout, p);
-	}
-
+	plugin_set_timeout(p);
 	return NULL;
 }
 
@@ -1442,13 +1583,45 @@ static void plugin_config_cb(const char *buffer,
 			     const jsmntok_t *idtok,
 			     struct plugin *plugin)
 {
+	const char *disable;
+
+	/* Plugin can also disable itself at this stage. */
+	if (json_scan(tmpctx, buffer, toks, "{result:{disable:%}}",
+		      JSON_SCAN_TAL(tmpctx, json_strdup, &disable)) == NULL) {
+		log_debug(plugin->log, "disabled itself at init: %s",
+			  disable);
+		/* Don't get upset if this was a built-in! */
+		plugin->important = false;
+		plugin_kill(plugin, disable);
+		return;
+	}
+
 	plugin->plugin_state = INIT_COMPLETE;
 	plugin->timeout_timer = tal_free(plugin->timeout_timer);
 	if (plugin->start_cmd) {
 		plugin_cmd_succeeded(plugin->start_cmd, plugin);
 		plugin->start_cmd = NULL;
 	}
-	check_plugins_resolved(plugin->plugins);
+	check_plugins_initted(plugin->plugins);
+}
+
+static void json_add_plugin_opt(struct json_stream *stream,
+				const char *name,
+				const char *type,
+				const struct plugin_opt_value *value)
+{
+	if (streq(type, "flag")) {
+		/* We don't include 'flag' types if they're not
+		 * flagged on */
+		if (value->as_bool)
+			json_add_bool(stream, name, value->as_bool);
+	} else if (streq(type, "bool")) {
+		json_add_bool(stream, name, value->as_bool);
+	} else if (streq(type, "string")) {
+		json_add_string(stream, name, value->as_str);
+	} else if (streq(type, "int")) {
+		json_add_s64(stream, name, value->as_int);
+	}
 }
 
 void
@@ -1463,23 +1636,24 @@ plugin_populate_init_request(struct plugin *plugin, struct jsonrpc_request *req)
 	list_for_each(&plugin->plugin_opts, opt, list) {
 		/* Trim the `--` that we added before */
 		name = opt->name + 2;
-		if (opt->value->as_bool) {
-			/* We don't include 'flag' types if they're not
-			 * flagged on */
-			if (streq(opt->type, "flag") && !*opt->value->as_bool)
-				continue;
 
-			json_add_bool(req->stream, name, *opt->value->as_bool);
-			if (!deprecated_apis)
+		/* If no values, assign default (if any!) */
+		if (tal_count(opt->values) == 0) {
+			if (opt->def)
+				tal_arr_expand(&opt->values, opt->def);
+			else
 				continue;
 		}
-		if (opt->value->as_int) {
-			json_add_s64(req->stream, name, *opt->value->as_int);
-			if (!deprecated_apis)
-				continue;
-		}
-		if (opt->value->as_str) {
-			json_add_string(req->stream, name, opt->value->as_str);
+
+		if (opt->multi) {
+			json_array_start(req->stream, name);
+			for (size_t i = 0; i < tal_count(opt->values); i++)
+				json_add_plugin_opt(req->stream, NULL,
+						    opt->type, opt->values[i]);
+			json_array_end(req->stream);
+		} else {
+			json_add_plugin_opt(req->stream, name,
+					    opt->type, opt->values[0]);
 		}
 	}
 	json_object_end(req->stream); /* end of .params.options */
@@ -1512,6 +1686,7 @@ plugin_config(struct plugin *plugin)
 {
 	struct jsonrpc_request *req;
 
+	plugin_set_timeout(plugin);
 	req = jsonrpc_request_start(plugin, "init", plugin->log,
 	                            NULL, plugin_config_cb, plugin);
 	plugin_populate_init_request(plugin, req);
@@ -1576,12 +1751,19 @@ void json_add_opt_plugins_array(struct json_stream *response,
 
 				/* Trim the `--` that we added before */
 				opt_name = opt->name + 2;
-				if (opt->value->as_bool) {
-					json_add_bool(response, opt_name, *opt->value->as_bool);
-				} else if (opt->value->as_int) {
-					json_add_s64(response, opt_name, *opt->value->as_int);
-				} else if (opt->value->as_str) {
-					json_add_string(response, opt_name, opt->value->as_str);
+				if (opt->multi) {
+					json_array_start(response, opt_name);
+					for (size_t i = 0; i < tal_count(opt->values); i++)
+						json_add_plugin_opt(response,
+								    NULL,
+								    opt->type,
+								    opt->values[i]);
+					json_array_end(response);
+				} else if (tal_count(opt->values)) {
+					json_add_plugin_opt(response,
+							    opt_name,
+							    opt->type,
+							    opt->values[0]);
 				} else {
 					json_add_null(response, opt_name);
 				}
@@ -1659,20 +1841,28 @@ void plugin_request_send(struct plugin *plugin,
 	req->stream = NULL;
 }
 
-void *plugin_exclusive_loop(struct plugin *plugin)
+void *plugins_exclusive_loop(struct plugin **plugins)
 {
 	void *ret;
+	size_t i;
+	bool last = false;
+	assert(tal_count(plugins) != 0);
 
-	io_conn_out_exclusive(plugin->stdin_conn, true);
-	io_conn_exclusive(plugin->stdout_conn, true);
+	for (i = 0; i < tal_count(plugins); ++i) {
+		io_conn_out_exclusive(plugins[i]->stdin_conn, true);
+		io_conn_exclusive(plugins[i]->stdout_conn, true);
+	}
 
 	/* We don't service timers here, either! */
 	ret = io_loop(NULL, NULL);
 
-	io_conn_out_exclusive(plugin->stdin_conn, false);
-	if (io_conn_exclusive(plugin->stdout_conn, false))
+	for (i = 0; i < tal_count(plugins); ++i) {
+		io_conn_out_exclusive(plugins[i]->stdin_conn, false);
+		last = io_conn_exclusive(plugins[i]->stdout_conn, false);
+	}
+	if (last)
 		fatal("Still io_exclusive after removing plugin %s?",
-		      plugin->cmd);
+		      plugins[tal_count(plugins) - 1]->cmd);
 
 	return ret;
 }
@@ -1691,7 +1881,8 @@ void plugins_set_builtin_plugins_dir(struct plugins *plugins,
 				take(path_join(NULL, dir,
 					       list_of_builtin_plugins[i])),
 				NULL,
-				/* important = */ true);
+				/* important = */ true,
+				NULL, NULL);
 }
 
 struct plugin_destroyed {

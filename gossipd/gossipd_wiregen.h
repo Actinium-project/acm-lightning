@@ -60,6 +60,11 @@ enum gossipd_wire {
         WIRE_GOSSIPD_GET_INCOMING_CHANNELS_REPLY = 3125,
         /*  master -> gossipd: blockheight increased. */
         WIRE_GOSSIPD_NEW_BLOCKHEIGHT = 3026,
+        /*  Tell lightningd we got a onion message (for us */
+        WIRE_GOSSIPD_GOT_ONIONMSG_TO_US = 3142,
+        WIRE_GOSSIPD_GOT_ONIONMSG_FORWARD = 3143,
+        /*  Lightningd tells us to send a onion message. */
+        WIRE_GOSSIPD_SEND_ONIONMSG = 3040,
 };
 
 const char *gossipd_wire_name(int e);
@@ -197,6 +202,20 @@ bool fromwire_gossipd_get_incoming_channels_reply(const tal_t *ctx, const void *
 u8 *towire_gossipd_new_blockheight(const tal_t *ctx, u32 blockheight);
 bool fromwire_gossipd_new_blockheight(const void *p, u32 *blockheight);
 
+/* WIRE: GOSSIPD_GOT_ONIONMSG_TO_US */
+/*  Tell lightningd we got a onion message (for us */
+u8 *towire_gossipd_got_onionmsg_to_us(const tal_t *ctx, const struct pubkey *blinding_in, const struct pubkey *reply_blinding, const struct onionmsg_path **reply_path, const u8 *rawmsg);
+bool fromwire_gossipd_got_onionmsg_to_us(const tal_t *ctx, const void *p, struct pubkey **blinding_in, struct pubkey **reply_blinding, struct onionmsg_path ***reply_path, u8 **rawmsg);
+
+/* WIRE: GOSSIPD_GOT_ONIONMSG_FORWARD */
+u8 *towire_gossipd_got_onionmsg_forward(const tal_t *ctx, const struct short_channel_id *next_scid, const struct node_id *next_node_id, const struct pubkey *next_blinding, const u8 *next_onion);
+bool fromwire_gossipd_got_onionmsg_forward(const tal_t *ctx, const void *p, struct short_channel_id **next_scid, struct node_id **next_node_id, struct pubkey **next_blinding, u8 **next_onion);
+
+/* WIRE: GOSSIPD_SEND_ONIONMSG */
+/*  Lightningd tells us to send a onion message. */
+u8 *towire_gossipd_send_onionmsg(const tal_t *ctx, const struct node_id *id, const u8 *onion, const struct pubkey *blinding);
+bool fromwire_gossipd_send_onionmsg(const tal_t *ctx, const void *p, struct node_id *id, u8 **onion, struct pubkey **blinding);
+
 
 #endif /* LIGHTNING_GOSSIPD_GOSSIPD_WIREGEN_H */
-// SHA256STAMP:9b93deed184d5f5c0d5a9e649fae6449645501ded555b63350bfa3ce8eef70ba
+// SHA256STAMP:1da012a28ad84883f18920e51c39a0af77f85e309e981f9ea8d158d0698f6a59

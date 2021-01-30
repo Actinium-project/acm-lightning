@@ -646,6 +646,34 @@ static struct migration dbmigrations[] = {
 	 " DEFAULT 0;"), NULL},
     {SQL("ALTER TABLE channels ADD full_channel_id BLOB DEFAULT NULL;"), fillin_missing_channel_id},
     {SQL("ALTER TABLE channels ADD funding_psbt BLOB DEFAULT NULL;"), NULL},
+    /* Channel closure reason */
+    {SQL("ALTER TABLE channels ADD closer INTEGER DEFAULT 2;"), NULL},
+    {SQL("ALTER TABLE channels ADD state_change_reason INTEGER DEFAULT 0;"), NULL},
+    {SQL("CREATE TABLE channel_state_changes ("
+	 "  channel_id BIGINT REFERENCES channels(id) ON DELETE CASCADE,"
+	 "  timestamp BIGINT,"
+	 "  old_state INTEGER,"
+	 "  new_state INTEGER,"
+	 "  cause INTEGER,"
+	 "  message TEXT"
+	 ");"), NULL},
+    {SQL("CREATE TABLE offers ("
+	 "  offer_id BLOB"
+	 ", bolt12 TEXT"
+	 ", label TEXT"
+	 ", status INTEGER"
+	 ", PRIMARY KEY (offer_id)"
+	 ");"), NULL},
+    /* A reference into our own offers table, if it was made from one */
+    {SQL("ALTER TABLE invoices ADD COLUMN local_offer_id BLOB DEFAULT NULL REFERENCES offers(offer_id);"), NULL},
+    /* A reference into our own offers table, if it was made from one */
+    {SQL("ALTER TABLE payments ADD COLUMN local_offer_id BLOB DEFAULT NULL REFERENCES offers(offer_id);"), NULL},
+    {SQL("ALTER TABLE channels ADD funding_tx_remote_sigs_received INTEGER DEFAULT 0;"), NULL},
+
+    /* Speeds up deletion of one peer from the database, measurements suggest
+     * it cuts down the time by 80%.  */
+    {SQL("CREATE INDEX forwarded_payments_out_htlc_id"
+	 " ON forwarded_payments (out_htlc_id);"), NULL},
 };
 
 /* Leak tracking. */

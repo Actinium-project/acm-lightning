@@ -27,14 +27,25 @@ struct tlv_field {
 	u8 *value;
 };
 
-/* Append a stream of tlvs: types[] must be in increasing type order! */
-void towire_tlvs(u8 **pptr,
-		 const struct tlv_record_type types[],
-		 size_t num_types,
-		 const void *record);
-
 /* Given any tlvstream serialize the raw fields (untyped ones). */
 void towire_tlvstream_raw(u8 **pptr, const struct tlv_field *fields);
+
+/* Given a tlv record with manually-set fields, populate ->fields */
+#define tlv_make_fields(tlv, type)					\
+	tlv_make_fields_(tlvs_##type, TLVS_ARRAY_SIZE_##type, (tlv))
+
+struct tlv_field *tlv_make_fields_(const struct tlv_record_type *types,
+				   size_t num_types,
+				   const void *record);
+
+/* Generic TLV decode/encode */
+bool fromwire_tlv(const u8 **cursor, size_t *max,
+		  const struct tlv_record_type *types, size_t num_types,
+		  void *record, struct tlv_field **fields);
+void towire_tlv(u8 **pptr,
+		const struct tlv_record_type *types, size_t num_types,
+		const void *record);
+bool tlv_fields_valid(const struct tlv_field *fields, size_t *err_index);
 
 
 

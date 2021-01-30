@@ -53,4 +53,4 @@ bool fromwire_status_peer_billboard(const tal_t *ctx, const void *p, bool *perm,
 
 
 #endif /* LIGHTNING_COMMON_STATUS_WIREGEN_H */
-// SHA256STAMP:adfe96ff3b9661f179d937c93c5457c38f20d1caeaaa646326ca0c6d5496a35c
+// SHA256STAMP:67770c6a9a4205f10a455ea925afc2be4f853642b1e7ed70e3867221c64b7abc

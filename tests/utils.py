@@ -5,6 +5,7 @@ from pyln.client import Millisatoshi
 
 EXPERIMENTAL_FEATURES = env("EXPERIMENTAL_FEATURES", "0") == "1"
 COMPAT = env("COMPAT", "1") == "1"
+EXPERIMENTAL_DUAL_FUND = env("EXPERIMENTAL_DUAL_FUND", "0") == "1"
 
 
 def hex_bits(features):
@@ -48,9 +49,6 @@ def expected_node_features(wumbo_channels=False, extra=[]):
 def expected_channel_features(wumbo_channels=False, extra=[]):
     """Return the expected channel features hexstring for this configuration"""
     features = []
-    if EXPERIMENTAL_FEATURES:
-        # OPT_ONION_MESSAGES
-        features += [103]
     return hex_bits(features + extra)
 
 

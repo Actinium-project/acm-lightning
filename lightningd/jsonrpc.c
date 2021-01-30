@@ -192,9 +192,16 @@ static struct command_result *json_stop(struct command *cmd,
 	if (!param(cmd, buffer, params, NULL))
 		return command_param_failed();
 
-	/* This can't have closed yet! */
-	cmd->ld->stop_conn = cmd->jcon->conn;
 	log_unusual(cmd->ld->log, "JSON-RPC shutdown");
+
+	/* With rpc_command_hook, jcon might have closed in the meantime! */
+	if (!cmd->jcon) {
+		/* Return us to toplevel lightningd.c */
+		io_break(cmd->ld);
+		return command_still_pending(cmd);
+	}
+
+	cmd->ld->stop_conn = cmd->jcon->conn;
 
 	/* This is the one place where result is a literal string. */
 	jout = json_out_new(tmpctx);
@@ -949,8 +956,10 @@ static struct io_plan *read_json(struct io_conn *conn,
 	if (!json_parse_input(&jcon->input_parser, &jcon->input_toks,
 			      jcon->buffer, jcon->used,
 			      &complete)) {
-		json_command_malformed(jcon, "null",
-				       "Invalid token in json input");
+		json_command_malformed(
+		    jcon, "null",
+		    tal_fmt(tmpctx, "Invalid token in json input: '%s'",
+			    tal_strndup(tmpctx, jcon->buffer, jcon->used)));
 		return io_halfclose(conn);
 	}
 
@@ -1347,7 +1356,9 @@ static struct command_result *json_notifications(struct command *cmd,
 		   NULL))
 		return command_param_failed();
 
-	cmd->jcon->notifications_enabled = *enable;
+	/* Catch the case where they sent this command then hung up. */
+	if (cmd->jcon)
+		cmd->jcon->notifications_enabled = *enable;
 	return command_success(cmd, json_stream_success(cmd));
 }
 

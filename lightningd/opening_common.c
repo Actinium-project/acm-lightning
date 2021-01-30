@@ -55,6 +55,8 @@ new_uncommitted_channel(struct peer *peer)
 	uc->peer->uncommitted_channel = uc;
 	tal_add_destructor(uc, destroy_uncommitted_channel);
 
+	uc->got_offer = false;
+
 	return uc;
 }
 
@@ -171,7 +173,7 @@ static void opening_memleak_req_done(struct subd *open_daemon,
 
 	tal_del_destructor2(open_daemon, opening_died_forget_memleak, cmd);
 	if (!fromwire_openingd_dev_memleak_reply(msg, &found_leak) &&
-			!fromwire_dual_open_dev_memleak_reply(msg,
+			!fromwire_dualopend_dev_memleak_reply(msg,
 							      &found_leak)) {
 		was_pending(command_fail(cmd, LIGHTNINGD,
 					 "Bad opening_dev_memleak"));
@@ -208,7 +210,7 @@ static void opening_memleak_req_next(struct command *cmd, struct peer *prev)
 			continue;
 
 		if (streq(open_daemon->name, "dualopend"))
-			msg = towire_dual_open_dev_memleak(NULL);
+			msg = towire_dualopend_dev_memleak(NULL);
 		else
 			msg = towire_openingd_dev_memleak(NULL);
 

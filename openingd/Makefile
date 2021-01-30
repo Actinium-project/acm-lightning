@@ -39,6 +39,7 @@ OPENINGD_COMMON_OBJS :=				\
 	common/amount.o				\
 	common/base32.o				\
 	common/bigsize.o			\
+	common/billboard.o			\
 	common/bip32.o				\
 	common/channel_config.o			\
 	common/channel_id.o			\
@@ -85,6 +86,10 @@ OPENINGD_COMMON_OBJS :=				\
 	common/wireaddr.o			\
 	gossipd/gossipd_peerd_wiregen.o		\
 	lightningd/gossip_msg.o
+
+ifeq ($(EXPERIMENTAL_FEATURES),1)
+OPENINGD_COMMON_OBJS += common/psbt_internal.o
+endif
 
 lightningd/lightning_openingd: $(OPENINGD_OBJS) $(OPENINGD_COMMON_OBJS) $(WIRE_OBJS) $(BITCOIN_OBJS) $(HSMD_CLIENT_OBJS)
 

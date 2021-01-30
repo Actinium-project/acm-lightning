@@ -93,6 +93,18 @@ bool json_to_txid(const char *buffer, const jsmntok_t *tok,
 				     tok->end - tok->start, txid);
 }
 
+bool json_to_outpoint(const char *buffer, const jsmntok_t *tok,
+		      struct bitcoin_outpoint *op)
+{
+	jsmntok_t t1, t2;
+
+	if (!split_tok(buffer, tok, ':', &t1, &t2))
+		return false;
+
+	return json_to_txid(buffer, &t1, &op->txid)
+		&& json_to_u32(buffer, &t2, &op->n);
+}
+
 bool json_to_channel_id(const char *buffer, const jsmntok_t *tok,
 			struct channel_id *cid)
 {
@@ -128,11 +140,10 @@ bool json_to_preimage(const char *buffer, const jsmntok_t *tok, struct preimage 
 	return hex_decode(buffer + tok->start, hexlen, preimage->r, sizeof(preimage->r));
 }
 
-bool json_to_psbt(const tal_t *ctx, const char *buffer,
-		  const jsmntok_t *tok, struct wally_psbt **dest)
+struct wally_psbt *json_to_psbt(const tal_t *ctx, const char *buffer,
+				const jsmntok_t *tok)
 {
-	*dest = psbt_from_b64(ctx, buffer + tok->start, tok->end - tok->start);
-	return dest != NULL;
+	return psbt_from_b64(ctx, buffer + tok->start, tok->end - tok->start);
 }
 
 void json_add_node_id(struct json_stream *response,
@@ -159,6 +170,23 @@ void json_add_pubkey(struct json_stream *response,
 	json_add_hex(response, fieldname, der, sizeof(der));
 }
 
+void json_add_pubkey32(struct json_stream *response,
+		       const char *fieldname,
+		       const struct pubkey32 *key)
+{
+	u8 output[32];
+
+	secp256k1_xonly_pubkey_serialize(secp256k1_ctx, output, &key->pubkey);
+	json_add_hex(response, fieldname, output, sizeof(output));
+}
+
+void json_add_bip340sig(struct json_stream *response,
+			const char *fieldname,
+			const struct bip340sig *sig)
+{
+	json_add_hex(response, fieldname, sig->u8, sizeof(sig->u8));
+}
+
 void json_add_txid(struct json_stream *result, const char *fieldname,
 		   const struct bitcoin_txid *txid)
 {
@@ -166,6 +194,14 @@ void json_add_txid(struct json_stream *result, const char *fieldname,
 
 	bitcoin_txid_to_hex(txid, hex, sizeof(hex));
 	json_add_string(result, fieldname, hex);
+}
+
+void json_add_outpoint(struct json_stream *result, const char *fieldname,
+		       const struct bitcoin_outpoint *out)
+{
+	char hex[hex_str_size(sizeof(out->txid))];
+	bitcoin_txid_to_hex(&out->txid, hex, sizeof(hex));
+	json_add_member(result, fieldname, true, "%s:%d", hex, out->n);
 }
 
 void json_add_short_channel_id(struct json_stream *response,
@@ -270,11 +306,13 @@ void json_add_tx(struct json_stream *result,
 
 void json_add_psbt(struct json_stream *stream,
 		   const char *fieldname,
-		   const struct wally_psbt *psbt)
+		   const struct wally_psbt *psbt TAKES)
 {
 	const char *psbt_b64;
 	psbt_b64 = psbt_to_b64(NULL, psbt);
 	json_add_string(stream, fieldname, take(psbt_b64));
+	if (taken(psbt))
+		tal_free(psbt);
 }
 
 void json_add_amount_msat_compat(struct json_stream *result,

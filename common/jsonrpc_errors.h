@@ -41,6 +41,7 @@ static const errcode_t PAY_NO_SUCH_PAYMENT = 208;
 static const errcode_t PAY_UNSPECIFIED_ERROR = 209;
 static const errcode_t PAY_STOPPED_RETRYING = 210;
 static const errcode_t PAY_STATUS_UNEXPECTED = 211;
+static const errcode_t PAY_OFFER_INVALID = 212;
 
 /* `fundchannel` or `withdraw` errors */
 static const errcode_t FUND_MAX_EXCEEDED = 300;
@@ -71,8 +72,20 @@ static const errcode_t INVOICE_EXPIRED_DURING_WAIT = 903;
 static const errcode_t INVOICE_WAIT_TIMED_OUT = 904;
 static const errcode_t INVOICE_NOT_FOUND = 905;
 static const errcode_t INVOICE_STATUS_UNEXPECTED = 906;
+static const errcode_t INVOICE_OFFER_INACTIVE = 907;
 
 /* Errors from HSM crypto operations. */
 static const errcode_t HSM_ECDH_FAILED = 800;
+
+/* Errors from `offer` commands */
+static const errcode_t OFFER_ALREADY_EXISTS = 1000;
+static const errcode_t OFFER_ALREADY_DISABLED = 1001;
+static const errcode_t OFFER_EXPIRED = 1002;
+static const errcode_t OFFER_ROUTE_NOT_FOUND = 1003;
+static const errcode_t OFFER_BAD_INVREQ_REPLY = 1004;
+static const errcode_t OFFER_TIMEOUT = 1005;
+
+/* Errors from wait* commands */
+static const errcode_t WAIT_TIMEOUT = 2000;
 
 #endif /* LIGHTNING_COMMON_JSONRPC_ERRORS_H */

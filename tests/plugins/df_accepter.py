@@ -5,8 +5,15 @@
 from pyln.client import Plugin, Millisatoshi
 from pyln.proto import bech32_decode
 from typing import Iterable, List, Optional
-from wallycore import psbt_add_output_at, psbt_from_base64, psbt_to_base64, tx_output_init
-
+from wallycore import (
+    psbt_add_output_at,
+    psbt_find_input_unknown,
+    psbt_from_base64,
+    psbt_get_input_unknown,
+    psbt_get_num_inputs,
+    psbt_to_base64,
+    tx_output_init,
+)
 
 plugin = Plugin()
 
@@ -58,11 +65,83 @@ def find_feerate(best, their_min, their_max, our_min, our_max):
     return our_max
 
 
+def find_inputs(b64_psbt):
+    serial_id_key = bytes.fromhex('fc096c696768746e696e6701')
+    psbt = psbt_from_base64(b64_psbt)
+    input_idxs = []
+
+    for i in range(psbt_get_num_inputs(psbt)):
+        idx = psbt_find_input_unknown(psbt, i, serial_id_key)
+        if idx == 0:
+            continue
+        # returned index is off by one, so 0 can be 'not found'
+        serial_bytes = psbt_get_input_unknown(psbt, i, idx - 1)
+        serial_id = int.from_bytes(serial_bytes, byteorder='big', signed=False)
+
+        # We're the accepter, so our inputs have odd serials
+        if serial_id % 2:
+            input_idxs.append(i)
+
+    return input_idxs
+
+
+@plugin.init()
+def init(configuration, options, plugin):
+    # this is the max channel size, pre-wumbo
+    plugin.max_fund = Millisatoshi((2 ** 24 - 1) * 1000)
+    plugin.inflight = {}
+    plugin.log('max funding set to {}'.format(plugin.max_fund))
+
+
+@plugin.method("setacceptfundingmax")
+def set_accept_funding_max(plugin, max_sats, **kwargs):
+    plugin.max_fund = Millisatoshi(max_sats)
+
+    return {'accepter_max_funding': plugin.max_fund}
+
+
+def add_inflight(plugin, peerid, chanid, psbt):
+    if peerid in plugin.inflight:
+        chans = plugin.inflight[peerid]
+    else:
+        chans = {}
+        plugin.inflight[peerid] = chans
+
+    if chanid in chans:
+        raise ValueError("channel {} already in flight (peer {})".format(chanid, peerid))
+    chans[chanid] = psbt
+
+
+def cleanup_inflight(plugin, chanid):
+    for peer, chans in plugin.inflight.items():
+        if chanid in chans:
+            psbt = chans[chanid]
+            del chans[chanid]
+            return psbt
+    return None
+
+
+def cleanup_inflight_peer(plugin, peerid):
+    if peerid in plugin.inflight:
+        chans = plugin.inflight[peerid]
+        for chanid, psbt in chans.items():
+            plugin.rpc.unreserveinputs(psbt)
+        del plugin.inflight[peerid]
+
+
 @plugin.hook('openchannel2')
 def on_openchannel(openchannel2, plugin, **kwargs):
     # We mirror what the peer does, wrt to funding amount ...
-    amount = openchannel2['their_funding']
+    amount = Millisatoshi(openchannel2['their_funding'])
     locktime = openchannel2['locktime']
+
+    if amount > plugin.max_fund:
+        plugin.log("amount adjusted from {} to {}".format(amount, plugin.max_fund))
+        amount = plugin.max_fund
+
+    if amount == 0:
+        plugin.log("accepter_max_funding set to zero")
+        return {'result': 'continue'}
 
     # ...unless they send us totally unacceptable feerates.
     feerate = find_feerate(openchannel2['funding_feerate_best'],
@@ -74,22 +153,33 @@ def on_openchannel(openchannel2, plugin, **kwargs):
     # Their feerate range is out of bounds, we're not going to
     # participate.
     if not feerate:
+        plugin.log("Declining to fund, no feerate found.")
         return {'result': 'continue'}
 
-    funding = plugin.rpc.fundpsbt(amount, ''.join([str(feerate), 'perkw']), 0, reserve=True,
-                                  locktime=locktime)
+    funding = plugin.rpc.fundpsbt(int(amount.to_satoshi()),
+                                  '{}perkw'.format(feerate),
+                                  0,  # because we're the accepter!!
+                                  reserve=True,
+                                  locktime=locktime,
+                                  minconf=0,
+                                  min_witness_weight=110)
     psbt_obj = psbt_from_base64(funding['psbt'])
 
     excess = Millisatoshi(funding['excess_msat'])
-    change_cost = Millisatoshi(124 * feerate // 1000 * 1000)
+    change_cost = Millisatoshi(124 * feerate)
     dust_limit = Millisatoshi(253 * 1000)
     if excess > (dust_limit + change_cost):
         addr = plugin.rpc.newaddr()['bech32']
         change = excess - change_cost
-        output = tx_output_init(int(change.to_satoshi()), get_script(addr))
+        output = tx_output_init(change.to_whole_satoshi(), get_script(addr))
         psbt_add_output_at(psbt_obj, 0, 0, output)
 
-    return {'result': 'continue', 'psbt': psbt_to_base64(psbt_obj, 0),
+    psbt = psbt_to_base64(psbt_obj, 0)
+    add_inflight(plugin, openchannel2['id'],
+                 openchannel2['channel_id'], psbt)
+    plugin.log("contributing {} at feerate {}".format(amount, feerate))
+
+    return {'result': 'continue', 'psbt': psbt,
             'accepter_funding_msat': amount,
             'funding_feerate': feerate}
 
@@ -106,12 +196,29 @@ def on_tx_sign(openchannel2_sign, plugin, **kwargs):
     psbt = openchannel2_sign['psbt']
 
     # We only sign the ones with our parity of a serial_id
-    # FIXME: find the inputs with an odd-serial, these are ours
-    # the key for a serial_id ::
-    our_inputs = [1]
+    input_idxs = find_inputs(psbt)
+    if len(input_idxs) > 0:
+        final_psbt = plugin.rpc.signpsbt(psbt, signonly=input_idxs)['signed_psbt']
+    else:
+        final_psbt = psbt
 
-    signed_psbt = plugin.rpc.signpsbt(psbt, signonly=our_inputs)['signed_psbt']
-    return {'result': 'continue', 'psbt': signed_psbt}
+    cleanup_inflight(plugin, openchannel2_sign['channel_id'])
+    return {'result': 'continue', 'psbt': final_psbt}
+
+
+@plugin.subscribe("channel_open_failed")
+def on_open_failed(channel_open_failed, plugin, **kwargs):
+    channel_id = channel_open_failed['channel_id']
+    psbt = cleanup_inflight(plugin, channel_id)
+    if psbt:
+        plugin.log("failed to open channel {}, unreserving".format(channel_id))
+        plugin.rpc.unreserveinputs(psbt)
+
+
+@plugin.subscribe("disconnect")
+def on_peer_disconnect(id, plugin, **kwargs):
+    plugin.log("peer {} disconnected, removing inflights".format(id))
+    cleanup_inflight_peer(plugin, id)
 
 
 plugin.run()

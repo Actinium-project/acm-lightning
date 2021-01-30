@@ -9,6 +9,7 @@
 #include <common/blinding.h>
 #include <common/ecdh.h>
 #include <common/hmac.h>
+#include <common/setup.h>
 #include <common/sphinx.h>
 #include <common/type_to_string.h>
 #include <common/utils.h>
@@ -52,10 +53,7 @@ int main(int argc, char **argv)
 {
 	bool first = false;
 
-	setup_locale();
-
-	secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY |
-						 SECP256K1_CONTEXT_SIGN);
+	common_setup(argv[0]);
 
 	opt_set_alloc(opt_allocfn, tal_reallocfn, tal_freefn);
 	opt_register_noarg("--help|-h", opt_usage_and_exit,
@@ -69,7 +67,6 @@ int main(int argc, char **argv)
 	opt_register_version();
 
 	opt_parse(&argc, argv, opt_log_stderr_exit);
-	setup_tmpctx();
 
 	if (argc < 2)
 		errx(1, "You must specify create or unwrap");
@@ -150,11 +147,12 @@ int main(int argc, char **argv)
 			u8 *p;
 			u8 buf[BIGSIZE_MAX_LEN];
 			const unsigned char npub[crypto_aead_chacha20poly1305_ietf_NPUBBYTES] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-			struct tlv_onionmsg_payload *inner, *outer;
+			struct tlv_onionmsg_payload *outer;
+			struct tlv_encmsg_tlvs *inner;
 			int ret;
 
 			/* Inner is encrypted */
-			inner = tlv_onionmsg_payload_new(tmpctx);
+			inner = tlv_encmsg_tlvs_new(tmpctx);
 			/* Use scid if they provided one */
 			if (scids[i]) {
 				inner->next_short_channel_id
@@ -207,8 +205,8 @@ int main(int argc, char **argv)
 	} else if (streq(argv[1], "unwrap")) {
 		struct privkey privkey;
 		struct pubkey blinding;
-		u8 onion[TOTAL_PACKET_SIZE], *dec;
-		struct onionpacket op;
+		u8 onion[TOTAL_PACKET_SIZE(ROUTING_INFO_SIZE)], *dec;
+		struct onionpacket *op;
 		struct secret ss, onion_ss;
 		struct secret hmac, rho;
 		struct route_step *rs;
@@ -218,6 +216,7 @@ int main(int argc, char **argv)
 		struct pubkey res;
 		struct sha256 h;
 		int ret;
+		enum onion_wire failcode;
 		const unsigned char npub[crypto_aead_chacha20poly1305_ietf_NPUBBYTES] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 
 		if (argc != 5)
@@ -234,7 +233,8 @@ int main(int argc, char **argv)
 		if (!pubkey_from_hexstr(argv[4], strlen(argv[4]), &blinding))
 			errx(1, "Invalid blinding %s", argv[4]);
 
-		if (parse_onionpacket(onion, sizeof(onion), &op) != 0)
+		op = parse_onionpacket(tmpctx, onion, sizeof(onion), &failcode);
+		if (!op)
 			errx(1, "Unparsable onion");
 
 		/*   ss(r) = H(k(r) * E(r)) */
@@ -251,7 +251,7 @@ int main(int argc, char **argv)
 		 * and use our raw privkey: this models how lightningd
 		 * will do it, since hsmd knows only how to ECDH with
 		 * our real key */
-		res = op.ephemeralkey;
+		res = op->ephemeralkey;
 		if (!first) {
 			if (secp256k1_ec_pubkey_tweak_mul(secp256k1_ctx,
 							  &res.pubkey,
@@ -264,7 +264,7 @@ int main(int argc, char **argv)
 				   privkey.secret.data, NULL, NULL) != 1)
 			abort();
 
-		rs = process_onionpacket(tmpctx, &op, &onion_ss, NULL, 0, false);
+		rs = process_onionpacket(tmpctx, op, &onion_ss, NULL, 0, false);
 		if (!rs)
 			errx(1, "Could not process onionpacket");
 
@@ -315,4 +315,6 @@ int main(int argc, char **argv)
 		printf("Next onion: %s\n", tal_hex(tmpctx, serialize_onionpacket(tmpctx, rs->next)));
 	} else
 		errx(1, "Either create or unwrap!");
+
+	common_shutdown();
 }

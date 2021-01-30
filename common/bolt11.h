@@ -14,6 +14,13 @@
 /* We only have 10 bits for the field length, meaning < 640 bytes */
 #define BOLT11_FIELD_BYTE_LIMIT ((1 << 10) * 5 / 8)
 
+/* BOLT #11:
+ * * `c` (24): `data_length` variable.
+ *    `min_final_cltv_expiry` to use for the last HTLC in the route.
+ *    Default is 18 if not specified.
+ */
+#define DEFAULT_FINAL_CLTV_DELTA 18
+
 struct feature_set;
 
 struct bolt11_field {
@@ -86,6 +93,16 @@ struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
 			     const char *description,
 			     const struct chainparams *must_be_chain,
 			     char **fail);
+
+/* Extracts signature but does not check it. */
+struct bolt11 *bolt11_decode_nosig(const tal_t *ctx, const char *str,
+				   const struct feature_set *our_features,
+				   const char *description,
+				   const struct chainparams *must_be_chain,
+				   struct sha256 *hash,
+				   u5 **sig,
+				   bool *have_n,
+				   char **fail);
 
 /* Initialize an empty bolt11 struct with optional amount */
 struct bolt11 *new_bolt11(const tal_t *ctx,

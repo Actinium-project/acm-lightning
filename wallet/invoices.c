@@ -107,8 +107,8 @@ static struct invoice_details *wallet_stmt2invoice_details(const tal_t *ctx,
 		dtl->paid_timestamp = db_column_u64(stmt, 8);
 	}
 
-	dtl->bolt11 = tal_strndup(dtl, db_column_blob(stmt, 9),
-				  db_column_bytes(stmt, 9));
+	dtl->invstring = tal_strndup(dtl, db_column_blob(stmt, 9),
+				     db_column_bytes(stmt, 9));
 
 	if (!db_column_is_null(stmt, 10))
 		dtl->description = tal_strdup(
@@ -119,6 +119,12 @@ static struct invoice_details *wallet_stmt2invoice_details(const tal_t *ctx,
 	dtl->features = tal_dup_arr(dtl, u8,
 				    db_column_blob(stmt, 11),
 				    db_column_bytes(stmt, 11), 0);
+	if (!db_column_is_null(stmt, 12)) {
+		dtl->local_offer_id = tal(dtl, struct sha256);
+		db_column_sha256(stmt, 12, dtl->local_offer_id);
+	} else
+		dtl->local_offer_id = NULL;
+
 	return dtl;
 }
 
@@ -258,7 +264,8 @@ bool invoices_create(struct invoices *invoices,
 		     const char *description,
 		     const u8 *features,
 		     const struct preimage *r,
-		     const struct sha256 *rhash)
+		     const struct sha256 *rhash,
+		     const struct sha256 *local_offer_id)
 {
 	struct db_stmt *stmt;
 	struct invoice dummy;
@@ -283,11 +290,11 @@ bool invoices_create(struct invoices *invoices,
 		"            ( payment_hash, payment_key, state"
 		"            , msatoshi, label, expiry_time"
 		"            , pay_index, msatoshi_received"
-		"            , paid_timestamp, bolt11, description, features)"
+		"            , paid_timestamp, bolt11, description, features, local_offer_id)"
 		"     VALUES ( ?, ?, ?"
 		"            , ?, ?, ?"
 		"            , NULL, NULL"
-		"            , NULL, ?, ?, ?);"));
+		"            , NULL, ?, ?, ?, ?);"));
 
 	db_bind_sha256(stmt, 0, rhash);
 	db_bind_preimage(stmt, 1, r);
@@ -299,8 +306,15 @@ bool invoices_create(struct invoices *invoices,
 	db_bind_json_escape(stmt, 4, label);
 	db_bind_u64(stmt, 5, expiry_time);
 	db_bind_text(stmt, 6, b11enc);
-	db_bind_text(stmt, 7, description);
+	if (!description)
+		db_bind_null(stmt, 7);
+	else
+		db_bind_text(stmt, 7, description);
 	db_bind_talarr(stmt, 8, features);
+	if (local_offer_id)
+		db_bind_sha256(stmt, 9, local_offer_id);
+	else
+		db_bind_null(stmt, 9);
 
 	db_exec_prepared_v2(stmt);
 
@@ -496,7 +510,29 @@ static enum invoice_status invoice_get_status(struct invoices *invoices, struct 
 	return state;
 }
 
-void invoices_resolve(struct invoices *invoices,
+/* If there's an associated offer, mark it used. */
+static void maybe_mark_offer_used(struct db *db, struct invoice invoice)
+{
+	struct db_stmt *stmt;
+	struct sha256 local_offer_id;
+
+	stmt = db_prepare_v2(
+		db, SQL("SELECT local_offer_id FROM invoices WHERE id = ?;"));
+	db_bind_u64(stmt, 0, invoice.id);
+	db_query_prepared(stmt);
+
+	db_step(stmt);
+	if (db_column_is_null(stmt, 0)) {
+		tal_free(stmt);
+		return;
+	}
+	db_column_sha256(stmt, 0, &local_offer_id);
+	tal_free(stmt);
+
+	wallet_offer_mark_used(db, &local_offer_id);
+}
+
+bool invoices_resolve(struct invoices *invoices,
 		      struct invoice invoice,
 		      struct amount_msat received)
 {
@@ -505,7 +541,8 @@ void invoices_resolve(struct invoices *invoices,
 	u64 paid_timestamp;
 	enum invoice_status state = invoice_get_status(invoices, invoice);
 
-	assert(state == UNPAID);
+	if (state != UNPAID)
+		return false;
 
 	/* Assign a pay-index. */
 	pay_index = get_next_pay_index(invoices->db);
@@ -525,8 +562,11 @@ void invoices_resolve(struct invoices *invoices,
 	db_bind_u64(stmt, 4, invoice.id);
 	db_exec_prepared_v2(take(stmt));
 
+	maybe_mark_offer_used(invoices->db, invoice);
+
 	/* Tell all the waiters about the paid invoice. */
 	trigger_invoice_waiter_resolve(invoices, invoice.id, &invoice);
+	return true;
 }
 
 /* Called when an invoice waiter is destructed. */
@@ -630,6 +670,7 @@ const struct invoice_details *invoices_get_details(const tal_t *ctx,
 					       ", bolt11"
 					       ", description"
 					       ", features"
+					       ", local_offer_id"
 					       " FROM invoices"
 					       " WHERE id = ?;"));
 	db_bind_u64(stmt, 0, invoice.id);

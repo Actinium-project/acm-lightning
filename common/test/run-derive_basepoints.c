@@ -4,6 +4,7 @@
 #include <ccan/str/hex/hex.h>
 #include <ccan/structeq/structeq.h>
 #include <common/amount.h>
+#include <common/setup.h>
 #include <common/utils.h>
 #include <stdio.h>
 #include <wally_core.h>
@@ -75,6 +76,9 @@ u64 fromwire_u64(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
 /* Generated stub for fromwire_u8 */
 u8 fromwire_u8(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
 { fprintf(stderr, "fromwire_u8 called!\n"); abort(); }
+/* Generated stub for fromwire_u8_array */
+void fromwire_u8_array(const u8 **cursor UNNEEDED, size_t *max UNNEEDED, u8 *arr UNNEEDED, size_t num UNNEEDED)
+{ fprintf(stderr, "fromwire_u8_array called!\n"); abort(); }
 /* Generated stub for towire */
 void towire(u8 **pptr UNNEEDED, const void *data UNNEEDED, size_t len UNNEEDED)
 { fprintf(stderr, "towire called!\n"); abort(); }
@@ -139,15 +143,12 @@ static struct info *new_info(const tal_t *ctx)
 	return info;
 }
 
-int main(void)
+int main(int argc, char *argv[])
 {
-	setup_locale();
-
 	const tal_t *ctx = tal(NULL, char);
 	struct info *baseline, *info;
 
-	wally_init(0);
-	secp256k1_ctx = wally_get_secp_context();
+	common_setup(argv[0]);
 	baseline = new_info(ctx);
 	assert(derive_basepoints(&baseline->seed, &baseline->funding_pubkey,
 				 &baseline->basepoints,
@@ -263,6 +264,6 @@ int main(void)
 				   &info->secrets.htlc_basepoint_secret));
 
 	tal_free(ctx);
-	wally_cleanup(0);
+	common_shutdown();
 	return 0;
 }

@@ -32,6 +32,7 @@ CHANNELD_COMMON_OBJS :=				\
 	common/amount.o				\
 	common/base32.o				\
 	common/bigsize.o			\
+	common/billboard.o			\
 	common/bip32.o				\
 	common/blinding.o			\
 	common/channel_config.o			\
@@ -91,10 +92,6 @@ CHANNELD_COMMON_OBJS :=				\
 	lightningd/gossip_msg.o			\
 	wire/fromwire.o				\
 	wire/towire.o
-
-ifeq ($(EXPERIMENTAL_FEATURES),1)
-CHANNELD_COMMON_OBJS += common/psbt_internal.o
-endif
 
 channeld/full_channel_error_names_gen.h: channeld/full_channel_error.h ccan/ccan/cdump/tools/cdump-enumstr
 	ccan/ccan/cdump/tools/cdump-enumstr channeld/full_channel_error.h > $@

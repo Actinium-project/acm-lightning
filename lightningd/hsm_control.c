@@ -6,6 +6,7 @@
 #include <ccan/io/io.h>
 #include <ccan/take/take.h>
 #include <common/ecdh.h>
+#include <common/hsm_encryption.h>
 #include <common/json.h>
 #include <common/json_helpers.h>
 #include <common/jsonrpc_errors.h>
@@ -106,7 +107,8 @@ struct ext_key *hsm_init(struct lightningd *ld)
 	 * actual secret. */
 	if (!ld->config.keypass) {
 		struct stat st;
-		if (stat("hsm_secret", &st) == 0 && st.st_size > 32)
+		if (stat("hsm_secret", &st) == 0 &&
+			 st.st_size == ENCRYPTED_HSM_SECRET_LEN)
 			errx(1, "hsm_secret is encrypted, you need to pass the "
 			        "--encrypted-hsm startup option.");
 	}
@@ -125,7 +127,8 @@ struct ext_key *hsm_init(struct lightningd *ld)
 	bip32_base = tal(ld, struct ext_key);
 	msg = wire_sync_read(tmpctx, ld->hsm_fd);
 	if (!fromwire_hsmd_init_reply(msg,
-				     &ld->id, bip32_base)) {
+				      &ld->id, bip32_base,
+				      &ld->bolt12_base)) {
 		if (ld->config.keypass)
 			errx(1, "Wrong password for encrypted hsm_secret.");
 		errx(1, "HSM did not give init reply");

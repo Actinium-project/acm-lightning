@@ -1,6 +1,7 @@
 #include <bitcoin/feerate.h>
 #include <bitcoin/psbt.h>
 #include <bitcoin/script.h>
+#include <ccan/asort/asort.h>
 #include <ccan/crypto/shachain/shachain.h>
 #include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
@@ -140,6 +141,55 @@ static bool wally_tx_output_scripteq(const struct wally_tx_output *out,
 				     const u8 *script)
 {
 	return memeq(out->script, out->script_len, script, tal_bytelen(script));
+}
+
+/* The feerate for the HTLC txs (which we grind) are the same as the
+ * feerate for the main tx.  However, there may be dust HTLCs which
+ * were added to the fee, so we can only estimate a maximum feerate */
+static void trim_maximum_feerate(struct amount_sat funding,
+				 const struct tx_parts *commitment)
+{
+	size_t weight;
+	struct amount_sat fee = funding;
+
+	/* FIXME: This doesn't work for elements? */
+	if (chainparams->is_elements)
+		return;
+
+	weight = bitcoin_tx_core_weight(tal_count(commitment->inputs),
+					tal_count(commitment->outputs));
+
+	/* BOLT #3:
+	 * ## Commitment Transaction
+	 *...
+	 *   * `txin[0]` script bytes: 0
+	 *   * `txin[0]` witness: `0 <signature_for_pubkey1> <signature_for_pubkey2>`
+	 */
+	/* Account for witness (1 byte count + 1 empty + sig + sig) */
+	assert(tal_count(commitment->inputs) == 1);
+	weight += bitcoin_tx_input_weight(false, 1 + 1 + 2 * bitcoin_tx_input_sig_weight());
+
+	for (size_t i = 0; i < tal_count(commitment->outputs); i++) {
+		struct amount_asset amt;
+		weight += bitcoin_tx_output_weight(commitment->outputs[i]
+						   ->script_len);
+
+		amt = wally_tx_output_get_amount(commitment->outputs[i]);
+		if (!amount_asset_is_main(&amt))
+			continue;
+		if (!amount_sat_sub(&fee, fee, amount_asset_to_sat(&amt))) {
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				      "Unable to subtract fee");
+		}
+	}
+
+	status_debug("reducing max_possible_feerate from %u...",
+		     max_possible_feerate);
+	/* This is naive, but simple. */
+	while (amount_sat_greater(amount_tx_fee(max_possible_feerate, weight),
+				  fee))
+		max_possible_feerate--;
+	status_debug("... to %u", max_possible_feerate);
 }
 
 static void send_coin_mvt(struct chain_coin_mvt *mvt TAKES)
@@ -2263,6 +2313,12 @@ static size_t resolve_our_htlc_ourcommit(struct tracked_output *out,
 	/* These htlcs are all possibilities, but signature will only match
 	 * one with the correct cltv: check which that is. */
 	for (i = 0; i < tal_count(matches); i++) {
+		/* Skip over duplicate HTLCs, since we only need one. */
+		if (i > 0
+		    && (htlcs[matches[i]].cltv_expiry
+			== htlcs[matches[i-1]].cltv_expiry))
+			continue;
+
 		/* BOLT #5:
 		 *
 		 * ## HTLC Output Handling: Local Commitment, Local Offers
@@ -3640,6 +3696,16 @@ search_done:
 	wait_for_resolved(outs);
 }
 
+static int cmp_htlc_cltv(const struct htlc_stub *a,
+			 const struct htlc_stub *b, void *unused)
+{
+	if (a->cltv_expiry < b->cltv_expiry)
+		return -1;
+	else if (a->cltv_expiry > b->cltv_expiry)
+		return 1;
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
 	setup_locale();
@@ -3731,6 +3797,9 @@ int main(int argc, char *argv[])
 			master_badmsg(WIRE_ONCHAIND_HTLC, msg);
 	}
 
+	/* Sort by CLTV, so matches are in CLTV order (and easy to skip dups) */
+	asort(htlcs, tal_count(htlcs), cmp_htlc_cltv, NULL);
+
 	outs = tal_arr(ctx, struct tracked_output *, 0);
 	wally_tx_input_get_txid(tx->inputs[0], &tmptxid);
 	new_tracked_output(&outs, &tmptxid,
@@ -3746,6 +3815,8 @@ int main(int argc, char *argv[])
 	status_debug("Old remote per-commit point: %s",
 		     type_to_string(tmpctx, struct pubkey,
 				    &old_remote_per_commit_point));
+
+	trim_maximum_feerate(funding, tx);
 
 	/* BOLT #5:
 	 *

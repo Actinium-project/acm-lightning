@@ -25,9 +25,11 @@
 #include <ccan/read_write_all/read_write_all.h>
 #include <ccan/take/take.h>
 #include <ccan/tal/str/str.h>
+#include <common/bolt12_merkle.h>
 #include <common/daemon_conn.h>
 #include <common/derive_basepoints.h>
 #include <common/hash_u5.h>
+#include <common/hsm_encryption.h>
 #include <common/key_derive.h>
 #include <common/memleak.h>
 #include <common/node_id.h>
@@ -43,6 +45,7 @@
 #include <hsmd/hsmd_wiregen.h>
 #include <inttypes.h>
 #include <secp256k1_ecdh.h>
+#include <secp256k1_schnorrsig.h>
 #include <sodium.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -59,10 +62,11 @@
 #define REQ_FD 3
 
 /*~ Nobody will ever find it here!  hsm_secret is our root secret, the bip32
- * tree is derived from that, and cached here. */
+ * tree and bolt12 payer_id keys are derived from that, and cached here. */
 static struct {
 	struct secret hsm_secret;
 	struct ext_key bip32;
+	secp256k1_keypair bolt12;
 } secretstuff;
 
 /* Version codes for BIP32 extended keys in libwally-core.
@@ -313,7 +317,7 @@ static void node_key(struct privkey *node_privkey, struct pubkey *node_id)
 	/* If caller specifies NULL, they don't want the results. */
 	if (node_privkey == NULL)
 		node_privkey = &unused_s;
-	else if (node_id == NULL)
+	if (node_id == NULL)
 		node_id = &unused_k;
 
 	/*~ So, there is apparently a 1 in 2^127 chance that a random value is
@@ -341,6 +345,31 @@ static void node_key(struct privkey *node_privkey, struct pubkey *node_id)
 				      "Failed to derive pubkey for dev_force_privkey");
 	}
 #endif
+}
+
+/*~ This returns the secret and/or public x-only key for this node. */
+static void node_schnorrkey(secp256k1_keypair *node_keypair,
+			    struct pubkey32 *node_id32)
+{
+	secp256k1_keypair unused_kp;
+	struct privkey node_privkey;
+
+	if (!node_keypair)
+		node_keypair = &unused_kp;
+
+	node_key(&node_privkey, NULL);
+	if (secp256k1_keypair_create(secp256k1_ctx, node_keypair,
+				     node_privkey.secret.data) != 1)
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Failed to derive keypair");
+
+	if (node_id32) {
+		if (secp256k1_keypair_xonly_pub(secp256k1_ctx,
+						&node_id32->pubkey,
+						NULL, node_keypair) != 1)
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				      "Failed to derive xonly pub");
+	}
 }
 
 /*~ This secret is the basis for all per-channel secrets: the per-channel seeds
@@ -459,6 +488,38 @@ static void populate_secretstuff(void)
 				  &secretstuff.bip32) != WALLY_OK)
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Can't derive private bip32 key");
+
+	/* BIP 33:
+	 *
+	 * We propose the first level of BIP32 tree structure to be used as
+	 * "purpose". This purpose determines the further structure beneath
+	 * this node.
+	 *
+	 *  m / purpose' / *
+	 *
+	 * Apostrophe indicates that BIP32 hardened derivation is used.
+	 *
+	 * We encourage different schemes to apply for assigning a separate
+	 * BIP number and use the same number for purpose field, so addresses
+	 * won't be generated from overlapping BIP32 spaces.
+	 *
+	 * Example: Scheme described in BIP44 should use 44' (or 0x8000002C)
+	 * as purpose.
+	 */
+	/* Clearly, we should use 9735, the unicode point for lightning! */
+	if (bip32_key_from_parent(&master_extkey,
+				  BIP32_INITIAL_HARDENED_CHILD|9735,
+				  BIP32_FLAG_KEY_PRIVATE,
+				  &child_extkey) != WALLY_OK)
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Can't derive bolt12 bip32 key");
+
+	/* libwally says: The private key with prefix byte 0; remove it
+	 * for libsecp256k1. */
+	if (secp256k1_keypair_create(secp256k1_ctx, &secretstuff.bolt12,
+				     child_extkey.priv_key+1) != 1)
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Can't derive bolt12 keypair");
 }
 
 /*~ Get the keys for this given BIP32 index: if privkey is NULL, we
@@ -498,28 +559,16 @@ static void bitcoin_key(struct privkey *privkey, struct pubkey *pubkey,
  */
 static void create_encrypted_hsm(int fd, const struct secret *encryption_key)
 {
-	crypto_secretstream_xchacha20poly1305_state crypto_state;
-	u8 header[crypto_secretstream_xchacha20poly1305_HEADERBYTES];
-	/* The cipher size is static with xchacha20poly1305 */
-	u8 cipher[sizeof(struct secret) + crypto_secretstream_xchacha20poly1305_ABYTES];
+	struct encrypted_hsm_secret cipher;
 
-	crypto_secretstream_xchacha20poly1305_init_push(&crypto_state, header,
-	                                                encryption_key->data);
-	crypto_secretstream_xchacha20poly1305_push(&crypto_state, cipher,
-	                                           NULL,
-	                                           secretstuff.hsm_secret.data,
-	                                           sizeof(secretstuff.hsm_secret.data),
-	                                           /* Additional data and tag */
-	                                           NULL, 0, 0);
-	if (!write_all(fd, header, sizeof(header))) {
+	if (!encrypt_hsm_secret(encryption_key, &secretstuff.hsm_secret,
+				&cipher))
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Encrypting hsm_secret");
+	if (!write_all(fd, cipher.data, ENCRYPTED_HSM_SECRET_LEN)) {
 		unlink_noerr("hsm_secret");
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-		              "Writing header of encrypted secret: %s", strerror(errno));
-	}
-	if (!write_all(fd, cipher, sizeof(cipher))) {
-		unlink_noerr("hsm_secret");
-		status_failed(STATUS_FAIL_INTERNAL_ERROR,
-		              "Writing encrypted secret: %s", strerror(errno));
+		              "Writing encrypted hsm_secret: %s", strerror(errno));
 	}
 }
 
@@ -613,7 +662,7 @@ static void load_hsm(const struct secret *encryption_key)
 		              "stating: %s", strerror(errno));
 
 	/* If the seed is stored in clear. */
-	if (st.st_size <= 32) {
+	if (st.st_size == 32) {
 		if (!read_all(fd, &secretstuff.hsm_secret, sizeof(secretstuff.hsm_secret)))
 			status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			              "reading: %s", strerror(errno));
@@ -633,35 +682,29 @@ static void load_hsm(const struct secret *encryption_key)
 				              "opening: %s", strerror(errno));
 		}
 	}
-	/*~ If an encryption key was passed and the `hsm_secret` is stored
+	/* If an encryption key was passed and the `hsm_secret` is stored
 	 * encrypted, recover the seed from the cipher. */
-	if (encryption_key && st.st_size > 32) {
-		crypto_secretstream_xchacha20poly1305_state crypto_state;
-		u8 header[crypto_secretstream_xchacha20poly1305_HEADERBYTES];
-		/* The cipher size is static with xchacha20poly1305 */
-		u8 cipher[sizeof(struct secret) + crypto_secretstream_xchacha20poly1305_ABYTES];
+	else if (st.st_size == ENCRYPTED_HSM_SECRET_LEN) {
+		struct encrypted_hsm_secret encrypted_secret;
 
-		if (!read_all(fd, &header, crypto_secretstream_xchacha20poly1305_HEADERBYTES))
+		/* hsm_control must have checked it! */
+		assert(encryption_key);
+
+		if (!read_all(fd, encrypted_secret.data, ENCRYPTED_HSM_SECRET_LEN))
 			status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			              "Reading xchacha20 header: %s", strerror(errno));
-		if (!read_all(fd, cipher, sizeof(cipher)))
-			status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			              "Reading encrypted secret: %s", strerror(errno));
-		if (crypto_secretstream_xchacha20poly1305_init_pull(&crypto_state, header,
-		                                                    encryption_key->data) != 0)
-			status_failed(STATUS_FAIL_INTERNAL_ERROR,
-			              "Initializing the crypto state: %s", strerror(errno));
-		if (crypto_secretstream_xchacha20poly1305_pull(&crypto_state,
-		                                               secretstuff.hsm_secret.data,
-		                                               NULL, 0, cipher, sizeof(cipher),
-		                                               NULL, 0) != 0) {
+			              "Reading encrypted hsm_secret: %s", strerror(errno));
+		if (!decrypt_hsm_secret(encryption_key, &encrypted_secret,
+					&secretstuff.hsm_secret)) {
 			/* Exit but don't throw a backtrace when the user made a mistake in typing
 			 * its password. Instead exit and `lightningd` will be able to give
 			 * an error message. */
 			exit(1);
 		}
 	}
-	/* else { handled in hsm_control } */
+	else
+		status_failed(STATUS_FAIL_INTERNAL_ERROR, "Invalid hsm_secret, "
+							  "no plaintext nor encrypted"
+							  " seed.");
 	close(fd);
 
 	populate_secretstuff();
@@ -675,6 +718,7 @@ static struct io_plan *init_hsm(struct io_conn *conn,
 {
 	struct node_id node_id;
 	struct pubkey key;
+	struct pubkey32 bolt12;
 	struct privkey *privkey;
 	struct secret *seed;
 	struct secrets *secrets;
@@ -714,23 +758,27 @@ static struct io_plan *init_hsm(struct io_conn *conn,
 	maybe_create_new_hsm(hsm_encryption_key, true);
 	load_hsm(hsm_encryption_key);
 
-	/*~ We don't need the hsm_secret encryption key anymore.
-	 * Note that sodium_munlock() also zeroes the memory. */
-	if (hsm_encryption_key) {
-		sodium_munlock(hsm_encryption_key, sizeof(*hsm_encryption_key));
-		tal_free(hsm_encryption_key);
-	}
+	/*~ We don't need the hsm_secret encryption key anymore. */
+	if (hsm_encryption_key)
+		discard_key(take(hsm_encryption_key));
 
 	/*~ We tell lightning our node id and (public) bip32 seed. */
 	node_key(NULL, &key);
 	node_id_from_pubkey(&node_id, &key);
+
+	/* We also give it the base key for bolt12 payerids */
+	if (secp256k1_keypair_xonly_pub(secp256k1_ctx, &bolt12.pubkey, NULL,
+					&secretstuff.bolt12) != 1)
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+		              "Could derive bolt12 public key.");
 
 	/*~ Note: marshalling a bip32 tree only marshals the public side,
 	 * not the secrets!  So we're not actually handing them out here!
 	 */
 	return req_reply(conn, c,
 			 take(towire_hsmd_init_reply(NULL, &node_id,
-						    &secretstuff.bip32)));
+						     &secretstuff.bip32,
+						     &bolt12)));
 }
 
 /*~ The client has asked us to extract the shared secret from an EC Diffie
@@ -1790,6 +1838,60 @@ static struct io_plan *handle_sign_message(struct io_conn *conn,
 			 take(towire_hsmd_sign_message_reply(NULL, &rsig)));
 }
 
+/*~ lightningd asks us to sign a bolt12 (e.g. offer). */
+static struct io_plan *handle_sign_bolt12(struct io_conn *conn,
+					   struct client *c,
+					   const u8 *msg_in)
+{
+	char *messagename, *fieldname;
+	struct sha256 merkle, sha;
+	struct bip340sig sig;
+	secp256k1_keypair kp;
+	u8 *publictweak;
+
+	if (!fromwire_hsmd_sign_bolt12(tmpctx, msg_in,
+				       &messagename, &fieldname, &merkle,
+				       &publictweak))
+		return bad_req(conn, c, msg_in);
+
+	sighash_from_merkle(messagename, fieldname, &merkle, &sha);
+
+	if (!publictweak) {
+		node_schnorrkey(&kp, NULL);
+	} else {
+		/* If we're tweaking key, we use bolt12 key */
+		struct pubkey32 bolt12;
+		struct sha256 tweak;
+
+		if (secp256k1_keypair_xonly_pub(secp256k1_ctx,
+						&bolt12.pubkey, NULL,
+						&secretstuff.bolt12) != 1)
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				      "Could not derive bolt12 public key.");
+		payer_key_tweak(&bolt12, publictweak, tal_bytelen(publictweak),
+				&tweak);
+
+		kp = secretstuff.bolt12;
+
+		if (secp256k1_keypair_xonly_tweak_add(secp256k1_ctx,
+						      &kp,
+						      tweak.u.u8) != 1) {
+			return bad_req_fmt(conn, c, msg_in,
+					   "Failed to get tweak key");
+		}
+	}
+
+	if (!secp256k1_schnorrsig_sign(secp256k1_ctx, sig.u8,
+				       sha.u.u8,
+				       &kp,
+				       NULL, NULL)) {
+		return bad_req_fmt(conn, c, msg_in, "Failed to sign bolt12");
+	}
+
+	return req_reply(conn, c,
+			 take(towire_hsmd_sign_bolt12_reply(NULL, &sig)));
+}
+
 #if DEVELOPER
 static struct io_plan *handle_memleak(struct io_conn *conn,
 				      struct client *c,
@@ -1871,6 +1973,7 @@ static bool check_client_capabilities(struct client *client,
 	case WIRE_HSMD_DEV_MEMLEAK:
 	case WIRE_HSMD_SIGN_MESSAGE:
 	case WIRE_HSMD_GET_OUTPUT_SCRIPTPUBKEY:
+	case WIRE_HSMD_SIGN_BOLT12:
 		return (client->capabilities & HSM_CAP_MASTER) != 0;
 
 	/*~ These are messages sent by the HSM so we should never receive them. */
@@ -1893,6 +1996,7 @@ static bool check_client_capabilities(struct client *client,
 	case WIRE_HSMD_DEV_MEMLEAK_REPLY:
 	case WIRE_HSMD_SIGN_MESSAGE_REPLY:
 	case WIRE_HSMD_GET_OUTPUT_SCRIPTPUBKEY_REPLY:
+	case WIRE_HSMD_SIGN_BOLT12_REPLY:
 		break;
 	}
 	return false;
@@ -1975,6 +2079,9 @@ static struct io_plan *handle_client(struct io_conn *conn, struct client *c)
 
 	case WIRE_HSMD_SIGN_MESSAGE:
 		return handle_sign_message(conn, c, c->msg_in);
+
+	case WIRE_HSMD_SIGN_BOLT12:
+		return handle_sign_bolt12(conn, c, c->msg_in);
 #if DEVELOPER
 	case WIRE_HSMD_DEV_MEMLEAK:
 		return handle_memleak(conn, c, c->msg_in);
@@ -1998,6 +2105,7 @@ static struct io_plan *handle_client(struct io_conn *conn, struct client *c)
 	case WIRE_HSMD_DEV_MEMLEAK_REPLY:
 	case WIRE_HSMD_SIGN_MESSAGE_REPLY:
 	case WIRE_HSMD_GET_OUTPUT_SCRIPTPUBKEY_REPLY:
+	case WIRE_HSMD_SIGN_BOLT12_REPLY:
 		break;
 	}
 

@@ -51,9 +51,17 @@ const char *onion_wire_name(int e);
  */
 bool onion_wire_is_defined(u16 type);
 
+struct onionmsg_path {
+        struct pubkey node_id;
+        u8 *enctlv;
+};
 struct tlv_tlv_payload_payment_data {
         struct secret payment_secret;
         u64 total_msat;
+};
+struct tlv_onionmsg_payload_reply_path {
+        struct pubkey blinding;
+        struct onionmsg_path **path;
 };
 struct tlv_tlv_payload {
         /* Raw fields including unknown ones. */
@@ -65,6 +73,30 @@ struct tlv_tlv_payload {
 	u32 *outgoing_cltv_value;
 	struct short_channel_id *short_channel_id;
         struct tlv_tlv_payload_payment_data *payment_data;
+};
+struct tlv_onionmsg_payload {
+        /* Raw fields including unknown ones. */
+        struct tlv_field *fields;
+
+	/* TODO The following explicit fields could just point into the
+	 * tlv_field entries above to save on memory. */
+	struct pubkey *next_node_id;
+	struct short_channel_id *next_short_channel_id;
+        struct tlv_onionmsg_payload_reply_path *reply_path;
+	u8 *enctlv;
+	struct pubkey *blinding;
+	u8 *invoice_request;
+	u8 *invoice;
+	u8 *invoice_error;
+};
+struct tlv_encmsg_tlvs {
+        /* Raw fields including unknown ones. */
+        struct tlv_field *fields;
+
+	/* TODO The following explicit fields could just point into the
+	 * tlv_field entries above to save on memory. */
+	struct pubkey *next_node_id;
+	struct short_channel_id *next_short_channel_id;
 };
 
 struct tlv_tlv_payload *tlv_tlv_payload_new(const tal_t *ctx);
@@ -88,7 +120,7 @@ bool fromwire_tlv_payload(const u8 **cursor, size_t *max,
  * ensures that the resulting stream is valid according to
  * `tlv_payload_is_valid`.
  */
-void towire_tlv_payload(u8 **pptr, const void *record);
+void towire_tlv_payload(u8 **pptr, const struct tlv_tlv_payload *record);
 
 /**
  * Check that the TLV stream is valid.
@@ -104,7 +136,7 @@ void towire_tlv_payload(u8 **pptr, const void *record);
 bool tlv_payload_is_valid(const struct tlv_tlv_payload *record,
 			  size_t *err_index);
 
-#define TLVS_TLV_PAYLOAD_ARRAY_SIZE 4
+#define TLVS_ARRAY_SIZE_tlv_payload 4
 extern const struct tlv_record_type tlvs_tlv_payload[];
 
 
@@ -116,6 +148,84 @@ enum tlv_payload_types {
 	TLV_TLV_PAYLOAD_SHORT_CHANNEL_ID = 6,
 	TLV_TLV_PAYLOAD_PAYMENT_DATA = 8,
 };
+
+struct tlv_onionmsg_payload *tlv_onionmsg_payload_new(const tal_t *ctx);
+
+/**
+ * Deserialize a TLV stream for the onionmsg_payload namespace.
+ *
+ * This function will parse any TLV stream, as long as the type, length and
+ * value fields are formatted correctly. Fields that are not known in the
+ * current namespace are stored in the `fields` member. Validity can be
+ * checked using onionmsg_payload_is_valid.
+ */
+bool fromwire_onionmsg_payload(const u8 **cursor, size_t *max,
+			  struct tlv_onionmsg_payload * record);
+
+/**
+ * Serialize a TLV stream for the onionmsg_payload namespace.
+ *
+ * This function only considers known fields from the onionmsg_payload namespace,
+ * and will ignore any fields that may be stored in the `fields` member. This
+ * ensures that the resulting stream is valid according to
+ * `onionmsg_payload_is_valid`.
+ */
+void towire_onionmsg_payload(u8 **pptr, const struct tlv_onionmsg_payload *record);
+
+/**
+ * Check that the TLV stream is valid.
+ *
+ * Enforces the followin validity rules:
+ * - Types must be in monotonic non-repeating order
+ * - We must understand all even types
+ *
+ * Returns false if an error was detected, otherwise returns true. If err_index
+ * is non-null and we detect an error it is set to the index of the first error
+ * detected.
+ */
+bool onionmsg_payload_is_valid(const struct tlv_onionmsg_payload *record,
+			  size_t *err_index);
+
+struct tlv_encmsg_tlvs *tlv_encmsg_tlvs_new(const tal_t *ctx);
+
+/**
+ * Deserialize a TLV stream for the encmsg_tlvs namespace.
+ *
+ * This function will parse any TLV stream, as long as the type, length and
+ * value fields are formatted correctly. Fields that are not known in the
+ * current namespace are stored in the `fields` member. Validity can be
+ * checked using encmsg_tlvs_is_valid.
+ */
+bool fromwire_encmsg_tlvs(const u8 **cursor, size_t *max,
+			  struct tlv_encmsg_tlvs * record);
+
+/**
+ * Serialize a TLV stream for the encmsg_tlvs namespace.
+ *
+ * This function only considers known fields from the encmsg_tlvs namespace,
+ * and will ignore any fields that may be stored in the `fields` member. This
+ * ensures that the resulting stream is valid according to
+ * `encmsg_tlvs_is_valid`.
+ */
+void towire_encmsg_tlvs(u8 **pptr, const struct tlv_encmsg_tlvs *record);
+
+/**
+ * Check that the TLV stream is valid.
+ *
+ * Enforces the followin validity rules:
+ * - Types must be in monotonic non-repeating order
+ * - We must understand all even types
+ *
+ * Returns false if an error was detected, otherwise returns true. If err_index
+ * is non-null and we detect an error it is set to the index of the first error
+ * detected.
+ */
+bool encmsg_tlvs_is_valid(const struct tlv_encmsg_tlvs *record,
+			  size_t *err_index);
+
+/* SUBTYPE: ONIONMSG_PATH */
+void towire_onionmsg_path(u8 **p, const struct onionmsg_path *onionmsg_path);
+struct onionmsg_path *fromwire_onionmsg_path(const tal_t *ctx, const u8 **cursor, size_t *plen);
 
 /* WIRE: INVALID_REALM */
 u8 *towire_invalid_realm(const tal_t *ctx);
@@ -207,4 +317,4 @@ bool fromwire_mpp_timeout(const void *p);
 
 
 #endif /* LIGHTNING_WIRE_ONION_WIREGEN_H */
-// SHA256STAMP:6f34c3287d2f8abec14ecd33fe8340b82298a34959e96a752f8dafc0762b8f65
+// SHA256STAMP:897accc52196e69cffeee8386a5e1af8754fe49baefd58460c788024e4e8dd6f

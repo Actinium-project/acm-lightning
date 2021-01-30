@@ -9,10 +9,12 @@
 
 struct amount_msat;
 struct amount_sat;
+struct bip340sig;
 struct channel_id;
 struct node_id;
 struct preimage;
 struct pubkey;
+struct pubkey32;
 struct secret;
 struct short_channel_id;
 struct wireaddr;
@@ -26,8 +28,8 @@ bool json_to_preimage(const char *buffer, const jsmntok_t *tok, struct preimage 
 bool json_to_secret(const char *buffer, const jsmntok_t *tok, struct secret *dest);
 
 /* Extract a psbt from this. */
-bool json_to_psbt(const tal_t *ctx, const char *buffer,
-		  const jsmntok_t *tok, struct wally_psbt **dest);
+struct wally_psbt *json_to_psbt(const tal_t *ctx, const char *buffer,
+				const jsmntok_t *tok);
 
 /* Extract a pubkey from this */
 bool json_to_pubkey(const char *buffer, const jsmntok_t *tok,
@@ -62,6 +64,10 @@ bool json_to_msat(const char *buffer, const jsmntok_t *tok,
 bool json_to_txid(const char *buffer, const jsmntok_t *tok,
 		  struct bitcoin_txid *txid);
 
+/* Extract a bitcoin outpoint from this */
+bool json_to_outpoint(const char *buffer, const jsmntok_t *tok,
+		      struct bitcoin_outpoint *op);
+
 /* Extract a channel id from this */
 bool json_to_channel_id(const char *buffer, const jsmntok_t *tok,
 			struct channel_id *cid);
@@ -78,6 +84,16 @@ bool split_tok(const char *buffer, const jsmntok_t *tok,
 void json_add_pubkey(struct json_stream *response,
 		     const char *fieldname,
 		     const struct pubkey *key);
+
+/* '"fieldname" : "89abcdef..."' or "89abcdef..." if fieldname is NULL */
+void json_add_pubkey32(struct json_stream *response,
+		       const char *fieldname,
+		       const struct pubkey32 *key);
+
+/* '"fieldname" : "89abcdef..."' or "89abcdef..." if fieldname is NULL */
+void json_add_bip340sig(struct json_stream *response,
+			const char *fieldname,
+			const struct bip340sig *sig);
 
 /* '"fieldname" : "89abcdef..."' or "89abcdef..." if fieldname is NULL */
 void json_add_secret(struct json_stream *response,
@@ -97,6 +113,10 @@ void json_add_channel_id(struct json_stream *response,
 /* '"fieldname" : <hexrev>' or "<hexrev>" if fieldname is NULL */
 void json_add_txid(struct json_stream *result, const char *fieldname,
 		   const struct bitcoin_txid *txid);
+
+/* '"fieldname" : "txid:n" */
+void json_add_outpoint(struct json_stream *result, const char *fieldname,
+		       const struct bitcoin_outpoint *out);
 
 /* '"fieldname" : "1234:5:6"' */
 void json_add_short_channel_id(struct json_stream *response,

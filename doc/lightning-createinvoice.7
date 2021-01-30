@@ -1,0 +1,62 @@
+.TH "LIGHTNING-CREATEINVOICE" "7" "" "" "lightning-createinvoice"
+.SH NAME
+lightning-createinvoice - Low-level invoice creation
+.SH SYNOPSIS
+
+\fBcreateinvoice\fR \fIinvstring\fR \fIlabel\fR \fIpreimage\fR
+
+.SH DESCRIPTION
+
+The \fBcreateinvoice\fR RPC command signs and saves an invoice into the
+database\.
+
+
+The \fIinvstring\fR parameter is of bolt11 form, but without the final
+signature appended\.  Minimal sanity checks are done\.  (Note: if
+\fBexperimental-offers\fR is enabled, \fIinvstring\fR can actually be an
+unsigned bolt12 invoice)\.
+
+
+The \fIlabel\fR must be a unique string or number (which is treated as a
+string, so "01" is different from "1"); it is never revealed to other
+nodes on the lightning network, but it can be used to query the status
+of this invoice\.
+
+
+The \fIpreimage\fR is the preimage to supply upon successful payment of
+the invoice\.
+
+.SH RETURN VALUE
+
+On success, an invoice object is returned, as per \fBlistinvoices\fR(7)\.
+
+
+On failure, an error is returned and no invoice is created\. If the
+lightning process fails before responding, the caller should use
+\fBlightning-listinvoices\fR(7) to query whether this invoice was created or
+not\.
+
+
+The following error codes may occur:
+
+.RS
+.IP \[bu]
+-1: Catchall nonspecific error\.
+.IP \[bu]
+900: An invoice with the given \fIlabel\fR already exists\.
+
+.RE
+.SH AUTHOR
+
+Rusty Russell \fI<rusty@rustcorp.com.au\fR> is mainly responsible\.
+
+.SH SEE ALSO
+
+\fBlightning-invoice\fR(7), \fBlightning-listinvoices\fR(7), \fBlightning-delinvoice\fR(7),
+\fBlightning-getroute\fR(7), \fBlightning-sendpay\fR(7)\.
+
+.SH RESOURCES
+
+Main web site: \fIhttps://github.com/ElementsProject/lightning\fR
+
+\" SHA256STAMP:155724c3e3130ed7f96d50a37dff99711dfcb4056c57d7eeb488fdb2b7925839

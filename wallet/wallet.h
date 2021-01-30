@@ -30,6 +30,8 @@ struct node_id;
 struct oneshot;
 struct peer;
 struct timers;
+enum channel_state;
+enum state_change;
 
 struct wallet {
 	struct lightningd *ld;
@@ -43,6 +45,10 @@ struct wallet {
 	/* Filter matching all outpoints corresponding to our owned outputs,
 	 * including all spent ones */
 	struct outpointfilter *owned_outpoints;
+
+	/* Filter matching all outpoints that might be a funding transaction on
+	 * the blockchain. This is currently all P2WSH outputs */
+	struct outpointfilter *utxoset_outpoints;
 
 	/* How many keys should we look ahead at most? */
 	u64 keyscan_gap;
@@ -234,14 +240,17 @@ struct wallet_payment {
 	struct secret *path_secrets;
 	struct node_id *route_nodes;
 	struct short_channel_id *route_channels;
-	/* bolt11 string; NULL for old payments. */
-	const char *bolt11;
+	/* bolt11/bolt12 string; NULL for old payments. */
+	const char *invstring;
 
 	/* The label of the payment. Must support `tal_len` */
 	const char *label;
 
 	/* If we could not decode the fail onion, just add it here. */
 	const u8 *failonion;
+
+	/* If we are associated with an internal offer */
+	struct sha256 *local_offer_id;
 };
 
 struct outpoint {
@@ -494,6 +503,24 @@ void wallet_channel_insert(struct wallet *w, struct channel *chan);
 void wallet_channel_close(struct wallet *w, u64 wallet_id);
 
 /**
+ * Adds a channel state change history entry into the database
+ */
+void wallet_state_change_add(struct wallet *w,
+			     const u64 channel_id,
+			     struct timeabs *timestamp,
+			     enum channel_state old_state,
+			     enum channel_state new_state,
+			     enum state_change cause,
+			     char *message);
+
+/**
+ * Gets all state change history entries for a channel from the database
+ */
+struct state_change_entry *wallet_state_change_get(struct wallet *w,
+						   const tal_t *ctx,
+						   u64 channel_id);
+
+/**
  * wallet_peer_delete -- After no more channels in peer, forget about it
  */
 void wallet_peer_delete(struct wallet *w, u64 peer_dbid);
@@ -699,13 +726,15 @@ struct invoice_details {
 	struct amount_msat received;
 	/* Set if state == PAID; time paid */
 	u64 paid_timestamp;
-	/* BOLT11 encoding for this invoice */
-	const char *bolt11;
+	/* BOLT11 or BOLT12 encoding for this invoice */
+	const char *invstring;
 
 	/* The description of the payment. */
 	char *description;
 	/* The features, if any (tal_arr) */
 	u8 *features;
+	/* The offer this refers to, if any. */
+	struct sha256 *local_offer_id;
 };
 
 /* An object that handles iteration over the set of invoices */
@@ -748,7 +777,8 @@ bool wallet_invoice_create(struct wallet *wallet,
 			   const char *description,
 			   const u8 *features,
 			   const struct preimage *r,
-			   const struct sha256 *rhash);
+			   const struct sha256 *rhash,
+			   const struct sha256 *local_offer_id);
 
 /**
  * wallet_invoice_find_by_label - Search for an invoice by label
@@ -863,10 +893,9 @@ const struct invoice_details *wallet_invoice_iterator_deref(const tal_t *ctx,
  * @invoice - the invoice to mark as paid.
  * @received - the actual amount received.
  *
- * Precondition: the invoice must not yet be expired (wallet
- * does not check!).
+ * If the invoice is not UNPAID, returns false.
  */
-void wallet_invoice_resolve(struct wallet *wallet,
+bool wallet_invoice_resolve(struct wallet *wallet,
 			    struct invoice invoice,
 			    struct amount_msat received);
 
@@ -1055,6 +1084,13 @@ void wallet_payment_set_failinfo(struct wallet *wallet,
 const struct wallet_payment **wallet_payment_list(const tal_t *ctx,
 						  struct wallet *wallet,
 						  const struct sha256 *payment_hash);
+
+/**
+ * wallet_payments_by_offer - Retrieve a list of payments for this local_offer_id
+ */
+const struct wallet_payment **wallet_payments_by_offer(const tal_t *ctx,
+						       struct wallet *wallet,
+						       const struct sha256 *local_offer_id);
 
 /**
  * wallet_htlc_sigs_save - Store the latest HTLC sigs for the channel
@@ -1312,4 +1348,127 @@ struct penalty_base *wallet_penalty_base_load_for_channel(const tal_t *ctx,
  */
 void wallet_penalty_base_delete(struct wallet *w, u64 chan_id, u64 commitnum);
 
+/* /!\ This is a DB ENUM, please do not change the numbering of any
+ * already defined elements (adding is ok) /!\ */
+#define OFFER_STATUS_ACTIVE_F  0x1
+#define OFFER_STATUS_SINGLE_F  0x2
+#define OFFER_STATUS_USED_F    0x4
+enum offer_status {
+	OFFER_MULTIPLE_USE = OFFER_STATUS_ACTIVE_F,
+	OFFER_SINGLE_USE = OFFER_STATUS_ACTIVE_F|OFFER_STATUS_SINGLE_F,
+	OFFER_USED = OFFER_STATUS_SINGLE_F|OFFER_STATUS_USED_F,
+	OFFER_SINGLE_DISABLED = OFFER_STATUS_SINGLE_F,
+	OFFER_MULTIPLE_DISABLED = 0,
+};
+
+static inline enum offer_status offer_status_in_db(enum offer_status s)
+{
+	switch (s) {
+	case OFFER_MULTIPLE_USE:
+		BUILD_ASSERT(OFFER_MULTIPLE_USE == 1);
+		return s;
+	case OFFER_SINGLE_USE:
+		BUILD_ASSERT(OFFER_SINGLE_USE == 3);
+		return s;
+	case OFFER_USED:
+		BUILD_ASSERT(OFFER_USED == 6);
+		return s;
+	case OFFER_SINGLE_DISABLED:
+		BUILD_ASSERT(OFFER_SINGLE_DISABLED == 2);
+		return s;
+	case OFFER_MULTIPLE_DISABLED:
+		BUILD_ASSERT(OFFER_MULTIPLE_DISABLED == 0);
+		return s;
+	}
+	fatal("%s: %u is invalid", __func__, s);
+}
+
+static inline bool offer_status_active(enum offer_status s)
+{
+	return s & OFFER_STATUS_ACTIVE_F;
+}
+
+static inline bool offer_status_single(enum offer_status s)
+{
+	return s & OFFER_STATUS_SINGLE_F;
+}
+
+/**
+ * Store an offer in the database.
+ * @w: the wallet
+ * @offer_id: the merkle root, as used for signing (must be unique)
+ * @bolt12: offer as text.
+ * @label: optional label for this offer.
+ * @status: OFFER_SINGLE_USE or OFFER_MULTIPLE_USE
+ */
+bool wallet_offer_create(struct wallet *w,
+			 const struct sha256 *offer_id,
+			 const char *bolt12,
+			 const struct json_escape *label,
+			 enum offer_status status)
+	NON_NULL_ARGS(1,2,3);
+
+/**
+ * Retrieve an offer from the database.
+ * @ctx: the tal context to allocate return from.
+ * @w: the wallet
+ * @offer_id: the merkle root, as used for signing (must be unique)
+ * @label: the label of the offer, set to NULL if none (or NULL)
+ * @status: set if succeeds (or NULL)
+ *
+ * If @offer_id is found, returns the bolt12 text, sets @label and
+ * @state.  Otherwise returns NULL.
+ */
+char *wallet_offer_find(const tal_t *ctx,
+			struct wallet *w,
+			const struct sha256 *offer_id,
+			const struct json_escape **label,
+			enum offer_status *status)
+	NON_NULL_ARGS(1,2,3);
+
+/**
+ * Iterate through all the offers.
+ * @w: the wallet
+ * @offer_id: the first offer id (if returns non-NULL)
+ *
+ * Returns pointer to hand as @stmt to wallet_offer_next(), or NULL.
+ * If you choose not to call wallet_offer_id_next() you must free it!
+ */
+struct db_stmt *wallet_offer_id_first(struct wallet *w,
+				      struct sha256 *offer_id);
+
+/**
+ * Iterate through all the offers.
+ * @w: the wallet
+ * @stmt: return from wallet_offer_id_first() or previous wallet_offer_id_next()
+ * @offer_id: the next offer id (if returns non-NULL)
+ *
+ * Returns NULL once we're out of offers.  If you choose not to call
+ * wallet_offer_id_next() again you must free return.
+ */
+struct db_stmt *wallet_offer_id_next(struct wallet *w,
+				     struct db_stmt *stmt,
+				     struct sha256 *offer_id);
+
+/**
+ * Disable an offer in the database.
+ * @w: the wallet
+ * @offer_id: the merkle root, as used for signing (must be unique)
+ * @s: the current status (must be active).
+ *
+ * Must exist.  Returns new status. */
+enum offer_status wallet_offer_disable(struct wallet *w,
+				       const struct sha256 *offer_id,
+				       enum offer_status s)
+	NO_NULL_ARGS;
+
+/**
+ * Mark an offer in the database used.
+ * @w: the wallet
+ * @offer_id: the merkle root, as used for signing (must be unique)
+ *
+ * Must exist and be active.
+ */
+void wallet_offer_mark_used(struct db *db, const struct sha256 *offer_id)
+	NO_NULL_ARGS;
 #endif /* LIGHTNING_WALLET_WALLET_H */

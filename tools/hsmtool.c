@@ -1,38 +1,48 @@
 #include <bitcoin/privkey.h>
+#include <ccan/array_size/array_size.h>
 #include <ccan/crypto/hkdf_sha256/hkdf_sha256.h>
 #include <ccan/err/err.h>
 #include <ccan/noerr/noerr.h>
 #include <ccan/read_write_all/read_write_all.h>
 #include <ccan/str/str.h>
 #include <ccan/tal/path/path.h>
+#include <ccan/tal/str/str.h>
 #include <common/bech32.h>
+#include <common/configdir.h>
 #include <common/derive_basepoints.h>
+#include <common/descriptor_checksum.h>
+#include <common/hsm_encryption.h>
 #include <common/node_id.h>
 #include <common/type_to_string.h>
 #include <common/utils.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
-#include <sodium.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <wally_bip39.h>
 
 #define ERROR_HSM_FILE errno
 #define ERROR_USAGE 2
 #define ERROR_LIBSODIUM 3
 #define ERROR_LIBWALLY 4
 #define ERROR_KEYDERIV 5
+#define ERROR_LANG_NOT_SUPPORTED 6
+#define ERROR_TERM 7
 
 static void show_usage(const char *progname)
 {
 	printf("%s <method> [arguments]\n", progname);
 	printf("methods:\n");
-	printf("	- decrypt <path/to/hsm_secret> <password>\n");
-	printf("	- encrypt <path/to/hsm_secret> <password>\n");
+	printf("	- decrypt <path/to/hsm_secret>\n");
+	printf("	- encrypt <path/to/hsm_secret>\n");
 	printf("	- dumpcommitments <node id> <channel dbid> <depth> "
-	       "<path/to/hsm_secret> [hsm_secret password]\n");
+	       "<path/to/hsm_secret>\n");
 	printf("	- guesstoremote <P2WPKH address> <node id> <tries> "
-	       "<path/to/hsm_secret> [hsm_secret password]\n");
+	       "<path/to/hsm_secret>\n");
+	printf("	- generatehsm <path/to/new/hsm_secret>\n");
+	printf("	- dumponchaindescriptors <path/to/hsm_secret> [network]\n");
 	exit(0);
 }
 
@@ -66,9 +76,9 @@ static void get_hsm_secret(struct secret *hsm_secret,
 
 	fd = open(hsm_secret_path, O_RDONLY);
 	if (fd < 0)
-		err(ERROR_HSM_FILE, "Could not open hsm_secret");
+		errx(ERROR_HSM_FILE, "Could not open hsm_secret");
 	if (!read_all(fd, hsm_secret, sizeof(*hsm_secret)))
-		err(ERROR_HSM_FILE, "Could not read hsm_secret");
+		errx(ERROR_HSM_FILE, "Could not read hsm_secret");
 	close(fd);
 }
 
@@ -80,33 +90,21 @@ static void get_encrypted_hsm_secret(struct secret *hsm_secret,
 {
 	int fd;
 	struct secret key;
-	u8 salt[16] = "c-lightning\0\0\0\0\0";
-	crypto_secretstream_xchacha20poly1305_state crypto_state;
-	u8 header[crypto_secretstream_xchacha20poly1305_HEADERBYTES];
-	/* The cipher size is static with xchacha20poly1305. */
-	u8 cipher[sizeof(struct secret) + crypto_secretstream_xchacha20poly1305_ABYTES];
+	struct encrypted_hsm_secret encrypted_secret;
+	char *err;
 
 	fd = open(hsm_secret_path, O_RDONLY);
 	if (fd < 0)
-		err(ERROR_HSM_FILE, "Could not open hsm_secret");
+		errx(ERROR_HSM_FILE, "Could not open hsm_secret");
 
-	if (!read_all(fd, header, crypto_secretstream_xchacha20poly1305_HEADERBYTES))
-		err(ERROR_HSM_FILE, "Could not read cipher header");
-	if (!read_all(fd, cipher, sizeof(cipher)))
-		err(ERROR_HSM_FILE, "Could not read cipher body");
+	if (!read_all(fd, encrypted_secret.data, ENCRYPTED_HSM_SECRET_LEN))
+		errx(ERROR_HSM_FILE, "Could not read encrypted hsm_secret");
 
-	if (crypto_pwhash(key.data, sizeof(key.data), passwd, strlen(passwd), salt,
-	                  crypto_pwhash_argon2id_OPSLIMIT_MODERATE,
-	                  crypto_pwhash_argon2id_MEMLIMIT_MODERATE,
-	                  crypto_pwhash_ALG_ARGON2ID13) != 0)
-		err(ERROR_LIBSODIUM, "Could not derive a key from the password.");
-	if (crypto_secretstream_xchacha20poly1305_init_pull(&crypto_state, header,
-	                                                    key.data) != 0)
-		err(ERROR_LIBSODIUM, "Could not initialize the crypto state");
-	if (crypto_secretstream_xchacha20poly1305_pull(&crypto_state, hsm_secret->data,
-	                                               NULL, 0, cipher, sizeof(cipher),
-	                                               NULL, 0) != 0)
-		err(ERROR_LIBSODIUM, "Could not retrieve the seed. Wrong password ?");
+	err = hsm_secret_encryption_key(passwd, &key);
+	if (err)
+		errx(ERROR_LIBSODIUM, "%s", err);
+	if (!decrypt_hsm_secret(&key, &encrypted_secret, hsm_secret))
+		errx(ERROR_LIBSODIUM, "Could not retrieve the seed. Wrong password ?");
 
 	close(fd);
 }
@@ -147,37 +145,60 @@ static void get_channel_seed(struct secret *channel_seed, struct node_id *peer_i
 	            info, strlen(info));
 }
 
-static int decrypt_hsm(const char *hsm_secret_path, const char *passwd)
+/* We detect an encrypted hsm_secret as a hsm_secret which is 73-bytes long. */
+static bool hsm_secret_is_encrypted(const char *hsm_secret_path)
+{
+	struct stat st;
+
+	if (stat(hsm_secret_path, &st) != 0)
+		errx(ERROR_HSM_FILE, "Could not stat hsm_secret");
+
+	if (st.st_size != 32 && st.st_size != ENCRYPTED_HSM_SECRET_LEN)
+		errx(ERROR_HSM_FILE, "Invalid hsm_secret (neither plaintext "
+				     "nor encrypted).");
+
+	return st.st_size == ENCRYPTED_HSM_SECRET_LEN;
+}
+
+static int decrypt_hsm(const char *hsm_secret_path)
 {
 	int fd;
-	struct stat st;
 	struct secret hsm_secret;
+	char *passwd, *err;
 	const char *dir, *backup;
 
+	/* This checks the file existence, too. */
+	if (!hsm_secret_is_encrypted(hsm_secret_path))
+		errx(ERROR_USAGE, "hsm_secret is not encrypted");
+	printf("Enter hsm_secret password:\n");
+	fflush(stdout);
+	passwd = read_stdin_pass(&err);
+	if (!passwd)
+		errx(ERROR_TERM, "%s", err);
+
 	if (sodium_init() == -1)
-		err(ERROR_LIBSODIUM,
+		errx(ERROR_LIBSODIUM,
 		    "Could not initialize libsodium. Not enough entropy ?");
 
 	dir = path_dirname(NULL, hsm_secret_path);
 	backup = path_join(dir, dir, "hsm_secret.backup");
 
-	if (stat(hsm_secret_path, &st) != 0)
-		err(ERROR_HSM_FILE, "Could not stat hsm_secret");
-	if (st.st_size <= 32)
-		err(ERROR_HSM_FILE, "hsm_secret is not encrypted");
 	get_encrypted_hsm_secret(&hsm_secret, hsm_secret_path, passwd);
+	/* Once the encryption key derived, we don't need it anymore. */
+	if (passwd)
+		free(passwd);
 
 	/* Create a backup file, "just in case". */
 	rename(hsm_secret_path, backup);
 	fd = open(hsm_secret_path, O_CREAT|O_EXCL|O_WRONLY, 0400);
 	if (fd < 0)
-		err(ERROR_HSM_FILE, "Could not open new hsm_secret");
+		errx(ERROR_HSM_FILE, "Could not open new hsm_secret");
 
 	if (!write_all(fd, &hsm_secret, sizeof(hsm_secret))) {
 		unlink_noerr(hsm_secret_path);
 		close(fd);
 		rename("hsm_secret.backup", hsm_secret_path);
-		err(ERROR_HSM_FILE,
+		errx(ERROR_HSM_FILE,
 		    "Failure writing plaintext seed to hsm_secret.");
 	}
 
@@ -185,7 +206,7 @@ static int decrypt_hsm(const char *hsm_secret_path, const char *passwd)
 	if (!ensure_hsm_secret_exists(fd, hsm_secret_path)) {
 		unlink_noerr(hsm_secret_path);
 		rename(backup, hsm_secret_path);
-		err(ERROR_HSM_FILE,
+		errx(ERROR_HSM_FILE,
 		    "Could not ensure hsm_secret existence.");
 	}
 	unlink_noerr(backup);
@@ -195,67 +216,71 @@ static int decrypt_hsm(const char *hsm_secret_path, const char *passwd)
 	return 0;
 }
 
-static int encrypt_hsm(const char *hsm_secret_path, const char *passwd)
+static int encrypt_hsm(const char *hsm_secret_path)
 {
 	int fd;
-	struct stat st;
 	struct secret key, hsm_secret;
-	u8 salt[16] = "c-lightning\0\0\0\0\0";
-	crypto_secretstream_xchacha20poly1305_state crypto_state;
-	u8 header[crypto_secretstream_xchacha20poly1305_HEADERBYTES];
-	/* The cipher size is static with xchacha20poly1305. */
-	u8 cipher[sizeof(struct secret) + crypto_secretstream_xchacha20poly1305_ABYTES];
+	struct encrypted_hsm_secret encrypted_hsm_secret;
+	char *passwd, *passwd_confirmation, *err;
 	const char *dir, *backup;
+
+	/* This checks the file existence, too. */
+	if (hsm_secret_is_encrypted(hsm_secret_path))
+		errx(ERROR_USAGE, "hsm_secret is already encrypted");
+
+	printf("Enter hsm_secret password:\n");
+	fflush(stdout);
+	passwd = read_stdin_pass(&err);
+	if (!passwd)
+		errx(ERROR_TERM, "%s", err);
+	printf("Confirm hsm_secret password:\n");
+	fflush(stdout);
+	passwd_confirmation = read_stdin_pass(&err);
+	if (!passwd_confirmation)
+		errx(ERROR_TERM, "%s", err);
+	if (!streq(passwd, passwd_confirmation))
+		errx(ERROR_USAGE, "Passwords confirmation mismatch.");
+	get_hsm_secret(&hsm_secret, hsm_secret_path);
 
 	dir = path_dirname(NULL, hsm_secret_path);
 	backup = path_join(dir, dir, "hsm_secret.backup");
 
 	if (sodium_init() == -1)
-		err(ERROR_LIBSODIUM,
+		errx(ERROR_LIBSODIUM,
 		    "Could not initialize libsodium. Not enough entropy ?");
-
-	if (stat(hsm_secret_path, &st) != 0)
-		err(ERROR_HSM_FILE, "Could not stat hsm_secret");
-	if (st.st_size > 32)
-		err(ERROR_USAGE, "hsm_secret is already encrypted");
-	get_hsm_secret(&hsm_secret, hsm_secret_path);
 
 	/* Derive the encryption key from the password provided, and try to encrypt
 	 * the seed. */
-	if (crypto_pwhash(key.data, sizeof(key.data), passwd, strlen(passwd), salt,
-	                  crypto_pwhash_argon2id_OPSLIMIT_MODERATE,
-	                  crypto_pwhash_argon2id_MEMLIMIT_MODERATE,
-	                  crypto_pwhash_ALG_ARGON2ID13) != 0)
-		err(ERROR_LIBSODIUM, "Could not derive a key from the password.");
-	if (crypto_secretstream_xchacha20poly1305_init_push(&crypto_state, header,
-	                                                    key.data) != 0)
-		err(ERROR_LIBSODIUM, "Could not initialize the crypto state");
-	if (crypto_secretstream_xchacha20poly1305_push(&crypto_state, cipher,
-	                                               NULL, hsm_secret.data,
-	                                               sizeof(hsm_secret.data),
-	                                               NULL, 0, 0) != 0)
-		err(ERROR_LIBSODIUM, "Could not encrypt the seed.");
+	err = hsm_secret_encryption_key(passwd, &key);
+	if (err)
+		errx(ERROR_LIBSODIUM, "%s", err);
+	if (!encrypt_hsm_secret(&key, &hsm_secret, &encrypted_hsm_secret))
+		errx(ERROR_LIBSODIUM, "Could not encrypt the hsm_secret seed.");
+
+	/* Once the encryption key derived, we don't need it anymore. */
+	free(passwd);
+	free(passwd_confirmation);
 
 	/* Create a backup file, "just in case". */
 	rename(hsm_secret_path, backup);
 	fd = open(hsm_secret_path, O_CREAT|O_EXCL|O_WRONLY, 0400);
 	if (fd < 0)
-		err(ERROR_HSM_FILE, "Could not open new hsm_secret");
+		errx(ERROR_HSM_FILE, "Could not open new hsm_secret");
 
 	/* Write the encrypted hsm_secret. */
-	if (!write_all(fd, header, sizeof(header))
-		|| !write_all(fd, cipher, sizeof(cipher))) {
+	if (!write_all(fd, encrypted_hsm_secret.data,
+		       sizeof(encrypted_hsm_secret.data))) {
 		unlink_noerr(hsm_secret_path);
 		close(fd);
 		rename(backup, hsm_secret_path);
-		err(ERROR_HSM_FILE, "Failure writing cipher to hsm_secret.");
+		errx(ERROR_HSM_FILE, "Failure writing cipher to hsm_secret.");
 	}
 
 	/* Be as paranoïd as in hsmd with the file state on disk. */
 	if (!ensure_hsm_secret_exists(fd, hsm_secret_path)) {
 		unlink_noerr(hsm_secret_path);
 		rename(backup, hsm_secret_path);
-		err(ERROR_HSM_FILE, "Could not ensure hsm_secret existence.");
+		errx(ERROR_HSM_FILE, "Could not ensure hsm_secret existence.");
 	}
 	unlink_noerr(backup);
 	tal_free(dir);
@@ -266,31 +291,40 @@ static int encrypt_hsm(const char *hsm_secret_path, const char *passwd)
 }
 
 static int dump_commitments_infos(struct node_id *node_id, u64 channel_id,
-                                  u64 depth, char *hsm_secret_path, char *passwd)
+                                  u64 depth, char *hsm_secret_path)
 {
 	struct sha256 shaseed;
 	struct secret hsm_secret, channel_seed, per_commitment_secret;
 	struct pubkey per_commitment_point;
+	char *passwd, *err;
 
 	secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY
 	                                         | SECP256K1_CONTEXT_SIGN);
 
-	if (passwd)
+	/* This checks the file existence, too. */
+	if (hsm_secret_is_encrypted(hsm_secret_path)) {
+		printf("Enter hsm_secret password:\n");
+		fflush(stdout);
+		passwd = read_stdin_pass(&err);
+		if (!passwd)
+			errx(ERROR_TERM, "%s", err);
 		get_encrypted_hsm_secret(&hsm_secret, hsm_secret_path, passwd);
-	else
+		free(passwd);
+	} else
 		get_hsm_secret(&hsm_secret, hsm_secret_path);
+
 	get_channel_seed(&channel_seed, node_id, channel_id, &hsm_secret);
 
 	derive_shaseed(&channel_seed, &shaseed);
 	printf("shaseed: %s\n", type_to_string(tmpctx, struct sha256, &shaseed));
 	for (u64 i = 0; i < depth; i++) {
 		if (!per_commit_secret(&shaseed, &per_commitment_secret, i))
-			err(ERROR_KEYDERIV, "Could not derive secret #%"PRIu64, i);
+			errx(ERROR_KEYDERIV, "Could not derive secret #%"PRIu64, i);
 		printf("commit secret #%"PRIu64": %s\n",
 		       i, tal_hexstr(tmpctx, per_commitment_secret.data,
 		                     sizeof(per_commitment_secret.data)));
 		if (!per_commit_point(&shaseed, &per_commitment_point, i))
-			err(ERROR_KEYDERIV, "Could not derive point #%"PRIu64, i);
+			errx(ERROR_KEYDERIV, "Could not derive point #%"PRIu64, i);
 		printf("commit point #%"PRIu64": %s\n",
 		       i, type_to_string(tmpctx, struct pubkey, &per_commitment_point));
 	}
@@ -315,9 +349,10 @@ static int dump_commitments_infos(struct node_id *node_id, u64 channel_id,
  * :param passwd: The *optional* hsm_secret password
  */
 static int guess_to_remote(const char *address, struct node_id *node_id,
-                           u64 tries, char *hsm_secret_path, char *passwd)
+                           u64 tries, char *hsm_secret_path)
 {
 	struct secret hsm_secret, channel_seed, basepoint_secret;
+	char *passwd, *err;
 	struct pubkey basepoint;
 	struct ripemd160 pubkeyhash;
 	/* We only support P2WPKH, hence 20. */
@@ -336,9 +371,16 @@ static int guess_to_remote(const char *address, struct node_id *node_id,
 	secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY
 	                                         | SECP256K1_CONTEXT_SIGN);
 
-	if (passwd)
+	/* This checks the file existence, too. */
+	if (hsm_secret_is_encrypted(hsm_secret_path)) {
+		printf("Enter hsm_secret password:\n");
+		fflush(stdout);
+		passwd = read_stdin_pass(&err);
+		if (!passwd)
+			errx(ERROR_TERM, "%s", err);
 		get_encrypted_hsm_secret(&hsm_secret, hsm_secret_path, passwd);
-	else
+		free(passwd);
+	} else
 		get_hsm_secret(&hsm_secret, hsm_secret_path);
 
 	for (u64 dbid = 1; dbid < tries ; dbid++) {
@@ -368,6 +410,181 @@ static int guess_to_remote(const char *address, struct node_id *node_id,
 	return 1;
 }
 
+static void get_words(struct words **words) {
+	struct wordlist_lang {
+		char *abbr;
+		char *name;
+	};
+
+	struct wordlist_lang languages[] = {
+		{"en", "English"},
+		{"es", "Spanish"},
+		{"fr", "French"},
+		{"it", "Italian"},
+		{"jp", "Japanese"},
+		{"zhs", "Chinese Simplified"},
+		{"zht", "Chinese Traditional"},
+	};
+
+	printf("Select your language:\n");
+	for (size_t i = 0; i < ARRAY_SIZE(languages); i++) {
+		printf("  %zu) %s (%s)\n", i, languages[i].name, languages[i].abbr);
+	}
+	printf("Select [0-%zu]: ", ARRAY_SIZE(languages));
+	fflush(stdout);
+
+	char *selected = NULL;
+	size_t size = 0;
+	size_t characters = getline(&selected, &size, stdin);
+	if (characters < 0)
+		errx(ERROR_USAGE, "Could not read line from stdin.");
+
+	/* To distinguish success/failure after call */
+	errno = 0;
+	char *endptr;
+	long val = strtol(selected, &endptr, 10);
+	if (errno == ERANGE || (errno != 0 && val == 0) || endptr == selected || val < 0 || val >= ARRAY_SIZE(languages))
+        errx(ERROR_USAGE, "Invalid language selection, select one from the list [0-6].");
+
+	bip39_get_wordlist(languages[val].abbr, words);
+}
+
+static void get_mnemonic(char *mnemonic) {
+	char *line = NULL;
+	size_t line_size = 0;
+
+	printf("Introduce your BIP39 word list separated by space:\n");
+	fflush(stdout);
+	size_t characters = getline(&line, &line_size, stdin);
+	if (characters < 0)
+		errx(ERROR_USAGE, "Could not read line from stdin.");
+	line[characters-1] = '\0';
+	strcpy(mnemonic, line);
+	free(line);
+}
+
+static void read_mnemonic(char *mnemonic) {
+	/* Get words for the mnemonic language */
+	struct words *words;
+	get_words(&words);
+
+	/* Get mnemonic */
+	get_mnemonic(mnemonic);
+
+	if (bip39_mnemonic_validate(words, mnemonic) != 0) {
+		errx(ERROR_USAGE, "Invalid mnemonic: \"%s\"", mnemonic);
+	}
+}
+
+static int generate_hsm(const char *hsm_secret_path)
+{
+	char mnemonic[BIP39_WORDLIST_LEN];
+	char *passphrase, *err;
+
+	read_mnemonic(mnemonic);
+	printf("Warning: remember that different passphrases yield different "
+	       "bitcoin wallets.\n");
+	printf("If left empty, no password is used (echo is disabled).\n");
+	printf("Enter your passphrase: \n");
+	fflush(stdout);
+	passphrase = read_stdin_pass(&err);
+	if (!passphrase)
+		errx(ERROR_TERM, "%s", err);
+	if (strlen(passphrase) == 0) {
+		free(passphrase);
+		passphrase = NULL;
+	}
+
+	u8 bip32_seed[BIP39_SEED_LEN_512];
+	size_t bip32_seed_len;
+
+	if (bip39_mnemonic_to_seed(mnemonic, passphrase, bip32_seed, sizeof(bip32_seed), &bip32_seed_len) != WALLY_OK)
+		errx(ERROR_LIBWALLY, "Unable to derive BIP32 seed from BIP39 mnemonic");
+
+	int fd = open(hsm_secret_path, O_CREAT|O_EXCL|O_WRONLY, 0400);
+	if (fd < 0) {
+		errx(ERROR_USAGE, "Unable to create hsm_secret file");
+	}
+	/* Write only the first 32 bytes, length of the (plaintext) seed in the
+	 * hsm_secret. */
+	if (!write_all(fd, bip32_seed, 32))
+		errx(ERROR_USAGE, "Error writing secret to hsm_secret file");
+
+	if (fsync(fd) != 0)
+		errx(ERROR_USAGE, "Error fsyncing hsm_secret file");
+
+	/* This should never fail if fsync succeeded. But paranoia is good, and bugs exist */
+	if (close(fd) != 0)
+		errx(ERROR_USAGE, "Error closing hsm_secret file");
+
+	printf("New hsm_secret file created at %s\n", hsm_secret_path);
+	printf("Use the `encrypt` command to encrypt the BIP32 seed if needed\n");
+
+	free(passphrase);
+	return 0;
+}
+
+static int dumponchaindescriptors(const char *hsm_secret_path, const char *old_passwd UNUSED,
+				  const bool is_testnet)
+{
+	struct secret hsm_secret;
+	char *passwd, *err;
+	u8 bip32_seed[BIP32_ENTROPY_LEN_256];
+	u32 salt = 0;
+	u32 version = is_testnet ?
+		BIP32_VER_TEST_PRIVATE : BIP32_VER_MAIN_PRIVATE;
+	struct ext_key master_extkey;
+	char *enc_xpub, *descriptor;
+	struct descriptor_checksum checksum;
+
+	/* This checks the file existence, too. */
+	if (hsm_secret_is_encrypted(hsm_secret_path)) {
+		printf("Enter hsm_secret password:\n");
+		fflush(stdout);
+		passwd = read_stdin_pass(&err);
+		if (!passwd)
+			errx(ERROR_TERM, "%s", err);
+		get_encrypted_hsm_secret(&hsm_secret, hsm_secret_path, passwd);
+		free(passwd);
+	} else
+		get_hsm_secret(&hsm_secret, hsm_secret_path);
+
+	/* We use m/0/0/k as the derivation tree for onchain funds. */
+
+	/* The root seed is derived from hsm_secret using hkdf.. */
+	do {
+		hkdf_sha256(bip32_seed, sizeof(bip32_seed),
+			    &salt, sizeof(salt),
+			    &hsm_secret, sizeof(hsm_secret),
+			    "bip32 seed", strlen("bip32 seed"));
+		salt++;
+		/* ..Which is used to derive m/ */
+	} while (bip32_key_from_seed(bip32_seed, sizeof(bip32_seed),
+				     version, 0, &master_extkey) != WALLY_OK);
+
+	if (bip32_key_to_base58(&master_extkey, BIP32_FLAG_KEY_PUBLIC, &enc_xpub) != WALLY_OK)
+		errx(ERROR_LIBWALLY, "Can't encode xpub");
+
+	/* Now we format the descriptor strings (we only ever create P2WPKH and
+	 * P2SH-P2WPKH outputs). */
+
+	descriptor = tal_fmt(NULL, "wpkh(%s/0/0/*)", enc_xpub);
+	if (!descriptor_checksum(descriptor, strlen(descriptor), &checksum))
+		errx(ERROR_LIBWALLY, "Can't derive descriptor checksum for wpkh");
+	printf("%s#%s\n", descriptor, checksum.csum);
+	tal_free(descriptor);
+
+	descriptor = tal_fmt(NULL, "sh(wpkh(%s/0/0/*))", enc_xpub);
+	if (!descriptor_checksum(descriptor, strlen(descriptor), &checksum))
+		errx(ERROR_LIBWALLY, "Can't derive descriptor checksum for sh(wpkh)");
+	printf("%s#%s\n", descriptor, checksum.csum);
+	tal_free(descriptor);
+
+	wally_free_string(enc_xpub);
+
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
 	const char *method;
@@ -380,37 +597,79 @@ int main(int argc, char *argv[])
 		show_usage(argv[0]);
 
 	if (streq(method, "decrypt")) {
-		if (argc < 4)
+		if (argc < 3)
 			show_usage(argv[0]);
-		return decrypt_hsm(argv[2], argv[3]);
+		return decrypt_hsm(argv[2]);
 	}
 
 	if (streq(method, "encrypt")) {
-		if (argc < 4)
+		if (argc < 3)
 			show_usage(argv[0]);
-		return encrypt_hsm(argv[2], argv[3]);
+		return encrypt_hsm(argv[2]);
 	}
 
 	if (streq(method, "dumpcommitments")) {
-		/*   node_id    channel_id   depth    hsm_secret  ?password? */
+		/*   node_id    channel_id   depth    hsm_secret  */
 		if (argc < 6)
 			show_usage(argv[0]);
 		struct node_id node_id;
 		if (!node_id_from_hexstr(argv[2], strlen(argv[2]), &node_id))
-			err(ERROR_USAGE, "Bad node id");
+			errx(ERROR_USAGE, "Bad node id");
 		return dump_commitments_infos(&node_id, atol(argv[3]), atol(argv[4]),
-		                              argv[5], argc >= 7 ? argv[6] : NULL);
+		                              argv[5]);
 	}
 
 	if (streq(method, "guesstoremote")) {
-		/*   address    node_id    depth    hsm_secret  ?password? */
+		/*   address    node_id    depth    hsm_secret */
 		if (argc < 6)
 			show_usage(argv[0]);
 		struct node_id node_id;
 		if (!node_id_from_hexstr(argv[3], strlen(argv[3]), &node_id))
 			errx(ERROR_USAGE, "Bad node id");
 		return guess_to_remote(argv[2], &node_id, atol(argv[4]),
-		                       argv[5], argc >= 7 ? argv[6] : NULL);
+		                       argv[5]);
+	}
+
+	if (streq(method, "generatehsm")) {
+		if (argc != 3)
+			show_usage(argv[0]);
+
+		char *hsm_secret_path = argv[2];
+
+		/* if hsm_secret already exists we abort the process
+		 * we do not want to lose someone else's funds */
+		struct stat st;
+		if (stat(hsm_secret_path, &st) == 0)
+			errx(ERROR_USAGE, "hsm_secret file at %s already exists", hsm_secret_path);
+
+		return generate_hsm(hsm_secret_path);
+	}
+
+	if (streq(method, "dumponchaindescriptors")) {
+		char *net = NULL;
+		bool is_testnet;
+
+		if (argc < 3)
+			show_usage(argv[0]);
+
+		if (argc > 3)
+			net = argv[3];
+		/* Previously, we accepted hsm_secret passwords on the command line.
+		 * This shifted the location of the network parameter.
+		 * TODO: remove this 3 releases after v0.9.3 */
+		if (deprecated_apis && argc > 4)
+			net = argv[4];
+
+		if (net && streq(net, "testnet"))
+			is_testnet = true;
+		else if (net && !streq(net, "bitcoin"))
+			errx(ERROR_USAGE, "Network '%s' not supported."
+					  " Supported networks: bitcoin (default),"
+					  " testnet", net);
+		else
+			is_testnet = false;
+
+		return dumponchaindescriptors(argv[2], NULL, is_testnet);
 	}
 
 	show_usage(argv[0]);

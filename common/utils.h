@@ -47,9 +47,9 @@ void clear_softref_(const tal_t *outer, size_t outersize, void **ptr);
 /* Note: p is never a complex expression, otherwise this multi-evaluates! */
 #define tal_arr_expand(p, s)						\
 	do {								\
-		size_t n = tal_count(*(p));				\
-		tal_resize((p), n+1);					\
-		(*(p))[n] = (s);					\
+		size_t n_ = tal_count(*(p));				\
+		tal_resize((p), n_+1);					\
+		(*(p))[n_] = (s);					\
 	} while(0)
 
 /**
@@ -71,6 +71,12 @@ void tal_arr_remove_(void *p, size_t elemsize, size_t n);
 				 TAL_LABEL(type, "[]")))
 void *tal_dup_talarr_(const tal_t *ctx, const tal_t *src TAKES,
 		      const char *label);
+
+/* Check for valid UTF-8 */
+bool utf8_check(const void *buf, size_t buflen);
+
+/* Check it's UTF-8, return copy (or same if TAKES), or NULL if not valid. */
+char *utf8_str(const tal_t *ctx, const u8 *buf TAKES, size_t buflen);
 
 /* Use the POSIX C locale. */
 void setup_locale(void);
@@ -110,6 +116,13 @@ STRUCTEQ_DEF(ripemd160, 0, u);
 #define IFDEV(dev, nondev) ((void)(nondev), (dev))
 #else
 #define IFDEV(dev, nondev) (nondev)
+#endif
+
+#if EXPERIMENTAL_FEATURES
+/* Make sure that nondev is evaluated, and valid, but is a constant */
+#define IFEXPERIMENTAL(exp, nonexp) (0 ? (nonexp) : (exp))
+#else
+#define IFEXPERIMENTAL(exp, nonexp) (nonexp)
 #endif
 
 /* Context which all wally allocations use (see common/setup.c) */

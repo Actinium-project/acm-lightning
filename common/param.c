@@ -124,7 +124,7 @@ static struct command_result *parse_by_name(struct command *cmd,
 		if (!p) {
 			if (!allow_extra) {
 				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-						    "unknown parameter: %.*s",
+						    "unknown parameter: %.*s, this may be caused by a failure to autodetect key=value-style parameters. Please try using the -k flag and explicit key=value pairs of parameters.",
 						    t->end - t->start,
 						    buffer + t->start);
 			}
@@ -261,8 +261,6 @@ static struct command_result *param_arr(struct command *cmd, const char *buffer,
 	return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 			    "Expected array or object for params");
 }
-
-#include <stdio.h>
 
 const char *param_subcommand(struct command *cmd, const char *buffer,
 			     const jsmntok_t tokens[],

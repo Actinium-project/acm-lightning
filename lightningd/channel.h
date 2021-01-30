@@ -70,6 +70,7 @@ struct channel {
 
 	struct amount_msat push;
 	bool remote_funding_locked;
+	bool remote_tx_sigs;
 	/* Channel if locked locally. */
 	struct short_channel_id *scid;
 
@@ -151,6 +152,15 @@ struct channel {
 
 	/* PSBT, for v2 channels. Saved until it's sent */
 	struct wally_psbt *psbt;
+
+	/* the one that initiated a bilateral close, NUM_SIDES if unknown. */
+	enum side closer;
+
+	/* Last known state_change cause */
+	enum state_change state_change_cause;
+
+	/* Outstanding command for this channel, v2 only */
+	struct command *openchannel_signed_cmd;
 };
 
 struct channel *new_channel(struct peer *peer, u64 dbid,
@@ -173,6 +183,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    struct amount_msat push,
 			    struct amount_sat our_funds,
 			    bool remote_funding_locked,
+                            bool remote_tx_sigs,
 			    /* NULL or stolen */
 			    struct short_channel_id *scid STEALS,
 			    struct channel_id *cid,
@@ -205,7 +216,9 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    const u8 *remote_upfront_shutdown_script STEALS,
 			    bool option_static_remotekey,
 			    bool option_anchor_outputs,
-			    struct wally_psbt *psbt STEALS);
+			    struct wally_psbt *psbt STEALS,
+			    enum side closer,
+			    enum state_change reason);
 
 void delete_channel(struct channel *channel STEALS);
 
@@ -222,7 +235,10 @@ void channel_fail_reconnect_later(struct channel *channel,
 				  const char *fmt,...) PRINTF_FMT(2,3);
 
 /* Channel has failed, give up on it. */
-void channel_fail_permanent(struct channel *channel, const char *fmt, ...);
+void channel_fail_permanent(struct channel *channel,
+			    enum state_change reason,
+			    const char *fmt,
+			    ...);
 /* Forget the channel. This is only used for the case when we "receive" error
  * during CHANNELD_AWAITING_LOCKIN if we are "fundee". */
 void channel_fail_forget(struct channel *channel, const char *fmt, ...);
@@ -231,7 +247,11 @@ void channel_internal_error(struct channel *channel, const char *fmt, ...);
 
 void channel_set_state(struct channel *channel,
 		       enum channel_state old_state,
-		       enum channel_state state);
+		       enum channel_state state,
+		       enum state_change reason,
+		       char *why);
+
+const char *channel_change_state_reason_str(enum state_change reason);
 
 /* Find a channel which is not onchain, if any */
 struct channel *peer_active_channel(struct peer *peer);
@@ -248,6 +268,8 @@ struct channel *channel_by_dbid(struct lightningd *ld, const u64 dbid);
 
 struct channel *active_channel_by_scid(struct lightningd *ld,
 				       const struct short_channel_id *scid);
+struct channel *any_channel_by_scid(struct lightningd *ld,
+				    const struct short_channel_id *scid);
 
 /* Get channel by channel_id, optionally returning uncommitted_channel. */
 struct channel *channel_by_cid(struct lightningd *ld,
