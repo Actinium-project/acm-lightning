@@ -230,7 +230,8 @@ static bool get_node_announcement_by_id(const tal_t *ctx,
  * message, and puts the announcemnt on an internal 'pending'
  * queue.  We'll send a request to lightningd to look it up, and continue
  * processing in `handle_txout_reply`. */
-static const u8 *handle_channel_announcement_msg(struct peer *peer,
+static const u8 *handle_channel_announcement_msg(struct daemon *daemon,
+						 struct peer *peer,
 						 const u8 *msg)
 {
 	const struct short_channel_id *scid;
@@ -239,20 +240,20 @@ static const u8 *handle_channel_announcement_msg(struct peer *peer,
 	/* If it's OK, tells us the short_channel_id to lookup; it notes
 	 * if this is the unknown channel the peer was looking for (in
 	 * which case, it frees and NULLs that ptr) */
-	err = handle_channel_announcement(peer->daemon->rstate, msg,
-					  peer->daemon->current_blockheight,
+	err = handle_channel_announcement(daemon->rstate, msg,
+					  daemon->current_blockheight,
 					  &scid, peer);
 	if (err)
 		return err;
 	else if (scid) {
 		/* We give them some grace period, in case we don't know about
 		 * block yet. */
-		if (peer->daemon->current_blockheight == 0
+		if (daemon->current_blockheight == 0
 		    || !is_scid_depth_announceable(scid,
-						   peer->daemon->current_blockheight)) {
-			tal_arr_expand(&peer->daemon->deferred_txouts, *scid);
+						   daemon->current_blockheight)) {
+			tal_arr_expand(&daemon->deferred_txouts, *scid);
 		} else {
-			daemon_conn_send(peer->daemon->master,
+			daemon_conn_send(daemon->master,
 					 take(towire_gossipd_get_txout(NULL,
 								      scid)));
 		}
@@ -268,7 +269,7 @@ static u8 *handle_channel_update_msg(struct peer *peer, const u8 *msg)
 
 	unknown_scid.u64 = 0;
 	err = handle_channel_update(peer->daemon->rstate, msg, peer,
-				    &unknown_scid);
+				    &unknown_scid, false);
 	if (err) {
 		if (unknown_scid.u64 != 0)
 			query_unknown_channel(peer->daemon, peer, &unknown_scid);
@@ -420,7 +421,7 @@ static bool handle_local_channel_announcement(struct daemon *daemon,
 		return false;
 	}
 
-	err = handle_channel_announcement_msg(peer, cannouncement);
+	err = handle_channel_announcement_msg(daemon, peer, cannouncement);
 	if (err) {
 		status_broken("peer %s invalid local_channel_announcement %s (%s)",
 			      type_to_string(tmpctx, struct node_id, &peer->id),
@@ -705,7 +706,7 @@ static struct io_plan *peer_msg_in(struct io_conn *conn,
 	/* These are messages relayed from peer */
 	switch ((enum peer_wire)fromwire_peektype(msg)) {
 	case WIRE_CHANNEL_ANNOUNCEMENT:
-		err = handle_channel_announcement_msg(peer, msg);
+		err = handle_channel_announcement_msg(peer->daemon, peer, msg);
 		goto handled_relay;
 	case WIRE_CHANNEL_UPDATE:
 		err = handle_channel_update_msg(peer, msg);
@@ -1723,89 +1724,50 @@ static struct io_plan *handle_txout_reply(struct io_conn *conn,
 	return daemon_conn_read_next(conn, daemon->master);
 }
 
-/* Fix up the channel_update to include the type if it doesn't currently have
- * one. See ElementsProject/lightning#1730 and lightningnetwork/lnd#1599 for the
- * in-depth discussion on why we break message parsing here... */
-static u8 *patch_channel_update(const tal_t *ctx, u8 *channel_update TAKES)
+/*~ lightningd tells us when about a gossip message directly, when told to by
+ * the addgossip RPC call.  That's usually used when a plugin gets an update
+ * returned in an payment error. */
+static struct io_plan *inject_gossip(struct io_conn *conn,
+				     struct daemon *daemon,
+				     const u8 *msg)
 {
-	u8 *fixed;
-	if (channel_update != NULL &&
-	    fromwire_peektype(channel_update) != WIRE_CHANNEL_UPDATE) {
-		/* This should be a channel_update, prefix with the
-		 * WIRE_CHANNEL_UPDATE type, but isn't. Let's prefix it. */
-		fixed = tal_arr(ctx, u8, 0);
-		towire_u16(&fixed, WIRE_CHANNEL_UPDATE);
-		towire(&fixed, channel_update, tal_bytelen(channel_update));
-		if (taken(channel_update))
-			tal_free(channel_update);
-		return fixed;
-	} else {
-		return tal_dup_talarr(ctx, u8, channel_update);
-	}
-}
+	u8 *goss;
+	const u8 *errmsg;
+	const char *err;
 
-/* Return NULL if the wrapped onion error message has no channel_update field,
- * or return the embedded channel_update message otherwise. */
-static u8 *channel_update_from_onion_error(const tal_t *ctx,
-					   const u8 *onion_message)
-{
-	u8 *channel_update = NULL;
-	struct amount_msat unused_msat;
-	u32 unused32;
+	if (!fromwire_gossipd_addgossip(msg, msg, &goss))
+		master_badmsg(WIRE_GOSSIPD_ADDGOSSIP, msg);
 
-	/* Identify failcodes that have some channel_update.
-	 *
-	 * TODO > BOLT 1.0: Add new failcodes when updating to a
-	 * new BOLT version. */
-	if (!fromwire_temporary_channel_failure(ctx,
-						onion_message,
-						&channel_update) &&
-	    !fromwire_amount_below_minimum(ctx,
-					   onion_message, &unused_msat,
-					   &channel_update) &&
-	    !fromwire_fee_insufficient(ctx,
-		    		       onion_message, &unused_msat,
-				       &channel_update) &&
-	    !fromwire_incorrect_cltv_expiry(ctx,
-		    			    onion_message, &unused32,
-					    &channel_update) &&
-	    !fromwire_expiry_too_soon(ctx,
-		    		      onion_message,
-				      &channel_update))
-		/* No channel update. */
-		return NULL;
-
-	return patch_channel_update(ctx, take(channel_update));
-}
-
-/*~ lightningd tells us when a payment has failed; we mark the channel (or
- * node) unusable here if it's a permanent failure, and unpack any
- * channel_update contained in the error. */
-static struct io_plan *handle_payment_failure(struct io_conn *conn,
-					      struct daemon *daemon,
-					      const u8 *msg)
-{
-	u8 *error;
-	u8 *channel_update;
-
-	if (!fromwire_gossipd_payment_failure(msg, msg, &error))
-		master_badmsg(WIRE_GOSSIPD_PAYMENT_FAILURE, msg);
-
-	channel_update = channel_update_from_onion_error(tmpctx, error);
-	if (channel_update) {
-		status_debug("Extracted channel_update %s from onionreply %s",
-			     tal_hex(tmpctx, channel_update),
-			     tal_hex(tmpctx, error));
-		u8 *err = handle_channel_update(daemon->rstate, channel_update,
-						NULL, NULL);
-		if (err) {
-			status_info("extracted bad channel_update %s from onionreply %s",
-				    sanitize_error(err, err, NULL),
-				    error);
-			tal_free(err);
-		}
+	switch (fromwire_peektype(goss)) {
+	case WIRE_CHANNEL_ANNOUNCEMENT:
+		errmsg = handle_channel_announcement_msg(daemon, NULL, goss);
+		break;
+	case WIRE_NODE_ANNOUNCEMENT:
+		errmsg = handle_node_announcement(daemon->rstate, goss,
+						  NULL, NULL);
+		break;
+	case WIRE_CHANNEL_UPDATE:
+		errmsg = handle_channel_update(daemon->rstate, goss,
+					       NULL, NULL, true);
+		break;
+	default:
+		err = tal_fmt(tmpctx, "unknown gossip type %i",
+			      fromwire_peektype(goss));
+		goto err_extracted;
 	}
 
+	/* The APIs above are designed to send error messages back to peers:
+	 * we extract the raw string instead. */
+	if (errmsg) {
+		err = sanitize_error(tmpctx, errmsg, NULL);
+		tal_free(errmsg);
+	} else
+		/* Send empty string if no error. */
+		err = "";
+
+err_extracted:
+	daemon_conn_send(daemon->master,
+			 take(towire_gossipd_addgossip_reply(NULL, err)));
 	return daemon_conn_read_next(conn, daemon->master);
 }
 
@@ -1890,9 +1852,6 @@ static struct io_plan *recv_req(struct io_conn *conn,
 	case WIRE_GOSSIPD_GET_TXOUT_REPLY:
 		return handle_txout_reply(conn, daemon, msg);
 
-	case WIRE_GOSSIPD_PAYMENT_FAILURE:
-		return handle_payment_failure(conn, daemon, msg);
-
 	case WIRE_GOSSIPD_OUTPOINT_SPENT:
 		return handle_outpoint_spent(conn, daemon, msg);
 
@@ -1907,6 +1866,9 @@ static struct io_plan *recv_req(struct io_conn *conn,
 
 	case WIRE_GOSSIPD_NEW_BLOCKHEIGHT:
 		return new_blockheight(conn, daemon, msg);
+
+	case WIRE_GOSSIPD_ADDGOSSIP:
+		return inject_gossip(conn, daemon, msg);
 
 #if DEVELOPER
 	case WIRE_GOSSIPD_DEV_SET_MAX_SCIDS_ENCODE_SIZE:
@@ -1942,6 +1904,7 @@ static struct io_plan *recv_req(struct io_conn *conn,
 	case WIRE_GOSSIPD_DEV_COMPACT_STORE_REPLY:
 	case WIRE_GOSSIPD_GOT_ONIONMSG_TO_US:
 	case WIRE_GOSSIPD_GOT_ONIONMSG_FORWARD:
+	case WIRE_GOSSIPD_ADDGOSSIP_REPLY:
 		break;
 	}
 
