@@ -375,7 +375,7 @@ void channel_errmsg(struct channel *channel,
 		    struct per_peer_state *pps,
 		    const struct channel_id *channel_id UNUSED,
 		    const char *desc,
-		    bool soft_error,
+		    bool warning,
 		    const u8 *err_for_them)
 {
 	notify_disconnect(channel->peer->ld, &channel->peer->id);
@@ -388,14 +388,15 @@ void channel_errmsg(struct channel *channel,
 	}
 
 	/* Do we have an error to send? */
-	if (err_for_them && !channel->error)
+	if (err_for_them && !channel->error && !warning)
 		channel->error = tal_dup_talarr(channel, u8, err_for_them);
 
 	/* Other implementations chose to ignore errors early on.  Not
 	 * surprisingly, they now spew out spurious errors frequently,
-	 * and we would close the channel on them. */
-	if (soft_error) {
-		channel_fail_reconnect_later(channel, "%s: (ignoring) %s",
+	 * and we would close the channel on them.  We now support warnings
+	 * for this case. */
+	if (warning) {
+		channel_fail_reconnect_later(channel, "%s WARNING: %s",
 					     channel->owner->name, desc);
 		return;
 	}
@@ -1082,9 +1083,9 @@ peer_connected_hook_deserialize(struct peer_connected_hook_payload *payload,
 	if (json_tok_streq(buffer, t_res, "disconnect")) {
 		payload->error = (u8*)"";
 		if (t_err) {
-			payload->error = towire_errorfmt(tmpctx, NULL, "%.*s",
-						         t_err->end - t_err->start,
-						         buffer + t_err->start);
+			payload->error = towire_warningfmt(tmpctx, NULL, "%.*s",
+							   t_err->end - t_err->start,
+							   buffer + t_err->start);
 		}
 		log_debug(ld->log, "peer_connected hook rejects and says '%s'",
 			  payload->error);
@@ -2237,7 +2238,8 @@ static void process_dev_forget_channel(struct bitcoind *bitcoind UNUSED,
 	json_add_txid(response, "funding_txid", &forget->channel->funding_txid);
 
 	/* Set error so we don't try to reconnect. */
-	forget->channel->error = towire_errorfmt(forget->channel, NULL,
+	forget->channel->error = towire_errorfmt(forget->channel,
+						 &forget->channel->cid,
 						 "dev_forget_channel");
 	delete_channel(forget->channel);
 

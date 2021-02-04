@@ -319,7 +319,7 @@ static u8 *handle_ping(struct peer *peer, const u8 *ping)
 	/* This checks the ping packet and makes a pong reply if needed; peer
 	 * can specify it doesn't want a response, to simulate traffic. */
 	if (!check_ping_make_pong(NULL, ping, &pong))
-		return towire_errorfmt(peer, NULL, "Bad ping");
+		return towire_warningfmt(peer, NULL, "Bad ping");
 
 	if (pong)
 		queue_peer_msg(peer, take(pong));
@@ -333,7 +333,7 @@ static const u8 *handle_pong(struct peer *peer, const u8 *pong)
 	const char *err = got_pong(pong, &peer->num_pings_outstanding);
 
 	if (err)
-		return towire_errorfmt(peer, NULL, "%s", err);
+		return towire_warningfmt(peer, NULL, "%s", err);
 
 	daemon_conn_send(peer->daemon->master,
 			 take(towire_gossipd_ping_reply(NULL, &peer->id, true,
@@ -454,7 +454,7 @@ static u8 *handle_onion_message(struct peer *peer, const u8 *msg)
 
 	/* FIXME: ratelimit! */
 	if (!fromwire_onion_message(msg, msg, &onion, tlvs))
-		return towire_errorfmt(peer, NULL, "Bad onion_message");
+		return towire_warningfmt(peer, NULL, "Bad onion_message");
 
 	/* We unwrap the onion now. */
 	op = parse_onionpacket(tmpctx, onion, tal_bytelen(onion), &badreason);
@@ -737,6 +737,7 @@ static struct io_plan *peer_msg_in(struct io_conn *conn,
 		goto handled_relay;
 
 	/* These are non-gossip messages (!is_msg_for_gossipd()) */
+	case WIRE_WARNING:
 	case WIRE_INIT:
 	case WIRE_ERROR:
 	case WIRE_OPEN_CHANNEL:

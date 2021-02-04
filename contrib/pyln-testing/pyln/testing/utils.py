@@ -84,13 +84,14 @@ TIMEOUT = int(env("TIMEOUT", 180 if SLOW_MACHINE else 60))
 def wait_for(success, timeout=TIMEOUT):
     start_time = time.time()
     interval = 0.25
-    while not success() and time.time() < start_time + timeout:
-        time.sleep(interval)
+    while not success():
+        time_left = start_time + timeout - time.time()
+        if time_left <= 0:
+            raise ValueError("Timeout while waiting for {}", success)
+        time.sleep(min(interval, time_left))
         interval *= 2
         if interval > 5:
             interval = 5
-    if time.time() > start_time + timeout:
-        raise ValueError("Error waiting for {}", success)
 
 
 def write_config(filename, opts, regtest_opts=None, section_name='regtest'):
@@ -618,8 +619,11 @@ class PrettyPrintingLightningRpc(LightningRpc):
 
 class LightningNode(object):
     def __init__(self, node_id, lightning_dir, bitcoind, executor, valgrind, may_fail=False,
-                 may_reconnect=False, allow_broken_log=False,
-                 allow_bad_gossip=False, db=None, port=None, disconnect=None, random_hsm=None, options=None,
+                 may_reconnect=False,
+                 allow_broken_log=False,
+                 allow_warning=False,
+                 allow_bad_gossip=False,
+                 db=None, port=None, disconnect=None, random_hsm=None, options=None,
                  **kwargs):
         self.bitcoin = bitcoind
         self.executor = executor
@@ -627,6 +631,7 @@ class LightningNode(object):
         self.may_reconnect = may_reconnect
         self.allow_broken_log = allow_broken_log
         self.allow_bad_gossip = allow_bad_gossip
+        self.allow_warning = allow_warning
         self.db = db
 
         # Assume successful exit
@@ -942,11 +947,14 @@ class LightningNode(object):
             raise ValueError("Error waiting for a route to destination {}".format(destination))
 
     # This helper waits for all HTLCs to settle
-    def wait_for_htlcs(self):
+    # `scids` can be a list of strings. If unset wait on all channels.
+    def wait_for_htlcs(self, scids=None):
         peers = self.rpc.listpeers()['peers']
         for p, peer in enumerate(peers):
             if 'channels' in peer:
                 for c, channel in enumerate(peer['channels']):
+                    if scids is not None and channel['short_channel_id'] not in scids:
+                        continue
                     if 'htlcs' in channel:
                         wait_for(lambda: len(self.rpc.listpeers()['peers'][p]['channels'][c]['htlcs']) == 0)
 
@@ -1203,6 +1211,7 @@ class NodeFactory(object):
             'disconnect',
             'may_fail',
             'allow_broken_log',
+            'allow_warning',
             'may_reconnect',
             'random_hsm',
             'feerates',

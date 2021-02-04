@@ -1,3 +1,4 @@
+#include <assert.h>
 #include <ccan/breakpoint/breakpoint.h>
 #include <ccan/tal/str/str.h>
 #include <common/crypto_sync.h>
@@ -24,45 +25,71 @@ peer_fatal_continue(const u8 *msg TAKES, const struct per_peer_state *pps)
 }
 
 /* We only support one channel per peer anyway */
-void peer_failed(struct per_peer_state *pps,
-		 const struct channel_id *channel_id,
-		 const char *fmt, ...)
+static void NORETURN
+peer_failed(struct per_peer_state *pps,
+	    bool warn,
+	    const struct channel_id *channel_id,
+	    const char *desc)
 {
-	va_list ap;
-	const char *desc;
-	u8 *msg, *err;
+	u8 *msg;
 
- 	va_start(ap, fmt);
-	desc = tal_vfmt(NULL, fmt, ap);
-	va_end(ap);
-
-	/* Tell peer the error. */
-	err = towire_errorfmt(desc, channel_id, "%s", desc);
-	sync_crypto_write(pps, err);
+	if (warn) {
+		msg = towire_warningfmt(desc, channel_id, "%s", desc);
+	} else {
+		msg = towire_errorfmt(desc, channel_id, "%s", desc);
+	}
+	sync_crypto_write(pps, msg);
 
 	/* Tell master the error so it can re-xmit. */
 	msg = towire_status_peer_error(NULL, channel_id,
-				       desc, false, pps,
-				       err);
+				       desc,
+				       warn,
+				       pps,
+				       msg);
 	peer_billboard(true, desc);
-	tal_free(desc);
 	peer_fatal_continue(take(msg), pps);
 }
 
-/* We're failing because peer sent us an error message */
+void peer_failed_warn(struct per_peer_state *pps,
+		      const struct channel_id *channel_id,
+		      const char *fmt, ...)
+{
+	va_list ap;
+	const char *desc;
+
+ 	va_start(ap, fmt);
+	desc = tal_vfmt(tmpctx, fmt, ap);
+	va_end(ap);
+
+	peer_failed(pps, true, channel_id, desc);
+}
+
+void peer_failed_err(struct per_peer_state *pps,
+		     const struct channel_id *channel_id,
+		     const char *fmt, ...)
+{
+	va_list ap;
+	const char *desc;
+
+	assert(channel_id);
+ 	va_start(ap, fmt);
+	desc = tal_vfmt(tmpctx, fmt, ap);
+	va_end(ap);
+
+	peer_failed(pps, false, channel_id, desc);
+}
+
+/* We're failing because peer sent us an error/warning message */
 void peer_failed_received_errmsg(struct per_peer_state *pps,
 				 const char *desc,
 				 const struct channel_id *channel_id,
-				 bool soft_error)
+				 bool warning)
 {
-	static const struct channel_id all_channels;
 	u8 *msg;
 
-	if (!channel_id)
-		channel_id = &all_channels;
-	msg = towire_status_peer_error(NULL, channel_id, desc, soft_error, pps,
+	msg = towire_status_peer_error(NULL, channel_id, desc, warning, pps,
 				       NULL);
-	peer_billboard(true, "Received error from peer: %s", desc);
+	peer_billboard(true, "Received %s", desc);
 	peer_fatal_continue(take(msg), pps);
 }
 
