@@ -4132,3 +4132,15 @@ def test_sendinvoice(node_factory, bitcoind):
 
     l1.rpc.call('sendinvoice', {'offer': refund,
                                 'label': 'test sendinvoice refund'})
+
+
+def test_self_pay(node_factory):
+    """Repro test for issue 4345: pay ourselves via the pay plugin.
+
+    """
+    l1, l2 = node_factory.line_graph(2, wait_for_announce=True)
+
+    inv = l1.rpc.invoice(10000, 'test', 'test')['bolt11']
+
+    with pytest.raises(RpcError):
+        l1.rpc.pay(inv)
