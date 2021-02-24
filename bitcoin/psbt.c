@@ -62,6 +62,16 @@ struct wally_psbt *create_psbt(const tal_t *ctx, size_t num_inputs, size_t num_o
 	return psbt;
 }
 
+struct wally_psbt *clone_psbt(const tal_t *ctx, struct wally_psbt *psbt)
+{
+	struct wally_psbt *clone;
+	tal_wally_start();
+	if (wally_psbt_clone_alloc(psbt, 0, &clone) != WALLY_OK)
+		abort();
+	tal_wally_end(tal_steal(ctx, clone));
+	return clone;
+}
+
 struct wally_psbt *new_psbt(const tal_t *ctx, const struct wally_tx *wtx)
 {
 	struct wally_psbt *psbt;
@@ -809,4 +819,31 @@ void psbt_txid(const tal_t *ctx,
 		*wtx = tx;
 	else
 		wally_tx_free(tx);
+}
+
+struct amount_sat psbt_compute_fee(struct wally_psbt *psbt)
+{
+	struct amount_sat fee, input_amt;
+	struct amount_asset asset;
+	bool ok;
+
+	fee = AMOUNT_SAT(0);
+	for (size_t i = 0; i < psbt->num_inputs; i++) {
+		input_amt = psbt_input_get_amount(psbt, i);
+		ok = amount_sat_add(&fee, fee, input_amt);
+		assert(ok);
+	}
+
+	for (size_t i = 0; i < psbt->num_outputs; i++) {
+		asset = wally_tx_output_get_amount(&psbt->tx->outputs[i]);
+		if (!amount_asset_is_main(&asset)
+		    || elements_wtx_output_is_fee(psbt->tx, i))
+			continue;
+
+		ok = amount_sat_sub(&fee, fee, amount_asset_to_sat(&asset));
+		if (!ok)
+			return AMOUNT_SAT(0);
+	}
+
+	return fee;
 }

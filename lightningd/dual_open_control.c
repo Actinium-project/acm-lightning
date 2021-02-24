@@ -479,7 +479,8 @@ openchannel2_hook_deserialize(struct openchannel2_payload *payload,
 	} else if (!json_tok_streq(buffer, t_result, "continue"))
 		fatal("Plugin returned an invalid response to the"
 		      " openchannel2 hook: %.*s",
-		      toks[0].end - toks[0].start, buffer + toks[0].start);
+		      json_tok_full_len(toks),
+		      json_tok_full(buffer, toks));
 
 	if (!hook_extract_psbt(payload, dualopend, buffer, toks,
 			       "openchannel2", true, &payload->psbt))
@@ -524,6 +525,9 @@ openchannel2_hook_deserialize(struct openchannel2_payload *payload,
 	if (!payload->psbt &&
 		!amount_sat_eq(payload->accepter_funding, AMOUNT_SAT(0))) {
 		/* Gotta give a PSBT if you set the accepter_funding amount */
+		/* Let dualopend know we've failed */
+		payload->err_msg = "Client error. Unable to continue";
+		openchannel2_hook_cb(payload);
 		return false;
 	}
 

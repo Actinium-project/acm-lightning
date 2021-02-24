@@ -962,11 +962,17 @@ def test_v2_open(node_factory, bitcoind, chainparams):
     # Wait for it to arrive.
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) > 0)
 
-    l1.rpc.fundchannel(l2.info['id'], 100000)
+    l1.rpc.fundchannel(l2.info['id'], 'all')
 
     bitcoind.generate_block(1)
     sync_blockheight(bitcoind, [l1])
     l1.daemon.wait_for_log(' to CHANNELD_NORMAL')
+
+    # Send a payment over the channel
+    p = l2.rpc.invoice(100000, 'testpayment', 'desc')
+    l1.rpc.pay(p['bolt11'])
+    result = l1.rpc.waitsendpay(p['payment_hash'])
+    assert(result['status'] == 'complete')
 
 
 def test_funding_push(node_factory, bitcoind, chainparams):
@@ -2299,12 +2305,20 @@ def test_no_fee_estimate(node_factory, bitcoind, executor):
     # Can't use feerate names, either.
     with pytest.raises(RpcError, match=r'Cannot estimate fees'):
         l1.rpc.withdraw(l2.rpc.newaddr()['bech32'], 'all', 'urgent')
+
+    with pytest.raises(RpcError, match=r'Cannot estimate fees'):
         l1.rpc.withdraw(l2.rpc.newaddr()['bech32'], 'all', 'normal')
+
+    with pytest.raises(RpcError, match=r'Cannot estimate fees'):
         l1.rpc.withdraw(l2.rpc.newaddr()['bech32'], 'all', 'slow')
 
     with pytest.raises(RpcError, match=r'Cannot estimate fees'):
         l1.rpc.fundchannel(l2.info['id'], 10**6, 'urgent')
+
+    with pytest.raises(RpcError, match=r'Cannot estimate fees'):
         l1.rpc.fundchannel(l2.info['id'], 10**6, 'normal')
+
+    with pytest.raises(RpcError, match=r'Cannot estimate fees'):
         l1.rpc.fundchannel(l2.info['id'], 10**6, 'slow')
 
     # Can with manual feerate.
@@ -2350,6 +2364,7 @@ def test_no_fee_estimate(node_factory, bitcoind, executor):
 
     # Can now fund a channel (as a test, use slow feerate).
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    sync_blockheight(bitcoind, [l1])
     l1.rpc.fundchannel(l2.info['id'], 10**6, 'slow')
 
     # Can withdraw (use urgent feerate). `minconf` may be needed depending on
