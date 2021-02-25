@@ -1314,7 +1314,8 @@ static void handle_peer_commit_sig(struct peer *peer, const u8 *msg)
 	 *
 	 * A receiving node:
 	 *  - once all pending updates are applied:
-	 *    - if `signature` is not valid for its local commitment transaction:
+	 *    - if `signature` is not valid for its local commitment transaction
+	 *      OR non-compliant with LOW-S-standard rule...:
 	 *      - MUST fail the channel.
 	 */
 	if (!check_tx_sig(txs[0], 0, NULL, funding_wscript,
@@ -1349,7 +1350,7 @@ static void handle_peer_commit_sig(struct peer *peer, const u8 *msg)
 	/* BOLT #2:
 	 *
 	 *   - if any `htlc_signature` is not valid for the corresponding HTLC
-	 *     transaction:
+	 *     transaction OR non-compliant with LOW-S-standard rule...:
 	 *     - MUST fail the channel.
 	 */
 	for (i = 0; i < tal_count(htlc_sigs); i++) {
@@ -2408,6 +2409,10 @@ static void peer_reconnect(struct peer *peer,
 	 *    number of the last `revoke_and_ack` the receiving node sent, AND
 	 *    the receiving node hasn't already received a `closing_signed`:
 	 *    - MUST re-send the `revoke_and_ack`.
+	 *    - if it has previously sent a `commitment_signed` that needs to be
+	 *      retransmitted:
+	 *      - MUST retransmit `revoke_and_ack` and `commitment_signed` in the
+	 *        same relative order as initially transmitted.
 	 *  - otherwise:
 	 *    - if `next_revocation_number` is not equal to 1 greater
 	 *      than the commitment number of the last `revoke_and_ack` the
@@ -2503,8 +2508,12 @@ static void peer_reconnect(struct peer *peer,
 					      ? NULL
 					      : &remote_current_per_commitment_point);
 
-	/* We have to re-send in the same order we sent originally:
-	 * revoke_and_ack (usually) alters our next commitment. */
+	/* BOLT #2:
+ 	 * - if it has previously sent a `commitment_signed` that needs to be
+	 *   retransmitted:
+	 *   - MUST retransmit `revoke_and_ack` and `commitment_signed` in the
+	 *     same relative order as initially transmitted.
+	 */
 	if (retransmit_revoke_and_ack && !peer->last_was_revoke)
 		resend_revoke(peer);
 

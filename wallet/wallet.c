@@ -1954,7 +1954,8 @@ void wallet_htlc_save_out(struct wallet *wallet,
 		" payment_key,"
 		" hstate,"
 		" routing_onion,"
-		" partid) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"));
+		" malformed_onion,"
+		" partid) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?);"));
 
 	db_bind_u64(stmt, 0, chan->dbid);
 	db_bind_u64(stmt, 1, out->key.id);
@@ -4233,6 +4234,13 @@ void wallet_offer_mark_used(struct db *db, const struct sha256 *offer_id)
 		      type_to_string(tmpctx, struct sha256, offer_id),
 		      status);
 
-	if (status == OFFER_SINGLE_USE)
-		offer_status_update(db, offer_id, status, OFFER_USED);
+	if (!offer_status_used(status)) {
+		enum offer_status newstatus;
+
+		if (offer_status_single(status))
+			newstatus = OFFER_SINGLE_USE_USED;
+		else
+			newstatus = OFFER_MULTIPLE_USE_USED;
+		offer_status_update(db, offer_id, status, newstatus);
+	}
 }

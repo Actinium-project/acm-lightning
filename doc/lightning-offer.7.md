@@ -89,15 +89,7 @@ invoices will be expired (i.e. only one person can pay this offer).
 RETURN VALUE
 ------------
 
-On success, an object as follows is returned:
-
-* *offer_id*: the hash of the offer.
-* *active*: true
-* *single_use*: true if *single_use* was specified.
-* *bolt12*: the bolt12 offer, starting with "lno1"
-
-Optionally:
-* *label*: the user-specified label.
+On success, an object as follows is returned as per lightning-listoffers(7).
 
 On failure, an error is returned and no offer is created. If the
 lightning process fails before responding, the caller should use
@@ -116,7 +108,7 @@ Rusty Russell <<rusty@rustcorp.com.au>> is mainly responsible.
 SEE ALSO
 --------
 
-lightning-offerout(7), lightning-listoffers(7), lightning-deloffer(7).
+lightning-offerout(7), lightning-listoffers(7), lightning-disableoffer(7).
 
 RESOURCES
 ---------

@@ -879,6 +879,12 @@ struct db_query db_postgres_queries[] = {
          .readonly = false,
     },
     {
+         .name = "UPDATE channel_htlcs SET malformed_onion = 0 WHERE malformed_onion IS NULL",
+         .query = "UPDATE channel_htlcs SET malformed_onion = 0 WHERE malformed_onion IS NULL",
+         .placeholders = 0,
+         .readonly = false,
+    },
+    {
          .name = "UPDATE vars SET intval = intval + 1 WHERE name = 'data_version' AND intval = ?",
          .query = "UPDATE vars SET intval = intval + 1 WHERE name = 'data_version' AND intval = $1",
          .placeholders = 1,
@@ -1383,8 +1389,8 @@ struct db_query db_postgres_queries[] = {
          .readonly = false,
     },
     {
-         .name = "INSERT INTO channel_htlcs ( channel_id, channel_htlc_id, direction, origin_htlc, msatoshi, cltv_expiry, payment_hash, payment_key, hstate, routing_onion, partid) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
-         .query = "INSERT INTO channel_htlcs ( channel_id, channel_htlc_id, direction, origin_htlc, msatoshi, cltv_expiry, payment_hash, payment_key, hstate, routing_onion, partid) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11);",
+         .name = "INSERT INTO channel_htlcs ( channel_id, channel_htlc_id, direction, origin_htlc, msatoshi, cltv_expiry, payment_hash, payment_key, hstate, routing_onion, malformed_onion, partid) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?);",
+         .query = "INSERT INTO channel_htlcs ( channel_id, channel_htlc_id, direction, origin_htlc, msatoshi, cltv_expiry, payment_hash, payment_key, hstate, routing_onion, malformed_onion, partid) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, $11);",
          .placeholders = 11,
          .readonly = false,
     },
@@ -1780,10 +1786,10 @@ struct db_query db_postgres_queries[] = {
     },
 };
 
-#define DB_POSTGRES_QUERY_COUNT 295
+#define DB_POSTGRES_QUERY_COUNT 296
 
 #endif /* HAVE_POSTGRES */
 
 #endif /* LIGHTNINGD_WALLET_GEN_DB_POSTGRES */
 
-// SHA256STAMP:cfcc8729b714d7182b2d3f99b83475d4c8b7f489527b1f7ec3c9e2734281315e
+// SHA256STAMP:d5554774287ded802c96fc975565e5557e5f7e174fea04ad7ec080400a15992b
