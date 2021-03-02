@@ -1438,7 +1438,8 @@ def test_ipv4_and_ipv6(node_factory):
     "FEERATE_FLOOR on testnets, and we test the new API."
 )
 def test_feerates(node_factory):
-    l1 = node_factory.get_node(options={'log-level': 'io'}, start=False)
+    l1 = node_factory.get_node(options={'log-level': 'io',
+                                        'dev-no-fake-fees': True}, start=False)
     l1.daemon.rpcproxy.mock_rpc('estimatesmartfee', {
         'error': {"errors": ["Insufficient data or no feerate found"], "blocks": 0}
     })
@@ -1894,6 +1895,7 @@ def test_list_features_only(node_factory):
                 ]
     if EXPERIMENTAL_FEATURES:
         expected += ['option_anchor_outputs/odd']
+        expected += ['option_shutdown_anysegwit/odd']
         expected += ['option_unknown_102/odd']
     assert features == expected
 
@@ -2283,10 +2285,10 @@ def test_sendcustommsg(node_factory):
     )
     l1.daemon.wait_for_log(r'\[IN\] {}'.format(serialized))
     l1.daemon.wait_for_logs([
-        r'Got custommessage_a {serialized} from peer {peer_id}'.format(
-            serialized=serialized, peer_id=l2.info['id']),
-        r'Got custommessage_b {serialized} from peer {peer_id}'.format(
-            serialized=serialized, peer_id=l2.info['id'])
+        r'Got custommessage_a {msg} from peer {peer_id}'.format(
+            msg=msg, peer_id=l2.info['id']),
+        r'Got custommessage_b {msg} from peer {peer_id}'.format(
+            msg=msg, peer_id=l2.info['id'])
     ])
 
     # This should work since the peer is currently owned by `openingd`
@@ -2298,10 +2300,10 @@ def test_sendcustommsg(node_factory):
     )
     l4.daemon.wait_for_log(r'\[IN\] {}'.format(serialized))
     l4.daemon.wait_for_logs([
-        r'Got custommessage_a {serialized} from peer {peer_id}'.format(
-            serialized=serialized, peer_id=l2.info['id']),
-        r'Got custommessage_b {serialized} from peer {peer_id}'.format(
-            serialized=serialized, peer_id=l2.info['id']),
+        r'Got custommessage_a {msg} from peer {peer_id}'.format(
+            msg=msg, peer_id=l2.info['id']),
+        r'Got custommessage_b {msg} from peer {peer_id}'.format(
+            msg=msg, peer_id=l2.info['id']),
     ])
 
 
