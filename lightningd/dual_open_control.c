@@ -4,7 +4,9 @@
 
 #include <bitcoin/psbt.h>
 #include <bitcoin/script.h>
+#include <ccan/ccan/mem/mem.h>
 #include <ccan/ccan/take/take.h>
+#include <ccan/ccan/tal/tal.h>
 #include <ccan/short_types/short_types.h>
 #include <common/amount.h>
 #include <common/channel_config.h>
@@ -44,10 +46,7 @@ static void handle_signed_psbt(struct lightningd *ld,
 			       struct commit_rcvd *rcvd)
 {
 	/* Now that we've got the signed PSBT, save it */
-	rcvd->channel->psbt =
-		tal_steal(rcvd->channel,
-			  cast_const(struct wally_psbt *, psbt));
-	wallet_channel_save(ld->wallet, rcvd->channel);
+	// FIXME: save psbt ?
 
 	channel_watch_funding(ld, rcvd->channel);
 
@@ -735,7 +734,6 @@ wallet_commit_channel(struct lightningd *ld,
 			      false, /* !remote_funding_locked */
                               false, /* !remote_tx_sigs */
 			      NULL, /* no scid yet */
-			      cid,
 			      /* The three arguments below are msatoshi_to_us,
 			       * msatoshi_to_us_min, and msatoshi_to_us_max.
 			       * Because, this is a newly-funded channel,
@@ -766,7 +764,6 @@ wallet_commit_channel(struct lightningd *ld,
 			      remote_upfront_shutdown_script,
 			      option_static_remotekey,
 			      option_anchor_outputs,
-			      NULL,
 			      NUM_SIDES, /* closer not yet known */
 			      opener == LOCAL ? REASON_USER : REASON_REMOTE);
 
@@ -1122,8 +1119,7 @@ static void opener_commit_received(struct subd *dualopend,
 		json_add_hex_talarr(response, "close_to",
 				    uc->fc->our_upfront_shutdown_script);
 	/* Now that we've got the final PSBT, save it */
-	channel->psbt = tal_steal(channel, psbt);
-	wallet_channel_save(uc->fc->cmd->ld->wallet, channel);
+	// FIXME: update channel->psbt
 
 	was_pending(command_success(uc->fc->cmd, response));
 
@@ -1288,6 +1284,8 @@ static void handle_peer_tx_sigs_sent(struct subd *dualopend,
 {
 	struct channel *channel = dualopend->channel;
 	const struct wally_tx *wtx;
+	/* FIXME: psbt? */
+	struct wally_psbt *psbt = NULL;
 
 	if (!fromwire_dualopend_tx_sigs_sent(msg)) {
 		channel_internal_error(channel,
@@ -1296,15 +1294,15 @@ static void handle_peer_tx_sigs_sent(struct subd *dualopend,
 		return;
 	}
 
-	if (psbt_finalize(cast_const(struct wally_psbt *, channel->psbt))) {
-		wtx = psbt_final_tx(NULL, channel->psbt);
+	if (psbt_finalize(cast_const(struct wally_psbt *, psbt))) {
+		wtx = psbt_final_tx(NULL, psbt);
 		if (!wtx) {
 			channel_internal_error(channel,
 					       "Unable to extract final tx"
 					       " from PSBT %s",
 					       type_to_string(tmpctx,
 							      struct wally_psbt,
-							      channel->psbt));
+							      psbt));
 			return;
 		}
 
@@ -1392,6 +1390,7 @@ cleanup:
 
 void dualopen_tell_depth(struct subd *dualopend,
 			 struct channel *channel,
+			 const struct bitcoin_txid *txid,
 			 u32 depth)
 {
 	const u8 *msg;
@@ -1405,6 +1404,35 @@ void dualopen_tell_depth(struct subd *dualopend,
 	/* Are we there yet? */
 	if (to_go == 0) {
 		assert(channel->scid);
+
+		/* Update the channel's info to the correct tx, if we need to */
+		if (!bitcoin_txid_eq(&channel->funding_txid, txid)) {
+			struct channel_inflight *inf;
+			inf = channel_inflight_find(channel, txid);
+			if (!inf) {
+				channel_internal_error(channel,
+					"Txid %s for channel"
+					" not found in available inflights."
+					"  (peer %s)",
+					type_to_string(tmpctx,
+						       struct bitcoin_txid,
+						       txid),
+					type_to_string(tmpctx,
+						       struct node_id,
+						       &channel->peer->id));
+				return;
+			}
+
+			channel->funding_txid = inf->funding->txid;
+			channel->funding_outnum = inf->funding->outnum;
+			channel->funding = inf->funding->total_funds;
+			channel->our_funds = inf->funding->our_funds;
+			channel->last_tx = tal_steal(channel, inf->last_tx);
+			channel->last_sig = inf->last_sig;
+
+			wallet_channel_save(dualopend->ld->wallet, channel);
+			/* FIXME: delete inflights */
+		}
 		msg = towire_dualopend_depth_reached(NULL, depth);
 		subd_send_msg(dualopend, take(msg));
 	} else
@@ -1509,6 +1537,7 @@ static void handle_peer_tx_sigs_msg(struct subd *dualopend,
 	const struct wally_tx *wtx;
 	struct lightningd *ld = dualopend->ld;
 	struct channel *channel = dualopend->channel;
+	struct wally_psbt *chan_psbt = NULL;
 
 	if (!fromwire_dualopend_funding_sigs(tmpctx, msg, &psbt)) {
 		channel_internal_error(channel,
@@ -1520,31 +1549,31 @@ static void handle_peer_tx_sigs_msg(struct subd *dualopend,
 	/* Save that we've gotten their sigs. Sometimes
 	 * the peer doesn't send any sigs (no inputs), otherwise
 	 * we could just check the PSBT was finalized */
-	channel->remote_tx_sigs = true;
+	// FIXME: inflight->remote_tx_sigs = true;
 	tal_wally_start();
-	if (wally_psbt_combine(channel->psbt, psbt) != WALLY_OK) {
+	if (wally_psbt_combine(chan_psbt, psbt) != WALLY_OK) {
 		channel_internal_error(channel,
 				       "Unable to combine PSBTs: %s, %s",
 				       type_to_string(tmpctx,
 						      struct wally_psbt,
-						      channel->psbt),
+						      chan_psbt),
 				       type_to_string(tmpctx,
 						      struct wally_psbt,
 						      psbt));
-		tal_wally_end(channel->psbt);
+		tal_wally_end(chan_psbt);
 		return;
 	}
-	tal_wally_end(channel->psbt);
+	tal_wally_end(chan_psbt);
 
-	if (psbt_finalize(cast_const(struct wally_psbt *, channel->psbt))) {
-		wtx = psbt_final_tx(NULL, channel->psbt);
+	if (psbt_finalize(cast_const(struct wally_psbt *, chan_psbt))) {
+		wtx = psbt_final_tx(NULL, chan_psbt);
 		if (!wtx) {
 			channel_internal_error(channel,
 					       "Unable to extract final tx"
 					       " from PSBT %s",
 					       type_to_string(tmpctx,
 							      struct wally_psbt,
-							      channel->psbt));
+							      chan_psbt));
 			return;
 		}
 		send_funding_tx(channel, take(wtx));
@@ -1568,8 +1597,101 @@ static void handle_peer_tx_sigs_msg(struct subd *dualopend,
 	wallet_channel_save(ld->wallet, channel);
 
 	/* Send notification with peer's signed PSBT */
-	notify_openchannel_peer_sigs(ld, &channel->cid,
-				     channel->psbt);
+	notify_openchannel_peer_sigs(ld, &channel->cid, chan_psbt);
+}
+
+static void handle_validate_rbf(struct subd *dualopend,
+				const u8 *msg)
+{
+	struct wally_psbt *candidate_psbt;
+	struct channel_inflight *inflight;
+	struct channel *channel = dualopend->channel;
+	bool *inputs_present;
+	struct amount_sat candidate_fee, last_fee;
+
+	if (!fromwire_dualopend_rbf_validate(tmpctx, msg,
+					     &candidate_psbt)) {
+		channel_internal_error(channel,
+				       "Malformed dualopend_rbf_validate %s",
+				       tal_hex(tmpctx, msg));
+		return;
+	}
+
+	inputs_present = tal_arr(tmpctx, bool, candidate_psbt->num_inputs);
+	memset(inputs_present, true, tal_bytelen(inputs_present));
+
+	/* Iterate through all previous inflights, confirm
+	 * that at least one input is in all proposed RBFs, including
+	 * this one. */
+	list_for_each(&channel->inflights, inflight, list) {
+		/* Remove every non-matching input from set */
+		for (size_t i = 0; i < candidate_psbt->num_inputs; i++) {
+			struct wally_tx_input *input =
+				&candidate_psbt->tx->inputs[i];
+			struct bitcoin_txid in_txid;
+
+			wally_tx_input_get_txid(input, &in_txid);
+
+			if (!psbt_has_input(inflight->funding_psbt,
+					    &in_txid, input->index))
+				inputs_present[i] = false;
+		}
+	}
+
+	/* Are there any inputs that were present on all txs? */
+	if (memeqzero(inputs_present, tal_bytelen(inputs_present))) {
+		char *errmsg;
+
+		inflight = list_tail(&channel->inflights,
+				     struct channel_inflight,
+				     list);
+		assert(inflight);
+
+		errmsg = tal_fmt(tmpctx, "No overlapping input"
+				 " present. New: %s, last: %s",
+				 type_to_string(tmpctx,
+						struct wally_psbt,
+						candidate_psbt),
+				 type_to_string(tmpctx,
+						struct wally_psbt,
+						inflight->funding_psbt));
+		msg = towire_dualopend_fail(NULL, errmsg);
+		goto send_msg;
+	}
+
+	candidate_fee = psbt_compute_fee(candidate_psbt);
+
+	inflight = list_tail(&channel->inflights,
+			     struct channel_inflight,
+			     list);
+	assert(inflight);
+	last_fee = psbt_compute_fee(inflight->funding_psbt);
+
+	/* BOLT-8edf819f1de3b110653f0b21594a04cfd03d5240 #2:
+	 *
+	 * The receiving node:
+	 * - if this is an RBF attempt:
+	 *  - MUST fail the RBF attempt if:
+	 *    - the completed transaction's total fees paid
+	 *      is less than the last successful funding transaction's fees.
+	 */
+	if (!amount_sat_greater(candidate_fee, last_fee)) {
+		char *errmsg = tal_fmt(tmpctx, "Proposed funding tx fee (%s)"
+				       " less than/equal to last (%s)",
+				       type_to_string(tmpctx,
+						      struct amount_sat,
+						      &candidate_fee),
+				       type_to_string(tmpctx,
+						      struct amount_sat,
+						      &last_fee));
+		msg = towire_dualopend_fail(NULL, errmsg);
+		goto send_msg;
+	}
+
+	msg = towire_dualopend_rbf_valid(NULL);
+
+send_msg:
+	subd_send_msg(channel->owner, take(msg));
 }
 
 
@@ -1580,7 +1702,6 @@ json_openchannel_signed(struct command *cmd,
 			 const jsmntok_t *params)
 {
 	struct wally_psbt *psbt;
-	struct uncommitted_channel *uc;
 	struct channel_id *cid;
 	struct channel *channel;
 	struct bitcoin_txid txid;
@@ -1591,22 +1712,19 @@ json_openchannel_signed(struct command *cmd,
 		   NULL))
 		return command_param_failed();
 
-	channel = channel_by_cid(cmd->ld, cid, &uc);
-	if (uc)
-		return command_fail(cmd, LIGHTNINGD,
-				    "Commitments for this channel not "
-				    "yet secured, see `openchannel_update`");
+	channel = channel_by_cid(cmd->ld, cid);
 	if (!channel)
 		return command_fail(cmd, FUNDING_UNKNOWN_CHANNEL,
 				    "Unknown channel");
-	if (channel->psbt && psbt_is_finalized(channel->psbt))
+	/* FIXME: use inflight? */
+	struct wally_psbt *chan_psbt = NULL;
+	if (chan_psbt && psbt_is_finalized(chan_psbt))
 		return command_fail(cmd, LIGHTNINGD,
 				    "Already have a finalized PSBT for "
 				    "this channel");
 	if (channel->openchannel_signed_cmd)
 		return command_fail(cmd, LIGHTNINGD,
-				    "Already sent sigs, waiting for"
-				    " peer's");
+				    "Already sent sigs, waiting for peer's");
 
 	/* Verify that the psbt's txid matches that of the
 	 * funding txid for this channel */
@@ -1631,24 +1749,23 @@ json_openchannel_signed(struct command *cmd,
 
 	/* Now that we've got the signed PSBT, save it */
 	tal_wally_start();
-	if (wally_psbt_combine(cast_const(struct wally_psbt *,
-					  channel->psbt),
+	if (wally_psbt_combine(cast_const(struct wally_psbt *, chan_psbt),
 			       psbt) != WALLY_OK) {
-		tal_wally_end(tal_free(channel->psbt));
+		tal_wally_end(tal_free(psbt));
 		return command_fail(cmd, FUNDING_PSBT_INVALID,
 				    "Failed adding sigs");
 	}
 
 	/* Make memleak happy, (otherwise cleaned up with `cmd`) */
 	tal_free(psbt);
-	tal_wally_end(tal_steal(channel, channel->psbt));
+	tal_wally_end(tal_steal(channel, chan_psbt));
 
 	wallet_channel_save(cmd->ld->wallet, channel);
 	channel_watch_funding(cmd->ld, channel);
 
 	/* Send our tx_sigs to the peer */
 	subd_send_msg(channel->owner,
-		      take(towire_dualopend_send_tx_sigs(NULL, channel->psbt)));
+		      take(towire_dualopend_send_tx_sigs(NULL, chan_psbt)));
 
 	channel->openchannel_signed_cmd = tal_steal(channel, cmd);
 	return command_still_pending(cmd);
@@ -1663,7 +1780,6 @@ static struct command_result *json_openchannel_update(struct command *cmd,
 	struct wally_psbt *psbt;
 	struct channel_id *cid;
 	struct channel *channel;
-	struct uncommitted_channel *uc;
 	u8 *msg;
 
 	if (!param(cmd, buffer, params,
@@ -1672,26 +1788,12 @@ static struct command_result *json_openchannel_update(struct command *cmd,
 		   NULL))
 		return command_param_failed();
 
-	/* We expect this to return NULL, as the channel hasn't been
-	 * created yet. Instead, the uncommitted channel is populated */
-	channel = channel_by_cid(cmd->ld, cid, &uc);
-	if (channel)
-		return command_fail(cmd, LIGHTNINGD, "Channel already %s",
-				    channel_state_name(channel));
-
-	if (!uc)
-		return command_fail(cmd, FUNDING_UNKNOWN_CHANNEL,
+	channel = channel_by_cid(cmd->ld, cid);
+	if (!channel)
+		return command_fail(cmd, LIGHTNINGD,
 				    "Unknown channel %s",
 				    type_to_string(tmpctx, struct channel_id,
 						   cid));
-
-	if (!uc->fc || !uc->fc->inflight)
-		return command_fail(cmd, LIGHTNINGD,
-				    "No channel funding in progress");
-
-	if (uc->fc->cmd)
-		return command_fail(cmd, LIGHTNINGD,
-				    "Channel funding in progress");
 
 	/* Add serials to PSBT */
 	psbt_add_serials(psbt, TX_INITIATOR);
@@ -1701,10 +1803,9 @@ static struct command_result *json_openchannel_update(struct command *cmd,
 				    type_to_string(tmpctx, struct wally_psbt,
 						   psbt));
 
-	uc->fc->cmd = cmd;
-
 	msg = towire_dualopend_psbt_updated(NULL, psbt);
-	subd_send_msg(uc->open_daemon, take(msg));
+	/* FIXME: daemon? */
+	subd_send_msg(NULL, take(msg));
 	return command_still_pending(cmd);
 }
 
@@ -1746,8 +1847,11 @@ static struct command_result *json_openchannel_init(struct command *cmd,
 		struct amount_sat in_amt = psbt_input_get_amount(psbt, i);
 		if (!amount_sat_add(&psbt_val, psbt_val, in_amt))
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "Overflow in adding PSBT input values. %s",
-					    type_to_string(tmpctx, struct wally_psbt, psbt));
+					    "Overflow in adding PSBT input"
+					    " values. %s",
+					    type_to_string(tmpctx,
+							   struct wally_psbt,
+							   psbt));
 	}
 
 	/* If they don't pass in at least enough in the PSBT to cover
@@ -1756,8 +1860,12 @@ static struct command_result *json_openchannel_init(struct command *cmd,
 		return command_fail(cmd, FUND_CANNOT_AFFORD,
 				    "Provided PSBT cannot afford funding of "
 				    "amount %s. %s",
-				    type_to_string(tmpctx, struct amount_sat, amount),
-				    type_to_string(tmpctx, struct wally_psbt, psbt));
+				    type_to_string(tmpctx,
+						   struct amount_sat,
+						   amount),
+				    type_to_string(tmpctx,
+						   struct wally_psbt,
+						   psbt));
 
 	fc->funding = *amount;
 	if (!feerate_per_kw_funding) {
@@ -1893,6 +2001,9 @@ static unsigned int dual_opend_msg(struct subd *dualopend,
 		case WIRE_DUALOPEND_GOT_OFFER:
 			accepter_got_offer(dualopend, uc, msg);
 			return 0;
+		case WIRE_DUALOPEND_GOT_RBF_OFFER:
+			// FIXME: do this
+			return 0;
 		case WIRE_DUALOPEND_PSBT_CHANGED:
 			if (uc->fc) {
 				if (!uc->fc->cmd) {
@@ -1920,6 +2031,9 @@ static unsigned int dual_opend_msg(struct subd *dualopend,
 			} else
 				accepter_commit_received(dualopend,
 							 uc, fds, msg);
+			return 0;
+		case WIRE_DUALOPEND_RBF_VALIDATE:
+			handle_validate_rbf(dualopend, msg);
 			return 0;
 		case WIRE_DUALOPEND_FUNDING_SIGS:
 			handle_peer_tx_sigs_msg(dualopend, msg);
@@ -1949,6 +2063,10 @@ static unsigned int dual_opend_msg(struct subd *dualopend,
 		case WIRE_DUALOPEND_FAILED:
 			open_failed(dualopend, msg);
 			return 0;
+		case WIRE_DUALOPEND_RBF_FAILED:
+			// FIXME: handle this
+			abort();
+			return 0;
 		case WIRE_DUALOPEND_DEV_MEMLEAK_REPLY:
 
 		/* Messages we send */
@@ -1956,6 +2074,8 @@ static unsigned int dual_opend_msg(struct subd *dualopend,
 		case WIRE_DUALOPEND_REINIT:
 		case WIRE_DUALOPEND_OPENER_INIT:
 		case WIRE_DUALOPEND_GOT_OFFER_REPLY:
+		case WIRE_DUALOPEND_GOT_RBF_OFFER_REPLY:
+		case WIRE_DUALOPEND_RBF_VALID:
 		case WIRE_DUALOPEND_FAIL:
 		case WIRE_DUALOPEND_PSBT_UPDATED:
 		case WIRE_DUALOPEND_SEND_TX_SIGS:
@@ -2077,7 +2197,7 @@ void peer_restart_dualopend(struct peer *peer,
 				      channel->our_msat,
 				      &channel->channel_info.theirbase,
 				      &channel->channel_info.remote_per_commit,
-				      channel->psbt,
+				      NULL, /* FIXME! */
 				      channel->opener,
 				      channel->scid != NULL,
 				      channel->remote_funding_locked,
@@ -2085,8 +2205,9 @@ void peer_restart_dualopend(struct peer *peer,
 				      channel->shutdown_scriptpubkey[REMOTE] != NULL,
 				      channel->shutdown_scriptpubkey[LOCAL],
 				      channel->remote_upfront_shutdown_script,
-				      channel->remote_tx_sigs,
+				      false, /* FIXME! */
                                       channel->fee_states,
+				      channel->channel_flags,
 				      send_msg);
 
 

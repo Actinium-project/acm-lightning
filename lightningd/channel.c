@@ -1,3 +1,4 @@
+#include <bitcoin/psbt.h>
 #include <bitcoin/script.h>
 #include <ccan/crypto/hkdf_sha256/hkdf_sha256.h>
 #include <ccan/tal/str/str.h>
@@ -117,7 +118,8 @@ static void destroy_channel(struct channel *channel)
 void delete_channel(struct channel *channel STEALS)
 {
 	struct peer *peer = channel->peer;
-	wallet_channel_close(channel->peer->ld->wallet, channel->dbid);
+	if (channel->dbid != 0)
+		wallet_channel_close(channel->peer->ld->wallet, channel->dbid);
 	tal_free(channel);
 
 	maybe_delete_peer(peer);
@@ -143,6 +145,46 @@ void get_channel_basepoints(struct lightningd *ld,
 		      tal_hex(msg, msg));
 }
 
+static void destroy_inflight(struct channel_inflight *inflight)
+{
+	list_del_from(&inflight->channel->inflights, &inflight->list);
+}
+
+struct channel_inflight *
+new_inflight(struct channel *channel,
+	     const struct bitcoin_txid funding_txid,
+	     u16 funding_outnum,
+	     u32 funding_feerate,
+	     struct amount_sat total_funds,
+	     struct amount_sat our_funds,
+	     struct wally_psbt *psbt STEALS,
+	     struct bitcoin_tx *last_tx STEALS,
+	     const struct bitcoin_signature last_sig)
+{
+	struct channel_inflight *inflight
+		= tal(channel, struct channel_inflight);
+	struct funding_info *funding
+		= tal(inflight, struct funding_info);
+
+	funding->txid = funding_txid;
+	funding->total_funds = total_funds;
+	funding->outnum = funding_outnum;
+	funding->feerate = funding_feerate;
+	funding->our_funds = our_funds;
+
+	inflight->funding = funding;
+	inflight->channel = channel,
+	inflight->remote_tx_sigs = false,
+	inflight->funding_psbt = tal_steal(inflight, psbt);
+	inflight->last_tx = tal_steal(inflight, last_tx);
+	inflight->last_sig = last_sig;
+
+	list_add_tail(&channel->inflights, &inflight->list);
+	tal_add_destructor(inflight, destroy_inflight);
+
+	return inflight;
+}
+
 struct channel *new_channel(struct peer *peer, u64 dbid,
 			    /* NULL or stolen */
 			    struct wallet_shachain *their_shachain,
@@ -163,7 +205,6 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    struct amount_msat push,
 			    struct amount_sat our_funds,
 			    bool remote_funding_locked,
-			    bool remote_tx_sigs,
 			    /* NULL or stolen */
 			    struct short_channel_id *scid,
 			    struct channel_id *cid,
@@ -196,7 +237,6 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    const u8 *remote_upfront_shutdown_script,
 			    bool option_static_remotekey,
 			    bool option_anchor_outputs,
-			    struct wally_psbt *psbt STEALS,
 			    enum side closer,
 			    enum state_change reason)
 {
@@ -240,7 +280,6 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 	channel->push = push;
 	channel->our_funds = our_funds;
 	channel->remote_funding_locked = remote_funding_locked;
-	channel->remote_tx_sigs = remote_tx_sigs;
 	channel->scid = tal_steal(channel, scid);
 	channel->cid = *cid;
 	channel->our_msat = our_msat;
@@ -284,15 +323,11 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 	channel->option_anchor_outputs = option_anchor_outputs;
 	channel->forgets = tal_arr(channel, struct command *, 0);
 
-	/* If we're already locked in, we no longer need the PSBT */
-	if (!remote_funding_locked && psbt)
-		channel->psbt = tal_steal(channel, psbt);
-	else
-		channel->psbt = tal_free(psbt);
-
 	list_add_tail(&peer->channels, &channel->list);
 	channel->rr_number = peer->ld->rr_counter++;
 	tal_add_destructor(channel, destroy_channel);
+
+	list_head_init(&channel->inflights);
 
 	channel->closer = closer;
 	channel->state_change_cause = reason;
@@ -326,6 +361,18 @@ struct channel *peer_active_channel(struct peer *peer)
 		if (channel_active(channel))
 			return channel;
 	}
+	return NULL;
+}
+
+struct channel_inflight *channel_inflight_find(struct channel *channel,
+					       const struct bitcoin_txid *txid)
+{
+	struct channel_inflight *inflight;
+	list_for_each(&channel->inflights, inflight, list) {
+		if (bitcoin_txid_eq(txid, &inflight->funding->txid))
+			return inflight;
+	}
+
 	return NULL;
 }
 
@@ -394,30 +441,24 @@ struct channel *channel_by_dbid(struct lightningd *ld, const u64 dbid)
 }
 
 struct channel *channel_by_cid(struct lightningd *ld,
-			       const struct channel_id *cid,
-			       struct uncommitted_channel **uc)
+			       const struct channel_id *cid)
 {
 	struct peer *p;
 	struct channel *channel;
 
 	list_for_each(&ld->peers, p, list) {
 		if (p->uncommitted_channel) {
-			if (channel_id_eq(&p->uncommitted_channel->cid, cid)) {
-				if (uc)
-					*uc = p->uncommitted_channel;
+			/* We can't use this method for old, uncommitted
+			 * channels; there's no "channel" struct here! */
+			if (channel_id_eq(&p->uncommitted_channel->cid, cid))
 				return NULL;
-			}
 		}
 		list_for_each(&p->channels, channel, list) {
 			if (channel_id_eq(&channel->cid, cid)) {
-				if (uc)
-					*uc = p->uncommitted_channel;
 				return channel;
 			}
 		}
 	}
-	if (uc)
-		*uc = NULL;
 	return NULL;
 }
 

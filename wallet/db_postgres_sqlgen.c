@@ -885,6 +885,18 @@ struct db_query db_postgres_queries[] = {
          .readonly = false,
     },
     {
+         .name = "CREATE INDEX forwarded_payments_state ON forwarded_payments (state)",
+         .query = "CREATE INDEX forwarded_payments_state ON forwarded_payments (state)",
+         .placeholders = 0,
+         .readonly = false,
+    },
+    {
+         .name = "CREATE TABLE channel_funding_inflights (  channel_id BIGSERIAL REFERENCES channels(id) ON DELETE CASCADE, funding_tx_id BLOB, funding_tx_outnum INTEGER, funding_feerate INTEGER, funding_satoshi BIGINT, our_funding_satoshi BIGINT, funding_psbt BLOB, last_tx BLOB, last_sig BLOB, funding_tx_remote_sigs_received INTEGER, PRIMARY KEY (channel_id, funding_tx_id));",
+         .query = "CREATE TABLE channel_funding_inflights (  channel_id BIGSERIAL REFERENCES channels(id) ON DELETE CASCADE, funding_tx_id BYTEA, funding_tx_outnum INTEGER, funding_feerate INTEGER, funding_satoshi BIGINT, our_funding_satoshi BIGINT, funding_psbt BYTEA, last_tx BYTEA, last_sig BYTEA, funding_tx_remote_sigs_received INTEGER, PRIMARY KEY (channel_id, funding_tx_id));",
+         .placeholders = 0,
+         .readonly = false,
+    },
+    {
          .name = "UPDATE vars SET intval = intval + 1 WHERE name = 'data_version' AND intval = ?",
          .query = "UPDATE vars SET intval = intval + 1 WHERE name = 'data_version' AND intval = $1",
          .placeholders = 1,
@@ -1197,14 +1209,32 @@ struct db_query db_postgres_queries[] = {
          .readonly = true,
     },
     {
+         .name = "INSERT INTO channel_funding_inflights (  channel_id, funding_tx_id, funding_tx_outnum, funding_feerate, funding_satoshi, our_funding_satoshi, funding_psbt, last_tx, last_sig) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);",
+         .query = "INSERT INTO channel_funding_inflights (  channel_id, funding_tx_id, funding_tx_outnum, funding_feerate, funding_satoshi, our_funding_satoshi, funding_psbt, last_tx, last_sig) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);",
+         .placeholders = 9,
+         .readonly = false,
+    },
+    {
+         .name = "UPDATE channel_funding_inflights SET  funding_psbt=? WHERE  channel_id=? AND funding_tx_id=? AND funding_tx_outnum=?",
+         .query = "UPDATE channel_funding_inflights SET  funding_psbt=$1 WHERE  channel_id=$2 AND funding_tx_id=$3 AND funding_tx_outnum=$4",
+         .placeholders = 4,
+         .readonly = false,
+    },
+    {
+         .name = "SELECT  funding_tx_id, funding_tx_outnum, funding_feerate, funding_satoshi, our_funding_satoshi, funding_psbt, last_tx, last_sig FROM channel_funding_inflights WHERE channel_id = ?",
+         .query = "SELECT  funding_tx_id, funding_tx_outnum, funding_feerate, funding_satoshi, our_funding_satoshi, funding_psbt, last_tx, last_sig FROM channel_funding_inflights WHERE channel_id = $1",
+         .placeholders = 1,
+         .readonly = true,
+    },
+    {
          .name = "SELECT id FROM channels ORDER BY id DESC LIMIT 1;",
          .query = "SELECT id FROM channels ORDER BY id DESC LIMIT 1;",
          .placeholders = 0,
          .readonly = true,
     },
     {
-         .name = "SELECT  id, peer_id, short_channel_id, full_channel_id, channel_config_local, channel_config_remote, state, funder, channel_flags, minimum_depth, next_index_local, next_index_remote, next_htlc_id, funding_tx_id, funding_tx_outnum, funding_satoshi, our_funding_satoshi, funding_locked_remote, funding_tx_remote_sigs_received, push_msatoshi, msatoshi_local, fundingkey_remote, revocation_basepoint_remote, payment_basepoint_remote, htlc_basepoint_remote, delayed_payment_basepoint_remote, per_commit_remote, old_per_commit_remote, local_feerate_per_kw, remote_feerate_per_kw, shachain_remote_id, shutdown_scriptpubkey_remote, shutdown_keyidx_local, last_sent_commit_state, last_sent_commit_id, last_tx, last_sig, last_was_revoke, first_blocknum, min_possible_feerate, max_possible_feerate, msatoshi_to_us_min, msatoshi_to_us_max, future_per_commitment_point, last_sent_commit, feerate_base, feerate_ppm, remote_upfront_shutdown_script, option_static_remotekey, option_anchor_outputs, shutdown_scriptpubkey_local, funding_psbt, closer, state_change_reason FROM channels WHERE state != ?;",
-         .query = "SELECT  id, peer_id, short_channel_id, full_channel_id, channel_config_local, channel_config_remote, state, funder, channel_flags, minimum_depth, next_index_local, next_index_remote, next_htlc_id, funding_tx_id, funding_tx_outnum, funding_satoshi, our_funding_satoshi, funding_locked_remote, funding_tx_remote_sigs_received, push_msatoshi, msatoshi_local, fundingkey_remote, revocation_basepoint_remote, payment_basepoint_remote, htlc_basepoint_remote, delayed_payment_basepoint_remote, per_commit_remote, old_per_commit_remote, local_feerate_per_kw, remote_feerate_per_kw, shachain_remote_id, shutdown_scriptpubkey_remote, shutdown_keyidx_local, last_sent_commit_state, last_sent_commit_id, last_tx, last_sig, last_was_revoke, first_blocknum, min_possible_feerate, max_possible_feerate, msatoshi_to_us_min, msatoshi_to_us_max, future_per_commitment_point, last_sent_commit, feerate_base, feerate_ppm, remote_upfront_shutdown_script, option_static_remotekey, option_anchor_outputs, shutdown_scriptpubkey_local, funding_psbt, closer, state_change_reason FROM channels WHERE state != $1;",
+         .name = "SELECT  id, peer_id, short_channel_id, full_channel_id, channel_config_local, channel_config_remote, state, funder, channel_flags, minimum_depth, next_index_local, next_index_remote, next_htlc_id, funding_tx_id, funding_tx_outnum, funding_satoshi, our_funding_satoshi, funding_locked_remote, push_msatoshi, msatoshi_local, fundingkey_remote, revocation_basepoint_remote, payment_basepoint_remote, htlc_basepoint_remote, delayed_payment_basepoint_remote, per_commit_remote, old_per_commit_remote, local_feerate_per_kw, remote_feerate_per_kw, shachain_remote_id, shutdown_scriptpubkey_remote, shutdown_keyidx_local, last_sent_commit_state, last_sent_commit_id, last_tx, last_sig, last_was_revoke, first_blocknum, min_possible_feerate, max_possible_feerate, msatoshi_to_us_min, msatoshi_to_us_max, future_per_commitment_point, last_sent_commit, feerate_base, feerate_ppm, remote_upfront_shutdown_script, option_static_remotekey, option_anchor_outputs, shutdown_scriptpubkey_local, closer, state_change_reason FROM channels WHERE state != ?;",
+         .query = "SELECT  id, peer_id, short_channel_id, full_channel_id, channel_config_local, channel_config_remote, state, funder, channel_flags, minimum_depth, next_index_local, next_index_remote, next_htlc_id, funding_tx_id, funding_tx_outnum, funding_satoshi, our_funding_satoshi, funding_locked_remote, push_msatoshi, msatoshi_local, fundingkey_remote, revocation_basepoint_remote, payment_basepoint_remote, htlc_basepoint_remote, delayed_payment_basepoint_remote, per_commit_remote, old_per_commit_remote, local_feerate_per_kw, remote_feerate_per_kw, shachain_remote_id, shutdown_scriptpubkey_remote, shutdown_keyidx_local, last_sent_commit_state, last_sent_commit_id, last_tx, last_sig, last_was_revoke, first_blocknum, min_possible_feerate, max_possible_feerate, msatoshi_to_us_min, msatoshi_to_us_max, future_per_commitment_point, last_sent_commit, feerate_base, feerate_ppm, remote_upfront_shutdown_script, option_static_remotekey, option_anchor_outputs, shutdown_scriptpubkey_local, closer, state_change_reason FROM channels WHERE state != $1;",
          .placeholders = 1,
          .readonly = true,
     },
@@ -1269,9 +1299,9 @@ struct db_query db_postgres_queries[] = {
          .readonly = false,
     },
     {
-         .name = "UPDATE channels SET  shachain_remote_id=?,  short_channel_id=?,  full_channel_id=?,  state=?,  funder=?,  channel_flags=?,  minimum_depth=?,  next_index_local=?,  next_index_remote=?,  next_htlc_id=?,  funding_tx_id=?,  funding_tx_outnum=?,  funding_satoshi=?,  our_funding_satoshi=?,  funding_locked_remote=?,  funding_tx_remote_sigs_received=?,  push_msatoshi=?,  msatoshi_local=?,  shutdown_scriptpubkey_remote=?,  shutdown_keyidx_local=?,  channel_config_local=?,  last_tx=?, last_sig=?,  last_was_revoke=?,  min_possible_feerate=?,  max_possible_feerate=?,  msatoshi_to_us_min=?,  msatoshi_to_us_max=?,  feerate_base=?,  feerate_ppm=?,  remote_upfront_shutdown_script=?,  option_static_remotekey=?,  option_anchor_outputs=?,  shutdown_scriptpubkey_local=?,  funding_psbt=?,  closer=?,  state_change_reason=? WHERE id=?",
-         .query = "UPDATE channels SET  shachain_remote_id=$1,  short_channel_id=$2,  full_channel_id=$3,  state=$4,  funder=$5,  channel_flags=$6,  minimum_depth=$7,  next_index_local=$8,  next_index_remote=$9,  next_htlc_id=$10,  funding_tx_id=$11,  funding_tx_outnum=$12,  funding_satoshi=$13,  our_funding_satoshi=$14,  funding_locked_remote=$15,  funding_tx_remote_sigs_received=$16,  push_msatoshi=$17,  msatoshi_local=$18,  shutdown_scriptpubkey_remote=$19,  shutdown_keyidx_local=$20,  channel_config_local=$21,  last_tx=$22, last_sig=$23,  last_was_revoke=$24,  min_possible_feerate=$25,  max_possible_feerate=$26,  msatoshi_to_us_min=$27,  msatoshi_to_us_max=$28,  feerate_base=$29,  feerate_ppm=$30,  remote_upfront_shutdown_script=$31,  option_static_remotekey=$32,  option_anchor_outputs=$33,  shutdown_scriptpubkey_local=$34,  funding_psbt=$35,  closer=$36,  state_change_reason=$37 WHERE id=$38",
-         .placeholders = 38,
+         .name = "UPDATE channels SET  shachain_remote_id=?,  short_channel_id=?,  full_channel_id=?,  state=?,  funder=?,  channel_flags=?,  minimum_depth=?,  next_index_local=?,  next_index_remote=?,  next_htlc_id=?,  funding_tx_id=?,  funding_tx_outnum=?,  funding_satoshi=?,  our_funding_satoshi=?,  funding_locked_remote=?,  push_msatoshi=?,  msatoshi_local=?,  shutdown_scriptpubkey_remote=?,  shutdown_keyidx_local=?,  channel_config_local=?,  last_tx=?, last_sig=?,  last_was_revoke=?,  min_possible_feerate=?,  max_possible_feerate=?,  msatoshi_to_us_min=?,  msatoshi_to_us_max=?,  feerate_base=?,  feerate_ppm=?,  remote_upfront_shutdown_script=?,  option_static_remotekey=?,  option_anchor_outputs=?,  shutdown_scriptpubkey_local=?,  closer=?,  state_change_reason=? WHERE id=?",
+         .query = "UPDATE channels SET  shachain_remote_id=$1,  short_channel_id=$2,  full_channel_id=$3,  state=$4,  funder=$5,  channel_flags=$6,  minimum_depth=$7,  next_index_local=$8,  next_index_remote=$9,  next_htlc_id=$10,  funding_tx_id=$11,  funding_tx_outnum=$12,  funding_satoshi=$13,  our_funding_satoshi=$14,  funding_locked_remote=$15,  push_msatoshi=$16,  msatoshi_local=$17,  shutdown_scriptpubkey_remote=$18,  shutdown_keyidx_local=$19,  channel_config_local=$20,  last_tx=$21, last_sig=$22,  last_was_revoke=$23,  min_possible_feerate=$24,  max_possible_feerate=$25,  msatoshi_to_us_min=$26,  msatoshi_to_us_max=$27,  feerate_base=$28,  feerate_ppm=$29,  remote_upfront_shutdown_script=$30,  option_static_remotekey=$31,  option_anchor_outputs=$32,  shutdown_scriptpubkey_local=$33,  closer=$34,  state_change_reason=$35 WHERE id=$36",
+         .placeholders = 36,
          .readonly = false,
     },
     {
@@ -1349,6 +1379,12 @@ struct db_query db_postgres_queries[] = {
     {
          .name = "DELETE FROM channeltxs WHERE channel_id=?",
          .query = "DELETE FROM channeltxs WHERE channel_id=$1",
+         .placeholders = 1,
+         .readonly = false,
+    },
+    {
+         .name = "DELETE FROM channel_funding_inflights  WHERE channel_id=?",
+         .query = "DELETE FROM channel_funding_inflights  WHERE channel_id=$1",
          .placeholders = 1,
          .readonly = false,
     },
@@ -1695,9 +1731,9 @@ struct db_query db_postgres_queries[] = {
          .readonly = true,
     },
     {
-         .name = "SELECT  f.state, in_msatoshi, out_msatoshi, hin.payment_hash as payment_hash, in_channel_scid, out_channel_scid, f.received_time, f.resolved_time, f.failcode FROM forwarded_payments f LEFT JOIN channel_htlcs hin ON (f.in_htlc_id = hin.id)",
-         .query = "SELECT  f.state, in_msatoshi, out_msatoshi, hin.payment_hash as payment_hash, in_channel_scid, out_channel_scid, f.received_time, f.resolved_time, f.failcode FROM forwarded_payments f LEFT JOIN channel_htlcs hin ON (f.in_htlc_id = hin.id)",
-         .placeholders = 0,
+         .name = "SELECT  f.state, in_msatoshi, out_msatoshi, hin.payment_hash as payment_hash, in_channel_scid, out_channel_scid, f.received_time, f.resolved_time, f.failcode FROM forwarded_payments f LEFT JOIN channel_htlcs hin ON (f.in_htlc_id = hin.id) WHERE (1 = ? OR f.state = ?) AND (1 = ? OR f.in_channel_scid = ?) AND (1 = ? OR f.out_channel_scid = ?)",
+         .query = "SELECT  f.state, in_msatoshi, out_msatoshi, hin.payment_hash as payment_hash, in_channel_scid, out_channel_scid, f.received_time, f.resolved_time, f.failcode FROM forwarded_payments f LEFT JOIN channel_htlcs hin ON (f.in_htlc_id = hin.id) WHERE (1 = $1 OR f.state = $2) AND (1 = $3 OR f.in_channel_scid = $4) AND (1 = $5 OR f.out_channel_scid = $6)",
+         .placeholders = 6,
          .readonly = true,
     },
     {
@@ -1779,6 +1815,12 @@ struct db_query db_postgres_queries[] = {
          .readonly = false,
     },
     {
+         .name = "SELECT COUNT(1) FROM channel_funding_inflights WHERE channel_id = ?;",
+         .query = "SELECT COUNT(1) FROM channel_funding_inflights WHERE channel_id = $1;",
+         .placeholders = 1,
+         .readonly = true,
+    },
+    {
          .name = "INSERT INTO channels (id) VALUES (1);",
          .query = "INSERT INTO channels (id) VALUES (1);",
          .placeholders = 0,
@@ -1786,10 +1828,10 @@ struct db_query db_postgres_queries[] = {
     },
 };
 
-#define DB_POSTGRES_QUERY_COUNT 296
+#define DB_POSTGRES_QUERY_COUNT 303
 
 #endif /* HAVE_POSTGRES */
 
 #endif /* LIGHTNINGD_WALLET_GEN_DB_POSTGRES */
 
-// SHA256STAMP:759b19435d68328d597f6540e1f4f8c42ce22ef91dbf66c1098de0434462546c
+// SHA256STAMP:bd2601eacac93b31e97a7bacfd71545dc748a47e40babb05e7e8dd77b009417d

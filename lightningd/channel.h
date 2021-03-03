@@ -18,12 +18,42 @@ struct billboard {
 	const char *transient;
 };
 
+struct funding_info {
+	struct bitcoin_txid txid;
+	u16 outnum;
+	u32 feerate;
+	struct amount_sat total_funds;
+
+	/* Our original funds, in funding amount */
+	struct amount_sat our_funds;
+};
+
+struct channel_inflight {
+	/* Inside channel->inflights. */
+	struct list_node list;
+
+	/* Channel context */
+	struct channel *channel;
+
+	/* Funding info */
+	const struct funding_info *funding;
+	struct wally_psbt *funding_psbt;
+	bool remote_tx_sigs;
+
+	/* Commitment tx and sigs */
+	struct bitcoin_tx *last_tx;
+	struct bitcoin_signature last_sig;
+};
+
 struct channel {
 	/* Inside peer->channels. */
 	struct list_node list;
 
 	/* Peer context */
 	struct peer *peer;
+
+	/* Inflight channel opens */
+	struct list_head inflights;
 
 	/* Database ID: 0 == not in db yet */
 	u64 dbid;
@@ -70,7 +100,6 @@ struct channel {
 
 	struct amount_msat push;
 	bool remote_funding_locked;
-	bool remote_tx_sigs;
 	/* Channel if locked locally. */
 	struct short_channel_id *scid;
 
@@ -150,9 +179,6 @@ struct channel {
 	/* Our position in the round-robin list.  */
 	u64 rr_number;
 
-	/* PSBT, for v2 channels. Saved until it's sent */
-	struct wally_psbt *psbt;
-
 	/* the one that initiated a bilateral close, NUM_SIDES if unknown. */
 	enum side closer;
 
@@ -183,7 +209,6 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    struct amount_msat push,
 			    struct amount_sat our_funds,
 			    bool remote_funding_locked,
-                            bool remote_tx_sigs,
 			    /* NULL or stolen */
 			    struct short_channel_id *scid STEALS,
 			    struct channel_id *cid,
@@ -216,9 +241,24 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    const u8 *remote_upfront_shutdown_script STEALS,
 			    bool option_static_remotekey,
 			    bool option_anchor_outputs,
-			    struct wally_psbt *psbt STEALS,
 			    enum side closer,
 			    enum state_change reason);
+
+/* new_inflight - Create a new channel_inflight for a channel */
+struct channel_inflight *
+new_inflight(struct channel *channel,
+	     const struct bitcoin_txid funding_txid,
+	     u16 funding_outnum,
+	     u32 funding_feerate,
+	     struct amount_sat funding,
+	     struct amount_sat our_funds,
+	     struct wally_psbt *funding_psbt STEALS,
+	     struct bitcoin_tx *last_tx STEALS,
+	     const struct bitcoin_signature last_sig);
+
+/* Given a txid, find an inflight channel stub. Returns NULL if none found */
+struct channel_inflight *channel_inflight_find(struct channel *channel,
+					       const struct bitcoin_txid *txid);
 
 void delete_channel(struct channel *channel STEALS);
 
@@ -271,10 +311,9 @@ struct channel *active_channel_by_scid(struct lightningd *ld,
 struct channel *any_channel_by_scid(struct lightningd *ld,
 				    const struct short_channel_id *scid);
 
-/* Get channel by channel_id, optionally returning uncommitted_channel. */
+/* Get channel by channel_id */
 struct channel *channel_by_cid(struct lightningd *ld,
-			       const struct channel_id *cid,
-			       struct uncommitted_channel **uc);
+			       const struct channel_id *cid);
 
 void channel_set_last_tx(struct channel *channel,
 			 struct bitcoin_tx *tx,

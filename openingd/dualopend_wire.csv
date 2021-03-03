@@ -68,6 +68,7 @@ msgdata,dualopend_reinit,remote_shutdown_len,u16,
 msgdata,dualopend_reinit,remote_shutdown_scriptpubkey,u8,remote_shutdown_len
 msgdata,dualopend_reinit,remote_funding_sigs_received,bool,
 msgdata,dualopend_reinit,fee_states,fee_states,
+msgdata,dualopend_reinit,channel_flags,u8,
 # Optional msg to send.
 msgdata,dualopend_reinit,len,u16,
 msgdata,dualopend_reinit,msg,u8,len
@@ -97,6 +98,25 @@ msgdata,dualopend_got_offer_reply,feerate_funding,u32,
 msgdata,dualopend_got_offer_reply,psbt,wally_psbt,
 msgdata,dualopend_got_offer_reply,shutdown_len,u16,
 msgdata,dualopend_got_offer_reply,our_shutdown_scriptpubkey,?u8,shutdown_len
+
+# dualopend->master: they offered a RBF, should we continue?
+msgtype,dualopend_got_rbf_offer,7500
+msgdata,dualopend_got_rbf_offer,channel_id,channel_id,
+msgdata,dualopend_got_rbf_offer,opener_funding,amount_sat,
+msgdata,dualopend_got_rbf_offer,funding_feerate_per_kw,u32,
+msgdata,dualopend_got_rbf_offer,locktime,u32,
+
+# master->dualopend: reply back with our funding info/contribs
+msgtype,dualopend_got_rbf_offer_reply,7505
+msgdata,dualopend_got_rbf_offer_reply,accepter_funding,amount_sat,
+msgdata,dualopend_got_rbf_offer_reply,psbt,wally_psbt,
+
+# dualopend->master: is this a valid RBF candidate transaction?
+msgtype,dualopend_rbf_validate,7506
+msgdata,dualopend_rbf_validate,proposed_funding_psbt,wally_psbt,
+
+# master->dualopend: this is a valid RBF candidate transaction
+msgtype,dualopend_rbf_valid,7507
 
 # dualopend->master: ready to commit channel open to database and
 #                    get some signatures for the funding_tx.
@@ -142,6 +162,10 @@ msgdata,dualopend_fail,reason,wirestring,
 # dualopend->master: we failed to negotiate channel
 msgtype,dualopend_failed,7004
 msgdata,dualopend_failed,reason,wirestring,
+
+# dualopend->master: we failed to negotate RBF
+msgtype,dualopend_rbf_failed,7015
+msgdata,dualopend_rbf_failed,reason,wirestring,
 
 # master->dualopend: hello, I'd like to start a channel open
 msgtype,dualopend_opener_init,7200
