@@ -470,7 +470,7 @@ void peer_start_channeld(struct channel *channel,
 	channel_set_owner(channel,
 			  new_channel_subd(ld,
 					   "lightning_channeld",
-					   channel, CHANNEL,
+					   channel,
 					   &channel->peer->id,
 					   channel->log, true,
 					   channeld_wire_name,
@@ -714,10 +714,13 @@ void channel_notify_new_block(struct lightningd *ld,
 	size_t i;
 
 	list_for_each (&ld->peers, peer, list) {
-		list_for_each (&peer->channels, channel, list)
+		list_for_each (&peer->channels, channel, list) {
+			if (channel_unsaved(channel))
+				continue;
 			if (is_fundee_should_forget(ld, channel, block_height)) {
 				tal_arr_expand(&to_forget, channel);
 			}
+		}
 	}
 
 	/* Need to forget in a separate loop, else the above

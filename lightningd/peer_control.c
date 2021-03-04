@@ -1148,6 +1148,10 @@ void peer_connected(struct lightningd *ld, const u8 *msg,
 	assert(!peer->uncommitted_channel);
 	hook_payload->channel = peer_active_channel(peer);
 
+	/* It might be v2 opening, though, since we hang onto these */
+	if (!hook_payload->channel)
+		hook_payload->channel = peer_unsaved_channel(peer);
+
 	plugin_hook_call_peer_connected(ld, hook_payload);
 }
 
@@ -1323,6 +1327,8 @@ static void json_add_peer(struct lightningd *ld,
 		connected = true;
 	else {
 		channel = peer_active_channel(p);
+		if (!channel)
+			channel = peer_unsaved_channel(p);
 		connected = channel && channel->connected;
 	}
 	json_add_bool(response, "connected", connected);
@@ -1470,6 +1476,12 @@ static struct command_result *json_close(struct command *cmd,
 
 			return command_success(cmd, json_stream_success(cmd));
 		}
+#if EXPERIMENTAL_FEATURES
+		if ((channel = peer_unsaved_channel(peer))) {
+			kill_unsaved_channel(channel, "close command called");
+			return command_success(cmd, json_stream_success(cmd));
+		}
+#endif /* EXPERIMENTAL_FEATURES */
 		return command_fail(cmd, LIGHTNINGD,
 				    "Peer has no active channel");
 	}
@@ -1639,6 +1651,8 @@ static void activate_peer(struct peer *peer, u32 delay)
 	}
 
 	list_for_each(&peer->channels, channel, list) {
+		if (channel_unsaved(channel))
+			continue;
 		/* Watching lockin may be unnecessary, but it's harmless. */
 		channel_watch_funding(ld, channel);
 	}
@@ -1733,6 +1747,13 @@ static struct command_result *json_disconnect(struct command *cmd,
 		return command_fail(cmd, LIGHTNINGD, "Peer is in state %s",
 				    channel_state_name(channel));
 	}
+#if EXPERIMENTAL_FEATURES
+	channel = peer_unsaved_channel(peer);
+	if (channel) {
+		kill_unsaved_channel(channel, "disconnect command");
+		return command_success(cmd, json_stream_success(cmd));
+	}
+#endif /* EXPERIMENTAL_FEATURES */
 	if (!peer->uncommitted_channel) {
 		return command_fail(cmd, LIGHTNINGD, "Peer not connected");
 	}
@@ -1773,7 +1794,9 @@ static struct command_result *json_getinfo(struct command *cmd,
         num_peers++;
 
         list_for_each(&peer->channels, channel, list) {
-            if (channel->state == CHANNELD_AWAITING_LOCKIN) {
+            if (channel->state == CHANNELD_AWAITING_LOCKIN
+		|| channel->state == DUALOPEND_AWAITING_LOCKIN
+		|| channel->state == DUALOPEND_OPEN_INIT) {
                 pending_channels++;
             } else if (channel_active(channel)) {
                 active_channels++;
@@ -2337,10 +2360,11 @@ static struct command_result *json_dev_forget_channel(struct command *cmd,
 				    "or `dev-fail` instead.");
 	}
 
-	bitcoind_getutxout(cmd->ld->topology->bitcoind,
-			   &forget->channel->funding_txid,
-			   forget->channel->funding_outnum,
-			   process_dev_forget_channel, forget);
+	if (!channel_unsaved(forget->channel))
+		bitcoind_getutxout(cmd->ld->topology->bitcoind,
+				   &forget->channel->funding_txid,
+				   forget->channel->funding_outnum,
+				   process_dev_forget_channel, forget);
 	return command_still_pending(cmd);
 }
 
@@ -2421,7 +2445,11 @@ static void peer_memleak_req_next(struct command *cmd, struct channel *prev)
 			if (prev != NULL)
 				continue;
 
-			/* Note: closingd does its own checking automatically */
+			/* Note: closingd and dualopend do their own
+			 * checking automatically */
+			if (channel_unsaved(c))
+				continue;
+
 			if (streq(c->owner->name, "channeld")) {
 				subd_req(c, c->owner,
 					 take(towire_channeld_dev_memleak(NULL)),
