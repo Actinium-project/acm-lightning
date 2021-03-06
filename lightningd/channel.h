@@ -286,6 +286,13 @@ new_inflight(struct channel *channel,
 struct channel_inflight *channel_inflight_find(struct channel *channel,
 					       const struct bitcoin_txid *txid);
 
+/* What's the most recent inflight for this channel? */
+struct channel_inflight *
+channel_current_inflight(const struct channel *channel);
+
+/* What's the last feerate used for a funding tx on this channel? */
+u32 channel_last_funding_feerate(const struct channel *channel);
+
 void delete_channel(struct channel *channel STEALS);
 
 const char *channel_state_name(const struct channel *channel);
@@ -310,6 +317,9 @@ void channel_fail_permanent(struct channel *channel,
 void channel_fail_forget(struct channel *channel, const char *fmt, ...);
 /* Permanent error, but due to internal problems, not peer. */
 void channel_internal_error(struct channel *channel, const char *fmt, ...);
+
+/* Clean up any in-progress commands for a channel */
+void channel_cleanup_commands(struct channel *channel, const char *why);
 
 void channel_set_state(struct channel *channel,
 		       enum channel_state old_state,

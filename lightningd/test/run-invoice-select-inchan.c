@@ -56,6 +56,13 @@ void broadcast_tx(struct chain_topology *topo UNNEEDED,
 /* Generated stub for channel_change_state_reason_str */
 const char *channel_change_state_reason_str(enum state_change reason UNNEEDED)
 { fprintf(stderr, "channel_change_state_reason_str called!\n"); abort(); }
+/* Generated stub for channel_cleanup_commands */
+void channel_cleanup_commands(struct channel *channel UNNEEDED, const char *why UNNEEDED)
+{ fprintf(stderr, "channel_cleanup_commands called!\n"); abort(); }
+/* Generated stub for channel_close_conn */
+void channel_close_conn(struct channel *channel UNNEEDED,
+			const char *why UNNEEDED)
+{ fprintf(stderr, "channel_close_conn called!\n"); abort(); }
 /* Generated stub for channel_fail_forget */
 void channel_fail_forget(struct channel *channel UNNEEDED, const char *fmt UNNEEDED, ...)
 { fprintf(stderr, "channel_fail_forget called!\n"); abort(); }
@@ -82,6 +89,9 @@ struct htlc_out *channel_has_htlc_out(struct channel *channel UNNEEDED)
 /* Generated stub for channel_internal_error */
 void channel_internal_error(struct channel *channel UNNEEDED, const char *fmt UNNEEDED, ...)
 { fprintf(stderr, "channel_internal_error called!\n"); abort(); }
+/* Generated stub for channel_last_funding_feerate */
+u32 channel_last_funding_feerate(const struct channel *channel UNNEEDED)
+{ fprintf(stderr, "channel_last_funding_feerate called!\n"); abort(); }
 /* Generated stub for channel_set_billboard */
 void channel_set_billboard(struct channel *channel UNNEEDED, bool perm UNNEEDED,
 			   const char *str TAKES UNNEEDED)
@@ -320,6 +330,10 @@ void json_add_txid(struct json_stream *result UNNEEDED, const char *fieldname UN
 void json_add_uncommitted_channel(struct json_stream *response UNNEEDED,
 				  const struct uncommitted_channel *uc UNNEEDED)
 { fprintf(stderr, "json_add_uncommitted_channel called!\n"); abort(); }
+/* Generated stub for json_add_unsaved_channel */
+void json_add_unsaved_channel(struct json_stream *response UNNEEDED,
+			      const struct channel *channel UNNEEDED)
+{ fprintf(stderr, "json_add_unsaved_channel called!\n"); abort(); }
 /* Generated stub for json_array_end */
 void json_array_end(struct json_stream *js UNNEEDED)
 { fprintf(stderr, "json_array_end called!\n"); abort(); }
@@ -372,10 +386,6 @@ bool json_tok_channel_id(const char *buffer UNNEEDED, const jsmntok_t *tok UNNEE
 void kill_uncommitted_channel(struct uncommitted_channel *uc UNNEEDED,
 			      const char *why UNNEEDED)
 { fprintf(stderr, "kill_uncommitted_channel called!\n"); abort(); }
-/* Generated stub for kill_unsaved_channel */
-void kill_unsaved_channel(struct channel *channel UNNEEDED,
-			  const char *why UNNEEDED)
-{ fprintf(stderr, "kill_unsaved_channel called!\n"); abort(); }
 /* Generated stub for log_ */
 void log_(struct log *log UNNEEDED, enum log_level level UNNEEDED,
 	  const struct node_id *node_id UNNEEDED,

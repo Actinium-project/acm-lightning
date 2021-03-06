@@ -380,8 +380,20 @@ void channel_errmsg(struct channel *channel,
 {
 	notify_disconnect(channel->peer->ld, &channel->peer->id);
 
+	/* Clean up any in-progress open attempts */
+	channel_cleanup_commands(channel, desc);
+
 	/* No per_peer_state means a subd crash or disconnection. */
 	if (!pps) {
+		/* If the channel is unsaved, we forget it */
+		if (channel_unsaved(channel)) {
+			log_unusual(channel->log, "%s",
+				    "Unsaved peer failed."
+				    " Disconnecting and deleting channel.");
+			delete_channel(channel);
+			return;
+		}
+
 		channel_fail_reconnect(channel, "%s: %s",
 				       channel->owner->name, desc);
 		return;
@@ -731,6 +743,35 @@ static void json_add_channel(struct lightningd *ld,
 	json_add_string(response, "channel_id",
 			type_to_string(tmpctx, struct channel_id, &channel->cid));
 	json_add_txid(response, "funding_txid", &channel->funding_txid);
+
+	if (channel->state == DUALOPEND_AWAITING_LOCKIN) {
+		struct channel_inflight *initial;
+		u32 last_feerate, next_feerate, feerate;
+		u8 feestep;
+
+		last_feerate = channel_last_funding_feerate(channel);
+		assert(last_feerate > 0);
+		next_feerate = last_feerate + last_feerate / 4;
+
+		initial = list_top(&channel->inflights,
+				   struct channel_inflight, list);
+		feerate = initial->funding->feerate;
+
+		json_add_string(response, "initial_feerate",
+			        tal_fmt(tmpctx, "%d%s", feerate,
+					feerate_style_name(FEERATE_PER_KSIPA)));
+		json_add_string(response, "last_feerate",
+				tal_fmt(tmpctx, "%d%s", last_feerate,
+					feerate_style_name(FEERATE_PER_KSIPA)));
+		json_add_string(response, "next_feerate",
+				tal_fmt(tmpctx, "%d%s", next_feerate,
+					feerate_style_name(FEERATE_PER_KSIPA)));
+
+		/* Now we derive the feestep */
+		for (feestep = 0; feerate < next_feerate; feestep++)
+			feerate += feerate / 4;
+		json_add_num(response, "next_fee_step", feestep);
+	}
 
 	if (channel->shutdown_scriptpubkey[LOCAL]) {
 		char *addr = encode_scriptpubkey_to_addr(tmpctx,
@@ -1360,8 +1401,14 @@ static void json_add_peer(struct lightningd *ld,
 	json_array_start(response, "channels");
 	json_add_uncommitted_channel(response, p->uncommitted_channel);
 
-	list_for_each(&p->channels, channel, list)
-		json_add_channel(ld, response, NULL, channel);
+	list_for_each(&p->channels, channel, list) {
+#if EXPERIMENTAL_FEATURES
+		if (channel_unsaved(channel))
+			json_add_unsaved_channel(response, channel);
+		else
+#endif /* EXPERIMENTAL_FEATURES */
+			json_add_channel(ld, response, NULL, channel);
+	}
 	json_array_end(response);
 
 	if (ll)
@@ -1489,7 +1536,7 @@ static struct command_result *json_close(struct command *cmd,
 		}
 #if EXPERIMENTAL_FEATURES
 		if ((channel = peer_unsaved_channel(peer))) {
-			kill_unsaved_channel(channel, "close command called");
+			channel_close_conn(channel, "close command called");
 			return command_success(cmd, json_stream_success(cmd));
 		}
 #endif /* EXPERIMENTAL_FEATURES */
@@ -1761,7 +1808,7 @@ static struct command_result *json_disconnect(struct command *cmd,
 #if EXPERIMENTAL_FEATURES
 	channel = peer_unsaved_channel(peer);
 	if (channel) {
-		kill_unsaved_channel(channel, "disconnect command");
+		channel_close_conn(channel, "disconnect command");
 		return command_success(cmd, json_stream_success(cmd));
 	}
 #endif /* EXPERIMENTAL_FEATURES */
@@ -2643,6 +2690,7 @@ static const struct json_command sendcustommsg_command = {
     .verbose = "dev-sendcustommsg node_id hexcustommsg",
 };
 
+/* Comment added to satisfice AUTODATA */
 AUTODATA(json_command, &sendcustommsg_command);
 
 #endif /* DEVELOPER */

@@ -35,6 +35,8 @@ enum dualopend_wire {
         WIRE_DUALOPEND_RBF_VALIDATE = 7506,
         /*  master->dualopend: this is a valid RBF candidate transaction */
         WIRE_DUALOPEND_RBF_VALID = 7507,
+        /*  master->dualopend: attempt an RBF */
+        WIRE_DUALOPEND_RBF_INIT = 7509,
         /*  dualopend->master: ready to commit channel open to database and */
         /*                     get some signatures for the funding_tx. */
         WIRE_DUALOPEND_COMMIT_RCVD = 7007,
@@ -44,10 +46,6 @@ enum dualopend_wire {
         WIRE_DUALOPEND_PSBT_UPDATED = 7108,
         /*  master->dualopend: fail this channel open */
         WIRE_DUALOPEND_FAIL = 7003,
-        /*  dualopend->master: we failed to negotiate channel */
-        WIRE_DUALOPEND_FAILED = 7004,
-        /*  dualopend->master: we failed to negotate RBF */
-        WIRE_DUALOPEND_RBF_FAILED = 7015,
         /*  master->dualopend: hello */
         WIRE_DUALOPEND_OPENER_INIT = 7200,
         /*  dualopend->master received tx_sigs from peer */
@@ -126,11 +124,16 @@ bool fromwire_dualopend_rbf_validate(const tal_t *ctx, const void *p, struct wal
 u8 *towire_dualopend_rbf_valid(const tal_t *ctx);
 bool fromwire_dualopend_rbf_valid(const void *p);
 
+/* WIRE: DUALOPEND_RBF_INIT */
+/*  master->dualopend: attempt an RBF */
+u8 *towire_dualopend_rbf_init(const tal_t *ctx, struct amount_sat our_funding, const struct wally_psbt *psbt);
+bool fromwire_dualopend_rbf_init(const tal_t *ctx, const void *p, struct amount_sat *our_funding, struct wally_psbt **psbt);
+
 /* WIRE: DUALOPEND_COMMIT_RCVD */
 /*  dualopend->master: ready to commit channel open to database and */
 /*                     get some signatures for the funding_tx. */
-u8 *towire_dualopend_commit_rcvd(const tal_t *ctx, const struct channel_config *their_config, const struct bitcoin_tx *remote_first_commit, const struct penalty_base *pbase, const struct bitcoin_signature *first_commit_sig, const struct wally_psbt *psbt, const struct pubkey *revocation_basepoint, const struct pubkey *payment_basepoint, const struct pubkey *htlc_basepoint, const struct pubkey *delayed_payment_basepoint, const struct pubkey *their_per_commit_point, const struct pubkey *remote_fundingkey, const struct bitcoin_txid *funding_txid, u16 funding_txout, struct amount_sat funding_satoshis, struct amount_sat our_funding_sats, u8 channel_flags, u32 feerate_per_kw_funding, u32 feerate_per_kw_commitment, struct amount_sat our_channel_reserve_satoshis, const u8 *local_shutdown_scriptpubkey, const u8 *remote_shutdown_scriptpubkey);
-bool fromwire_dualopend_commit_rcvd(const tal_t *ctx, const void *p, struct channel_config *their_config, struct bitcoin_tx **remote_first_commit, struct penalty_base **pbase, struct bitcoin_signature *first_commit_sig, struct wally_psbt **psbt, struct pubkey *revocation_basepoint, struct pubkey *payment_basepoint, struct pubkey *htlc_basepoint, struct pubkey *delayed_payment_basepoint, struct pubkey *their_per_commit_point, struct pubkey *remote_fundingkey, struct bitcoin_txid *funding_txid, u16 *funding_txout, struct amount_sat *funding_satoshis, struct amount_sat *our_funding_sats, u8 *channel_flags, u32 *feerate_per_kw_funding, u32 *feerate_per_kw_commitment, struct amount_sat *our_channel_reserve_satoshis, u8 **local_shutdown_scriptpubkey, u8 **remote_shutdown_scriptpubkey);
+u8 *towire_dualopend_commit_rcvd(const tal_t *ctx, const struct channel_config *their_config, const struct bitcoin_tx *remote_first_commit, const struct penalty_base *pbase, const struct bitcoin_signature *first_commit_sig, const struct wally_psbt *psbt, const struct pubkey *revocation_basepoint, const struct pubkey *payment_basepoint, const struct pubkey *htlc_basepoint, const struct pubkey *delayed_payment_basepoint, const struct pubkey *their_per_commit_point, const struct pubkey *remote_fundingkey, const struct bitcoin_txid *funding_txid, u16 funding_txout, struct amount_sat funding_satoshis, struct amount_sat our_funding_sats, u8 channel_flags, u32 feerate_per_kw_funding, u32 feerate_per_kw_commitment, const u8 *local_shutdown_scriptpubkey, const u8 *remote_shutdown_scriptpubkey);
+bool fromwire_dualopend_commit_rcvd(const tal_t *ctx, const void *p, struct channel_config *their_config, struct bitcoin_tx **remote_first_commit, struct penalty_base **pbase, struct bitcoin_signature *first_commit_sig, struct wally_psbt **psbt, struct pubkey *revocation_basepoint, struct pubkey *payment_basepoint, struct pubkey *htlc_basepoint, struct pubkey *delayed_payment_basepoint, struct pubkey *their_per_commit_point, struct pubkey *remote_fundingkey, struct bitcoin_txid *funding_txid, u16 *funding_txout, struct amount_sat *funding_satoshis, struct amount_sat *our_funding_sats, u8 *channel_flags, u32 *feerate_per_kw_funding, u32 *feerate_per_kw_commitment, u8 **local_shutdown_scriptpubkey, u8 **remote_shutdown_scriptpubkey);
 
 /* WIRE: DUALOPEND_PSBT_CHANGED */
 /*  dualopend->master: peer updated the psbt */
@@ -146,16 +149,6 @@ bool fromwire_dualopend_psbt_updated(const tal_t *ctx, const void *p, struct wal
 /*  master->dualopend: fail this channel open */
 u8 *towire_dualopend_fail(const tal_t *ctx, const wirestring *reason);
 bool fromwire_dualopend_fail(const tal_t *ctx, const void *p, wirestring **reason);
-
-/* WIRE: DUALOPEND_FAILED */
-/*  dualopend->master: we failed to negotiate channel */
-u8 *towire_dualopend_failed(const tal_t *ctx, const wirestring *reason);
-bool fromwire_dualopend_failed(const tal_t *ctx, const void *p, wirestring **reason);
-
-/* WIRE: DUALOPEND_RBF_FAILED */
-/*  dualopend->master: we failed to negotate RBF */
-u8 *towire_dualopend_rbf_failed(const tal_t *ctx, const wirestring *reason);
-bool fromwire_dualopend_rbf_failed(const tal_t *ctx, const void *p, wirestring **reason);
 
 /* WIRE: DUALOPEND_OPENER_INIT */
 /*  master->dualopend: hello */
@@ -223,4 +216,4 @@ bool fromwire_dualopend_dev_memleak_reply(const void *p, bool *leak);
 
 
 #endif /* LIGHTNING_OPENINGD_DUALOPEND_WIREGEN_H */
-// SHA256STAMP:16b6a5025dbdb4cd770749cf8557990d0a4ff2b85ad6fca17ce91769dd22fd68
+// SHA256STAMP:407d42d23a8c3b4526b63fdbb572a1d8e75b4e7e390e13af018e289e5ac857cd

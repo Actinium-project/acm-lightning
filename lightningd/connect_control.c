@@ -283,14 +283,16 @@ static void peer_please_disconnect(struct lightningd *ld, const u8 *msg)
 	c = active_channel_by_id(ld, &id, &uc);
 	if (uc)
 		kill_uncommitted_channel(uc, "Reconnected");
-	else if (c)
+	else if (c) {
+		channel_cleanup_commands(c, "Reconnected");
 		channel_fail_reconnect(c, "Reconnected");
+	}
 #if EXPERIMENTAL_FEATURES
 	else {
 		/* v2 has unsaved channels, not uncommitted_chans */
 		c = unsaved_channel_by_id(ld, &id);
 		if (c)
-			kill_unsaved_channel(c, "Reconnected");
+			channel_close_conn(c, "Reconnected");
 	}
 #endif /* EXPERIMENTAL_FEATURES */
 }

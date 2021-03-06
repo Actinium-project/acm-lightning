@@ -715,6 +715,47 @@ void channel_fail_forget(struct channel *channel, const char *fmt, ...)
 	tal_free(why);
 }
 
+struct channel_inflight *
+channel_current_inflight(const struct channel *channel)
+{
+	struct channel_inflight *inflight;
+	/* The last inflight should always be the one in progress */
+	inflight = list_tail(&channel->inflights,
+			     struct channel_inflight,
+			     list);
+	if (inflight)
+		assert(bitcoin_txid_eq(&channel->funding_txid,
+				       &inflight->funding->txid));
+	return inflight;
+}
+
+u32 channel_last_funding_feerate(const struct channel *channel)
+{
+	struct channel_inflight *inflight;
+	inflight = channel_current_inflight(channel);
+	if (!inflight)
+		return 0;
+	return inflight->funding->feerate;
+}
+
+void channel_cleanup_commands(struct channel *channel, const char *why)
+{
+	if (channel->open_attempt) {
+		struct open_attempt *oa = channel->open_attempt;
+		if (oa->cmd)
+			was_pending(command_fail(oa->cmd, LIGHTNINGD,
+						 "%s", why));
+		notify_channel_open_failed(channel->peer->ld, &channel->cid);
+		channel->open_attempt = tal_free(channel->open_attempt);
+	}
+
+	if (channel->openchannel_signed_cmd) {
+		was_pending(command_fail(channel->openchannel_signed_cmd,
+					 LIGHTNINGD, "%s", why));
+		channel->openchannel_signed_cmd = NULL;
+	}
+}
+
 void channel_internal_error(struct channel *channel, const char *fmt, ...)
 {
 	va_list ap;
@@ -724,8 +765,17 @@ void channel_internal_error(struct channel *channel, const char *fmt, ...)
 	why = tal_vfmt(channel, fmt, ap);
 	va_end(ap);
 
-	log_broken(channel->log, "Peer internal error %s: %s",
+	log_broken(channel->log, "Internal error %s: %s",
 		   channel_state_name(channel), why);
+
+	channel_cleanup_commands(channel, why);
+
+	if (channel_unsaved(channel)) {
+		subd_release_channel(channel->owner, channel);
+		delete_channel(channel);
+		tal_free(why);
+		return;
+	}
 
 	/* Don't expose internal error causes to remove unless doing dev */
 #if DEVELOPER

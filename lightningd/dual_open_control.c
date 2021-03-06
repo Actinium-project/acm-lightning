@@ -4,6 +4,7 @@
 
 #include <bitcoin/psbt.h>
 #include <bitcoin/script.h>
+#include <ccan/array_size/array_size.h>
 #include <ccan/ccan/mem/mem.h>
 #include <ccan/ccan/take/take.h>
 #include <ccan/ccan/tal/tal.h>
@@ -41,93 +42,136 @@ struct commit_rcvd {
 	struct uncommitted_channel *uc;
 };
 
-static void
-unsaved_channel_disconnect(struct channel *channel,
-			   enum log_level level,
-			   const char *desc)
+static void channel_disconnect(struct channel *channel,
+			       enum log_level level,
+			       bool reconnect,
+			       const char *desc)
 {
-	u8 *msg = towire_connectd_peer_disconnected(tmpctx, &channel->peer->id);
-	log_(channel->log, level, NULL, false, "%s", desc);
+	u8 *msg = towire_connectd_peer_disconnected(tmpctx,
+						    &channel->peer->id);
 	subd_send_msg(channel->peer->ld->connectd, msg);
-	if (channel->open_attempt && channel->open_attempt->cmd)
-		was_pending(command_fail(channel->open_attempt->cmd,
-					 LIGHTNINGD, "%s", desc));
+
+	log_(channel->log, level, NULL, false, "%s", desc);
+	channel_cleanup_commands(channel, desc);
+
 	notify_disconnect(channel->peer->ld, &channel->peer->id);
-	channel->open_attempt = tal_free(channel->open_attempt);
-	if (list_empty(&channel->inflights))
-		memset(&channel->cid, 0xFF, sizeof(channel->cid));
+
+	if (channel_unsaved(channel)) {
+		log_unusual(channel->log, "%s",
+			    "Unsaved peer failed."
+			    " Disconnecting and deleting channel.");
+		delete_channel(channel);
+		return;
+	}
+
+	if (reconnect)
+		channel_fail_reconnect(channel, "%s: %s",
+				       channel->owner->name, desc);
 }
 
-void kill_unsaved_channel(struct channel *channel,
-			  const char *why)
+void channel_close_conn(struct channel *channel, const char *why)
 {
-	log_info(channel->log, "Killing dualopend: %s", why);
-
 	/* Close dualopend */
 	if (channel->owner) {
+		log_info(channel->log, "Killing dualopend: %s", why);
+
 		subd_release_channel(channel->owner, channel);
 		channel->owner = NULL;
 	}
 
-	unsaved_channel_disconnect(channel, LOG_INFORM, why);
-	tal_free(channel);
+	channel_disconnect(channel, LOG_INFORM, false, why);
 }
 
-static struct channel_inflight *
-channel_current_inflight(struct channel *channel)
+void channel_close_reconn(struct channel *channel, const char *why)
 {
-	struct channel_inflight *inflight;
-	/* The last inflight should always be the one in progress */
-	inflight = list_tail(&channel->inflights,
-			     struct channel_inflight,
-			     list);
-	if (inflight)
-		assert(bitcoin_txid_eq(&channel->funding_txid,
-				       &inflight->funding->txid));
-	return inflight;
-}
+	/* Close the daemon */
+	if (channel->owner) {
+		log_info(channel->log, "Killing %s: %s",
+			 channel->owner->name, why);
 
-static void handle_signed_psbt(struct lightningd *ld,
-			       struct subd *dualopend,
-			       const struct wally_psbt *psbt,
-			       struct channel *channel)
-{
-	struct channel_inflight *inflight;
-	struct bitcoin_txid txid;
-
-	inflight = channel_current_inflight(channel);
-	/* Check that we've got the same / correct PSBT */
-	psbt_txid(NULL, psbt, &txid, NULL);
-	if (!bitcoin_txid_eq(&inflight->funding->txid, &txid)) {
-		log_broken(channel->log,
-			   "PSBT's txid does not match. %s != %s",
-			   type_to_string(tmpctx, struct bitcoin_txid,
-					  &txid),
-			   type_to_string(tmpctx, struct bitcoin_txid,
-					  &inflight->funding->txid));
-		/* FIXME: what's the ideal error handling here ? */
-		subd_send_msg(dualopend,
-			      take(towire_dualopend_fail(NULL,
-							 "Peer error with PSBT"
-							 " signatures.")));
-		return;
+		subd_release_channel(channel->owner, channel);
+		channel->owner = NULL;
 	}
 
-	/* Now that we've got the signed PSBT, save it */
-	tal_free(inflight->funding_psbt);
-	inflight->funding_psbt = tal_steal(inflight,
-					   cast_const(struct wally_psbt *,
-						      psbt));
-	wallet_inflight_save(ld->wallet, inflight);
-	channel_watch_funding(ld, channel);
+	channel_disconnect(channel, LOG_INFORM, true, why);
+}
 
-	/* Send peer our signatures */
-	subd_send_msg(dualopend,
-		      take(towire_dualopend_send_tx_sigs(NULL, psbt)));
+static void channel_err_broken_reconn(struct channel *channel,
+				      const char *fmt, ...)
+{
+	va_list ap;
+	const char *errmsg;
+
+	va_start(ap, fmt);
+	errmsg = tal_vfmt(tmpctx, fmt, ap);
+	va_end(ap);
+
+	log_broken(channel->log, "%s", errmsg);
+	channel_close_reconn(channel, errmsg);
+}
+
+static void channel_err_broken(struct channel *channel,
+			       const char *fmt, ...)
+{
+	va_list ap;
+	const char *errmsg;
+
+	va_start(ap, fmt);
+	errmsg = tal_vfmt(tmpctx, fmt, ap);
+	va_end(ap);
+
+	log_broken(channel->log, "%s", errmsg);
+	channel_close_conn(channel, errmsg);
+}
+
+void json_add_unsaved_channel(struct json_stream *response,
+			      const struct channel *channel)
+{
+	struct amount_msat total;
+
+	if (!channel)
+		return;
+
+	/* If we're chatting but no channel, that's shown by connected: True */
+	if (!channel->open_attempt)
+		return;
+
+	json_object_start(response, NULL);
+	json_add_string(response, "state", channel_state_name(channel));
+	json_add_string(response, "owner", channel->owner->name);
+	json_add_string(response, "opener", channel->opener == LOCAL ?
+					    "local" : "remote");
+	json_array_start(response, "status");
+	for (size_t i = 0; i < ARRAY_SIZE(channel->billboard.permanent); i++) {
+		if (!channel->billboard.permanent[i])
+			continue;
+		json_add_string(response, NULL,
+				channel->billboard.permanent[i]);
+	}
+	if (channel->billboard.transient)
+		json_add_string(response, NULL, channel->billboard.transient);
+	json_array_end(response);
+
+	/* These should never fail. */
+	if (amount_sat_to_msat(&total, channel->open_attempt->funding)) {
+		json_add_amount_msat_compat(response, total,
+					    "msatoshi_to_us", "to_us_msat");
+		/* This will change if peer adds funds */
+		json_add_amount_msat_compat(response, total,
+					    "msatoshi_total", "total_msat");
+	}
+
+	json_array_start(response, "features");
+	/* v2 channels assumed to have both static_remotekey + anchor_outputs */
+	json_add_string(response, NULL, "option_static_remotekey");
+	json_add_string(response, NULL, "option_anchor_outputs");
+	json_array_end(response);
+	json_object_end(response);
 }
 
 struct rbf_channel_payload {
 	struct subd *dualopend;
+	struct channel *channel;
 	struct node_id peer_id;
 
 	/* Info specific to this RBF */
@@ -181,6 +225,7 @@ rbf_channel_hook_serialize(struct rbf_channel_payload *payload,
 */
 struct openchannel2_payload {
 	struct subd *dualopend;
+	struct channel *channel;
 	struct node_id peer_id;
 	struct channel_id channel_id;
 	struct amount_sat their_funding;
@@ -468,15 +513,19 @@ static void rbf_channel_remove_dualopend(struct subd *dualopend,
 static void rbf_channel_hook_cb(struct rbf_channel_payload *payload STEALS)
 {
 	struct subd *dualopend = payload->dualopend;
-	struct channel *channel;
+	struct channel *channel = payload->channel;
 	u8 *msg;
 
 	tal_steal(tmpctx, payload);
 
-	if (!dualopend)
+	if (!dualopend) {
+		channel_err_broken(channel, "Lost conn to node %s"
+				   " awaiting callback",
+				   type_to_string(tmpctx,
+						  struct node_id,
+						  &channel->peer->id));
 		return;
-
-	channel = dualopend->channel;
+	}
 
 	tal_del_destructor2(dualopend, rbf_channel_remove_dualopend, payload);
 
@@ -513,14 +562,12 @@ rbf_channel_hook_deserialize(struct rbf_channel_payload *payload,
 			     const jsmntok_t *toks)
 {
 	struct subd *dualopend = payload->dualopend;
-	struct channel *channel;
+	struct channel *channel = payload->channel;
 
 	if (!dualopend) {
-		tal_free(dualopend);
+		rbf_channel_hook_cb(payload);
 		return false;
 	}
-
-	channel = dualopend->channel;
 
 	/* FIXME: move to new json extraction */
 	const jsmntok_t *t_result = json_get_member(buffer, toks, "result");
@@ -563,6 +610,13 @@ rbf_channel_hook_deserialize(struct rbf_channel_payload *payload,
 		psbt_add_serials(payload->psbt, our_role);
 	}
 
+	/* We require the PSBT to meet certain criteria such as
+	 * extra, proprietary fields (`serial_id`s) or
+	 * to have a `redeemscripts` iff the inputs are P2SH.
+	 *
+	 * Since this is externally provided, we confirm that
+	 * they've done the right thing / haven't lost any required info.
+	 */
 	if (payload->psbt && !psbt_has_required_fields(payload->psbt))
 		fatal("Plugin supplied PSBT that's missing"
 		      " required fields: %s",
@@ -600,15 +654,21 @@ static void
 openchannel2_hook_cb(struct openchannel2_payload *payload STEALS)
 {
 	struct subd *dualopend = payload->dualopend;
-	struct channel *channel;
+	struct channel *channel = payload->channel;
 	u8 *msg;
 
 	/* Free payload regardless of what happens next */
 	tal_steal(tmpctx, payload);
 
-	/* If our daemon died, we're done */
-	if (!dualopend)
+	/* Our daemon died, we fail and try to reconnect */
+	if (!dualopend) {
+		channel_err_broken(channel, "Lost conn to node %s"
+				   " awaiting callback",
+				   type_to_string(tmpctx,
+						  struct node_id,
+						  &channel->peer->id));
 		return;
+	}
 
 	channel = dualopend->channel;
 
@@ -733,6 +793,13 @@ openchannel2_hook_deserialize(struct openchannel2_payload *payload,
 	if (payload->psbt)
 		psbt_add_serials(payload->psbt, TX_ACCEPTER);
 
+	/* We require the PSBT to meet certain criteria such as
+	 * extra, proprietary fields (`serial_id`s) or
+	 * to have a `redeemscripts` iff the inputs are P2SH.
+	 *
+	 * Since this is externally provided, we confirm that
+	 * they've done the right thing / haven't lost any required info.
+	 */
 	if (payload->psbt && !psbt_has_required_fields(payload->psbt))
 		fatal("Plugin supplied PSBT that's missing required fields. %s",
 		      type_to_string(tmpctx, struct wally_psbt, payload->psbt));
@@ -798,6 +865,13 @@ openchannel2_changed_deserialize(struct openchannel2_psbt_payload *payload,
 	/* Add serials to PSBT, before checking for required fields */
 	psbt_add_serials(psbt, TX_ACCEPTER);
 
+	/* We require the PSBT to meet certain criteria such as
+	 * extra, proprietary fields (`serial_id`s) or
+	 * to have a `redeemscripts` iff the inputs are P2SH.
+	 *
+	 * Since this is externally provided, we confirm that
+	 * they've done the right thing / haven't lost any required info.
+	 */
 	if (!psbt_has_required_fields(psbt))
 		fatal("Plugin supplied PSBT that's missing required fields. %s",
 		      type_to_string(tmpctx, struct wally_psbt, psbt));
@@ -842,6 +916,13 @@ openchannel2_signed_deserialize(struct openchannel2_psbt_payload *payload,
 			       false, &psbt))
 		return false;
 
+	/* We require the PSBT to meet certain criteria such as
+	 * extra, proprietary fields (`serial_id`s) or
+	 * to have a `redeemscripts` iff the inputs are P2SH.
+	 *
+	 * Since this is externally provided, we confirm that
+	 * they've done the right thing / haven't lost any required info.
+	 */
 	if (!psbt_has_required_fields(psbt))
 		fatal("Plugin supplied PSBT that's missing required fields. %s",
 		      type_to_string(tmpctx, struct wally_psbt, psbt));
@@ -869,29 +950,68 @@ openchannel2_signed_deserialize(struct openchannel2_psbt_payload *payload,
 static void
 openchannel2_sign_hook_cb(struct openchannel2_psbt_payload *payload STEALS)
 {
+	struct channel *channel = payload->channel;
+	struct channel_inflight *inflight;
+	struct bitcoin_txid txid;
+	u8 *msg;
+
 	/* Whatever happens, we free the payload */
 	tal_steal(tmpctx, payload);
 
+	/* Finalize it, if not already. It shouldn't work entirely */
+	psbt_finalize(payload->psbt);
+
+	if (!psbt_side_finalized(payload->psbt, TX_ACCEPTER)) {
+		log_broken(channel->log,
+			   "Plugin must return a 'psbt' with signatures "
+			   "for their inputs %s",
+			   type_to_string(tmpctx,
+					  struct wally_psbt,
+					  payload->psbt));
+		msg = towire_dualopend_fail(NULL, "Peer error with PSBT"
+					    " signatures.");
+		goto send_msg;
+	}
+
+	inflight = channel_current_inflight(channel);
+
+	/* Check that we've got the same / correct PSBT */
+	psbt_txid(NULL, payload->psbt, &txid, NULL);
+	if (!bitcoin_txid_eq(&inflight->funding->txid, &txid)) {
+		log_broken(channel->log,
+			   "PSBT's txid does not match. %s != %s",
+			   type_to_string(tmpctx, struct bitcoin_txid,
+					  &txid),
+			   type_to_string(tmpctx, struct bitcoin_txid,
+					  &inflight->funding->txid));
+		msg = towire_dualopend_fail(NULL, "Peer error with PSBT"
+					    " signatures.");
+		goto send_msg;
+	}
+
+	/* Now that we've got the signed PSBT, save it */
+	tal_free(inflight->funding_psbt);
+	inflight->funding_psbt = tal_steal(inflight,
+					   cast_const(struct wally_psbt *,
+						      payload->psbt));
+	wallet_inflight_save(payload->ld->wallet, inflight);
+	channel_watch_funding(payload->ld, channel);
+	msg = towire_dualopend_send_tx_sigs(NULL, inflight->funding_psbt);
+
+send_msg:
+	/* Peer's gone away, let's try reconnecting */
 	if (!payload->dualopend) {
-		log_broken(payload->ld->log, "dualopend daemon died"
-			   " before signed PSBT returned");
-		channel_internal_error(payload->channel, "daemon died");
+		channel_err_broken_reconn(channel, "%s: dualopend daemon died"
+					  " before signed PSBT returned",
+					  channel->owner->name);
 		return;
 	}
 	tal_del_destructor2(payload->dualopend,
 			    openchannel2_psbt_remove_dualopend,
 			    payload);
 
-	/* Finalize it, if not already. It shouldn't work entirely */
-	psbt_finalize(payload->psbt);
-
-	if (!psbt_side_finalized(payload->psbt, TX_ACCEPTER))
-		fatal("Plugin must return a 'psbt' with signatures "
-		      "for their inputs %s",
-		      type_to_string(tmpctx, struct wally_psbt, payload->psbt));
-
-	handle_signed_psbt(payload->ld, payload->dualopend,
-			   payload->psbt, payload->channel);
+	/* Send peer our signatures */
+	subd_send_msg(payload->dualopend, take(msg));
 }
 
 REGISTER_PLUGIN_HOOK(openchannel2,
@@ -918,8 +1038,100 @@ REGISTER_PLUGIN_HOOK(rbf_channel,
 		     rbf_channel_hook_serialize,
 		     struct rbf_channel_payload *);
 
+static struct amount_sat calculate_reserve(struct channel_config *their_config,
+					   struct amount_sat funding_total,
+					   enum side opener)
+{
+	struct amount_sat reserve, dust_limit;
+
+	/* BOLT-fe0351ca2cea3105c4f2eb18c571afca9d21c85b #2
+	 *
+	 * The channel reserve is fixed at 1% of the total channel balance
+	 * rounded down (sum of `funding_satoshis` from `open_channel2`
+	 * and `accept_channel2`) or the `dust_limit_satoshis` from
+	 * `open_channel2`, whichever is greater.
+	 */
+	reserve = amount_sat_div(funding_total, 100);
+	dust_limit = opener == LOCAL ?
+		chainparams->dust_limit :
+		their_config->dust_limit;
+
+	if (amount_sat_greater(dust_limit, reserve))
+		return dust_limit;
+
+	return reserve;
+}
+
+static void channel_update_reserve(struct channel *channel,
+				   struct channel_config *their_config,
+				   struct amount_sat funding_total)
+{
+	struct amount_sat reserve;
+
+	reserve = calculate_reserve(their_config,
+				    funding_total,
+				    channel->opener);
+
+	/* Depending on path, these are disjoint */
+	their_config->channel_reserve = reserve;
+	channel->channel_info.their_config.channel_reserve = reserve;
+	channel->our_config.channel_reserve = reserve;
+}
+
 /* Steals fields from uncommitted_channel: returns NULL if can't generate a
  * key for this channel (shouldn't happen!). */
+static struct channel_inflight *
+wallet_update_channel(struct lightningd *ld,
+		      struct channel *channel,
+		      struct bitcoin_tx *remote_commit STEALS,
+		      struct bitcoin_signature *remote_commit_sig,
+		      const struct bitcoin_txid *funding_txid,
+		      u16 funding_outnum,
+		      struct amount_sat total_funding,
+		      struct amount_sat our_funding,
+		      u32 funding_feerate,
+		      struct wally_psbt *psbt STEALS)
+{
+	struct amount_msat our_msat;
+	struct channel_inflight *inflight;
+
+	if (!amount_sat_to_msat(&our_msat, our_funding)) {
+		log_broken(channel->log, "Unable to convert funds");
+		return NULL;
+	}
+
+	assert(channel->unsaved_dbid == 0);
+	assert(channel->dbid != 0);
+
+	channel->funding_txid = *funding_txid;
+	channel->funding_outnum = funding_outnum;
+	channel->funding = total_funding;
+	channel->our_funds = our_funding;
+	channel->our_msat = our_msat;
+	channel->msat_to_us_min = our_msat;
+	channel->msat_to_us_max = our_msat;
+	channel->last_tx = tal_steal(channel, remote_commit);
+	channel->last_sig = *remote_commit_sig;
+
+	/* Update in database */
+	wallet_channel_save(ld->wallet, channel);
+
+	/* Add open attempt to channel's inflights */
+	inflight = new_inflight(channel,
+				channel->funding_txid,
+				channel->funding_outnum,
+				funding_feerate,
+				channel->funding,
+				channel->our_funds,
+				psbt,
+				channel->last_tx,
+				channel->last_sig);
+	wallet_inflight_add(ld->wallet, inflight);
+
+	return inflight;
+}
+
+/* Returns NULL if can't generate a key for this channel (Shouldn't happen) */
 static struct channel_inflight *
 wallet_commit_channel(struct lightningd *ld,
 		      struct channel *channel,
@@ -1012,7 +1224,6 @@ wallet_commit_channel(struct lightningd *ld,
 				channel->last_tx,
 				channel->last_sig);
 	wallet_inflight_add(ld->wallet, inflight);
-	channel->open_attempt = NULL;
 
 	return inflight;
 }
@@ -1038,7 +1249,8 @@ static void handle_peer_wants_to_close(struct subd *dualopend,
 	}
 
 	if (!fromwire_dualopend_got_shutdown(channel, msg, &scriptpubkey)) {
-		channel_internal_error(channel, "bad channel_got_shutdown %s",
+		channel_internal_error(channel,
+				       "Bad DUALOPEND_GOT_SHUTDOWN: %s",
 				       tal_hex(msg, msg));
 		return;
 	}
@@ -1095,7 +1307,7 @@ static void handle_channel_closed(struct subd *dualopend,
 
 	if (!fromwire_dualopend_shutdown_complete(tmpctx, msg, &pps)) {
 		channel_internal_error(dualopend->channel,
-				       "bad shutdown_complete: %s",
+				       "Bad DUALOPEND_SHUTDOWN_COMPLETE: %s",
 				       tal_hex(msg, msg));
 		close(fds[0]);
 		close(fds[1]);
@@ -1112,47 +1324,6 @@ static void handle_channel_closed(struct subd *dualopend,
 			  REASON_UNKNOWN,
 			  "Start closingd");
 }
-
-static void
-opening_failed_cancel_commands(struct channel *channel,
-			       struct open_attempt *oa,
-			       const char *desc)
-{
-	if (oa->cmd)
-		was_pending(command_fail(oa->cmd, LIGHTNINGD, "%s", desc));
-
-	/* FIXME: cancels? */
-
-	channel->open_attempt = tal_free(channel->open_attempt);
-	if (list_empty(&channel->inflights))
-		memset(&channel->cid, 0xFF, sizeof(channel->cid));
-}
-
-static void open_failed(struct subd *dualopend, const u8 *msg)
-{
-	char *desc;
-	struct channel *channel = dualopend->channel;
-	struct open_attempt *oa = channel->open_attempt;
-
-	if (!fromwire_dualopend_failed(msg, msg, &desc)) {
-		log_broken(channel->log,
-			   "Bad DUALOPEND_FAILED %s",
-			   tal_hex(msg, msg));
-
-		if (oa->cmd)
-			was_pending(command_fail(oa->cmd, LIGHTNINGD, "%s",
-						 tal_hex(oa->cmd, msg)));
-
-		notify_channel_open_failed(dualopend->ld, &channel->cid);
-		subd_release_channel(dualopend, channel);
-		channel->open_attempt = tal_free(channel->open_attempt);
-		return;
-	}
-
-	notify_channel_open_failed(dualopend->ld, &channel->cid);
-	opening_failed_cancel_commands(channel, oa, desc);
-}
-
 
 struct channel_send {
 	const struct wally_tx *wtx;
@@ -1229,6 +1400,7 @@ static void send_funding_tx(struct channel *channel,
 {
 	struct lightningd *ld = channel->peer->ld;
 	struct channel_send *cs;
+	struct bitcoin_txid txid;
 
 	cs = tal(channel, struct channel_send);
 	cs->channel = channel;
@@ -1242,8 +1414,10 @@ static void send_funding_tx(struct channel *channel,
 		tal_wally_end(tal_steal(cs, cs->wtx));
 	}
 
+	wally_txid(wtx, &txid);
 	log_debug(channel->log,
-		  "Broadcasting funding tx for channel %s. %s",
+		  "Broadcasting funding tx %s for channel %s. %s",
+		  type_to_string(tmpctx, struct bitcoin_txid, &txid),
 		  type_to_string(tmpctx, struct channel_id, &channel->cid),
 		  type_to_string(tmpctx, struct wally_tx, cs->wtx));
 
@@ -1262,7 +1436,7 @@ static void handle_peer_tx_sigs_sent(struct subd *dualopend,
 
 	if (!fromwire_dualopend_tx_sigs_sent(msg)) {
 		channel_internal_error(channel,
-				       "bad WIRE_DUALOPEND_TX_SIGS_SENT %s",
+				       "Bad WIRE_DUALOPEND_TX_SIGS_SENT: %s",
 				       tal_hex(tmpctx, msg));
 		return;
 	}
@@ -1272,7 +1446,6 @@ static void handle_peer_tx_sigs_sent(struct subd *dualopend,
 	    && inflight->remote_tx_sigs) {
 		wtx = psbt_final_tx(NULL, inflight->funding_psbt);
 		if (!wtx) {
-			/* FIXME: what's the ideal error handling here? */
 			channel_internal_error(channel,
 					       "Unable to extract final tx"
 					       " from PSBT %s",
@@ -1312,7 +1485,7 @@ static void handle_peer_locked(struct subd *dualopend, const u8 *msg)
 
 	if (!fromwire_dualopend_peer_locked(msg, &remote_per_commit))
 		channel_internal_error(channel,
-				       "bad WIRE_DUALOPEND_PEER_LOCKED %s",
+				       "Bad WIRE_DUALOPEND_PEER_LOCKED: %s",
 				       tal_hex(msg, msg));
 
 	/* Updates channel with the next per-commit point etc */
@@ -1332,13 +1505,10 @@ static void handle_channel_locked(struct subd *dualopend,
 	struct per_peer_state *pps;
 
 	if (!fromwire_dualopend_channel_locked(tmpctx, msg, &pps)) {
-		log_broken(dualopend->log,
-			   "bad WIRE_DUALOPEND_CHANNEL_LOCKED %s",
-			   tal_hex(msg, msg));
-		close(fds[0]);
-		close(fds[1]);
-		close(fds[2]);
-		goto cleanup;
+		channel_internal_error(channel,
+				       "Bad WIRE_DUALOPEND_CHANNEL_LOCKED: %s",
+				       tal_hex(msg, msg));
+		return;
 	}
 	per_peer_state_set_fds_arr(pps, fds);
 
@@ -1360,9 +1530,6 @@ static void handle_channel_locked(struct subd *dualopend,
 	/* FIXME: LND sigs/update_fee msgs? */
 	peer_start_channeld(channel, pps, NULL, false);
 	return;
-
-cleanup:
-	subd_release_channel(dualopend, channel);
 }
 
 void dualopen_tell_depth(struct subd *dualopend,
@@ -1407,6 +1574,11 @@ void dualopen_tell_depth(struct subd *dualopend,
 			channel->last_tx = tal_steal(channel, inf->last_tx);
 			channel->last_sig = inf->last_sig;
 
+			/* Update the reserve */
+			channel_update_reserve(channel,
+					       &channel->channel_info.their_config,
+					       inf->funding->total_funds);
+
 			wallet_channel_save(dualopend->ld->wallet, channel);
 			/* FIXME: delete inflights */
 		}
@@ -1429,18 +1601,29 @@ static void rbf_got_offer(struct subd *dualopend, const u8 *msg)
 
 	payload = tal(dualopend, struct rbf_channel_payload);
 	payload->dualopend = dualopend;
+	payload->channel = channel;
 
 	if (!fromwire_dualopend_got_rbf_offer(msg,
 					      &payload->channel_id,
 					      &payload->their_funding,
 					      &payload->funding_feerate_per_kw,
 					      &payload->locktime)) {
-		log_broken(channel->log, "Malformed dualopend_got_rbf_offer %s",
-			   tal_hex(msg, msg));
-		unsaved_channel_disconnect(channel, LOG_BROKEN,
-					   "Malformed internal wire message");
-		subd_release_channel(dualopend, channel);
-		tal_free(dualopend);
+		channel_internal_error(channel,
+				       "Bad WIRE_DUALOPEND_GOT_RBF_OFFER: %s",
+				       tal_hex(msg, msg));
+		return;
+	}
+
+	/* There's currently another attempt in progress? */
+	if (channel->open_attempt) {
+		log_debug(channel->log,
+			  "RBF attempted while previous attempt"
+			  " is still in progress");
+
+		subd_send_msg(dualopend,
+			      take(towire_dualopend_fail(NULL,
+					"Error. Already negotiation"
+					" in progress")));
 		return;
 	}
 
@@ -1483,6 +1666,7 @@ static void accepter_got_offer(struct subd *dualopend,
 
 	payload = tal(dualopend, struct openchannel2_payload);
 	payload->dualopend = dualopend;
+	payload->channel = channel;
 	payload->psbt = NULL;
 	payload->accepter_funding = AMOUNT_SAT(0);
 	payload->our_shutdown_scriptpubkey = NULL;
@@ -1504,9 +1688,8 @@ static void accepter_got_offer(struct subd *dualopend,
 					  &payload->channel_flags,
 					  &payload->locktime,
 					  &payload->shutdown_scriptpubkey)) {
-		log_broken(channel->log, "Malformed dual_open_got_offer %s",
-			   tal_hex(tmpctx, msg));
-		tal_free(dualopend);
+		channel_internal_error(channel, "Bad DUALOPEND_GOT_OFFER: %s",
+				       tal_hex(tmpctx, msg));
 		return;
 	}
 
@@ -1536,7 +1719,7 @@ static void handle_peer_tx_sigs_msg(struct subd *dualopend,
 
 	if (!fromwire_dualopend_funding_sigs(tmpctx, msg, &psbt)) {
 		channel_internal_error(channel,
-				       "bad dualopend_funding_sigs: %s",
+				       "Bad DUALOPEND_FUNDING_SIGS: %s",
 				       tal_hex(tmpctx, msg));
 		return;
 	}
@@ -1613,7 +1796,7 @@ static void handle_validate_rbf(struct subd *dualopend,
 	if (!fromwire_dualopend_rbf_validate(tmpctx, msg,
 					     &candidate_psbt)) {
 		channel_internal_error(channel,
-				       "Malformed dualopend_rbf_validate %s",
+				       "Bad DUALOPEND_RBF_VALIDATE: %s",
 				       tal_hex(tmpctx, msg));
 		return;
 	}
@@ -1737,6 +1920,11 @@ json_openchannel_bump(struct command *cmd,
 				    " Current state %s, expected state %s",
 				    channel_state_name(channel),
 				    channel_state_str(DUALOPEND_AWAITING_LOCKIN));
+	if (channel->opener != LOCAL)
+		return command_fail(cmd, FUNDING_STATE_INVALID,
+				    "Only the channel opener can initiate an"
+				    " RBF attempt");
+
 	/* Ok, we're kosher to start */
 	channel->open_attempt = oa = new_channel_open_attempt(channel);
 	oa->funding = *amount;
@@ -1744,7 +1932,24 @@ json_openchannel_bump(struct command *cmd,
 	oa->our_upfront_shutdown_script
 		= channel->shutdown_scriptpubkey[LOCAL];
 
-	/* FIXME: call dualopend with psbt + amount!! */
+	/* Add serials to any input that's missing them */
+	psbt_add_serials(psbt, TX_INITIATOR);
+
+	/* We require the PSBT to meet certain criteria such as
+	 * extra, proprietary fields (`serial_id`s) or
+	 * to have a `redeemscripts` iff the inputs are P2SH.
+	 *
+	 * Since this is externally provided, we confirm that
+	 * they've done the right thing / haven't lost any required info.
+	 */
+	if (!psbt_has_required_fields(psbt))
+		return command_fail(cmd, FUNDING_PSBT_INVALID,
+				    "PSBT is missing required fields %s",
+				    type_to_string(tmpctx, struct wally_psbt,
+						   psbt));
+
+	subd_send_msg(channel->owner,
+		      take(towire_dualopend_rbf_init(NULL, *amount, psbt)));
 	return command_still_pending(cmd);
 }
 
@@ -1896,6 +2101,14 @@ static struct command_result *json_openchannel_update(struct command *cmd,
 
 	/* Add serials to PSBT */
 	psbt_add_serials(psbt, TX_INITIATOR);
+
+	/* We require the PSBT to meet certain criteria such as
+	 * extra, proprietary fields (`serial_id`s) or
+	 * to have a `redeemscripts` iff the inputs are P2SH.
+	 *
+	 * Since this is externally provided, we confirm that
+	 * they've done the right thing / haven't lost any required info.
+	 */
 	if (!psbt_has_required_fields(psbt))
 		return command_fail(cmd, FUNDING_PSBT_INVALID,
 				    "PSBT is missing required fields %s",
@@ -2029,6 +2242,14 @@ static struct command_result *json_openchannel_init(struct command *cmd,
 
 	/* Add serials to any input that's missing them */
 	psbt_add_serials(psbt, TX_INITIATOR);
+
+	/* We require the PSBT to meet certain criteria such as
+	 * extra, proprietary fields (`serial_id`s) or
+	 * to have a `redeemscripts` iff the inputs are P2SH.
+	 *
+	 * Since this is externally provided, we confirm that
+	 * they've done the right thing / haven't lost any required info.
+	 */
 	if (!psbt_has_required_fields(psbt))
 		return command_fail(cmd, FUNDING_PSBT_INVALID,
 				    "PSBT is missing required fields %s",
@@ -2072,7 +2293,7 @@ channel_fail_fallen_behind(struct subd* dualopend, const u8 *msg)
 
 	if (!fromwire_dualopend_fail_fallen_behind(msg)) {
 		channel_internal_error(channel,
-				       "bad dualopen_fail_fallen_behind %s",
+				       "Bad DUALOPEND_FAIL_FALLEN_BEHIND: %s",
 				       tal_hex(tmpctx, msg));
 		return;
 	}
@@ -2100,10 +2321,9 @@ static void handle_psbt_changed(struct subd *dualopend,
 					     &cid,
 					     &funding_serial,
 					     &psbt)) {
-		log_broken(dualopend->log,
-			   "Malformed dual_open_psbt_changed %s",
-			   tal_hex(tmpctx, msg));
-		tal_free(dualopend);
+		channel_internal_error(channel,
+				       "Bad DUALOPEND_PSBT_CHANGED: %s",
+				       tal_hex(tmpctx, msg));
 		return;
 	}
 
@@ -2111,17 +2331,10 @@ static void handle_psbt_changed(struct subd *dualopend,
 	switch (oa->role) {
 	case TX_INITIATOR:
 		if (!cmd) {
-			/* FIXME: handling for post-inflight errors */
-			unsaved_channel_disconnect(channel, LOG_UNUSUAL,
-						   tal_fmt(tmpctx,
-							   "Unexpected PSBT"
-							   "_CHANGED %s",
-							   tal_hex(tmpctx,
-								   msg)));
-			if (list_empty(&channel->inflights)) {
-				subd_release_channel(dualopend, channel);
-				tal_free(dualopend);
-			}
+			channel_err_broken(channel,
+					   tal_fmt(tmpctx, "Unexpected"
+						   " PSBT_CHANGED %s",
+						   tal_hex(tmpctx, msg)));
 			return;
 		}
 		/* This might be the first time we learn the channel_id */
@@ -2171,11 +2384,7 @@ static void handle_commit_received(struct subd *dualopend,
 	struct json_stream *response;
 	struct openchannel2_psbt_payload *payload;
 	struct channel_inflight *inflight;
-	char *err_reason;
 	struct command *cmd = oa->cmd;
-
-	/* We clean up the open attempt regardless */
-	tal_steal(tmpctx, oa);
 
 	if (!fromwire_dualopend_commit_rcvd(tmpctx, msg,
 					    &channel_info.their_config,
@@ -2196,55 +2405,100 @@ static void handle_commit_received(struct subd *dualopend,
 					    &channel->channel_flags,
 					    &feerate_funding,
 					    &feerate_commitment,
-					    &channel->our_config.channel_reserve,
 					    &local_upfront_shutdown_script,
 					    &remote_upfront_shutdown_script)) {
-		log_broken(channel->log, "bad WIRE_DUALOPEND_COMMIT_RCVD %s",
-			   tal_hex(msg, msg));
-		err_reason = "bad WIRE_DUALOPEND_COMMIT_RCVD";
-		unsaved_channel_disconnect(channel, LOG_BROKEN, err_reason);
-		goto failed;
+		channel_internal_error(channel,
+				       "Bad WIRE_DUALOPEND_COMMIT_RCVD: %s",
+				       tal_hex(msg, msg));
+		channel->open_attempt = tal_free(channel->open_attempt);
+		return;
 	}
 
-	if (peer_active_channel(channel->peer)) {
-		err_reason = "already have active channel";
-		unsaved_channel_disconnect(channel, LOG_BROKEN, err_reason);
-		goto failed;
-	}
+	/* We need to update the channel reserve on the config */
+	channel_update_reserve(channel,
+			       &channel_info.their_config,
+			       total_funding);
 
-	if (!(inflight = wallet_commit_channel(ld, channel,
-					       remote_commit,
-					       &remote_commit_sig,
-					       &funding_txid,
-					       funding_outnum,
-					       total_funding,
-					       funding_ours,
-					       &channel_info,
-					       feerate_funding,
-					       feerate_commitment,
-					       oa->role == TX_INITIATOR ?
-							oa->our_upfront_shutdown_script :
-							local_upfront_shutdown_script,
-					       remote_upfront_shutdown_script,
-					       psbt))) {
-		err_reason = "commit channel failed";
-		unsaved_channel_disconnect(channel, LOG_BROKEN, err_reason);
-		goto failed;
-	}
+	if (channel->state == DUALOPEND_OPEN_INIT) {
+		if (peer_active_channel(channel->peer)) {
+			channel_err_broken_reconn(channel,
+						  "Already have active"
+						  " channel with %s",
+						  type_to_string(tmpctx,
+							 struct node_id,
+							 &channel->peer->id));
+			channel->open_attempt
+				= tal_free(channel->open_attempt);
+			return;
+		}
 
-	if (pbase)
-		wallet_penalty_base_add(ld->wallet, channel->dbid, pbase);
+		if (!(inflight = wallet_commit_channel(ld, channel,
+						       remote_commit,
+						       &remote_commit_sig,
+						       &funding_txid,
+						       funding_outnum,
+						       total_funding,
+						       funding_ours,
+						       &channel_info,
+						       feerate_funding,
+						       feerate_commitment,
+						       oa->role == TX_INITIATOR ?
+								oa->our_upfront_shutdown_script :
+								local_upfront_shutdown_script,
+						       remote_upfront_shutdown_script,
+						       psbt))) {
+			channel_internal_error(channel,
+					       "wallet_commit_channel failed"
+					       " (chan %s)",
+					       type_to_string(tmpctx,
+							      struct channel_id,
+							      &channel->cid));
+			channel->open_attempt
+				= tal_free(channel->open_attempt);
+			return;
+		}
+
+		/* FIXME: handle RBF pbases */
+		if (pbase)
+			wallet_penalty_base_add(ld->wallet,
+						channel->dbid,
+						pbase);
+
+	} else {
+		assert(channel->state == DUALOPEND_AWAITING_LOCKIN);
+
+		if (!(inflight = wallet_update_channel(ld, channel,
+						       remote_commit,
+						       &remote_commit_sig,
+						       &funding_txid,
+						       funding_outnum,
+						       total_funding,
+						       funding_ours,
+						       feerate_funding,
+						       psbt))) {
+			channel_err_broken_reconn(channel,
+						  "wallet_update_channel failed"
+						  " (chan %s)",
+						  type_to_string(
+							  tmpctx,
+							  struct channel_id,
+							  &channel->cid));
+			channel->open_attempt
+				= tal_free(channel->open_attempt);
+			return;
+		}
+
+	}
 
 	switch (oa->role) {
 	case TX_INITIATOR:
 		if (!oa->cmd) {
-			err_reason = tal_fmt(tmpctx,
-					     "Unexpected COMMIT_RCVD %s",
-					     tal_hex(msg, msg));
-
-			unsaved_channel_disconnect(channel, LOG_UNUSUAL,
-						   err_reason);
-			goto failed;
+			channel_err_broken(channel,
+					   "Unexpected COMMIT_RCVD %s",
+					   tal_hex(msg, msg));
+			channel->open_attempt
+				= tal_free(channel->open_attempt);
+			return;
 		}
 		response = json_stream_success(oa->cmd);
 		json_add_string(response, "channel_id",
@@ -2261,6 +2515,8 @@ static void handle_commit_received(struct subd *dualopend,
 			/* FIXME: also include the output as address */
 		}
 
+		channel->open_attempt
+			= tal_free(channel->open_attempt);
 		was_pending(command_success(cmd, response));
 		return;
 	case TX_ACCEPTER:
@@ -2273,6 +2529,9 @@ static void handle_commit_received(struct subd *dualopend,
 		payload->channel = channel;
 		payload->psbt = clone_psbt(payload, inflight->funding_psbt);
 
+		channel->open_attempt
+			= tal_free(channel->open_attempt);
+
 		/* We don't have a command, so set to NULL here */
 		payload->channel->openchannel_signed_cmd = NULL;
 		/* We call out to hook who will
@@ -2280,14 +2539,8 @@ static void handle_commit_received(struct subd *dualopend,
 		plugin_hook_call_openchannel2_sign(ld, payload);
 		return;
 	}
-	abort();
 
-failed:
-	if (cmd) {
-		was_pending(command_fail(cmd, LIGHTNINGD,
-					 "%s", err_reason));
-	}
-	subd_release_channel(dualopend, channel);
+	abort();
 }
 
 static unsigned int dual_opend_msg(struct subd *dualopend,
@@ -2337,19 +2590,13 @@ static unsigned int dual_opend_msg(struct subd *dualopend,
 		case WIRE_DUALOPEND_FAIL_FALLEN_BEHIND:
 			channel_fail_fallen_behind(dualopend, msg);
 			return 0;
-		case WIRE_DUALOPEND_FAILED:
-			open_failed(dualopend, msg);
-			return 0;
-		case WIRE_DUALOPEND_RBF_FAILED:
-			// FIXME: handle this
-			abort();
-			return 0;
 		case WIRE_DUALOPEND_DEV_MEMLEAK_REPLY:
 
 		/* Messages we send */
 		case WIRE_DUALOPEND_INIT:
 		case WIRE_DUALOPEND_REINIT:
 		case WIRE_DUALOPEND_OPENER_INIT:
+		case WIRE_DUALOPEND_RBF_INIT:
 		case WIRE_DUALOPEND_GOT_OFFER_REPLY:
 		case WIRE_DUALOPEND_GOT_RBF_OFFER_REPLY:
 		case WIRE_DUALOPEND_RBF_VALID:
@@ -2448,12 +2695,9 @@ static void start_fresh_dualopend(struct peer *peer,
 					  take(&hsmfd), NULL);
 
 	if (!channel->owner) {
-		char *errmsg;
-		errmsg = tal_fmt(tmpctx,
-				 "Running lightning_dualopend: %s",
-				 strerror(errno));
-		unsaved_channel_disconnect(channel, LOG_BROKEN, errmsg);
-		tal_free(channel);
+		channel_err_broken_reconn(channel,
+					  "Running lightning_dualopend: %s",
+					  strerror(errno));
 		return;
 	}
 
