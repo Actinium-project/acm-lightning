@@ -1875,7 +1875,6 @@ static void peer_in(struct peer *peer, const u8 *msg)
 		return;
 	case WIRE_INIT_RBF:
 	case WIRE_ACK_RBF:
-	case WIRE_BLACKLIST_PODLE:
 #endif
 		break;
 
@@ -2880,7 +2879,10 @@ static void handle_dev_memleak(struct peer *peer, const u8 *msg)
  * just forward it here. */
 static void channeld_send_custommsg(struct peer *peer, const u8 *msg)
 {
-	sync_crypto_write(peer->pps, take(msg));
+	u8 *inner;
+	if (!fromwire_custommsg_out(tmpctx, msg, &inner))
+		master_badmsg(WIRE_CUSTOMMSG_OUT, msg);
+	sync_crypto_write(peer->pps, take(inner));
 }
 #endif /* DEVELOPER */
 

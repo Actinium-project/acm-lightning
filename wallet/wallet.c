@@ -1173,8 +1173,11 @@ static struct channel *wallet_stmt2channel(struct wallet *w, struct db_stmt *stm
 		return NULL;
 	}
 
-	get_channel_basepoints(w->ld, &peer->id, db_column_u64(stmt, 0),
-			       &local_basepoints, &local_funding_pubkey);
+	db_column_pubkey(stmt, 52, &local_basepoints.revocation);
+	db_column_pubkey(stmt, 53, &local_basepoints.payment);
+	db_column_pubkey(stmt, 54, &local_basepoints.htlc);
+	db_column_pubkey(stmt, 55, &local_basepoints.delayed_payment);
+	db_column_pubkey(stmt, 56, &local_funding_pubkey);
 
 	db_column_amount_sat(stmt, 15, &funding_sat);
 	db_column_amount_sat(stmt, 16, &our_funding_sat);
@@ -1315,6 +1318,11 @@ static bool wallet_channels_load_active(struct wallet *w)
 					", shutdown_scriptpubkey_local" // 49
 					", closer" // 50
 					", state_change_reason" // 51
+					", revocation_basepoint_local" // 52
+					", payment_basepoint_local" // 53
+					", htlc_basepoint_local" // 54
+					", delayed_payment_basepoint_local" // 55
+					", funding_pubkey_local" // 56
 					" FROM channels"
                                         " WHERE state != ?;")); //? 0
 	db_bind_int(stmt, 0, CLOSED);
@@ -1810,10 +1818,25 @@ void wallet_channel_insert(struct wallet *w, struct channel *chan)
 	/* Insert a stub, that we update, unifies INSERT and UPDATE paths */
 	stmt = db_prepare_v2(
 	    w->db, SQL("INSERT INTO channels ("
-		       "peer_id, first_blocknum, id) VALUES (?, ?, ?);"));
+		       "  peer_id"
+		       ", first_blocknum"
+		       ", id"
+		       ", revocation_basepoint_local"
+		       ", payment_basepoint_local"
+		       ", htlc_basepoint_local"
+		       ", delayed_payment_basepoint_local"
+		       ", funding_pubkey_local"
+		       ") VALUES (?, ?, ?, ?, ?, ?, ?, ?);"));
 	db_bind_u64(stmt, 0, chan->peer->dbid);
 	db_bind_int(stmt, 1, chan->first_blocknum);
 	db_bind_int(stmt, 2, chan->dbid);
+
+	db_bind_pubkey(stmt, 3, &chan->local_basepoints.revocation);
+	db_bind_pubkey(stmt, 4, &chan->local_basepoints.payment);
+	db_bind_pubkey(stmt, 5, &chan->local_basepoints.htlc);
+	db_bind_pubkey(stmt, 6, &chan->local_basepoints.delayed_payment);
+	db_bind_pubkey(stmt, 7, &chan->local_funding_pubkey);
+
 	db_exec_prepared_v2(take(stmt));
 
 	wallet_channel_config_insert(w, &chan->our_config);
