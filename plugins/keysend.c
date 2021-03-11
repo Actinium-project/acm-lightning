@@ -56,23 +56,31 @@ static struct keysend_data *keysend_init(struct payment *p)
 static void keysend_cb(struct keysend_data *d, struct payment *p) {
 	struct createonion_hop *last_payload;
 	size_t hopcount;
-	struct gossmap_node *node;
-	bool enabled;
-	const struct gossmap *gossmap = get_gossmap(p->plugin);
 
 	/* On the root payment we perform the featurebit check. */
 	if (p->parent == NULL && p->step == PAYMENT_STEP_INITIALIZED) {
-		node = gossmap_find_node(gossmap, p->destination);
-
-		enabled = gossmap_node_get_feature(gossmap, node,
-						   KEYSEND_FEATUREBIT) != -1;
-		if (!enabled)
+		if (!payment_root(p)->destination_has_tlv)
 			return payment_fail(
 			    p,
 			    "Recipient %s does not support keysend payments "
-			    "(feature bit %d missing in node announcement)",
-			    node_id_to_hexstr(tmpctx, p->destination),
-			    KEYSEND_FEATUREBIT);
+			    "(no TLV support)",
+			    node_id_to_hexstr(tmpctx, p->destination));
+	} else if (p->step == PAYMENT_STEP_FAILED) {
+		/* Now we can look at the error, and the failing node,
+		   and determine whether they didn't like our
+		   attempt. This is required since most nodes don't
+		   explicitly signal support for keysend through the
+		   featurebit method.*/
+
+		if (p->result != NULL &&
+		    node_id_eq(p->destination, p->result->erring_node) &&
+		    p->result->failcode == WIRE_INVALID_ONION_PAYLOAD) {
+			return payment_abort(
+			    p,
+			    "Recipient %s reported an invalid payload, this "
+			    "usually means they don't support keysend.",
+			    node_id_to_hexstr(tmpctx, p->destination));
+		}
 	}
 
 	if (p->step != PAYMENT_STEP_ONION_PAYLOAD)

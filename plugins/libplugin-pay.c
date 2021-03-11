@@ -61,6 +61,7 @@ struct payment *payment_new(tal_t *ctx, struct command *cmd,
 	p->invstring = NULL;
 	p->routetxt = NULL;
 	p->max_htlcs = UINT32_MAX;
+	p->aborterror = NULL;
 
 	/* Copy over the relevant pieces of information. */
 	if (parent != NULL) {
@@ -1886,6 +1887,14 @@ static void payment_finished(struct payment *p)
 
 			if (command_finished(cmd, ret)) {/* Ignore result. */}
 			return;
+		} else if (p->aborterror != NULL) {
+			/* We set an explicit toplevel error message,
+			 * so let's report that. */
+			ret = jsonrpc_stream_fail(cmd, PAY_STOPPED_RETRYING,
+						  p->aborterror);
+			payment_json_add_attempts(ret, "attempts", p);
+			if (command_finished(cmd, ret)) {/* Ignore result. */}
+			return;
 		} else if (result.failure == NULL || result.failure->failcode < NODE) {
 			/* This is failing because we have no more routes to try */
 			msg = tal_fmt(cmd,
@@ -2026,6 +2035,32 @@ void payment_continue(struct payment *p)
 	/* We should never get here, it'd mean one of the state machine called
 	 * `payment_continue` after the final state. */
 	abort();
+}
+
+void payment_abort(struct payment *p, const char *fmt, ...) {
+	va_list ap;
+	struct payment *root = payment_root(p);
+	payment_set_step(p, PAYMENT_STEP_FAILED);
+	p->end_time = time_now();
+
+	va_start(ap, fmt);
+	p->failreason = tal_vfmt(p, fmt, ap);
+	va_end(ap);
+
+	root->abort = true;
+
+	/* Only set the abort error if it's not yet set, otherwise we
+	 * might end up clobbering the earliest and decisive failure
+	 * with less relevant ones. */
+	if (root->aborterror == NULL)
+		root->aborterror = tal_dup_talarr(root, char, p->failreason);
+
+	paymod_log(p, LOG_INFORM, "%s", p->failreason);
+
+	/* Do not use payment_continue, because that'd continue
+	 * applying the modifiers before calling
+	 * payment_finished(). */
+	payment_finished(p);
 }
 
 void payment_fail(struct payment *p, const char *fmt, ...)
@@ -2278,14 +2313,19 @@ static void trim_route(struct route_info **route, size_t n)
 
 /* Make sure routehints are reasonable length, and (since we assume we
  * can append), not directly to us.  Note: untrusted data! */
-static struct route_info **filter_routehints(struct routehints_data *d,
+static struct route_info **filter_routehints(struct gossmap *map,
+					     struct payment *p,
+					     struct routehints_data *d,
 					     struct node_id *myid,
 					     struct route_info **hints)
 {
+	const size_t max_hops = ROUTING_MAX_HOPS / 2;
 	char *mods = tal_strdup(tmpctx, "");
 	for (size_t i = 0; i < tal_count(hints); i++) {
+		struct gossmap_node *entrynode, *src;
+		u32 distance;
+
 		/* Trim any routehint > 10 hops */
-		size_t max_hops = ROUTING_MAX_HOPS / 2;
 		if (tal_count(hints[i]) > max_hops) {
 			tal_append_fmt(&mods,
 				       "Trimmed routehint %zu (%zu hops) to %zu. ",
@@ -2306,6 +2346,52 @@ static struct route_info **filter_routehints(struct routehints_data *d,
 		if (tal_count(hints[i]) == 0) {
 			tal_append_fmt(&mods,
 				       "Removed empty routehint %zu. ", i);
+			tal_arr_remove(&hints, i);
+			i--;
+		}
+
+		/* If routehint entrypoint is unreachable there's no
+		 * point in keeping it. */
+		entrynode = gossmap_find_node(map, &hints[i][0].pubkey);
+		src = gossmap_find_node(map, p->local_id);
+
+		if (entrynode == NULL) {
+			tal_append_fmt(&mods,
+				       "Removed routehint %zu because "
+				       "entrypoint %s is unknown. ",
+				       i,
+				       type_to_string(tmpctx, struct node_id,
+						      &hints[i][0].pubkey));
+			plugin_log(p->plugin, LOG_DBG,
+				   "Removed routehint %zu because "
+				   "entrypoint %s is unknown. ",
+				   i,
+				   type_to_string(tmpctx, struct node_id,
+						  &hints[i][0].pubkey));
+			tal_arr_remove(&hints, i);
+			i--;
+			continue;
+		}
+
+		distance = dijkstra_distance(
+		    dijkstra(tmpctx, map, entrynode, AMOUNT_MSAT(1), 1,
+			     payment_route_can_carry_even_disabled,
+			     route_score_cheaper, p),
+		    gossmap_node_idx(map, src));
+
+		if (distance == UINT_MAX) {
+			tal_append_fmt(&mods,
+				       "Removed routehint %zu because "
+				       "entrypoint %s is unreachable. ",
+				       i,
+				       type_to_string(tmpctx, struct node_id,
+						      &hints[i][0].pubkey));
+			plugin_log(p->plugin, LOG_DBG,
+				       "Removed routehint %zu because "
+				       "entrypoint %s is unreachable. ",
+				       i,
+				       type_to_string(tmpctx, struct node_id,
+						      &hints[i][0].pubkey));
 			tal_arr_remove(&hints, i);
 			i--;
 		}
@@ -2539,6 +2625,17 @@ static struct command_result *routehint_getroute_result(struct command *cmd,
 		/* FIXME: ***DO*** we need to add this extra routehint?
 		 * Once we run out of routehints the default system will
 		 * just attempt directly routing to the destination anyway.  */
+	} else if (tal_count(d->routehints) == 0) {
+		/* If we don't have any routehints and the destination
+		 * isn't reachable, then there is no point in
+		 * continuing. */
+
+		payment_abort(
+		    p,
+		    "Destination %s is not reachable directly and "
+		    "all routehints were unusable.",
+		    type_to_string(tmpctx, struct node_id, p->destination));
+		return command_still_pending(cmd);
 	}
 
 	routehint_pre_getroute(d, p);
@@ -2581,7 +2678,7 @@ static void routehint_step_cb(struct routehints_data *d, struct payment *p)
 {
 	struct route_hop hop;
 	const struct payment *root = payment_root(p);
-
+	struct gossmap *map;
 	if (p->step == PAYMENT_STEP_INITIALIZED) {
 		if (root->routes == NULL)
 			return payment_continue(p);
@@ -2590,8 +2687,9 @@ static void routehint_step_cb(struct routehints_data *d, struct payment *p)
 		 * beginning, and every other payment will filter out the
 		 * exluded ones on the fly. */
 		if (p->parent == NULL) {
-			d->routehints = filter_routehints(d, p->local_id,
-							  p->routes);
+			map = get_gossmap(p->plugin);
+			d->routehints = filter_routehints(
+			    map, p, d, p->local_id, p->routes);
 			/* filter_routehints modifies the array, but
 			 * this could trigger a resize and the resize
 			 * could trigger a realloc.

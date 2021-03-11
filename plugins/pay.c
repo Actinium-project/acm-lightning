@@ -1521,6 +1521,11 @@ static void paystatus_add_payment(struct json_stream *s, const struct payment *p
 	/* TODO Add routehint. */
 	/* TODO Add route details */
 
+	if (p->step < PAYMENT_STEP_SPLIT)
+		json_add_string(s, "state", "pending");
+	else
+		json_add_string(s, "state", "completed");
+
 	if (p->step == PAYMENT_STEP_SPLIT) {
 		/* Don't add anything, this is neither a success nor a failure. */
 	} else if (p->result != NULL) {
@@ -1530,7 +1535,7 @@ static void paystatus_add_payment(struct json_stream *s, const struct payment *p
 			json_object_start(s, "failure");
 		json_add_sendpay_result(s, p->result);
 		json_object_end(s);
-	} else {
+	} else if (p->step >= PAYMENT_STEP_SPLIT) {
 		json_object_start(s, "failure");
 		json_add_num(s, "code", PAY_ROUTE_NOT_FOUND);
 		json_add_string(s, "message", "Call to getroute: Could not find a route");
@@ -1956,7 +1961,7 @@ static struct command_result *json_paymod(struct command *cmd,
 	struct payment *p;
 	const char *b11str;
 	struct bolt11 *b11;
-	char *fail;
+	char *b11_fail, *b12_fail;
 	u64 *maxfee_pct_millionths;
 	u32 *maxdelay;
 	struct amount_msat *exemptfee, *msat;
@@ -1998,31 +2003,42 @@ static struct command_result *json_paymod(struct command *cmd,
 	p = payment_new(cmd, cmd, NULL /* No parent */, paymod_mods);
 	p->invstring = tal_steal(p, b11str);
 
-	b11 = bolt11_decode(cmd, b11str, plugin_feature_set(cmd->plugin),
-			    NULL, chainparams, &fail);
-	if (b11) {
+	if (!bolt12_has_prefix(b11str)) {
+		b11 =
+		    bolt11_decode(cmd, b11str, plugin_feature_set(cmd->plugin),
+				  NULL, chainparams, &b11_fail);
+		if (b11 == NULL)
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "Invalid bolt11: %s", b11_fail);
+
 		invmsat = b11->msat;
 		invexpiry = b11->timestamp + b11->expiry;
 
 		p->destination = tal_dup(p, struct node_id, &b11->receiver_id);
-		p->destination_has_tlv = feature_offered(b11->features,
-							 OPT_VAR_ONION);
+		p->destination_has_tlv =
+		    feature_offered(b11->features, OPT_VAR_ONION);
 		p->payment_hash = tal_dup(p, struct sha256, &b11->payment_hash);
-		p->payment_secret = b11->payment_secret
+		p->payment_secret =
+		    b11->payment_secret
 			? tal_dup(p, struct secret, b11->payment_secret)
 			: NULL;
 		p->routes = tal_steal(p, b11->routes);
 		p->min_final_cltv_expiry = b11->min_final_cltv_expiry;
 		p->features = tal_steal(p, b11->features);
 		/* Sanity check */
-		if (feature_offered(b11->features, OPT_VAR_ONION)
-		    && !b11->payment_secret)
+		if (feature_offered(b11->features, OPT_VAR_ONION) &&
+		    !b11->payment_secret)
+			return command_fail(
+			    cmd, JSONRPC2_INVALID_PARAMS,
+			    "Invalid bolt11:"
+			    " sets feature var_onion with no secret");
+	} else {
+		b12 = invoice_decode(cmd, b11str, strlen(b11str),
+				     plugin_feature_set(cmd->plugin),
+				     chainparams, &b12_fail);
+		if (b12 == NULL)
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "Invalid bolt11:"
-					    " sets feature var_onion with no secret");
-	} else if ((b12 = invoice_decode(cmd, b11str, strlen(b11str),
-					 plugin_feature_set(cmd->plugin),
-					 chainparams, &fail)) != NULL) {
+					    "Invalid bolt12: %s", b12_fail);
 		if (!exp_offers)
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 					    "experimental-offers disabled");
@@ -2046,14 +2062,14 @@ static struct command_result *json_paymod(struct command *cmd,
 
 		/* FIXME: gossmap should store as pubkey32 */
 		p->destination = tal(p, struct node_id);
-		gossmap_guess_node_id(get_gossmap(cmd->plugin),
-				      b12->node_id,
+		gossmap_guess_node_id(get_gossmap(cmd->plugin), b12->node_id,
 				      p->destination);
 		p->destination_has_tlv = true;
 		p->payment_hash = tal_dup(p, struct sha256, b12->payment_hash);
 		if (b12->recurrence_counter && !label)
-			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-					    "recurring invoice requires a label");
+			return command_fail(
+			    cmd, JSONRPC2_INVALID_PARAMS,
+			    "recurring invoice requires a label");
 		/* FIXME payment_secret should be signature! */
 		{
 			struct sha256 merkle;
@@ -2061,7 +2077,8 @@ static struct command_result *json_paymod(struct command *cmd,
 			p->payment_secret = tal(p, struct secret);
 			merkle_tlv(b12->fields, &merkle);
 			memcpy(p->payment_secret, &merkle, sizeof(merkle));
-			BUILD_ASSERT(sizeof(*p->payment_secret) == sizeof(merkle));
+			BUILD_ASSERT(sizeof(*p->payment_secret) ==
+				     sizeof(merkle));
 		}
 		p->routes = NULL;
 		/* FIXME: paths! */
@@ -2076,16 +2093,15 @@ static struct command_result *json_paymod(struct command *cmd,
 		 *     `seconds_from_timestamp`.
 		 * - otherwise:
 		 *   - MUST reject the invoice if the current time since
-		 *     1970-01-01 UTC is greater than `timestamp` plus 7200.
+		 *     1970-01-01 UTC is greater than `timestamp` plus
+		 * 7200.
 		 */
 		if (b12->relative_expiry)
 			invexpiry = *b12->timestamp + *b12->relative_expiry;
 		else
 			invexpiry = *b12->timestamp + BOLT12_DEFAULT_REL_EXPIRY;
 		p->local_offer_id = tal_steal(p, local_offer_id);
-	} else
-		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				    "Invalid bolt11: %s", fail);
+	}
 
 	if (time_now().ts.tv_sec > invexpiry)
 		return command_fail(cmd, PAY_INVOICE_EXPIRED, "Invoice expired");
