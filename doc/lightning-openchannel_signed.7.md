@@ -38,16 +38,19 @@ with `code` being one of the following:
 - -32602: If the given parameters are wrong.
 - -1: Catchall nonspecific error.
 - 303: Funding transaction broadcast failed.
+- 305: Peer is not connected.
 - 309: PSBT missing required fields.
 - 311: Unknown channel id.
+- 312: Channel in an invalid state
 
 SEE ALSO
 --------
 
-lightning-openchannel\_update(7), lightning-openchannel\_signed(7),
-lightning-fundchannel\_start(7), lightning-fundchannel\_complete(7),
-lightning-fundchannel(7), lightning-fundpsbt(7), lightning-utxopsbt(7),
-lightning-multifundchannel(7)
+=======
+lightning-openchannel\_init(7), lightning-openchannel\_update(7),
+lightning-openchannel\_bump(7), lightning-fundchannel\_start(7),
+lightning-fundchannel\_complete(7), lightning-fundchannel(7),
+lightning-fundpsbt(7), lightning-utxopsbt(7), lightning-multifundchannel(7)
 
 AUTHOR
 ------

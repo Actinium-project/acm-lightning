@@ -699,6 +699,7 @@ openchannel2_hook_deserialize(struct openchannel2_payload *payload,
 			      const char *buffer,
 			      const jsmntok_t *toks)
 {
+	const u8 *shutdown_script;
 	struct subd *dualopend = payload->dualopend;
 
 	/* If our daemon died, we're done */
@@ -722,12 +723,9 @@ openchannel2_hook_deserialize(struct openchannel2_payload *payload,
 		if (json_get_member(buffer, toks, "psbt"))
 			fatal("Plugin rejected openchannel2 but"
 			      " also set `psbt`");
-		if (json_get_member(buffer, toks, "accepter_funding_msat"))
+		if (json_get_member(buffer, toks, "our_funding_msat"))
 			fatal("Plugin rejected openchannel2 but"
-			      " also set `accepter_funding_psbt`");
-		if (json_get_member(buffer, toks, "funding_feerate"))
-			fatal("Plugin rejected openchannel2 but"
-			      " also set `funding_feerate`");
+			      " also set `our_funding_psbt`");
 
 		const jsmntok_t *t_errmsg = json_get_member(buffer, toks,
 							    "error_message");
@@ -750,8 +748,14 @@ openchannel2_hook_deserialize(struct openchannel2_payload *payload,
 			       "openchannel2", true, &payload->psbt))
 		return false;
 
-	payload->our_shutdown_scriptpubkey =
+	shutdown_script =
 		hook_extract_shutdown_script(dualopend, buffer, toks);
+	if (shutdown_script && payload->our_shutdown_scriptpubkey)
+		log_broken(dualopend->ld->log,
+			   "openchannel2 hook close_to address was"
+			   " already set by other plugin. Ignoring!");
+	else
+		payload->our_shutdown_scriptpubkey = shutdown_script;
 
 	/* Add a serial_id to everything that doesn't have one yet */
 	if (payload->psbt)
@@ -769,9 +773,9 @@ openchannel2_hook_deserialize(struct openchannel2_payload *payload,
 		      type_to_string(tmpctx, struct wally_psbt, payload->psbt));
 
 	if (!hook_extract_amount(dualopend, buffer, toks,
-				 "accepter_funding_msat",
+				 "our_funding_msat",
 				 &payload->accepter_funding))
-		fatal("Plugin failed to supply accepter_funding_msat field");
+		fatal("Plugin failed to supply our_funding_msat field");
 
 	if (!payload->psbt &&
 		!amount_sat_eq(payload->accepter_funding, AMOUNT_SAT(0))) {
@@ -1880,7 +1884,7 @@ json_openchannel_bump(struct command *cmd,
 {
 	struct channel_id *cid;
 	struct channel *channel;
-	struct amount_sat *amount;
+	struct amount_sat *amount, psbt_val;
 	struct wally_psbt *psbt;
 	struct open_attempt *oa;
 
@@ -1891,6 +1895,36 @@ json_openchannel_bump(struct command *cmd,
 		   NULL))
 		return command_param_failed();
 
+	psbt_val = AMOUNT_SAT(0);
+	for (size_t i = 0; i < psbt->num_inputs; i++) {
+		struct amount_sat in_amt = psbt_input_get_amount(psbt, i);
+		if (!amount_sat_add(&psbt_val, psbt_val, in_amt))
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "Overflow in adding PSBT input"
+					    " values. %s",
+					    type_to_string(tmpctx,
+							   struct wally_psbt,
+							   psbt));
+	}
+
+	/* If they don't pass in at least enough in the PSBT to cover
+	 * their amount, nope */
+	if (!amount_sat_greater(psbt_val, *amount))
+		return command_fail(cmd, FUND_CANNOT_AFFORD,
+				    "Provided PSBT cannot afford funding of "
+				    "amount %s. %s",
+				    type_to_string(tmpctx,
+						   struct amount_sat,
+						   amount),
+				    type_to_string(tmpctx,
+						   struct wally_psbt,
+						   psbt));
+
+	if (!topology_synced(cmd->ld->topology)) {
+		return command_fail(cmd, FUNDING_STILL_SYNCING_BITCOIN,
+				    "Still syncing with bitcoin network");
+	}
+
 	/* Are we in a state where we can attempt an RBF? */
 	channel = channel_by_cid(cmd->ld, cid);
 	if (!channel)
@@ -1899,12 +1933,27 @@ json_openchannel_bump(struct command *cmd,
 				    type_to_string(tmpctx, struct channel_id,
 						   cid));
 
+	/* BOLT #2:
+	 *  - if both nodes advertised `option_support_large_channel`:
+	 *    - MAY set `funding_satoshis` greater than or equal to 2^24 satoshi.
+	 *  - otherwise:
+	 *    - MUST set `funding_satoshis` to less than 2^24 satoshi.
+	 */
+	if (!feature_negotiated(cmd->ld->our_features,
+				channel->peer->their_features,
+				OPT_LARGE_CHANNELS)
+	    && amount_sat_greater(*amount, chainparams->max_funding))
+		return command_fail(cmd, FUND_MAX_EXCEEDED,
+				    "Amount exceeded %s",
+				    type_to_string(tmpctx, struct amount_sat,
+						   &chainparams->max_funding));
+
 	if (!channel->owner)
-		return command_fail(cmd, LIGHTNINGD,
+		return command_fail(cmd, FUNDING_PEER_NOT_CONNECTED,
 				      "Peer not connected.");
 
 	if (channel->open_attempt)
-		return command_fail(cmd, LIGHTNINGD,
+		return command_fail(cmd, FUNDING_STATE_INVALID,
 				    "Commitments for this channel not "
 				    "secured, see `openchannel_update`");
 
@@ -1970,20 +2019,20 @@ json_openchannel_signed(struct command *cmd,
 		return command_fail(cmd, FUNDING_UNKNOWN_CHANNEL,
 				    "Unknown channel");
 	if (!channel->owner)
-		return command_fail(cmd, LIGHTNINGD,
+		return command_fail(cmd, FUNDING_PEER_NOT_CONNECTED,
 				    "Peer not connected");
 
 	if (channel->open_attempt)
-		return command_fail(cmd, LIGHTNINGD,
+		return command_fail(cmd, FUNDING_STATE_INVALID,
 				    "Commitments for this channel not "
 				    "yet secured, see `openchannel_update`");
 
 	if (list_empty(&channel->inflights))
-		return command_fail(cmd, LIGHTNINGD,
+		return command_fail(cmd, FUNDING_STATE_INVALID,
 				    "Channel open not initialized yet.");
 
 	if (channel->openchannel_signed_cmd)
-		return command_fail(cmd, LIGHTNINGD,
+		return command_fail(cmd, FUNDING_STATE_INVALID,
 				    "Already sent sigs, waiting for peer's");
 
 	/* Verify that the psbt's txid matches that of the
@@ -2016,7 +2065,7 @@ json_openchannel_signed(struct command *cmd,
 						   &inflight->funding->txid));
 
 	if (inflight->funding_psbt && psbt_is_finalized(inflight->funding_psbt))
-		return command_fail(cmd, LIGHTNINGD,
+		return command_fail(cmd, FUNDING_STATE_INVALID,
 				    "Already have a finalized PSBT for "
 				    "this channel");
 
@@ -2076,20 +2125,20 @@ static struct command_result *json_openchannel_update(struct command *cmd,
 
 	channel = channel_by_cid(cmd->ld, cid);
 	if (!channel)
-		return command_fail(cmd, LIGHTNINGD,
+		return command_fail(cmd, FUNDING_UNKNOWN_CHANNEL,
 				    "Unknown channel %s",
 				    type_to_string(tmpctx, struct channel_id,
 						   cid));
 	if (!channel->owner)
-		return command_fail(cmd, LIGHTNINGD,
+		return command_fail(cmd, FUNDING_PEER_NOT_CONNECTED,
 				    "Peer not connected");
 
 	if (!channel->open_attempt)
-		return command_fail(cmd, LIGHTNINGD,
+		return command_fail(cmd, FUNDING_STATE_INVALID,
 				    "Channel open not in progress");
 
 	if (channel->open_attempt->cmd)
-		return command_fail(cmd, LIGHTNINGD,
+		return command_fail(cmd, FUNDING_STATE_INVALID,
 				    "Another openchannel command"
 				    " is in progress");
 
@@ -2206,8 +2255,8 @@ static struct command_result *json_openchannel_init(struct command *cmd,
 				    "Peer not connected");
 	if (channel->open_attempt
 	     || !list_empty(&channel->inflights))
-		return command_fail(cmd, LIGHTNINGD, "Channel funding"
-				    " in-progress. %s",
+		return command_fail(cmd, FUNDING_STATE_INVALID,
+				    "Channel funding in-progress. %s",
 				    channel_state_name(channel));
 
 #if EXPERIMENTAL_FEATURES
@@ -2405,6 +2454,7 @@ static void handle_commit_received(struct subd *dualopend,
 				       "Bad WIRE_DUALOPEND_COMMIT_RCVD: %s",
 				       tal_hex(msg, msg));
 		channel->open_attempt = tal_free(channel->open_attempt);
+		notify_channel_open_failed(channel->peer->ld, &channel->cid);
 		return;
 	}
 
