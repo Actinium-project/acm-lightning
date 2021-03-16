@@ -583,6 +583,15 @@ corresponding functionality, which are in draft status as BOLT12\.
 This usually requires \fBexperimental-onion-messages\fR as well\.  See
 \fBlightning-offer\fR(7) and \fBlightning-fetchinvoice\fR(7)\.
 
+
+ \fBexperimental-shutdown-wrong-funding\fR
+
+
+Specifying this allows the \fBwrong_funding\fR field in shutdown: if a
+remote node has opened a channel but claims it used the incorrect txid
+(and the channel hasn't been used yet at all) this allows them to
+negotiate a clean shutdown with the txid they offer\.
+
 .SH BUGS
 
 You should report bugs on our github issues page, and maybe submit a fix
@@ -608,4 +617,4 @@ Main web site: \fIhttps://github.com/ElementsProject/lightning\fR
 Note: the modules in the ccan/ directory have their own licenses, but
 the rest of the code is covered by the BSD-style MIT license\.
 
-\" SHA256STAMP:8e18374d48aff1d2574667c603e36cdac81c35e09a49397dc6982f1688dd454a
+\" SHA256STAMP:b0cdc467650b05758f90f2523ab8b45e526ac818e426cb2c2bc42cb98673e373

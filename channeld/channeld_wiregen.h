@@ -151,13 +151,13 @@ bool fromwire_channeld_got_revoke_reply(const void *p);
 
 /* WIRE: CHANNELD_SEND_SHUTDOWN */
 /*  Tell peer to shut down channel. */
-u8 *towire_channeld_send_shutdown(const tal_t *ctx, const u8 *shutdown_scriptpubkey);
-bool fromwire_channeld_send_shutdown(const tal_t *ctx, const void *p, u8 **shutdown_scriptpubkey);
+u8 *towire_channeld_send_shutdown(const tal_t *ctx, const u8 *shutdown_scriptpubkey, const struct bitcoin_outpoint *wrong_funding);
+bool fromwire_channeld_send_shutdown(const tal_t *ctx, const void *p, u8 **shutdown_scriptpubkey, struct bitcoin_outpoint **wrong_funding);
 
 /* WIRE: CHANNELD_GOT_SHUTDOWN */
 /*  Peer told us that channel is shutting down */
-u8 *towire_channeld_got_shutdown(const tal_t *ctx, const u8 *scriptpubkey);
-bool fromwire_channeld_got_shutdown(const tal_t *ctx, const void *p, u8 **scriptpubkey);
+u8 *towire_channeld_got_shutdown(const tal_t *ctx, const u8 *scriptpubkey, const struct bitcoin_outpoint *wrong_funding);
+bool fromwire_channeld_got_shutdown(const tal_t *ctx, const void *p, u8 **scriptpubkey, struct bitcoin_outpoint **wrong_funding);
 
 /* WIRE: CHANNELD_SHUTDOWN_COMPLETE */
 /*  Shutdown is complete */
@@ -213,4 +213,4 @@ bool fromwire_channeld_send_error_reply(const void *p);
 
 
 #endif /* LIGHTNING_CHANNELD_CHANNELD_WIREGEN_H */
-// SHA256STAMP:8b6491f5aa25f4c067f4aedff32620ddb8b39cc78f95c70cb2d0b5366026871a
+// SHA256STAMP:60143693b0c3611c8ecdf7f3549ef9f4c280e359cac0cd1f4df38cdca2dad3cb

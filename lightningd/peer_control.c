@@ -1353,6 +1353,18 @@ static enum watch_result funding_spent(struct channel *channel,
 	return onchaind_funding_spent(channel, tx, block->height, false);
 }
 
+void channel_watch_wrong_funding(struct lightningd *ld, struct channel *channel)
+{
+	/* Watch the "wrong" funding too, in case we spend it. */
+	if (channel->shutdown_wrong_funding) {
+		/* FIXME: Remove arg from cb? */
+		watch_txo(channel, ld->topology, channel,
+			  &channel->shutdown_wrong_funding->txid,
+			  channel->shutdown_wrong_funding->n,
+			  funding_spent);
+	}
+}
+
 void channel_watch_funding(struct lightningd *ld, struct channel *channel)
 {
 	/* FIXME: Remove arg from cb? */
@@ -1361,6 +1373,7 @@ void channel_watch_funding(struct lightningd *ld, struct channel *channel)
 	watch_txo(channel, ld->topology, channel,
 		  &channel->funding_txid, channel->funding_outnum,
 		  funding_spent);
+	channel_watch_wrong_funding(ld, channel);
 }
 
 static void json_add_peer(struct lightningd *ld,
@@ -1492,6 +1505,19 @@ command_find_channel(struct command *cmd,
 	}
 }
 
+static struct command_result *param_outpoint(struct command *cmd,
+					     const char *name,
+					     const char *buffer,
+					     const jsmntok_t *tok,
+					     struct bitcoin_outpoint **outp)
+{
+	*outp = tal(cmd, struct bitcoin_outpoint);
+	if (json_to_outpoint(buffer, tok, *outp))
+		return NULL;
+	return command_fail_badparam(cmd, name, buffer, tok,
+				     "should be a txid:outnum");
+}
+
 static struct command_result *json_close(struct command *cmd,
 					 const char *buffer,
 					 const jsmntok_t *obj UNNEEDED,
@@ -1502,8 +1528,9 @@ static struct command_result *json_close(struct command *cmd,
 	struct channel *channel COMPILER_WANTS_INIT("gcc 7.3.0 fails, 8.3 OK");
 	unsigned int *timeout;
 	const u8 *close_to_script = NULL;
-	bool close_script_set;
+	bool close_script_set, wrong_funding_changed;
 	const char *fee_negotiation_step_str;
+	struct bitcoin_outpoint *wrong_funding;
 	char* end;
 
 	if (!param(cmd, buffer, params,
@@ -1513,6 +1540,7 @@ static struct command_result *json_close(struct command *cmd,
 		   p_opt("destination", param_bitcoin_address, &close_to_script),
 		   p_opt("fee_negotiation_step", param_string,
 			 &fee_negotiation_step_str),
+		   p_opt("wrong_funding", param_outpoint, &wrong_funding),
 		   NULL))
 		return command_param_failed();
 
@@ -1618,6 +1646,34 @@ static struct command_result *json_close(struct command *cmd,
 			    fee_negotiation_step_str);
 	}
 
+	if (wrong_funding) {
+		if (!feature_negotiated(cmd->ld->our_features,
+					channel->peer->their_features,
+					OPT_SHUTDOWN_WRONG_FUNDING)) {
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "wrong_funding feature not negotiated"
+					    " (we said %s, they said %s: try experimental-shutdown-wrong-funding?)",
+					    feature_offered(cmd->ld->our_features
+							    ->bits[INIT_FEATURE],
+							    OPT_SHUTDOWN_WRONG_FUNDING)
+					    ? "yes" : "no",
+					    feature_offered(channel->peer->their_features,
+							    OPT_SHUTDOWN_WRONG_FUNDING)
+					    ? "yes" : "no");
+		}
+
+		wrong_funding_changed = true;
+		channel->shutdown_wrong_funding
+			= tal_steal(channel, wrong_funding);
+	} else {
+		if (channel->shutdown_wrong_funding) {
+			channel->shutdown_wrong_funding
+				= tal_free(channel->shutdown_wrong_funding);
+			wrong_funding_changed = true;
+		} else
+			wrong_funding_changed = false;
+	}
+
 	/* Normal case.
 	 * We allow states shutting down and sigexchange; a previous
 	 * close command may have timed out, and this current command
@@ -1647,7 +1703,8 @@ static struct command_result *json_close(struct command *cmd,
 				} else
 					msg = towire_channeld_send_shutdown(
 						NULL,
-						channel->shutdown_scriptpubkey[LOCAL]);
+						channel->shutdown_scriptpubkey[LOCAL],
+						channel->shutdown_wrong_funding);
 				subd_send_msg(channel->owner, take(msg));
 			}
 
@@ -1662,8 +1719,9 @@ static struct command_result *json_close(struct command *cmd,
 	/* Register this command for later handling. */
 	register_close_command(cmd->ld, cmd, channel, *timeout);
 
-	/* If we set `channel->shutdown_scriptpubkey[LOCAL]`, save it. */
-	if (close_script_set)
+	/* If we set `channel->shutdown_scriptpubkey[LOCAL]` or
+	 * changed shutdown_wrong_funding, save it. */
+	if (close_script_set || wrong_funding_changed)
 		wallet_channel_save(cmd->ld->wallet, channel);
 
 	/* Wait until close drops down to chain. */

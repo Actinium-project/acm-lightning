@@ -156,6 +156,8 @@ struct peer {
 	bool send_shutdown;
 	/* Has shutdown been sent by each side? */
 	bool shutdown_sent[NUM_SIDES];
+	/* If master told us to send wrong_funding */
+	struct bitcoin_outpoint *shutdown_wrong_funding;
 
 	/* Information used for reestablishment. */
 	bool last_was_revoke;
@@ -740,6 +742,7 @@ static bool shutdown_complete(const struct peer *peer)
 static void maybe_send_shutdown(struct peer *peer)
 {
 	u8 *msg;
+	struct tlv_shutdown_tlvs *tlvs;
 
 	if (!peer->send_shutdown)
 		return;
@@ -748,7 +751,17 @@ static void maybe_send_shutdown(struct peer *peer)
 	 * over us */
 	send_channel_update(peer, ROUTING_FLAGS_DISABLED);
 
-	msg = towire_shutdown(NULL, &peer->channel_id, peer->final_scriptpubkey);
+	if (peer->shutdown_wrong_funding) {
+		tlvs = tlv_shutdown_tlvs_new(tmpctx);
+		tlvs->wrong_funding
+			= tal(tlvs, struct tlv_shutdown_tlvs_wrong_funding);
+		tlvs->wrong_funding->txid = peer->shutdown_wrong_funding->txid;
+		tlvs->wrong_funding->outnum = peer->shutdown_wrong_funding->n;
+	} else
+		tlvs = NULL;
+
+	msg = towire_shutdown(NULL, &peer->channel_id, peer->final_scriptpubkey,
+			      tlvs);
 	sync_crypto_write(peer->pps, take(msg));
 	peer->send_shutdown = false;
 	peer->shutdown_sent[LOCAL] = true;
@@ -1633,11 +1646,14 @@ static void handle_peer_shutdown(struct peer *peer, const u8 *shutdown)
 {
 	struct channel_id channel_id;
 	u8 *scriptpubkey;
+	struct tlv_shutdown_tlvs *tlvs = tlv_shutdown_tlvs_new(tmpctx);
+	struct bitcoin_outpoint *wrong_funding;
 
 	/* Disable the channel. */
 	send_channel_update(peer, ROUTING_FLAGS_DISABLED);
 
-	if (!fromwire_shutdown(tmpctx, shutdown, &channel_id, &scriptpubkey))
+	if (!fromwire_shutdown(tmpctx, shutdown, &channel_id, &scriptpubkey,
+			       tlvs))
 		peer_failed_warn(peer->pps, &peer->channel_id,
 				 "Bad shutdown %s", tal_hex(peer, shutdown));
 
@@ -1659,10 +1675,49 @@ static void handle_peer_shutdown(struct peer *peer, const u8 *shutdown)
 			    tal_hex(peer, scriptpubkey),
 			    tal_hex(peer, peer->remote_upfront_shutdown_script));
 
+	/* We only accept an wrong_funding if:
+	 * 1. It was negotiated.
+	 * 2. It's not dual-funding.
+	 * 3. They opened it.
+	 * 4. The channel was never used.
+	 */
+	if (tlvs->wrong_funding) {
+		if (!feature_negotiated(peer->our_features,
+					peer->their_features,
+					OPT_SHUTDOWN_WRONG_FUNDING))
+			peer_failed_warn(peer->pps, &peer->channel_id,
+					 "wrong_funding shutdown needs"
+					 " feature %u",
+					 OPT_SHUTDOWN_WRONG_FUNDING);
+		if (feature_negotiated(peer->our_features,
+				       peer->their_features,
+				       OPT_DUAL_FUND))
+			peer_failed_warn(peer->pps, &peer->channel_id,
+					 "wrong_funding shutdown invalid"
+					 " with dual-funding");
+		if (peer->channel->opener != REMOTE)
+			peer_failed_warn(peer->pps, &peer->channel_id,
+					 "No shutdown wrong_funding"
+					 " for channels we opened!");
+		if (peer->next_index[REMOTE] != 1
+		    || peer->next_index[LOCAL] != 1)
+			peer_failed_warn(peer->pps, &peer->channel_id,
+					 "No shutdown wrong_funding"
+					 " for used channels!");
+
+		/* Turn into our outpoint type. */
+		wrong_funding = tal(tmpctx, struct bitcoin_outpoint);
+		wrong_funding->txid = tlvs->wrong_funding->txid;
+		wrong_funding->n = tlvs->wrong_funding->outnum;
+	} else {
+		wrong_funding = NULL;
+	}
+
 	/* Tell master: we don't have to wait because on reconnect other end
 	 * will re-send anyway. */
 	wire_sync_write(MASTER_FD,
-			take(towire_channeld_got_shutdown(NULL, scriptpubkey)));
+			take(towire_channeld_got_shutdown(NULL, scriptpubkey,
+							  wrong_funding)));
 
 	peer->shutdown_sent[REMOTE] = true;
 	/* BOLT #2:
@@ -2823,7 +2878,8 @@ static void handle_shutdown_cmd(struct peer *peer, const u8 *inmsg)
 {
 	u8 *local_shutdown_script;
 
-	if (!fromwire_channeld_send_shutdown(peer, inmsg, &local_shutdown_script))
+	if (!fromwire_channeld_send_shutdown(peer, inmsg, &local_shutdown_script,
+					     &peer->shutdown_wrong_funding))
 		master_badmsg(WIRE_CHANNELD_SEND_SHUTDOWN, inmsg);
 
 	tal_free(peer->final_scriptpubkey);
@@ -3184,6 +3240,7 @@ int main(int argc, char *argv[])
 	peer->channel_local_active = false;
 	peer->from_master = msg_queue_new(peer);
 	peer->shutdown_sent[LOCAL] = false;
+	peer->shutdown_wrong_funding = NULL;
 	peer->last_update_timestamp = 0;
 	/* We actually received it in the previous daemon, but near enough */
 	peer->last_recv = time_now();

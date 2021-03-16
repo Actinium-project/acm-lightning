@@ -399,6 +399,19 @@ void bitcoin_tx_input_get_txid(const struct bitcoin_tx *tx, int innum,
 	wally_tx_input_get_txid(&tx->wtx->inputs[innum], out);
 }
 
+void bitcoin_tx_input_set_txid(struct bitcoin_tx *tx, int innum,
+			       const struct bitcoin_txid *txid,
+			       u32 index)
+{
+	struct wally_tx_input *in;
+	assert(innum < tx->wtx->num_inputs);
+
+	in = &tx->wtx->inputs[innum];
+	BUILD_ASSERT(sizeof(struct bitcoin_txid) == sizeof(in->txhash));
+	memcpy(in->txhash, txid, sizeof(struct bitcoin_txid));
+	in->index = index;
+}
+
 void wally_tx_input_get_txid(const struct wally_tx_input *in,
 			     struct bitcoin_txid *txid)
 {
@@ -714,6 +727,19 @@ struct wally_tx *fromwire_wally_tx(const tal_t *ctx,
 void towire_bitcoin_txid(u8 **pptr, const struct bitcoin_txid *txid)
 {
 	towire_sha256_double(pptr, &txid->shad);
+}
+
+void towire_bitcoin_outpoint(u8 **pptr, const struct bitcoin_outpoint *outp)
+{
+	towire_bitcoin_txid(pptr, &outp->txid);
+	towire_u32(pptr, outp->n);
+}
+
+void fromwire_bitcoin_outpoint(const u8 **cursor, size_t *max,
+			       struct bitcoin_outpoint *outp)
+{
+	fromwire_bitcoin_txid(cursor, max, &outp->txid);
+	outp->n = fromwire_u32(cursor, max);
 }
 
 void towire_bitcoin_tx(u8 **pptr, const struct bitcoin_tx *tx)

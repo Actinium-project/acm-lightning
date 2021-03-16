@@ -54,6 +54,8 @@ fi
 if [ -z "$PATH_TO_BITCOIN" ]; then
 	if [ -d "$HOME/.bitcoin" ]; then
 		PATH_TO_BITCOIN="$HOME/.bitcoin"
+	elif [ -d "$HOME/Library/Application Support/Bitcoin/" ]; then
+		PATH_TO_BITCOIN="$HOME/Library/Application Support/Bitcoin/"
 	else
 		echo "\$PATH_TO_BITCOIN not set to a .bitcoin dir?" >&2
 		return
@@ -86,9 +88,14 @@ start_nodes() {
 		log-level=debug
 		log-file=/tmp/l$i-$network/log
 		addr=localhost:$socket
-		dev-fast-gossip
-		dev-bitcoind-poll=5
 		EOF
+
+		# If we've configured to use developer, add dev options
+		if $LIGHTNINGD --help | grep -q dev-fast-gossip; then
+			echo "dev-fast-gossip" >> "/tmp/l$i-$network/config"
+			echo "dev-bitcoind-poll=5" >> "/tmp/l$i-$network/config"
+		fi
+
 
 		# Start the lightning nodes
 		test -f "/tmp/l$i-$network/lightningd-$network.pid" || \
