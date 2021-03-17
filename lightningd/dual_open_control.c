@@ -1310,12 +1310,12 @@ static void sendfunding_done(struct bitcoind *bitcoind UNUSED,
 	channel->openchannel_signed_cmd = NULL;
 
 	if (!cmd && channel->opener == LOCAL)
-		log_broken(channel->log,
-			   "No outstanding command for channel %s,"
-			   " funding sent was success? %d",
-			   type_to_string(tmpctx, struct channel_id,
-					  &channel->cid),
-			   success);
+		log_unusual(channel->log,
+			    "No outstanding command for channel %s,"
+			    " funding sent was success? %d",
+			    type_to_string(tmpctx, struct channel_id,
+					   &channel->cid),
+			    success);
 
 	if (!success) {
 		if (cmd)
@@ -1405,8 +1405,17 @@ static void handle_peer_tx_sigs_sent(struct subd *dualopend,
 	}
 
 	inflight = channel_current_inflight(channel);
-	if (psbt_finalize(inflight->funding_psbt)
-	    && inflight->remote_tx_sigs) {
+
+	/* Once we've sent our sigs to the peer, we're fine
+	 * to broadcast the transaction, even if they haven't
+	 * sent us their tx-sigs yet. They're not allowed to
+	 * send us funding-locked until their tx-sigs has been
+	 * received, but that's no reason not to broadcast.
+	 * Note this only happens if we're the only input-er */
+	if (psbt_finalize(inflight->funding_psbt) &&
+	    !inflight->tx_broadcast) {
+		inflight->tx_broadcast = true;
+
 		wtx = psbt_final_tx(NULL, inflight->funding_psbt);
 		if (!wtx) {
 			channel_internal_error(channel,
@@ -1496,17 +1505,17 @@ static void handle_channel_locked(struct subd *dualopend,
 	assert(channel->scid);
 	assert(channel->remote_funding_locked);
 
-	if (channel->state != DUALOPEND_AWAITING_LOCKIN) {
+	/* This can happen if we missed their sigs, for some reason */
+	if (channel->state != DUALOPEND_AWAITING_LOCKIN)
 		log_debug(channel->log, "Lockin complete, but state %s",
 			  channel_state_name(channel));
-	} else {
-		channel_set_state(channel,
-				  DUALOPEND_AWAITING_LOCKIN,
-				  CHANNELD_NORMAL,
-				  REASON_UNKNOWN,
-				  "Lockin complete");
-		channel_record_open(channel);
-	}
+
+	channel_set_state(channel,
+			  channel->state,
+			  CHANNELD_NORMAL,
+			  REASON_UNKNOWN,
+			  "Lockin complete");
+	channel_record_open(channel);
 
 	/* FIXME: LND sigs/update_fee msgs? */
 	peer_start_channeld(channel, pps, NULL, false);
@@ -1721,7 +1730,14 @@ static void handle_peer_tx_sigs_msg(struct subd *dualopend,
 	tal_wally_end(inflight->funding_psbt);
 	wallet_inflight_save(ld->wallet, inflight);
 
-	if (psbt_finalize(cast_const(struct wally_psbt *, inflight->funding_psbt))) {
+	/* It's possible we haven't sent them our (empty) tx-sigs yet,
+	 * but we should be sending it soon... */
+	if (psbt_finalize(cast_const(struct wally_psbt *,
+			  inflight->funding_psbt))
+	    && !inflight->tx_broadcast) {
+		inflight->tx_broadcast = true;
+
+		/* Saves the now finalized version of the psbt */
 		wallet_inflight_save(ld->wallet, inflight);
 		wtx = psbt_final_tx(NULL, inflight->funding_psbt);
 		if (!wtx) {
