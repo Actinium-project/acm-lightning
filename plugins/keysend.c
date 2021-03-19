@@ -156,7 +156,7 @@ static struct command_result *json_keysend(struct command *cmd, const char *buf,
 
 	p = payment_new(cmd, cmd, NULL /* No parent */, pay_mods);
 	p->local_id = &my_id;
-	p->json_buffer = tal_steal(p, buf);
+	p->json_buffer = tal_dup_talarr(p, const char, buf);
 	p->json_toks = params;
 	p->destination = tal_steal(p, destination);
 	p->destination_has_tlv = true;
@@ -171,13 +171,19 @@ static struct command_result *json_keysend(struct command *cmd, const char *buf,
 	p->deadline = timeabs_add(time_now(), time_from_sec(*retryfor));
 	p->getroute->riskfactorppm = 10000000;
 
+	if (node_id_eq(&my_id, p->destination)) {
+		return command_fail(
+		    cmd, JSONRPC2_INVALID_PARAMS,
+		    "We are the destination. Keysend cannot be used to send funds to yourself");
+	}
+
 	if (!amount_msat_fee(&p->constraints.fee_budget, p->amount, 0,
 			     *maxfee_pct_millionths / 100)) {
-		tal_free(p);
 		return command_fail(
 		    cmd, JSONRPC2_INVALID_PARAMS,
 		    "Overflow when computing fee budget, fee rate too high.");
 	}
+
 	p->constraints.cltv_budget = *maxdelay;
 
 	payment_mod_exemptfee_get_data(p)->amount = *exemptfee;
