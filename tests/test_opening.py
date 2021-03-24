@@ -124,20 +124,21 @@ def test_v2_open_sigs_restart(node_factory, bitcoind):
 
     # Fund the channel, should appear to finish ok even though the
     # peer fails
-    with pytest.raises(RpcError, match=r'Peer not connected'):
+    with pytest.raises(RpcError):
         l1.rpc.fundchannel(l2.info['id'], chan_amount)
 
-    log = l1.daemon.is_in_log('UNKNOWN TYPE channel_id psbt')
-    psbt = re.search("channel_id psbt (.*)", log).group(1)
-
     chan_id = first_channel_id(l1, l2)
+    log = l1.daemon.is_in_log('{} psbt'.format(chan_id))
+    psbt = re.search("psbt (.*)", log).group(1)
+
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     l1.daemon.wait_for_log('Peer has reconnected, state DUALOPEND_OPEN_INIT')
     with pytest.raises(RpcError):
         l1.rpc.openchannel_signed(chan_id, psbt)
 
     l2.daemon.wait_for_log('Broadcasting funding tx')
-    bitcoind.generate_block(6)
+    txid = l2.rpc.listpeers(l1.info['id'])['peers'][0]['channels'][0]['funding_txid']
+    bitcoind.generate_block(6, wait_for_mempool=txid)
 
     # Make sure we're ok.
     l2.daemon.wait_for_log(r'to CHANNELD_NORMAL')
@@ -170,13 +171,13 @@ def test_v2_open_sigs_restart_while_dead(node_factory, bitcoind):
 
     # Fund the channel, should appear to finish ok even though the
     # peer fails
-    with pytest.raises(RpcError, match=r'Peer not connected'):
+    with pytest.raises(RpcError):
         l1.rpc.fundchannel(l2.info['id'], chan_amount)
 
-    log = l1.daemon.is_in_log('UNKNOWN TYPE channel_id psbt')
-    psbt = re.search("channel_id psbt (.*)", log).group(1)
-
     chan_id = first_channel_id(l1, l2)
+    log = l1.daemon.is_in_log('{} psbt'.format(chan_id))
+    psbt = re.search("psbt (.*)", log).group(1)
+
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     l1.daemon.wait_for_log('Peer has reconnected, state DUALOPEND_OPEN_INIT')
     with pytest.raises(RpcError):
