@@ -800,6 +800,10 @@ static char *opt_set_wumbo(struct lightningd *ld)
 
 static char *opt_set_dual_fund(struct lightningd *ld)
 {
+	/* Dual funding implies anchor outputs */
+	feature_set_or(ld->our_features,
+		       take(feature_set_for_feature(NULL,
+						    OPTIONAL_FEATURE(OPT_ANCHOR_OUTPUTS))));
 	feature_set_or(ld->our_features,
 		       take(feature_set_for_feature(NULL,
 						    OPTIONAL_FEATURE(OPT_DUAL_FUND))));
@@ -869,13 +873,11 @@ static void register_opts(struct lightningd *ld)
 				 opt_set_wumbo, ld,
 				 "Allow channels larger than 0.16777215 BTC");
 
-#if EXPERIMENTAL_FEATURES
 	opt_register_early_noarg("--experimental-dual-fund",
 				 opt_set_dual_fund, ld,
 				 "experimental: Advertise dual-funding"
 				 " and allow peers to establish channels"
-				 " via v2 channel open protocol");
-#endif
+				 " via v2 channel open protocol.");
 
 	/* This affects our features, so set early. */
 	opt_register_early_noarg("--experimental-onion-messages",

@@ -77,12 +77,7 @@ static const struct feature_style feature_styles[] = {
 	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
 			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT} },
-#if EXPERIMENTAL_FEATURES
 	{ OPT_ANCHOR_OUTPUTS,
-	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
-			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
-			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT } },
-	{ OPT_SHUTDOWN_ANYSEGWIT,
 	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
 			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT } },
@@ -91,6 +86,11 @@ static const struct feature_style feature_styles[] = {
 			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
 			  [BOLT11_FEATURE] = FEATURE_REPRESENT,
 			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT} },
+#if EXPERIMENTAL_FEATURES
+	{ OPT_SHUTDOWN_ANYSEGWIT,
+	  .copy_style = { [INIT_FEATURE] = FEATURE_REPRESENT,
+			  [NODE_ANNOUNCE_FEATURE] = FEATURE_REPRESENT,
+			  [CHANNEL_FEATURE] = FEATURE_DONT_REPRESENT } },
 #endif
 };
 
@@ -117,15 +117,13 @@ static const struct dependency feature_deps[] = {
 	 *...
 	 * `option_anchor_outputs` | ...      | ...      | `option_static_remotekey`
 	 */
-#if EXPERIMENTAL_FEATURES
 	{ OPT_ANCHOR_OUTPUTS, OPT_STATIC_REMOTEKEY },
-	/* BOLT-7b04b1461739c5036add61782d58ac490842d98b #9:
+	/* BOLT-f53ca2301232db780843e894f55d95d512f297f9 #9:
 	 * Name                | Description  | Context  | Dependencies  |
 	 * ...
 	 * `option_dual_fund`  | ...          | ...      | `option_anchor_outputs`
 	 */
 	{ OPT_DUAL_FUND, OPT_ANCHOR_OUTPUTS },
-#endif
 };
 
 static void trim_features(u8 **features)
@@ -382,20 +380,58 @@ int features_unsupported(const struct feature_set *our_features,
 static const char *feature_name(const tal_t *ctx, size_t f)
 {
 	static const char *fnames[] = {
-		"option_data_loss_protect",
+		"option_data_loss_protect", 	/* 0/1 */
 		"option_initial_routing_sync",
 		"option_upfront_shutdown_script",
 		"option_gossip_queries",
 		"option_var_onion_optin",
-		"option_gossip_queries_ex",
+		"option_gossip_queries_ex", 	/* 10/11 */
 		"option_static_remotekey",
 		"option_payment_secret",
 		"option_basic_mpp",
 		"option_support_large_channel",
-		"option_anchor_outputs",
+		"option_anchor_outputs", 	/* 20/21 */
 		"option_anchors_zero_fee_htlc_tx",
 		NULL,
 		"option_shutdown_anysegwit",
+		"option_dual_fund",
+		NULL, /* 30/31 */
+		NULL,
+		NULL,
+		NULL,
+		NULL,
+		NULL, /* 40/41 */
+		NULL,
+		NULL,
+		NULL,
+		NULL,
+		NULL, /* 50/51 */
+		NULL,
+		NULL,
+		NULL,
+		NULL,
+		NULL, /* 60/61 */
+		NULL,
+		NULL,
+		NULL,
+		NULL,
+		NULL, /* 70/71 */
+		NULL,
+		NULL,
+		NULL,
+		NULL,
+		NULL, /* 80/81 */
+		NULL,
+		NULL,
+		NULL,
+		NULL,
+		NULL, /* 90/91 */
+		NULL,
+		NULL,
+		NULL,
+		NULL,
+		NULL, /* 100/101 */
+		"option_onion_messages", /* 102/103 */
 	};
 
 	if (f / 2 >= ARRAY_SIZE(fnames) || !fnames[f / 2])
