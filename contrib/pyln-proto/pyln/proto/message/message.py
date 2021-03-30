@@ -248,7 +248,7 @@ other types.  Since 'msgtype' is almost identical, it inherits from this too.
             fieldname, s = s.split('=', 1)
             f = self.find_field(fieldname)
             if f is None:
-                raise ValueError("Unknown field name {}".format(fieldname))
+                raise ValueError("Unknown field name '{}'. Expected one of [{}])".format(fieldname, ','.join(str(f) for f in self.fields)))
             ret[fieldname], s = f.fieldtype.val_from_str(s)
             if s[0] == ',':
                 s = s[1:]
@@ -297,10 +297,17 @@ other types.  Since 'msgtype' is almost identical, it inherits from this too.
 
     def write(self, io_out: BufferedIOBase, v: Dict[str, Any], otherfields: Dict[str, Any]) -> None:
         self._raise_if_badvals(v)
-        for fname, val in v.items():
-            field = self.find_field(fname)
-            assert field
-            field.fieldtype.write(io_out, val, otherfields)
+        for f in self.fields:
+            if f.name in v:
+                val = v[f.name]
+            else:
+                if f.option is not None:
+                    raise ValueError("Missing field {} {}".format(f.name, otherfields))
+                val = None
+
+            if self.name in otherfields:
+                otherfields = otherfields[self.name]
+            f.fieldtype.write(io_out, val, otherfields)
 
     def read(self, io_in: BufferedIOBase, otherfields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         vals = {}
