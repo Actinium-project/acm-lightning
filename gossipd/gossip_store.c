@@ -62,6 +62,7 @@ static void gossip_store_destroy(struct gossip_store *gs)
 }
 
 #if HAVE_PWRITEV
+/* One fewer syscall for the win! */
 static ssize_t gossip_pwritev(int fd, const struct iovec *iov, int iovcnt,
 			      off_t offset)
 {
@@ -71,25 +72,9 @@ static ssize_t gossip_pwritev(int fd, const struct iovec *iov, int iovcnt,
 static ssize_t gossip_pwritev(int fd, const struct iovec *iov, int iovcnt,
 			      off_t offset)
 {
-	u8 *buf;
-	size_t len;
-	ssize_t ret;
-
-	/* Make a temporary linear buffer to fall back to pwrite() */
-	len = 0;
-	for (size_t i = 0; i < iovcnt; i++)
-		len += iov[i].iov_len;
-
-	buf = tal_arr(NULL, u8, len);
-	len = 0;
-	for (size_t i = 0; i < iovcnt; i++) {
-		memcpy(buf + len, iov[i].iov_base, iov[i].iov_len);
-		len += iov[i].iov_len;
-	}
-
-	ret = pwrite(fd, buf, len, offset);
-	tal_free(buf);
-	return ret;
+	if (lseek(fd, offset, SEEK_SET) != offset)
+		return -1;
+	return writev(fd, iov, iovcnt);
 }
 #endif /* !HAVE_PWRITEV */
 
@@ -100,6 +85,9 @@ static bool append_msg(int fd, const u8 *msg, u32 timestamp,
 	u32 msglen;
 	struct iovec iov[2];
 
+	/* Don't ever overwrite the version header! */
+	assert(*len);
+
 	msglen = tal_count(msg);
 	hdr.len = cpu_to_be32(msglen);
 	if (push)
@@ -107,7 +95,8 @@ static bool append_msg(int fd, const u8 *msg, u32 timestamp,
 	hdr.crc = cpu_to_be32(crc32c(timestamp, msg, msglen));
 	hdr.timestamp = cpu_to_be32(timestamp);
 
-	/* Use pwritev so it will appear in store atomically */
+	/* pwritev makes it more likely to appear at once, plus it's
+	 * exactly what we want. */
 	iov[0].iov_base = &hdr;
 	iov[0].iov_len = sizeof(hdr);
 	iov[1].iov_base = (void *)msg;
@@ -634,6 +623,9 @@ static u32 delete_by_index(struct gossip_store *gs, u32 index, int type)
 
 	/* Should never get here during loading! */
 	assert(gs->writable);
+
+	/* Should never try to overwrite version */
+	assert(index);
 
 #if DEVELOPER
 	const u8 *msg = gossip_store_get(tmpctx, gs, index);
