@@ -287,9 +287,8 @@ close_command_timeout(struct close_command *cc)
 	/* This will trigger drop_to_chain, which will trigger
 	 * resolution of the command and destruction of the
 	 * close_command. */
-	if (!deprecated_apis)
-		json_notify_fmt(cc->cmd, LOG_INFORM,
-				"Timed out, forcing close.");
+	json_notify_fmt(cc->cmd, LOG_INFORM,
+			"Timed out, forcing close.");
 	channel_fail_permanent(cc->channel, REASON_USER,
 			       "Forcibly closed by `close` command timeout");
 }
@@ -313,7 +312,7 @@ register_close_command(struct lightningd *ld,
 			    &destroy_close_command_on_channel_destroy,
 			    cc);
 
-	if (!deprecated_apis && !channel->owner) {
+	if (!channel->owner) {
 		char *msg = tal_strdup(tmpctx, "peer is offline, will negotiate once they reconnect");
 		if (timeout)
 			tal_append_fmt(&msg, " (%u seconds before unilateral close)",
@@ -573,7 +572,7 @@ static struct amount_sat commit_txfee(const struct channel *channel,
 	}
 
 	/*
-	 * BOLT-f5490f17d17ff49dc26ee459432b3c9db4fda8a9 #2:
+	 * BOLT #2:
 	 * A sending node:
 	 *...
 	 * - SHOULD NOT offer `amount_msat` if, after adding that HTLC to its
@@ -588,7 +587,7 @@ static struct amount_sat commit_txfee(const struct channel *channel,
 				 channel->option_anchor_outputs);
 
 	if (channel->option_anchor_outputs) {
-		/* BOLT-a12da24dd0102c170365124782b46d9710950ac1:
+		/* BOLT #3:
 		 * If `option_anchor_outputs` applies to the commitment
 		 * transaction, also subtract two times the fixed anchor size
 		 * of 330 sats from the funder (either `to_local` or

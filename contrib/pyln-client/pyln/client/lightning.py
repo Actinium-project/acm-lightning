@@ -514,47 +514,19 @@ class LightningRpc(UnixDomainSocketRpc):
         payload.update({k: v for k, v in kwargs.items()})
         return self.call("check", payload)
 
-    def _deprecated_close(self, peer_id, force=None, timeout=None):
-        warnings.warn("close now takes unilateraltimeout arg: expect removal"
-                      " in early 2020",
-                      DeprecationWarning)
-        payload = {
-            "id": peer_id,
-            "force": force,
-            "timeout": timeout
-        }
-        return self.call("close", payload)
-
-    def close(self, peer_id, *args, **kwargs):
+    def close(self, peer_id, unilateraltimeout=None, destination=None, fee_negotiation_step=None):
         """
         Close the channel with peer {id}, forcing a unilateral
         close after {unilateraltimeout} seconds if non-zero, and
         the to-local output will be sent to {destination}.
-
-        Deprecated usage has {force} and {timeout} args.
         """
-
-        if 'force' in kwargs or 'timeout' in kwargs:
-            return self._deprecated_close(peer_id, *args, **kwargs)
-
-        # Single arg is ambigious.
-        if len(args) >= 1:
-            if isinstance(args[0], bool):
-                return self._deprecated_close(peer_id, *args, **kwargs)
-            if len(args) == 2:
-                if args[0] is None and isinstance(args[1], int):
-                    return self._deprecated_close(peer_id, *args, **kwargs)
-
-        def _close(peer_id, unilateraltimeout=None, destination=None, fee_negotiation_step=None):
-            payload = {
-                "id": peer_id,
-                "unilateraltimeout": unilateraltimeout,
-                "destination": destination,
-                "fee_negotiation_step": fee_negotiation_step
-            }
-            return self.call("close", payload)
-
-        return _close(peer_id, *args, **kwargs)
+        payload = {
+            "id": peer_id,
+            "unilateraltimeout": unilateraltimeout,
+            "destination": destination,
+            "fee_negotiation_step": fee_negotiation_step
+        }
+        return self.call("close", payload)
 
     def connect(self, peer_id, host=None, port=None):
         """
@@ -635,7 +607,7 @@ class LightningRpc(UnixDomainSocketRpc):
         return self.call("dev-memleak")
 
     def dev_pay(self, bolt11, msatoshi=None, label=None, riskfactor=None,
-                description=None, maxfeepercent=None, retry_for=None,
+                maxfeepercent=None, retry_for=None,
                 maxdelay=None, exemptfee=None, use_shadow=True):
         """
         A developer version of `pay`, with the possibility to deactivate
@@ -651,8 +623,6 @@ class LightningRpc(UnixDomainSocketRpc):
             "maxdelay": maxdelay,
             "exemptfee": exemptfee,
             "use_shadow": use_shadow,
-            # Deprecated.
-            "description": description,
         }
         return self.call("pay", payload)
 
@@ -722,22 +692,7 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("feerates", payload)
 
-    def _deprecated_fundchannel(self, node_id, satoshi, feerate=None, announce=True, minconf=None, utxos=None):
-        warnings.warn("fundchannel: the 'satoshi' field is renamed 'amount' : expect removal"
-                      " in Mid-2020",
-                      DeprecationWarning)
-
-        payload = {
-            "id": node_id,
-            "satoshi": satoshi,
-            "feerate": feerate,
-            "announce": announce,
-            "minconf": minconf,
-            "utxos": utxos
-        }
-        return self.call("fundchannel", payload)
-
-    def fundchannel(self, node_id, *args, **kwargs):
+    def fundchannel(self, node_id, amount, feerate=None, announce=True, minconf=None, utxos=None, push_msat=None, close_to=None):
         """
         Fund channel with {id} using {amount} satoshis with feerate
         of {feerate} (uses default feerate if unset).
@@ -747,39 +702,19 @@ class LightningRpc(UnixDomainSocketRpc):
         fund a channel from these specifics utxos.
         {close_to} is a valid Bitcoin address.
         """
-
-        if 'satoshi' in kwargs:
-            return self._deprecated_fundchannel(node_id, *args, **kwargs)
-
-        def _fundchannel(node_id, amount, feerate=None, announce=True, minconf=None, utxos=None, push_msat=None, close_to=None):
-            payload = {
-                "id": node_id,
-                "amount": amount,
-                "feerate": feerate,
-                "announce": announce,
-                "minconf": minconf,
-                "utxos": utxos,
-                "push_msat": push_msat,
-                "close_to": close_to,
-            }
-            return self.call("fundchannel", payload)
-
-        return _fundchannel(node_id, *args, **kwargs)
-
-    def _deprecated_fundchannel_start(self, node_id, satoshi, feerate=None, announce=True):
-        warnings.warn("fundchannel_start: the 'satoshi' field is renamed 'amount' : expect removal"
-                      " in Mid-2020",
-                      DeprecationWarning)
-
         payload = {
             "id": node_id,
-            "satoshi": satoshi,
+            "amount": amount,
             "feerate": feerate,
             "announce": announce,
+            "minconf": minconf,
+            "utxos": utxos,
+            "push_msat": push_msat,
+            "close_to": close_to,
         }
-        return self.call("fundchannel_start", payload)
+        return self.call("fundchannel", payload)
 
-    def fundchannel_start(self, node_id, *args, **kwargs):
+    def fundchannel_start(self, node_id, amount, feerate=None, announce=True, close_to=None):
         """
         Start channel funding with {id} for {amount} satoshis
         with feerate of {feerate} (uses default feerate if unset).
@@ -789,21 +724,14 @@ class LightningRpc(UnixDomainSocketRpc):
         'fundchannel_complete' to complete channel establishment
         with peer.
         """
-
-        if 'satoshi' in kwargs:
-            return self._deprecated_fundchannel_start(node_id, *args, **kwargs)
-
-        def _fundchannel_start(node_id, amount, feerate=None, announce=True, close_to=None):
-            payload = {
-                "id": node_id,
-                "amount": amount,
-                "feerate": feerate,
-                "announce": announce,
-                "close_to": close_to,
-            }
-            return self.call("fundchannel_start", payload)
-
-        return _fundchannel_start(node_id, *args, **kwargs)
+        payload = {
+            "id": node_id,
+            "amount": amount,
+            "feerate": feerate,
+            "announce": announce,
+            "close_to": close_to,
+        }
+        return self.call("fundchannel_start", payload)
 
     def fundchannel_cancel(self, node_id):
         """
@@ -1058,7 +986,7 @@ class LightningRpc(UnixDomainSocketRpc):
         return self.call("newaddr", {"addresstype": addresstype})
 
     def pay(self, bolt11, msatoshi=None, label=None, riskfactor=None,
-            description=None, maxfeepercent=None, retry_for=None,
+            maxfeepercent=None, retry_for=None,
             maxdelay=None, exemptfee=None):
         """
         Send payment specified by {bolt11} with {msatoshi}
@@ -1074,8 +1002,6 @@ class LightningRpc(UnixDomainSocketRpc):
             "retry_for": retry_for,
             "maxdelay": maxdelay,
             "exemptfee": exemptfee,
-            # Deprecated.
-            "description": description,
         }
         return self.call("pay", payload)
 
@@ -1189,39 +1115,20 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("plugin", payload)
 
-    def _deprecated_sendpay(self, route, payment_hash, description, msatoshi=None):
-        warnings.warn("sendpay: the 'description' field is renamed 'label' : expect removal"
-                      " in early-2020",
-                      DeprecationWarning)
-        payload = {
-            "route": route,
-            "payment_hash": payment_hash,
-            "label": description,
-            "msatoshi": msatoshi,
-        }
-        return self.call("sendpay", payload)
-
-    def sendpay(self, route, payment_hash, *args, **kwargs):
+    def sendpay(self, route, payment_hash, label=None, msatoshi=None, bolt11=None, payment_secret=None, partid=None):
         """
         Send along {route} in return for preimage of {payment_hash}.
         """
-
-        if 'description' in kwargs:
-            return self._deprecated_sendpay(route, payment_hash, *args, **kwargs)
-
-        def _sendpay(route, payment_hash, label=None, msatoshi=None, bolt11=None, payment_secret=None, partid=None):
-            payload = {
-                "route": route,
-                "payment_hash": payment_hash,
-                "label": label,
-                "msatoshi": msatoshi,
-                "bolt11": bolt11,
-                "payment_secret": payment_secret,
-                "partid": partid,
-            }
-            return self.call("sendpay", payload)
-
-        return _sendpay(route, payment_hash, *args, **kwargs)
+        payload = {
+            "route": route,
+            "payment_hash": payment_hash,
+            "label": label,
+            "msatoshi": msatoshi,
+            "bolt11": bolt11,
+            "payment_secret": payment_secret,
+            "partid": partid,
+        }
+        return self.call("sendpay", payload)
 
     def setchannelfee(self, id, base=None, ppm=None):
         """

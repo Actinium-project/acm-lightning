@@ -140,6 +140,7 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->dev_force_tmp_channel_id = NULL;
 	ld->dev_no_htlc_timeout = false;
 	ld->dev_no_version_checks = false;
+	ld->dev_max_funding_unconfirmed = 2016;
 #endif
 
 	/*~ These are CCAN lists: an embedded double-linked list.  It's not
@@ -226,7 +227,6 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->use_proxy_always = false;
 	ld->pure_tor_setup = false;
 	ld->tor_service_password = NULL;
-	ld->max_funding_unconfirmed = 2016;
 
 	/*~ This is initialized later, but the plugin loop examines this,
 	 * so set it to NULL explicitly now. */
@@ -238,11 +238,6 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	 *  is that :-)
 	 */
 	jsonrpc_setup(ld);
-
-	/*~ We changed when we start plugins, messing up relative paths.
-	 * This saves our original dirs so we can fixup and warn for the
-	 * moment (0.7.2). */
-	ld->original_directory = path_cwd(ld);
 
 	/*~ We run a number of plugins (subprocesses that we talk JSON-RPC with)
 	 * alongside this process. This allows us to have an easy way for users

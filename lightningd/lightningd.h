@@ -194,10 +194,6 @@ struct lightningd {
 	/* PID file */
 	char *pidfile;
 
-	/* Number of blocks we wait for a channel to get funded
-	 * if we are the fundee. */
-	u32 max_funding_unconfirmed;
-
 	/* RPC which asked us to shutdown, if non-NULL */
 	struct io_conn *stop_conn;
 	/* RPC response to send once we've shut down. */
@@ -243,6 +239,10 @@ struct lightningd {
 	bool dev_no_htlc_timeout;
 
 	bool dev_no_version_checks;
+
+	/* Number of blocks we wait for a channel to get funded
+	 * if we are the fundee. */
+	u32 dev_max_funding_unconfirmed;
 #endif /* DEVELOPER */
 
 	/* tor support */
@@ -250,9 +250,6 @@ struct lightningd {
 	bool use_proxy_always;
 	char *tor_service_password;
 	bool pure_tor_setup;
-
-	/* Original directory for deprecated plugin-relative-to-cwd */
-	const char *original_directory;
 
 	struct plugins *plugins;
 
