@@ -944,6 +944,28 @@ static struct bitcoin_signature *unraw_sigs(const tal_t *ctx,
 	return sigs;
 }
 
+/* Do we want to update fees? */
+static bool want_fee_update(const struct peer *peer, u32 *target)
+{
+	u32 max, val;
+
+	if (peer->channel->opener != LOCAL)
+		return false;
+
+	max = approx_max_feerate(peer->channel);
+	val = peer->desired_feerate;
+
+	/* FIXME: We should avoid adding HTLCs until we can meet this
+	 * feerate! */
+	if (val > max)
+		val = max;
+
+	if (target)
+		*target = val;
+
+	return val != channel_feerate(peer->channel, REMOTE);
+}
+
 static void send_commit(struct peer *peer)
 {
 	u8 *msg;
@@ -954,6 +976,7 @@ static void send_commit(struct peer *peer)
 	const struct htlc **htlc_map;
 	struct wally_tx_output *direct_outputs[NUM_SIDES];
 	struct penalty_base *pbase;
+	u32 feerate_target;
 
 #if DEVELOPER
 	/* Hack to suppress all commit sends if dev_disconnect says to */
@@ -1002,27 +1025,21 @@ static void send_commit(struct peer *peer)
 	}
 
 	/* If we wanted to update fees, do it now. */
-	if (peer->channel->opener == LOCAL) {
-		u32 feerate, max = approx_max_feerate(peer->channel);
-
-		feerate = peer->desired_feerate;
-
-		/* FIXME: We should avoid adding HTLCs until we can meet this
-		 * feerate! */
-		if (feerate > max)
-			feerate = max;
-
-		if (feerate != channel_feerate(peer->channel, REMOTE)) {
+	if (want_fee_update(peer, &feerate_target)) {
+		/* FIXME: We occasionally desynchronize with LND here, so
+		 * don't stress things by having more than one feerate change
+		 * in-flight! */
+		if (feerate_changes_done(peer->channel->fee_states)) {
 			u8 *msg;
 
-			if (!channel_update_feerate(peer->channel, feerate))
+			if (!channel_update_feerate(peer->channel, feerate_target))
 				status_failed(STATUS_FAIL_INTERNAL_ERROR,
 					      "Could not afford feerate %u"
 					      " (vs max %u)",
-					      feerate, max);
+					      feerate_target, approx_max_feerate(peer->channel));
 
 			msg = towire_update_fee(NULL, &peer->channel_id,
-						feerate);
+						feerate_target);
 			sync_crypto_write(peer->pps, take(msg));
 		}
 	}
@@ -1035,7 +1052,9 @@ static void send_commit(struct peer *peer)
 	 */
 	changed_htlcs = tal_arr(tmpctx, const struct htlc *, 0);
 	if (!channel_sending_commit(peer->channel, &changed_htlcs)) {
-		status_debug("Can't send commit: nothing to send");
+		status_debug("Can't send commit: nothing to send, feechange %s (%s)",
+			     want_fee_update(peer, NULL) ? "wanted": "not wanted",
+			     type_to_string(tmpctx, struct fee_states, peer->channel->fee_states));
 
 		/* Covers the case where we've just been told to shutdown. */
 		maybe_send_shutdown(peer);
@@ -1386,8 +1405,13 @@ static void handle_peer_commit_sig(struct peer *peer, const u8 *msg)
 	status_debug("Received commit_sig with %zu htlc sigs",
 		     tal_count(htlc_sigs));
 
-	return send_revocation(peer,
-			       &commit_sig, htlc_sigs, changed_htlcs, txs[0]);
+	send_revocation(peer,
+			&commit_sig, htlc_sigs, changed_htlcs, txs[0]);
+
+	/* This might have synced the feerates: if so, we may want to
+	 * update */
+	if (want_fee_update(peer, NULL))
+		start_commit_timer(peer);
 }
 
 /* Pops the penalty base for the given commitnum from our internal list. There
@@ -3040,8 +3064,6 @@ static void init_channel(struct peer *peer)
 
 	assert(!(fcntl(MASTER_FD, F_GETFL) & O_NONBLOCK));
 
-	status_setup_sync(MASTER_FD);
-
 	msg = wire_sync_read(tmpctx, MASTER_FD);
 	if (!fromwire_channeld_init(peer, msg,
 				   &chainparams,
@@ -3224,6 +3246,8 @@ int main(int argc, char *argv[])
 	struct peer *peer;
 
 	subdaemon_setup(argc, argv);
+
+	status_setup_sync(MASTER_FD);
 
 	peer = tal(NULL, struct peer);
 	peer->expecting_pong = false;
