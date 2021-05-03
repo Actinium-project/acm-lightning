@@ -39,7 +39,12 @@ enum plugin_state {
  * A plugin, exposed as a stub so we can pass it as an argument.
  */
 struct plugin {
+	/* Must be first element in the struct otherwise we get false
+	 * positives for leaks. */
 	struct list_node list;
+
+	/* The filename that can be used to refer to the plugin. */
+	const char *shortname;
 
 	pid_t pid;
 	char *cmd;
@@ -93,6 +98,10 @@ struct plugin {
 	/* Parameters for dynamically-started plugins. */
 	const char *parambuf;
 	const jsmntok_t *params;
+
+	/* Notification topics that this plugin has registered with us
+	 * and that other plugins may subscribe to. */
+	const char **notification_topics;
 };
 
 /**

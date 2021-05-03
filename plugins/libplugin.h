@@ -219,6 +219,10 @@ struct command_result *forward_result(struct command *cmd,
  * send_req() path. */
 struct command_result *timer_complete(struct plugin *p);
 
+/* Signals that we've completed a command. Useful for when
+ * there's no `cmd` present */
+struct command_result *command_done(void);
+
 /* Access timer infrastructure to add a timer.
  *
  * Freeing this releases the timer, otherwise it's freed after @cb
@@ -241,6 +245,13 @@ void plugin_log(struct plugin *p, enum log_level l, const char *fmt, ...) PRINTF
 /* Notify the caller of something. */
 struct json_stream *plugin_notify_start(struct command *cmd, const char *method);
 void plugin_notify_end(struct command *cmd, struct json_stream *js);
+
+/* Send a notification for a custom notification topic. These are sent
+ * to lightningd and distributed to subscribing plugins. */
+struct json_stream *plugin_notification_start(struct plugin *plugins,
+					      const char *method);
+void plugin_notification_end(struct plugin *plugin,
+			     struct json_stream *stream TAKES);
 
 /* Convenience wrapper for notify "message" */
 void plugin_notify_message(struct command *cmd,
@@ -289,6 +300,8 @@ void NORETURN LAST_ARG_NULL plugin_main(char *argv[],
 					size_t num_notif_subs,
 					const struct plugin_hook *hook_subs,
 					size_t num_hook_subs,
+					const char **notif_topics,
+					size_t num_notif_topics,
 					...);
 
 struct listpeers_channel {

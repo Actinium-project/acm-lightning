@@ -599,14 +599,14 @@ def test_openchannel_hook(node_factory, bitcoind):
     if l2.config('experimental-dual-fund'):
         # openchannel2 var checks
         expected.update({
-            'commitment_feerate_per_kw': '750',
+            'channel_id': '.*',
+            'commitment_feerate_per_kw': '7500',
+            'funding_feerate_per_kw': '7500',
             'feerate_our_max': '150000',
             'feerate_our_min': '1875',
-            'funding_feerate_best': '7500',
-            'funding_feerate_max': '150000',
-            'funding_feerate_min': '1875',
             'locktime': '.*',
             'their_funding': '100000000msat',
+            'channel_max_msat': '16777215000msat',
         })
     else:
         expected.update({
@@ -2402,3 +2402,29 @@ def test_self_disable(node_factory):
     # Also works with dynamic load attempts
     with pytest.raises(RpcError, match="Disabled via selfdisable option"):
         l1.rpc.plugin_start(p2, selfdisable=True)
+
+
+def test_custom_notification_topics(node_factory):
+    plugin = os.path.join(
+        os.path.dirname(__file__), "plugins", "custom_notifications.py"
+    )
+    l1, l2 = node_factory.line_graph(2, opts=[{'plugin': plugin}, {}])
+    l1.rpc.emit()
+    l1.daemon.wait_for_log(r'Got a custom notification Hello world')
+
+    inv = l2.rpc.invoice(42, "lbl", "desc")['bolt11']
+    l1.rpc.pay(inv)
+
+    l1.daemon.wait_for_log(r'Got a pay_success notification from plugin pay for payment_hash [0-9a-f]{64}')
+
+    # And now make sure that we drop unannounced notifications
+    l1.rpc.faulty_emit()
+    l1.daemon.wait_for_log(
+        r"Plugin attempted to send a notification to topic .* not forwarding"
+    )
+    time.sleep(1)
+    assert not l1.daemon.is_in_log(r'Got the ididntannouncethis event')
+
+    # The plugin just dist what previously was a fatal mistake (emit
+    # an unknown notification), make sure we didn't kill it.
+    assert 'custom_notifications.py' in [p['name'] for p in l1.rpc.listconfigs()['plugins']]

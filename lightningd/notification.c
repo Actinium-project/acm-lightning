@@ -18,11 +18,25 @@ static struct notification *find_notification_by_topic(const char* topic)
 	return NULL;
 }
 
-bool notifications_have_topic(const char *topic)
+bool notifications_topic_is_native(const char *topic)
 {
 	struct notification *noti = find_notification_by_topic(topic);
-	if (noti)
+	return noti != NULL;
+}
+
+bool notifications_have_topic(const struct plugins *plugins, const char *topic)
+{
+	struct plugin *plugin;
+	if (notifications_topic_is_native(topic))
 		return true;
+
+	/* Some plugin at some point announced it'd be emitting
+	 * notifications to this topic. */
+	list_for_each(&plugins->plugins, plugin, list) {
+		for (size_t i = 0; i < tal_count(plugin->notification_topics); i++)
+			if (streq(plugin->notification_topics[i], topic))
+				return true;
+	}
 
 	return false;
 }

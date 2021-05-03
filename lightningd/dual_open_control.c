@@ -183,6 +183,9 @@ struct rbf_channel_payload {
 	/* General info */
 	u32 feerate_our_max;
 	u32 feerate_our_min;
+	/* What's the maximum amount of funding
+	 * this channel can hold */
+	struct amount_sat channel_max;
 
 	/* Returned from hook */
 	struct amount_sat our_funding;
@@ -206,6 +209,8 @@ rbf_channel_hook_serialize(struct rbf_channel_payload *payload,
 		     payload->feerate_our_min);
 	json_add_num(stream, "funding_feerate_per_kw",
 		     payload->funding_feerate_per_kw);
+	json_add_amount_sat_only(stream, "channel_max_msat",
+				 payload->channel_max);
 	json_object_end(stream);
 }
 
@@ -241,6 +246,9 @@ struct openchannel2_payload {
 	u8 channel_flags;
 	u32 locktime;
 	u8 *shutdown_scriptpubkey;
+	/* What's the maximum amount of funding
+	 * this channel can hold */
+	struct amount_sat channel_max;
 
 	struct amount_sat accepter_funding;
 	struct wally_psbt *psbt;
@@ -278,6 +286,8 @@ openchannel2_hook_serialize(struct openchannel2_payload *payload,
 	if (tal_bytelen(payload->shutdown_scriptpubkey) != 0)
 		json_add_hex_talarr(stream, "shutdown_scriptpubkey",
 				    payload->shutdown_scriptpubkey);
+	json_add_amount_sat_only(stream, "channel_max_msat",
+				 payload->channel_max);
 	json_object_end(stream);
 }
 
@@ -617,6 +627,10 @@ rbf_channel_hook_deserialize(struct rbf_channel_payload *payload,
 				 "our_funding_msat", &payload->our_funding))
 		fatal("Plugin failed to supply our_funding_msat field");
 
+	if (payload->psbt
+	    && amount_sat_eq(payload->our_funding, AMOUNT_SAT(0)))
+		fatal("Plugin failed to supply our_funding_msat field");
+
 	if (!payload->psbt &&
 		!amount_sat_eq(payload->our_funding, AMOUNT_SAT(0))) {
 
@@ -777,8 +791,12 @@ openchannel2_hook_deserialize(struct openchannel2_payload *payload,
 				 &payload->accepter_funding))
 		fatal("Plugin failed to supply our_funding_msat field");
 
-	if (!payload->psbt &&
-		!amount_sat_eq(payload->accepter_funding, AMOUNT_SAT(0))) {
+	if (payload->psbt
+	    && amount_sat_eq(payload->accepter_funding, AMOUNT_SAT(0)))
+		fatal("Plugin failed to supply our_funding_msat field");
+
+	if (!payload->psbt
+	    && !amount_sat_eq(payload->accepter_funding, AMOUNT_SAT(0))) {
 		/* Gotta give a PSBT if you set the accepter_funding amount */
 		/* Let dualopend know we've failed */
 		payload->err_msg = "Client error. Unable to continue";
@@ -1636,6 +1654,12 @@ static void rbf_got_offer(struct subd *dualopend, const u8 *msg)
 	/* No error message known (yet) */
 	payload->err_msg = NULL;
 
+	payload->channel_max = chainparams->max_funding;
+	if (feature_negotiated(dualopend->ld->our_features,
+			       channel->peer->their_features,
+			       OPT_LARGE_CHANNELS))
+		payload->channel_max = AMOUNT_SAT(UINT_MAX);
+
 	tal_add_destructor2(dualopend, rbf_channel_remove_dualopend, payload);
 	plugin_hook_call_rbf_channel(dualopend->ld, payload);
 }
@@ -1694,6 +1718,12 @@ static void accepter_got_offer(struct subd *dualopend,
 	 * the plugin */
 	payload->feerate_our_min = feerate_min(dualopend->ld, NULL);
 	payload->feerate_our_max = feerate_max(dualopend->ld, NULL);
+
+	payload->channel_max = chainparams->max_funding;
+	if (feature_negotiated(dualopend->ld->our_features,
+			       channel->peer->their_features,
+			       OPT_LARGE_CHANNELS))
+		payload->channel_max = AMOUNT_SAT(UINT64_MAX);
 
 	tal_add_destructor2(dualopend, openchannel2_remove_dualopend, payload);
 	plugin_hook_call_openchannel2(dualopend->ld, payload);

@@ -134,7 +134,7 @@ static void tx_must_be_eq(const struct bitcoin_tx *a,
  *    htlc 4 expiry: 504
  *    htlc 4 payment_preimage: 0404040404040404040404040404040404040404040404040404040404040404
  */
-static const struct htlc **setup_htlcs(const tal_t *ctx)
+static const struct htlc **setup_htlcs_0_to_4(const tal_t *ctx)
 {
 	const struct htlc **htlcs = tal_arr(ctx, const struct htlc *, 5);
 	int i;
@@ -166,16 +166,56 @@ static const struct htlc **setup_htlcs(const tal_t *ctx)
 			break;
 		}
 
-		if (i == 0 || i == 1 || i == 4) {
-			/* direction: remote->local */
-
-		} else {
-			/* direction: local->remote */
-			htlc->state = SENT_ADD_ACK_REVOCATION;
-		}
 		htlc->expiry.locktime = 500 + i;
 		htlc->r = tal(htlc, struct preimage);
 		memset(htlc->r, i, sizeof(*htlc->r));
+		sha256(&htlc->rhash, htlc->r, sizeof(*htlc->r));
+		htlcs[i] = htlc;
+	}
+	return htlcs;
+}
+
+/* BOLT #3:
+ *    htlc 5 direction: local->remote
+ *    htlc 5 amount_msat: 5000000
+ *    htlc 5 expiry: 505
+ *    htlc 5 payment_preimage: 0505050505050505050505050505050505050505050505050505050505050505
+ *    htlc 6 direction: local->remote
+ *    htlc 6 amount_msat: 5000000
+ *    htlc 6 expiry: 506
+ *    htlc 6 payment_preimage: 0505050505050505050505050505050505050505050505050505050505050505
+*/
+static const struct htlc **setup_htlcs_1_5_and_6(const tal_t *ctx)
+{
+	const struct htlc **htlcs = tal_arr(ctx, const struct htlc *, 3);
+	int i;
+	const u64 htlc_ids[] = {1, 5, 6};
+
+	for (i = 0; i < 3; i++) {
+		struct htlc *htlc = tal(htlcs, struct htlc);
+
+		htlc->r = tal(htlc, struct preimage);
+		htlc->id = htlc_ids[i];
+		switch (htlc->id) {
+		case 1:
+			htlc->state = RCVD_ADD_ACK_REVOCATION;
+			htlc->amount = AMOUNT_MSAT(2000000);
+			htlc->expiry.locktime = 501;
+			memset(htlc->r, 1, sizeof(*htlc->r));
+			break;
+		case 5:
+			htlc->state = SENT_ADD_ACK_REVOCATION;
+			htlc->amount = AMOUNT_MSAT(5000000);
+			htlc->expiry.locktime = 505;
+			memset(htlc->r, 5, sizeof(*htlc->r));
+			break;
+		case 6:
+			htlc->state = SENT_ADD_ACK_REVOCATION;
+			htlc->amount = AMOUNT_MSAT(5000000);
+			htlc->expiry.locktime = 506;
+			memset(htlc->r, 5, sizeof(*htlc->r));
+			break;
+		}
 		sha256(&htlc->rhash, htlc->r, sizeof(*htlc->r));
 		htlcs[i] = htlc;
 	}
@@ -240,6 +280,7 @@ static void report_htlcs(const struct bitcoin_tx *tx,
 	keyset.other_htlc_key = *remote_htlckey;
 
 	for (i = 0; i < tal_count(htlc_map); i++) {
+		struct bitcoin_signature localhtlcsig;
 		const struct htlc *htlc = htlc_map[i];
 
 		if (!htlc)
@@ -281,19 +322,11 @@ static void report_htlcs(const struct bitcoin_tx *tx,
 			      x_remote_htlcsecretkey, remote_htlckey,
 			      SIGHASH_ALL,
 			      &remotehtlcsig[i]);
-		printf("# signature for output %zi (htlc %"PRIu64")\n", i, htlc->id);
+		printf("# signature for output #%zi (%s for htlc #%"PRIu64")\n",
+		       i, htlc_owner(htlc) == LOCAL ? "htlc-timeout" : "htlc-success", htlc->id);
 		printf("remote_htlc_signature = %s\n",
-		       type_to_string(tmpctx, struct bitcoin_signature,
-				      &remotehtlcsig[i]));
-	}
-
-	/* For any HTLC outputs, produce htlc_tx */
-	for (i = 0; i < tal_count(htlc_map); i++) {
-		struct bitcoin_signature localhtlcsig;
-		const struct htlc *htlc = htlc_map[i];
-
-		if (!htlc)
-			continue;
+		       type_to_string(tmpctx, secp256k1_ecdsa_signature,
+				      &remotehtlcsig[i].s));
 
 		sign_tx_input(htlc_tx[i], 0,
 			      NULL,
@@ -301,9 +334,9 @@ static void report_htlcs(const struct bitcoin_tx *tx,
 			      local_htlcsecretkey, local_htlckey,
 			      SIGHASH_ALL,
 			      &localhtlcsig);
-		printf("# local_signature = %s\n",
-		       type_to_string(tmpctx, struct bitcoin_signature,
-				      &localhtlcsig));
+		printf("# local_htlc_signature = %s\n",
+		       type_to_string(tmpctx, secp256k1_ecdsa_signature,
+				      &localhtlcsig.s));
 		if (htlc_owner(htlc) == LOCAL) {
 			htlc_timeout_tx_add_witness(htlc_tx[i],
 						    local_htlckey,
@@ -324,7 +357,7 @@ static void report_htlcs(const struct bitcoin_tx *tx,
 						    remote_revocation_key,
 						    option_anchor_outputs);
 		}
-		printf("output htlc_%s_tx %"PRIu64": %s\n",
+		printf("htlc_%s_tx (htlc #%"PRIu64"): %s\n",
 		       htlc_owner(htlc) == LOCAL ? "timeout" : "success",
 		       htlc->id,
 		       tal_hex(tmpctx, linearize_tx(tmpctx, htlc_tx[i])));
@@ -361,7 +394,7 @@ static void report(struct bitcoin_tx *tx,
 		      SIGHASH_ALL,
 		      &remotesig);
 	printf("remote_signature = %s\n",
-	       type_to_string(tmpctx, struct bitcoin_signature, &remotesig));
+	       type_to_string(tmpctx, secp256k1_ecdsa_signature, &remotesig.s));
 	sign_tx_input(tx, 0,
 		      NULL,
 		      wscript,
@@ -369,7 +402,7 @@ static void report(struct bitcoin_tx *tx,
 		      SIGHASH_ALL,
 		      &localsig);
 	printf("# local_signature = %s\n",
-	       type_to_string(tmpctx, struct bitcoin_signature, &localsig));
+	       type_to_string(tmpctx, secp256k1_ecdsa_signature, &localsig.s));
 
 	witness =
 	    bitcoin_witness_2of2(tx, &localsig, &remotesig,
@@ -491,11 +524,23 @@ int main(int argc, const char *argv[])
 	struct amount_msat to_local, to_remote;
 	const struct htlc **htlcs, **htlc_map, **htlc_map2, **inv_htlcs;
 	bool option_anchor_outputs = false;
+	bool option_static_remotekey = false;
+
+	/* Allow us to check static-remotekey BOLT 3 vectors, too */
+	if (argv[1] && streq(argv[1], "--static-remotekey"))
+		option_static_remotekey = true;
 
 	chainparams = chainparams_for_network("bitcoin");
 
-	htlcs = setup_htlcs(tmpctx);
+	htlcs = setup_htlcs_0_to_4(tmpctx);
 	inv_htlcs = invert_htlcs(htlcs);
+
+#if DEVELOPER
+	/* This lets us match test vectors exactly. */
+	extern bool dev_no_grind;
+
+	dev_no_grind = true;
+#endif /* DEVELOPER */
 
 	/* BOLT #3:
 	 *
@@ -675,10 +720,14 @@ int main(int argc, const char *argv[])
 	printf("localkey: %s\n",
 	       type_to_string(tmpctx, struct pubkey, &localkey));
 
-	if (!derive_simple_key(&remote_payment_basepoint,
-			       &x_local_per_commitment_point,
-			       &remotekey))
-		abort();
+	if (option_static_remotekey)
+		remotekey = remote_payment_basepoint;
+	else {
+		if (!derive_simple_key(&remote_payment_basepoint,
+				       &x_local_per_commitment_point,
+				       &remotekey))
+			abort();
+	}
 	printf("remotekey: %s\n",
 	       type_to_string(tmpctx, struct pubkey, &remotekey));
 
@@ -801,7 +850,7 @@ int main(int argc, const char *argv[])
 	to_remote.millisatoshis = 3000000000;
 	feerate_per_kw = 0;
 	printf("\n"
-	       "name: commitment tx with all 5 htlcs untrimmed (minimum feerate)\n"
+	       "name: commitment tx with all five HTLCs untrimmed (minimum feerate)\n"
 	       "to_local_msat: %"PRIu64"\n"
 	       "to_remote_msat: %"PRIu64"\n"
 	       "local_feerate_per_kw: %u\n",
@@ -901,12 +950,19 @@ int main(int argc, const char *argv[])
 		}
 #endif
 		printf("\n"
-		       "name: commitment tx with %zu output%s untrimmed (maximum feerate)\n"
+		       "name: commitment tx with %s untrimmed (maximum feerate)\n"
 		       "to_local_msat: %"PRIu64"\n"
 		       "to_remote_msat: %"PRIu64"\n"
 		       "local_feerate_per_kw: %u\n",
-		       tx->wtx->num_outputs,
-		       tx->wtx->num_outputs > 1 ? "s" : "",
+		       /* Spec was "neatened" to change these numbers to words! */
+		       tx->wtx->num_outputs == 7 ? "seven outputs"
+		       : tx->wtx->num_outputs == 6 ? "six outputs"
+		       : tx->wtx->num_outputs == 5 ? "five outputs"
+		       : tx->wtx->num_outputs == 4 ? "four outputs"
+		       : tx->wtx->num_outputs == 3 ? "three outputs"
+		       : tx->wtx->num_outputs == 2 ? "two outputs"
+		       : tx->wtx->num_outputs == 1 ? "one output"
+		       : "no outputs???",
 		       to_local.millisatoshis, to_remote.millisatoshis, feerate_per_kw-1);
 		/* Recalc with verbosity on */
 		print_superverbose = true;
@@ -942,12 +998,19 @@ int main(int argc, const char *argv[])
 		       htlc_map);
 
 		printf("\n"
-		       "name: commitment tx with %zu output%s untrimmed (minimum feerate)\n"
+		       "name: commitment tx with %s untrimmed (minimum feerate)\n"
 		       "to_local_msat: %"PRIu64"\n"
 		       "to_remote_msat: %"PRIu64"\n"
 		       "local_feerate_per_kw: %u\n",
-		       newtx->wtx->num_outputs,
-		       newtx->wtx->num_outputs > 1 ? "s" : "",
+		       /* Spec was "neatened" to change these numbers to words! */
+		       newtx->wtx->num_outputs == 7 ? "seven outputs"
+		       : newtx->wtx->num_outputs == 6 ? "six outputs"
+		       : newtx->wtx->num_outputs == 5 ? "five outputs"
+		       : newtx->wtx->num_outputs == 4 ? "four outputs"
+		       : newtx->wtx->num_outputs == 3 ? "three outputs"
+		       : newtx->wtx->num_outputs == 2 ? "two outputs"
+		       : newtx->wtx->num_outputs == 1 ? "one output"
+		       : "no outputs???",
 		       to_local.millisatoshis, to_remote.millisatoshis, feerate_per_kw);
 		/* Recalc with verbosity on */
 		print_superverbose = true;
@@ -1020,7 +1083,7 @@ int main(int argc, const char *argv[])
 		assert(feerate_per_kw == 9651936);
 
 		printf("\n"
-		       "name: commitment tx with fee greater than opener amount\n"
+		       "name: commitment tx with fee greater than funder amount\n"
 		       "to_local_msat: %"PRIu64"\n"
 		       "to_remote_msat: %"PRIu64"\n"
 		       "local_feerate_per_kw: %u\n",
@@ -1058,6 +1121,72 @@ int main(int argc, const char *argv[])
 		break;
 	}
 
+	htlcs = setup_htlcs_1_5_and_6(tmpctx);
+	inv_htlcs = invert_htlcs(htlcs);
+
+	/* BOLT #3:
+	 *
+	 *     name: commitment tx with 3 htlc outputs, 2 offered having the same amount and preimage
+	 *     to_local_msat: 6988000000
+	 *     to_remote_msat: 3000000000
+	 *     local_feerate_per_kw: 253
+	 */
+	to_local.millisatoshis = 6988000000;
+	to_remote.millisatoshis = 3000000000;
+	feerate_per_kw = 253;
+	printf("\n"
+	       "name: commitment tx with 3 htlc outputs, 2 offered having the same amount and preimage\n"
+	       "to_local_msat: %"PRIu64"\n"
+	       "to_remote_msat: %"PRIu64"\n"
+	       "local_feerate_per_kw: %u\n",
+	       to_local.millisatoshis, to_remote.millisatoshis, feerate_per_kw);
+
+	print_superverbose = true;
+	tx = commit_tx(tmpctx,
+		       &funding_txid, funding_output_index,
+		       funding_amount,
+		       &local_funding_pubkey,
+		       &remote_funding_pubkey,
+		       LOCAL, to_self_delay,
+		       &keyset,
+		       feerate_per_kw,
+		       dust_limit,
+		       to_local,
+		       to_remote,
+		       htlcs, &htlc_map, NULL, commitment_number ^ cn_obscurer,
+		       option_anchor_outputs,
+		       LOCAL);
+	print_superverbose = false;
+	tx2 = commit_tx(tmpctx,
+			&funding_txid, funding_output_index,
+			funding_amount,
+			&local_funding_pubkey,
+			&remote_funding_pubkey,
+			REMOTE, to_self_delay,
+			&keyset,
+			feerate_per_kw,
+			dust_limit,
+			to_local,
+			to_remote,
+			inv_htlcs, &htlc_map2, NULL,
+			commitment_number ^ cn_obscurer,
+			option_anchor_outputs,
+			REMOTE);
+	tx_must_be_eq(tx, tx2);
+	report(tx, wscript, &x_remote_funding_privkey, &remote_funding_pubkey,
+	       &local_funding_privkey, &local_funding_pubkey,
+	       to_self_delay,
+	       &local_htlcsecretkey,
+	       &localkey,
+	       &local_htlckey,
+	       &local_delayedkey,
+	       &x_remote_htlcsecretkey,
+	       &remotekey,
+	       &remote_htlckey,
+	       &remote_revocation_key,
+	       feerate_per_kw,
+	       option_anchor_outputs,
+	       htlc_map);
 	common_shutdown();
 
 	/* FIXME: Do BOLT comparison! */
