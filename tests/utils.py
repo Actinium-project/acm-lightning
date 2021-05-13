@@ -2,10 +2,10 @@ from pyln.testing.utils import TEST_NETWORK, TIMEOUT, VALGRIND, DEVELOPER, DEPRE
 from pyln.testing.utils import env, only_one, wait_for, write_config, TailableProc, sync_blockheight, wait_channel_quiescent, get_tx_p2wsh_outnum  # noqa: F401
 import bitstring
 from pyln.client import Millisatoshi
+from pyln.testing.utils import EXPERIMENTAL_DUAL_FUND
 
 EXPERIMENTAL_FEATURES = env("EXPERIMENTAL_FEATURES", "0") == "1"
 COMPAT = env("COMPAT", "1") == "1"
-EXPERIMENTAL_DUAL_FUND = env("EXPERIMENTAL_DUAL_FUND", "0") == "1"
 
 
 def hex_bits(features):
@@ -30,6 +30,11 @@ def expected_peer_features(wumbo_channels=False, extra=[]):
         features += [27]
     if wumbo_channels:
         features += [19]
+    if EXPERIMENTAL_DUAL_FUND:
+        # option_anchor_outputs
+        features += [21]
+        # option_dual_fund
+        features += [29]
     return hex_bits(features + extra)
 
 
@@ -47,6 +52,11 @@ def expected_node_features(wumbo_channels=False, extra=[]):
         features += [27]
     if wumbo_channels:
         features += [19]
+    if EXPERIMENTAL_DUAL_FUND:
+        # option_anchor_outputs
+        features += [21]
+        # option_dual_fund
+        features += [29]
     return hex_bits(features + extra)
 
 
@@ -137,7 +147,7 @@ def first_channel_id(n1, n2):
 
 
 def basic_fee(feerate):
-    if EXPERIMENTAL_FEATURES:
+    if EXPERIMENTAL_FEATURES or EXPERIMENTAL_DUAL_FUND:
         # option_anchor_outputs
         weight = 1124
     else:

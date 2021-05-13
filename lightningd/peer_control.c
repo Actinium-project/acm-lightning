@@ -384,17 +384,16 @@ void channel_errmsg(struct channel *channel,
 	/* Clean up any in-progress open attempts */
 	channel_cleanup_commands(channel, desc);
 
+	if (channel_unsaved(channel)) {
+		log_info(channel->log, "%s", "Unsaved peer failed."
+			 " Disconnecting and deleting channel.");
+		delete_channel(channel);
+		return;
+	}
+
 	/* No per_peer_state means a subd crash or disconnection. */
 	if (!pps) {
 		/* If the channel is unsaved, we forget it */
-		if (channel_unsaved(channel)) {
-			log_unusual(channel->log, "%s",
-				    "Unsaved peer failed."
-				    " Disconnecting and deleting channel.");
-			delete_channel(channel);
-			return;
-		}
-
 		channel_fail_reconnect(channel, "%s: %s",
 				       channel->owner->name, desc);
 		return;
@@ -1094,12 +1093,11 @@ send_error:
 	if (feature_negotiated(ld->our_features,
 			       peer->their_features,
 			       OPT_DUAL_FUND)) {
-		/* if we have a channel, we're actually restarting
-		 * dualopend. we only get here if there's an error  */
 		if (channel) {
 			assert(!channel->owner);
 			assert(channel->state == DUALOPEND_OPEN_INIT
-			       || channel->state == DUALOPEND_AWAITING_LOCKIN);
+			       || channel->state == DUALOPEND_AWAITING_LOCKIN
+			       || channel->state == AWAITING_UNILATERAL);
 			channel->peer->addr = addr;
 			channel->peer->connected_incoming = payload->incoming;
 			peer_restart_dualopend(peer, payload->pps, channel, error);
@@ -1564,7 +1562,8 @@ static struct command_result *json_close(struct command *cmd,
 			return command_success(cmd, json_stream_success(cmd));
 		}
 		if ((channel = peer_unsaved_channel(peer))) {
-			channel_close_conn(channel, "close command called");
+			channel_unsaved_close_conn(channel,
+						   "close command called");
 			return command_success(cmd, json_stream_success(cmd));
 		}
 		return command_fail(cmd, LIGHTNINGD,
@@ -1869,7 +1868,7 @@ static struct command_result *json_disconnect(struct command *cmd,
 	}
 	channel = peer_unsaved_channel(peer);
 	if (channel) {
-		channel_close_conn(channel, "disconnect command");
+		channel_unsaved_close_conn(channel, "disconnect command");
 		return command_success(cmd, json_stream_success(cmd));
 	}
 	if (!peer->uncommitted_channel) {

@@ -2,7 +2,7 @@ from fixtures import *  # noqa: F401,F403
 from fixtures import TEST_NETWORK
 from pyln.client import RpcError
 from utils import (
-    only_one, wait_for, sync_blockheight, DEVELOPER, first_channel_id
+    only_one, wait_for, sync_blockheight, first_channel_id
 )
 
 import pytest
@@ -16,7 +16,8 @@ def find_next_feerate(node, peer):
 
 
 @unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd doesnt yet support PSBT features we need')
-@unittest.skipIf(not DEVELOPER, "uses dev-disconnect")
+@pytest.mark.developer("uses dev-disconnect")
+@pytest.mark.openchannel('v1')  # Mixed v1 + v2, v2 manually turned on
 def test_multifunding_v2_best_effort(node_factory, bitcoind):
     '''
     Check that best_effort flag works.
@@ -100,17 +101,16 @@ def test_multifunding_v2_best_effort(node_factory, bitcoind):
 
 
 @unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd doesnt yet support PSBT features we need')
-@unittest.skipIf(not DEVELOPER, "uses dev-disconnect")
+@pytest.mark.developer("uses dev-disconnect")
+@pytest.mark.openchannel('v2')
 def test_v2_open_sigs_restart(node_factory, bitcoind):
     disconnects_1 = ['-WIRE_TX_SIGNATURES']
     disconnects_2 = ['+WIRE_TX_SIGNATURES']
 
     l1, l2 = node_factory.get_nodes(2,
-                                    opts=[{'experimental-dual-fund': None,
-                                           'disconnect': disconnects_1,
+                                    opts=[{'disconnect': disconnects_1,
                                            'may_reconnect': True},
-                                          {'experimental-dual-fund': None,
-                                           'disconnect': disconnects_2,
+                                          {'disconnect': disconnects_2,
                                            'may_reconnect': True}])
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
@@ -146,7 +146,8 @@ def test_v2_open_sigs_restart(node_factory, bitcoind):
 
 
 @unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd doesnt yet support PSBT features we need')
-@unittest.skipIf(not DEVELOPER, "uses dev-disconnect")
+@pytest.mark.developer("uses dev-disconnect")
+@pytest.mark.openchannel('v2')
 def test_v2_open_sigs_restart_while_dead(node_factory, bitcoind):
     # Same thing as above, except the transaction mines
     # while we're asleep
@@ -154,12 +155,10 @@ def test_v2_open_sigs_restart_while_dead(node_factory, bitcoind):
     disconnects_2 = ['+WIRE_TX_SIGNATURES']
 
     l1, l2 = node_factory.get_nodes(2,
-                                    opts=[{'experimental-dual-fund': None,
-                                           'disconnect': disconnects_1,
+                                    opts=[{'disconnect': disconnects_1,
                                            'may_reconnect': True,
                                            'may_fail': True},
-                                          {'experimental-dual-fund': None,
-                                           'disconnect': disconnects_2,
+                                          {'disconnect': disconnects_2,
                                            'may_reconnect': True,
                                            'may_fail': True}])
 
@@ -201,12 +200,9 @@ def test_v2_open_sigs_restart_while_dead(node_factory, bitcoind):
 
 
 @unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd doesnt yet support PSBT features we need')
+@pytest.mark.openchannel('v2')
 def test_v2_rbf(node_factory, bitcoind, chainparams):
-    l1, l2 = node_factory.get_nodes(2,
-                                    opts=[{'experimental-dual-fund': None,
-                                           'wumbo': None},
-                                          {'experimental-dual-fund': None,
-                                           'wumbo': None}])
+    l1, l2 = node_factory.get_nodes(2, opts={'wumbo': None})
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     amount = 2**24
@@ -280,10 +276,10 @@ def test_v2_rbf(node_factory, bitcoind, chainparams):
 
 
 @unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd doesnt yet support PSBT features we need')
+@pytest.mark.openchannel('v2')
 def test_v2_rbf_multi(node_factory, bitcoind, chainparams):
     l1, l2 = node_factory.get_nodes(2,
-                                    opts={'experimental-dual-fund': None,
-                                          'may_reconnect': True,
+                                    opts={'may_reconnect': True,
                                           'allow_warning': True})
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
@@ -360,18 +356,17 @@ def test_v2_rbf_multi(node_factory, bitcoind, chainparams):
 
 
 @unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd doesnt yet support PSBT features we need')
-@unittest.skipIf(not DEVELOPER, "uses dev-disconnect")
+@pytest.mark.developer("uses dev-disconnect")
+@pytest.mark.openchannel('v2')
 def test_rbf_reconnect_init(node_factory, bitcoind, chainparams):
     disconnects = ['-WIRE_INIT_RBF',
                    '@WIRE_INIT_RBF',
                    '+WIRE_INIT_RBF']
 
     l1, l2 = node_factory.get_nodes(2,
-                                    opts=[{'experimental-dual-fund': None,
-                                           'disconnect': disconnects,
+                                    opts=[{'disconnect': disconnects,
                                            'may_reconnect': True},
-                                          {'experimental-dual-fund': None,
-                                           'may_reconnect': True}])
+                                          {'may_reconnect': True}])
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     amount = 2**24
@@ -412,17 +407,16 @@ def test_rbf_reconnect_init(node_factory, bitcoind, chainparams):
 
 
 @unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd doesnt yet support PSBT features we need')
-@unittest.skipIf(not DEVELOPER, "uses dev-disconnect")
+@pytest.mark.developer("uses dev-disconnect")
+@pytest.mark.openchannel('v2')
 def test_rbf_reconnect_ack(node_factory, bitcoind, chainparams):
     disconnects = ['-WIRE_ACK_RBF',
                    '@WIRE_ACK_RBF',
                    '+WIRE_ACK_RBF']
 
     l1, l2 = node_factory.get_nodes(2,
-                                    opts=[{'experimental-dual-fund': None,
-                                           'may_reconnect': True},
-                                          {'experimental-dual-fund': None,
-                                           'disconnect': disconnects,
+                                    opts=[{'may_reconnect': True},
+                                          {'disconnect': disconnects,
                                            'may_reconnect': True}])
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
@@ -464,7 +458,8 @@ def test_rbf_reconnect_ack(node_factory, bitcoind, chainparams):
 
 
 @unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd doesnt yet support PSBT features we need')
-@unittest.skipIf(not DEVELOPER, "uses dev-disconnect")
+@pytest.mark.developer("uses dev-disconnect")
+@pytest.mark.openchannel('v2')
 def test_rbf_reconnect_tx_construct(node_factory, bitcoind, chainparams):
     disconnects = ['=WIRE_TX_ADD_INPUT',  # Initial funding succeeds
                    '-WIRE_TX_ADD_INPUT',
@@ -478,11 +473,9 @@ def test_rbf_reconnect_tx_construct(node_factory, bitcoind, chainparams):
                    '+WIRE_TX_COMPLETE']
 
     l1, l2 = node_factory.get_nodes(2,
-                                    opts=[{'experimental-dual-fund': None,
-                                           'disconnect': disconnects,
+                                    opts=[{'disconnect': disconnects,
                                            'may_reconnect': True},
-                                          {'experimental-dual-fund': None,
-                                           'may_reconnect': True}])
+                                          {'may_reconnect': True}])
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     amount = 2**24
@@ -532,7 +525,8 @@ def test_rbf_reconnect_tx_construct(node_factory, bitcoind, chainparams):
 
 
 @unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd doesnt yet support PSBT features we need')
-@unittest.skipIf(not DEVELOPER, "uses dev-disconnect")
+@pytest.mark.developer("uses dev-disconnect")
+@pytest.mark.openchannel('v2')
 def test_rbf_reconnect_tx_sigs(node_factory, bitcoind, chainparams):
     disconnects = ['=WIRE_TX_SIGNATURES',  # Initial funding succeeds
                    '-WIRE_TX_SIGNATURES',  # When we send tx-sigs, RBF
@@ -542,11 +536,9 @@ def test_rbf_reconnect_tx_sigs(node_factory, bitcoind, chainparams):
                    '+WIRE_TX_SIGNATURES']  # When we RBF again
 
     l1, l2 = node_factory.get_nodes(2,
-                                    opts=[{'experimental-dual-fund': None,
-                                           'disconnect': disconnects,
+                                    opts=[{'disconnect': disconnects,
                                            'may_reconnect': True},
-                                          {'experimental-dual-fund': None,
-                                           'may_reconnect': True}])
+                                          {'may_reconnect': True}])
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     amount = 2**24
@@ -666,10 +658,10 @@ def test_rbf_reconnect_tx_sigs(node_factory, bitcoind, chainparams):
 
 
 @unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd doesnt yet support PSBT features we need')
+@pytest.mark.openchannel('v2')
 def test_rbf_no_overlap(node_factory, bitcoind, chainparams):
     l1, l2 = node_factory.get_nodes(2,
-                                    opts={'experimental-dual-fund': None,
-                                          'allow_warning': True})
+                                    opts={'allow_warning': True})
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     amount = 2**24
@@ -702,8 +694,9 @@ def test_rbf_no_overlap(node_factory, bitcoind, chainparams):
 
 
 @unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd doesnt yet support PSBT features we need')
+@pytest.mark.openchannel('v2')
 def test_funder_options(node_factory, bitcoind):
-    l1, l2, l3 = node_factory.get_nodes(3, opts={'experimental-dual-fund': None})
+    l1, l2, l3 = node_factory.get_nodes(3)
     l1.fundwallet(10**7)
 
     # Check the default options
