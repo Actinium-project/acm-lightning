@@ -81,6 +81,12 @@ endif
 # (method=thread to support xdist)
 PYTEST_OPTS := -v -p no:logging $(PYTEST_OPTS)
 PYTHONPATH=$(shell pwd)/contrib/pyln-client:$(shell pwd)/contrib/pyln-testing:$(shell pwd)/contrib/pyln-proto/:$(shell pwd)/external/lnprototest:$(shell pwd)/contrib/pyln-spec/bolt1:$(shell pwd)/contrib/pyln-spec/bolt2:$(shell pwd)/contrib/pyln-spec/bolt4:$(shell pwd)/contrib/pyln-spec/bolt7
+# Collect generated python files to be excluded from lint checks
+PYTHON_GENERATED=
+
+# Options to pass to cppcheck. Mostly used to exclude files that are
+# generated with external tools that we don't have control over
+CPPCHECK_OPTS=-q --language=c --std=c11 --error-exitcode=1 --suppressions-list=.cppcheck-suppress --inline-suppr
 
 # This is where we add new features as bitcoin adds them.
 FEATURES :=
@@ -320,6 +326,7 @@ include devtools/Makefile
 include tools/Makefile
 include plugins/Makefile
 include tests/plugins/Makefile
+include contrib/libhsmd_python/Makefile
 ifneq ($(FUZZING),0)
 	include tests/fuzz/Makefile
 endif
@@ -458,7 +465,7 @@ check-python-flake8:
 	@# E501 line too long (N > 79 characters)
 	@# E731 do not assign a lambda expression, use a def
 	@# W503: line break before binary operator
-	@flake8 --ignore=E501,E731,W503 ${PYSRC}
+	@flake8 --ignore=E501,E731,W503 --exclude $(shell echo ${PYTHON_GENERATED} | sed 's/ \+/,/g') ${PYSRC}
 
 check-pytest-pyln-proto:
 	PATH=$(PYLN_PATH) PYTHONPATH=$(PYTHONPATH) $(PYTEST) contrib/pyln-proto/tests/
@@ -468,10 +475,10 @@ check-includes: check-src-includes check-hdr-includes
 
 # cppcheck gets confused by list_for_each(head, i, list): thinks i is uninit.
 .cppcheck-suppress:
-	@git ls-files -- "*.c" "*.h" | grep -vE '^ccan/' | xargs grep -n '_for_each' | sed 's/\([^:]*:.*\):.*/uninitvar:\1/' > $@
+	@git ls-files -- "*.c" "*.h" | grep -vE '^(ccan|contrib)/' | xargs grep -n '_for_each' | sed 's/\([^:]*:.*\):.*/uninitvar:\1/' > $@
 
 check-cppcheck: .cppcheck-suppress
-	@trap 'rm -f .cppcheck-suppress' 0; git ls-files -- "*.c" "*.h" | grep -vE '^ccan/' | xargs cppcheck -q --language=c --std=c11 --error-exitcode=1 --suppressions-list=.cppcheck-suppress --inline-suppr
+	@trap 'rm -f .cppcheck-suppress' 0; git ls-files -- "*.c" "*.h" | grep -vE '^ccan/' | xargs cppcheck  ${CPPCHECK_OPTS}
 
 check-shellcheck:
 	@git ls-files -- "*.sh" | xargs shellcheck
@@ -483,7 +490,7 @@ check-tmpctx:
 	@if git grep -n 'tal_free[(]tmpctx)' | grep -Ev '^ccan/|/test/|^common/setup.c:|^common/utils.c:'; then echo "Don't free tmpctx!">&2; exit 1; fi
 
 check-discouraged-functions:
-	@if git grep -E "[^a-z_/](fgets|fputs|gets|scanf|sprintf)\(" -- "*.c" "*.h" ":(exclude)ccan/"; then exit 1; fi
+	@if git grep -E "[^a-z_/](fgets|fputs|gets|scanf|sprintf)\(" -- "*.c" "*.h" ":(exclude)ccan/" ":(exclude)contrib/"; then exit 1; fi
 
 # Don't access amount_msat and amount_sat members directly without a good reason
 # since it risks overflow.
