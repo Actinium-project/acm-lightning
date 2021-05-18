@@ -5,3 +5,7 @@ pay
 spenderp
 multifundchannel
 txprepare
+fundchannel
+fetchinvoice
+offers
+keysend
