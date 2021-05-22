@@ -58,7 +58,6 @@ HTABLE_DEFINE_TYPE(ptrint_t, nodeidx_id, nodeid_hash, nodeidx_eq_id,
 struct gossmap {
 	/* The file descriptor and filename to monitor */
 	int fd;
-	int st_dev, st_ino;
 	const char *fname;
 
 	/* The memory map of the file: u8 for arithmetic portability */
@@ -301,10 +300,10 @@ static u32 init_chan_arr(struct gossmap_chan *chan_arr, size_t start)
 	size_t i;
 	for (i = start; i < tal_count(chan_arr) - 1; i++) {
 		chan_arr[i].cann_off = i + 1;
-		chan_arr[i].scid_off = 0;
+		chan_arr[i].plus_scid_off = 0;
 	}
 	chan_arr[i].cann_off = UINT_MAX;
-	chan_arr[i].scid_off = 0;
+	chan_arr[i].plus_scid_off = 0;
 	return start;
 }
 
@@ -327,13 +326,16 @@ static struct gossmap_chan *next_free_chan(struct gossmap *map)
 
 static struct gossmap_chan *new_channel(struct gossmap *map,
 					u32 cannounce_off,
-					u32 scid_off,
+					u32 plus_scid_off,
+					bool private,
 					u32 n1idx, u32 n2idx)
 {
 	struct gossmap_chan *chan = next_free_chan(map);
 
 	chan->cann_off = cannounce_off;
-	chan->scid_off = scid_off;
+	chan->private = private;
+	chan->plus_scid_off = plus_scid_off;
+	chan->cupdate_off[0] = chan->cupdate_off[1] = 0;
 	memset(chan->half, 0, sizeof(chan->half));
 	chan->half[0].nodeidx = n1idx;
 	chan->half[1].nodeidx = n2idx;
@@ -371,7 +373,7 @@ void gossmap_remove_chan(struct gossmap *map, struct gossmap_chan *chan)
 	remove_chan_from_node(map, gossmap_nth_node(map, chan, 0), chanidx);
 	remove_chan_from_node(map, gossmap_nth_node(map, chan, 1), chanidx);
 	chan->cann_off = map->freed_chans;
-	chan->scid_off = 0;
+	chan->plus_scid_off = 0;
 	map->freed_chans = chanidx;
 }
 
@@ -396,22 +398,23 @@ void gossmap_remove_node(struct gossmap *map, struct gossmap_node *node)
  *     * [`point`:`node_id_2`]
  */
 static struct gossmap_chan *add_channel(struct gossmap *map,
-					size_t cannounce_off)
+					size_t cannounce_off,
+					bool private)
 {
 	/* Note that first two bytes are message type */
 	const size_t feature_len_off = 2 + (64 + 64 + 64 + 64);
 	size_t feature_len;
-	size_t scid_off;
+	size_t plus_scid_off;
 	struct node_id node_id[2];
 	struct gossmap_node *n[2];
 	struct gossmap_chan *chan;
 	u32 nidx[2];
 
 	feature_len = map_be16(map, cannounce_off + feature_len_off);
-	scid_off = cannounce_off + feature_len_off + 2 + feature_len + 32;
+	plus_scid_off = feature_len_off + 2 + feature_len + 32;
 
-	map_nodeid(map, scid_off + 8, &node_id[0]);
-	map_nodeid(map, scid_off + 8 + PUBKEY_CMPR_LEN, &node_id[1]);
+	map_nodeid(map, cannounce_off + plus_scid_off + 8, &node_id[0]);
+	map_nodeid(map, cannounce_off + plus_scid_off + 8 + PUBKEY_CMPR_LEN, &node_id[1]);
 
 	/* We carefully map pointers to indexes, since new_node can move them! */
 	n[0] = gossmap_find_node(map, &node_id[0]);
@@ -426,7 +429,8 @@ static struct gossmap_chan *add_channel(struct gossmap *map,
 	else
 		nidx[1] = new_node(map);
 
-	chan = new_channel(map, cannounce_off, scid_off, nidx[0], nidx[1]);
+	chan = new_channel(map, cannounce_off, plus_scid_off, private,
+			   nidx[0], nidx[1]);
 
 	/* Now we have a channel, we can add nodes to htable */
 	if (!n[0])
@@ -487,11 +491,14 @@ static void update_channel(struct gossmap *map, size_t cupdate_off)
 			= u64_to_fp16(map_be64(map, htlc_maximum_off), true);
 	else
 		hc.htlc_max = 0xFFFF;
+
+	chanflags = map_u8(map, channel_flags_off);
+	hc.enabled = !(chanflags & 2);
 	hc.base_fee = map_be32(map, fee_base_off);
 	hc.proportional_fee = map_be32(map, fee_prop_off);
 	hc.delay = map_be16(map, cltv_expiry_delta_off);
 
-	/* Check they fit */
+	/* Check they fit: we turn off if not. */
 	if (hc.base_fee != map_be32(map, fee_base_off)
 	    || hc.proportional_fee != map_be32(map, fee_prop_off)
 	    || hc.delay != map_be16(map, cltv_expiry_delta_off)) {
@@ -500,14 +507,14 @@ static void update_channel(struct gossmap *map, size_t cupdate_off)
 		      map_be32(map, fee_base_off),
 		      map_be32(map, fee_prop_off),
 		      map_be16(map, cltv_expiry_delta_off));
-		return;
+		hc.htlc_max = 0;
+		hc.enabled = false;
 	}
 
-	chanflags = map_u8(map, channel_flags_off);
-	hc.enabled = !(chanflags & 2);
 	/* Preserve this */
 	hc.nodeidx = chan->half[chanflags & 1].nodeidx;
 	chan->half[chanflags & 1] = hc;
+	chan->cupdate_off[chanflags & 1] = cupdate_off;
 }
 
 static void remove_channel_by_deletemsg(struct gossmap *map, size_t del_off)
@@ -530,7 +537,7 @@ struct short_channel_id gossmap_chan_scid(const struct gossmap *map,
 					  const struct gossmap_chan *c)
 {
 	struct short_channel_id scid;
-	scid.u64 = map_be64(map, c->scid_off);
+	scid.u64 = map_be64(map, c->cann_off + c->plus_scid_off);
 
 	return scid;
 }
@@ -561,6 +568,21 @@ static void node_announcement(struct gossmap *map, size_t nann_off)
 	n->nann_off = nann_off;
 }
 
+static void reopen_store(struct gossmap *map, size_t ended_off)
+{
+	int fd = open(map->fname, O_RDONLY);
+
+	if (fd < 0)
+		err(1, "Failed to reopen %s", map->fname);
+
+	/* This tells us the equivalent offset in new map */
+	map->map_end = map_be64(map, ended_off + 2);
+
+	close(map->fd);
+	map->fd = fd;
+	gossmap_refresh(map);
+}
+
 static bool map_catchup(struct gossmap *map)
 {
 	size_t reclen;
@@ -573,9 +595,7 @@ static bool map_catchup(struct gossmap *map)
 		u16 type;
 
 		map_copy(map, map->map_end, &ghdr, sizeof(ghdr));
-		reclen = (be32_to_cpu(ghdr.len)
-			  & ~(GOSSIP_STORE_LEN_DELETED_BIT|
-			      GOSSIP_STORE_LEN_PUSH_BIT))
+		reclen = (be32_to_cpu(ghdr.len) & GOSSIP_STORE_LEN_MASK)
 			+ sizeof(ghdr);
 
 		if (be32_to_cpu(ghdr.len) & GOSSIP_STORE_LEN_DELETED_BIT)
@@ -588,9 +608,9 @@ static bool map_catchup(struct gossmap *map)
 		off = map->map_end + sizeof(ghdr);
 		type = map_be16(map, off);
 		if (type == WIRE_CHANNEL_ANNOUNCEMENT)
-			add_channel(map, off);
+			add_channel(map, off, false);
 		else if (type == WIRE_GOSSIP_STORE_PRIVATE_CHANNEL)
-			add_channel(map, off + 2 + 8 + 2);
+			add_channel(map, off + 2 + 8 + 2, true);
 		else if (type == WIRE_CHANNEL_UPDATE)
 			update_channel(map, off);
 		else if (type == WIRE_GOSSIP_STORE_PRIVATE_UPDATE)
@@ -599,6 +619,8 @@ static bool map_catchup(struct gossmap *map)
 			remove_channel_by_deletemsg(map, off);
 		else if (type == WIRE_NODE_ANNOUNCEMENT)
 			node_announcement(map, off);
+		else if (type == WIRE_GOSSIP_STORE_ENDED)
+			reopen_store(map, off);
 		else
 			continue;
 
@@ -610,16 +632,11 @@ static bool map_catchup(struct gossmap *map)
 
 static bool load_gossip_store(struct gossmap *map)
 {
-	struct stat st;
-
 	map->fd = open(map->fname, O_RDONLY);
 	if (map->fd < 0)
 		return false;
 
-	fstat(map->fd, &st);
-	map->st_dev = st.st_dev;
-	map->st_ino = st.st_ino;
-	map->map_size = st.st_size;
+	map->map_size = lseek(map->fd, 0, SEEK_END);
 	map->local = NULL;
 	/* If this fails, we fall back to read */
 	map->mmap = mmap(NULL, map->map_size, PROT_READ, MAP_SHARED, map->fd, 0);
@@ -639,12 +656,12 @@ static bool load_gossip_store(struct gossmap *map)
 	 * and 10000 nodes, let's assume each channel gets about 750 bytes.
 	 *
 	 * We halve this, since often some records are deleted. */
-	chanidx_htable_init_sized(&map->channels, st.st_size / 750 / 2);
-	nodeidx_htable_init_sized(&map->nodes, st.st_size / 2500 / 2);
+	chanidx_htable_init_sized(&map->channels, map->map_size / 750 / 2);
+	nodeidx_htable_init_sized(&map->nodes, map->map_size / 2500 / 2);
 
-	map->chan_arr = tal_arr(map, struct gossmap_chan, st.st_size / 750 / 2 + 1);
+	map->chan_arr = tal_arr(map, struct gossmap_chan, map->map_size / 750 / 2 + 1);
 	map->freed_chans = init_chan_arr(map->chan_arr, 0);
-	map->node_arr = tal_arr(map, struct gossmap_node, st.st_size / 2500 / 2 + 1);
+	map->node_arr = tal_arr(map, struct gossmap_node, map->map_size / 2500 / 2 + 1);
 	map->freed_nodes = init_node_arr(map->node_arr, 0);
 
 	map->map_end = 1;
@@ -677,6 +694,9 @@ struct localmod {
 	struct half_chan hc[2];
 	/* orig[n] defined if updates_set[n] and local_off == 0xFFFFFFFF */
 	struct half_chan orig[2];
+
+	/* Original update offsets */
+	u32 orig_cupdate_off[2];
 };
 
 struct gossmap_localmods {
@@ -842,7 +862,8 @@ void gossmap_apply_localmods(struct gossmap *map,
 				continue;
 
 			/* Create new channel, pointing into local. */
-			chan = add_channel(map, map->map_size + mod->local_off);
+			chan = add_channel(map, map->map_size + mod->local_off,
+					   true);
 		}
 
 		/* Save old, overwrite (keep nodeidx) */
@@ -850,8 +871,10 @@ void gossmap_apply_localmods(struct gossmap *map,
 			if (!mod->updates_set[h])
 				continue;
 			mod->orig[h] = chan->half[h];
+			mod->orig_cupdate_off[h] = chan->cupdate_off[h];
 			chan->half[h] = mod->hc[h];
 			chan->half[h].nodeidx = mod->orig[h].nodeidx;
+			chan->cupdate_off[h] = 0xFFFFFFFF;
 		}
 	}
 }
@@ -880,6 +903,7 @@ void gossmap_remove_localmods(struct gossmap *map,
 				nodeidx = chan->half[h].nodeidx;
 				chan->half[h] = mod->orig[h];
 				chan->half[h].nodeidx = nodeidx;
+				chan->cupdate_off[h] = mod->orig_cupdate_off[h];
 			}
 		}
 	}
@@ -888,31 +912,19 @@ void gossmap_remove_localmods(struct gossmap *map,
 
 bool gossmap_refresh(struct gossmap *map)
 {
-	struct stat st;
+	off_t len;
 
-	/* You must remoe local updates before this. */
+	/* You must remove local updates before this. */
 	assert(!map->local);
 
-	/* If file has changed, move to it. */
-	if (stat(map->fname, &st) != 0)
-		err(1, "statting %s", map->fname);
-
-	if (map->st_ino != st.st_ino || map->st_dev != st.st_dev) {
-		destroy_map(map);
-		tal_free(map->chan_arr);
-		tal_free(map->node_arr);
-		if (!load_gossip_store(map))
-			err(1, "reloading %s", map->fname);
-		return true;
-	}
-
 	/* If file has gotten larger, try rereading */
-	if (st.st_size == map->map_size)
+	len = lseek(map->fd, 0, SEEK_END);
+	if (len == map->map_size)
 		return false;
 
 	if (map->mmap)
 		munmap(map->mmap, map->map_size);
-	map->map_size = st.st_size;
+	map->map_size = len;
 	map->mmap = mmap(NULL, map->map_size, PROT_READ, MAP_SHARED, map->fd, 0);
 	if (map->mmap == MAP_FAILED)
 		map->mmap = NULL;
@@ -938,7 +950,41 @@ void gossmap_node_get_id(const struct gossmap *map,
 	int dir;
 	struct gossmap_chan *c = gossmap_nth_chan(map, node, 0, &dir);
 
-	map_nodeid(map, c->scid_off + 8 + PUBKEY_CMPR_LEN*dir, id);
+	map_nodeid(map, c->cann_off + c->plus_scid_off
+		   + 8 + PUBKEY_CMPR_LEN*dir, id);
+}
+
+bool gossmap_chan_get_capacity(const struct gossmap *map,
+			       const struct gossmap_chan *c,
+			       struct amount_sat *amount)
+{
+	struct gossip_hdr ghdr;
+	size_t off;
+	u16 type;
+
+	/* For private, we need to go back WIRE_GOSSIP_STORE_PRIVATE_CHANNEL,
+	 * which is 8 (satoshis) + 2 (len) */
+	if (c->private) {
+		*amount = amount_sat(map_be64(map, c->cann_off - 8 - 2));
+		return true;
+	}
+
+	/* Skip over this record to next; expect a gossip_store_channel_amount */
+	off = c->cann_off - sizeof(ghdr);
+	map_copy(map, off, &ghdr, sizeof(ghdr));
+	off += sizeof(ghdr) + (be32_to_cpu(ghdr.len) & GOSSIP_STORE_LEN_MASK);
+
+	/* Partial write, this can happen. */
+	if (off + sizeof(ghdr) + 2 > map->map_size)
+		return false;
+
+	/* Get type of next field. */
+	type = map_be16(map, off + sizeof(ghdr));
+	if (type != WIRE_GOSSIP_STORE_CHANNEL_AMOUNT)
+		return false;
+
+	*amount = amount_sat(map_be64(map, off + sizeof(ghdr) + sizeof(be16)));
+	return true;
 }
 
 struct gossmap_chan *gossmap_nth_chan(const struct gossmap *map,
@@ -1005,7 +1051,7 @@ size_t gossmap_num_chans(const struct gossmap *map)
 static struct gossmap_chan *chan_iter(const struct gossmap *map, size_t start)
 {
 	for (size_t i = start; i < tal_count(map->chan_arr); i++) {
-		if (map->chan_arr[i].scid_off != 0)
+		if (map->chan_arr[i].plus_scid_off != 0)
 			return &map->chan_arr[i];
 	}
 	return NULL;
@@ -1040,9 +1086,18 @@ u8 *gossmap_chan_get_announce(const tal_t *ctx,
 			      const struct gossmap *map,
 			      const struct gossmap_chan *c)
 {
-	u16 len = map_be16(map, c->cann_off);
-	u8 *msg = tal_arr(ctx, u8, len);
+	u32 len;
+	u8 *msg;
+	u32 pre_off;
 
+	/* We need to go back to struct gossip_hdr to get len */
+	if (c->private)
+		pre_off = 2 + 8 + 2 + sizeof(struct gossip_hdr);
+	else
+		pre_off = sizeof(struct gossip_hdr);
+	len = (map_be32(map, c->cann_off - pre_off) & GOSSIP_STORE_LEN_MASK);
+
+	msg = tal_arr(ctx, u8, len);
 	map_copy(map, c->cann_off, msg, len);
 	return msg;
 }
@@ -1052,13 +1107,14 @@ u8 *gossmap_node_get_announce(const tal_t *ctx,
 			      const struct gossmap *map,
 			      const struct gossmap_node *n)
 {
-	u16 len;
+	u32 len;
 	u8 *msg;
 
 	if (n->nann_off == 0)
 		return NULL;
 
-	len = map_be16(map, n->nann_off);
+	len = (map_be32(map, n->nann_off - sizeof(struct gossip_hdr))
+	       & GOSSIP_STORE_LEN_MASK);
 	msg = tal_arr(ctx, u8, len);
 
 	map_copy(map, n->nann_off, msg, len);
@@ -1091,6 +1147,83 @@ int gossmap_chan_get_feature(const struct gossmap *map,
 
 	return map_feature_test(map, COMPULSORY_FEATURE(fbit),
 				c->cann_off + feature_len_off + 2, feature_len);
+}
+
+u8 *gossmap_chan_get_features(const tal_t *ctx,
+			      const struct gossmap *map,
+			      const struct gossmap_chan *c)
+{
+	u8 *ret;
+	/* Note that first two bytes are message type */
+	const size_t feature_len_off = 2 + (64 + 64 + 64 + 64);
+	size_t feature_len;
+
+	feature_len = map_be16(map, c->cann_off + feature_len_off);
+	ret = tal_arr(ctx, u8, feature_len);
+
+	map_copy(map, c->cann_off + feature_len_off + 2, ret, feature_len);
+	return ret;
+}
+
+/* BOLT #7:
+ * 1. type: 258 (`channel_update`)
+ * 2. data:
+ *     * [`signature`:`signature`]
+ *     * [`chain_hash`:`chain_hash`]
+ *     * [`short_channel_id`:`short_channel_id`]
+ *     * [`u32`:`timestamp`]
+ *     * [`byte`:`message_flags`]
+ *     * [`byte`:`channel_flags`]
+ *     * [`u16`:`cltv_expiry_delta`]
+ *     * [`u64`:`htlc_minimum_msat`]
+ *     * [`u32`:`fee_base_msat`]
+ *     * [`u32`:`fee_proportional_millionths`]
+ *     * [`u64`:`htlc_maximum_msat`] (option_channel_htlc_max)
+ */
+void gossmap_chan_get_update_details(const struct gossmap *map,
+				     const struct gossmap_chan *chan,
+				     int dir,
+				     u32 *timestamp,
+				     u8 *message_flags,
+				     u8 *channel_flags,
+				     u32 *fee_base_msat,
+				     u32 *fee_proportional_millionths,
+				     struct amount_msat *htlc_minimum_msat,
+				     /* iff message_flags & 1 */
+				     struct amount_msat *htlc_maximum_msat)
+{
+	/* Note that first two bytes are message type */
+	const size_t scid_off = chan->cupdate_off[dir] + 2 + (64 + 32);
+	const size_t timestamp_off = scid_off + 8;
+	const size_t message_flags_off = timestamp_off + 4;
+	const size_t channel_flags_off = message_flags_off + 1;
+	const size_t cltv_expiry_delta_off = channel_flags_off + 1;
+	const size_t htlc_minimum_off = cltv_expiry_delta_off + 2;
+	const size_t fee_base_off = htlc_minimum_off + 8;
+	const size_t fee_prop_off = fee_base_off + 4;
+	const size_t htlc_maximum_off = fee_prop_off + 4;
+	u8 mflags;
+
+	assert(gossmap_chan_set(chan, dir));
+
+	if (timestamp)
+		*timestamp = map_be32(map, timestamp_off);
+	/* We need this (below), even if they don't want it */
+	mflags = map_u8(map, message_flags_off);
+	if (message_flags)
+		*message_flags = mflags;
+	if (channel_flags)
+		*channel_flags = map_u8(map, channel_flags_off);
+	if (fee_base_msat)
+		*fee_base_msat = map_be32(map, fee_base_off);
+	if (fee_proportional_millionths)
+		*fee_proportional_millionths = map_be32(map, fee_prop_off);
+	if (htlc_minimum_msat)
+		*htlc_minimum_msat
+			= amount_msat(map_be64(map, htlc_minimum_off));
+	if (htlc_maximum_msat && (mflags & 1))
+		*htlc_maximum_msat
+			= amount_msat(map_be64(map, htlc_maximum_off));
 }
 
 /* BOLT #7:

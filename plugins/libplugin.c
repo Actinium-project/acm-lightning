@@ -6,6 +6,7 @@
 #include <ccan/tal/str/str.h>
 #include <common/daemon.h>
 #include <common/json_stream.h>
+#include <common/route.h>
 #include <common/utils.h>
 #include <errno.h>
 #include <plugins/libplugin.h>
@@ -229,8 +230,8 @@ static struct command_result *command_complete(struct command *cmd,
 	return &complete;
 }
 
-struct command_result *WARN_UNUSED_RESULT
-command_finished(struct command *cmd, struct json_stream *response)
+struct command_result *command_finished(struct command *cmd,
+					struct json_stream *response)
 {
 	/* "result" or "error" object */
 	json_object_end(response);
@@ -1619,8 +1620,8 @@ static bool json_to_route_hop_inplace(struct route_hop *dst, const char *buffer,
 	    amounttok == NULL || delaytok == NULL || styletok == NULL)
 		return false;
 
-	json_to_node_id(buffer, idtok, &dst->nodeid);
-	json_to_short_channel_id(buffer, channeltok, &dst->channel_id);
+	json_to_node_id(buffer, idtok, &dst->node_id);
+	json_to_short_channel_id(buffer, channeltok, &dst->scid);
 	json_to_int(buffer, directiontok, &dst->direction);
 	json_to_msat(buffer, amounttok, &dst->amount);
 	json_to_number(buffer, delaytok, &dst->delay);

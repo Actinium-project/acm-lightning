@@ -23,7 +23,8 @@ dijkstra_(const tal_t *ctx,
 			     void *arg),
 	  u64 (*path_score)(u32 distance,
 			    struct amount_msat cost,
-			    struct amount_msat risk),
+			    struct amount_msat risk,
+			    const struct gossmap_chan *c),
 	  void *arg);
 
 #define dijkstra(ctx, map, start, amount, riskfactor, channel_ok,	\
@@ -41,9 +42,6 @@ u32 dijkstra_distance(const struct dijkstra *dij, u32 node_idx);
 
 /* Total CLTV delay (0 if unreachable) */
 u32 dijkstra_delay(const struct dijkstra *dij, u32 node_idx);
-
-/* Total cost to get here (-1ULL if unreachable) */
-struct amount_msat dijkstra_amount(const struct dijkstra *dij, u32 node_idx);
 
 /* Best path we found to here */
 struct gossmap_chan *dijkstra_best_chan(const struct dijkstra *dij,

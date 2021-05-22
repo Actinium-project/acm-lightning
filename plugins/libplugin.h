@@ -101,18 +101,18 @@ struct plugin_hook {
 const struct feature_set *plugin_feature_set(const struct plugin *p);
 
 /* Helper to create a JSONRPC2 request stream. Send it with `send_outreq`. */
-struct out_req *
-jsonrpc_request_start_(struct plugin *plugin, struct command *cmd,
-		       const char *method,
-		       struct command_result *(*cb)(struct command *command,
-						    const char *buf,
-						    const jsmntok_t *result,
-						    void *arg),
-		       struct command_result *(*errcb)(struct command *command,
-						       const char *buf,
-						       const jsmntok_t *result,
-						       void *arg),
-		       void *arg);
+struct out_req *jsonrpc_request_start_(struct plugin *plugin,
+				       struct command *cmd,
+				       const char *method,
+				       struct command_result *(*cb)(struct command *command,
+								    const char *buf,
+								    const jsmntok_t *result,
+								    void *arg),
+				       struct command_result *(*errcb)(struct command *command,
+								       const char *buf,
+								       const jsmntok_t *result,
+								       void *arg),
+				       void *arg);
 
 #define jsonrpc_request_start(plugin, cmd, method, cb, errcb, arg)	\
 	jsonrpc_request_start_((plugin), (cmd), (method),		\
@@ -145,12 +145,12 @@ struct json_stream *jsonrpc_stream_fail_data(struct command *cmd,
 
 /* This command is finished, here's the response (the content of the
  * "result" or "error" field) */
-struct command_result *WARN_UNUSED_RESULT
-command_finished(struct command *cmd, struct json_stream *response);
+WARN_UNUSED_RESULT
+struct command_result *command_finished(struct command *cmd, struct json_stream *response);
 
 /* Helper for a command that'll be finished in a callback. */
-struct command_result *WARN_UNUSED_RESULT
-command_still_pending(struct command *cmd);
+WARN_UNUSED_RESULT
+struct command_result *command_still_pending(struct command *cmd);
 
 /* Helper to create a zero or single-value JSON object; if @str is NULL,
  * object is empty. */
@@ -199,8 +199,8 @@ void rpc_scan(struct plugin *plugin,
 	      ...);
 
 /* Send an async rpc request to lightningd. */
-struct command_result *
-send_outreq(struct plugin *plugin, const struct out_req *req);
+struct command_result *send_outreq(struct plugin *plugin,
+				   const struct out_req *req);
 
 /* Callback to just forward error and close request; @cmd cannot be NULL */
 struct command_result *forward_error(struct command *cmd,
@@ -339,21 +339,6 @@ struct createonion_response {
 struct createonion_response *json_to_createonion_response(const tal_t *ctx,
 							  const char *buffer,
 							  const jsmntok_t *toks);
-
-enum route_hop_style {
-	ROUTE_HOP_LEGACY = 1,
-	ROUTE_HOP_TLV = 2,
-};
-
-struct route_hop {
-	struct short_channel_id channel_id;
-	int direction;
-	struct node_id nodeid;
-	struct amount_msat amount;
-	u32 delay;
-	struct pubkey *blinding;
-	enum route_hop_style style;
-};
 
 struct route_hop *json_to_route(const tal_t *ctx, const char *buffer,
 				const jsmntok_t *toks);

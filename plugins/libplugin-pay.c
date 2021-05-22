@@ -8,7 +8,6 @@
 #include <common/memleak.h>
 #include <common/pseudorand.h>
 #include <common/random_select.h>
-#include <common/route.h>
 #include <common/type_to_string.h>
 #include <errno.h>
 #include <plugins/libplugin-pay.h>
@@ -395,7 +394,7 @@ static void payment_exclude_most_expensive(struct payment *p)
 			worst = fee;
 		}
 	}
-	channel_hints_update(p, e->channel_id, e->direction, false, false,
+	channel_hints_update(p, e->scid, e->direction, false, false,
 			     NULL, NULL);
 }
 
@@ -411,7 +410,7 @@ static void payment_exclude_longest_delay(struct payment *p)
 			worst = delay;
 		}
 	}
-	channel_hints_update(p, e->channel_id, e->direction, false, false,
+	channel_hints_update(p, e->scid, e->direction, false, false,
 			     NULL, NULL);
 }
 
@@ -457,7 +456,7 @@ static struct channel_hint *payment_chanhints_get(struct payment *p,
 	struct channel_hint *curhint;
 	for (size_t j = 0; j < tal_count(root->channel_hints); j++) {
 		curhint = &root->channel_hints[j];
-		if (short_channel_id_eq(&curhint->scid.scid, &h->channel_id) &&
+		if (short_channel_id_eq(&curhint->scid.scid, &h->scid) &&
 		    curhint->scid.dir == h->direction) {
 			return curhint;
 		}
@@ -687,61 +686,73 @@ static bool payment_route_can_carry_even_disabled(const struct gossmap *map,
 	return payment_route_check(map, c, dir, amount, p);
 }
 
-static struct route_hop *route_hops_from_route(const tal_t *ctx,
-					       struct payment *p,
-					       struct route **r)
-{
-	struct route_hop *hops = tal_arr(ctx, struct route_hop, tal_count(r));
-	struct amount_msat amt;
-	struct gossmap *gossmap = get_gossmap(p->plugin);
-	u32 delay;
-
-	for (size_t i = 0; i < tal_count(hops); i++) {
-		const struct gossmap_node *dst;
-
-		hops[i].channel_id = gossmap_chan_scid(gossmap, r[i]->c);
-		hops[i].direction = r[i]->dir;
-		hops[i].blinding = NULL;
-
-		/* nodeid is nodeid of *dst* */
-		dst = gossmap_nth_node(gossmap, r[i]->c, !r[i]->dir);
-		gossmap_node_get_id(gossmap, dst, &hops[i].nodeid);
-		if (gossmap_node_get_feature(gossmap, dst, OPT_VAR_ONION) != -1)
-			hops[i].style = ROUTE_HOP_TLV;
-		else
-			hops[i].style = ROUTE_HOP_LEGACY;
-	}
-
-	/* Now iterate backwards to derive amount and delay. */
-	amt = p->getroute->amount;
-	delay = p->getroute->cltv;
-	for (int i = tal_count(hops) - 1; i >= 0; i--) {
-		const struct half_chan *h = &r[i]->c->half[r[i]->dir];
-
-		hops[i].amount = amt;
-		hops[i].delay = delay;
-
-		if (!amount_msat_add_fee(&amt,
-					 h->base_fee, h->proportional_fee))
-			abort();
-		delay += h->delay;
-	}
-
-	return hops;
-}
-
-static struct command_result *payment_getroute(struct payment *p)
+static struct route_hop *route(const tal_t *ctx,
+			       struct gossmap *gossmap,
+			       const struct gossmap_node *src,
+			       const struct gossmap_node *dst,
+			       struct amount_msat amount,
+			       u32 final_delay,
+			       double riskfactor,
+			       size_t max_hops,
+			       struct payment *p,
+			       const char **errmsg)
 {
 	const struct dijkstra *dij;
-	const struct gossmap_node *dst, *src;
-	struct route **r;
-	struct amount_msat fee;
-	struct gossmap *gossmap;
+	struct route_hop *r;
 	bool (*can_carry)(const struct gossmap *,
 			  const struct gossmap_chan *,
 			  int,
 			  struct amount_msat,
 			  struct payment *);
+
+	can_carry = payment_route_can_carry;
+	dij = dijkstra(tmpctx, gossmap, dst, amount, riskfactor,
+		       can_carry, route_score_cheaper, p);
+	r = route_from_dijkstra(ctx, gossmap, dij, src, amount, final_delay);
+	if (!r) {
+		/* Try using disabled channels too */
+		/* FIXME: is there somewhere we can annotate this for paystatus? */
+		can_carry = payment_route_can_carry_even_disabled;
+		dij = dijkstra(ctx, gossmap, dst, amount, riskfactor,
+			       can_carry, route_score_cheaper, p);
+		r = route_from_dijkstra(ctx, gossmap, dij, src,
+					amount, final_delay);
+		if (!r) {
+			*errmsg = "No path found";
+			return NULL;
+		}
+	}
+
+	/* If it's too far, fall back to using shortest path. */
+	if (tal_count(r) > max_hops) {
+		tal_free(r);
+		/* FIXME: is there somewhere we can annotate this for paystatus? */
+		dij = dijkstra(tmpctx, gossmap, dst, amount, riskfactor,
+			       can_carry, route_score_shorter, p);
+		r = route_from_dijkstra(ctx, gossmap, dij, src,
+					amount, final_delay);
+		if (!r) {
+			*errmsg = "No path found";
+			return NULL;
+		}
+
+		/* If it's still too far, fail. */
+		if (tal_count(r) > max_hops) {
+			*errmsg = tal_fmt(ctx, "Shortest path found was length %zu",
+					  tal_count(r));
+			return tal_free(r);
+		}
+	}
+
+	return r;
+}
+
+static struct command_result *payment_getroute(struct payment *p)
+{
+	const struct gossmap_node *dst, *src;
+	struct amount_msat fee;
+	const char *errstr;
+	struct gossmap *gossmap;
 
 	gossmap = get_gossmap(p->plugin);
 
@@ -765,48 +776,17 @@ static struct command_result *payment_getroute(struct payment *p)
 		return command_still_pending(p->cmd);
 	}
 
-	can_carry = payment_route_can_carry;
-	dij = dijkstra(tmpctx, gossmap, dst, p->getroute->amount,
-		       p->getroute->riskfactorppm / 1000000.0,
-		       can_carry, route_score_cheaper, p);
-	r = route_from_dijkstra(tmpctx, gossmap, dij, src);
-	if (!r) {
-		/* Try using disabled channels too */
-		/* FIXME: is there somewhere we can annotate this for paystatus? */
-		can_carry = payment_route_can_carry_even_disabled;
-		dij = dijkstra(tmpctx, gossmap, dst, p->getroute->amount,
-			       p->getroute->riskfactorppm / 1000000.0,
-			       can_carry, route_score_cheaper, p);
-		r = route_from_dijkstra(tmpctx, gossmap, dij, src);
-		if (!r) {
-			payment_fail(p, "No path found");
-			return command_still_pending(p->cmd);
-		}
-	}
-
-	/* If it's too far, fall back to using shortest path. */
-	if (tal_count(r) > p->getroute->max_hops) {
-		/* FIXME: is there somewhere we can annotate this for paystatus? */
-		dij = dijkstra(tmpctx, gossmap, dst, p->getroute->amount,
-			       p->getroute->riskfactorppm / 1000000.0,
-			       can_carry, route_score_shorter, p);
-		r = route_from_dijkstra(tmpctx, gossmap, dij, src);
-		if (!r) {
-			payment_fail(p, "No path found");
-			return command_still_pending(p->cmd);
-		}
-
-		/* If it's still too far, fail. */
-		if (tal_count(r) > p->getroute->max_hops) {
-			payment_fail(p, "Shortest path found was length %zu",
-				     tal_count(p->route));
-			return command_still_pending(p->cmd);
-		}
+	p->route = route(p, gossmap, src, dst, p->getroute->amount, p->getroute->cltv,
+			 p->getroute->riskfactorppm / 1000000.0, p->getroute->max_hops,
+			 p, &errstr);
+	if (!p->route) {
+		payment_fail(p, "%s", errstr);
+		/* Let payment_finished_ handle this, so we mark it as pending */
+		return command_still_pending(p->cmd);
 	}
 
 	/* OK, now we *have* a route */
 	p->step = PAYMENT_STEP_GOT_ROUTE;
-	p->route = route_hops_from_route(p, p, r);
 
 	if (tal_count(p->route) == 0) {
 		payment_root(p)->abort = true;
@@ -1016,7 +996,7 @@ static void payment_result_infer(struct route_hop *route,
 	assert(i <= len);
 
 	if (r->erring_node == NULL)
-		r->erring_node = &route[i-1].nodeid;
+		r->erring_node = &route[i-1].node_id;
 
 	/* The above assert was enough for the erring_node, but might be off
 	 * by one on channel and direction, in case the destination failed on
@@ -1025,7 +1005,7 @@ static void payment_result_infer(struct route_hop *route,
 		return;
 
 	if (r->erring_channel == NULL)
-		r->erring_channel = &route[i].channel_id;
+		r->erring_channel = &route[i].scid;
 
 	if (r->erring_direction == NULL)
 		r->erring_direction = &route[i].direction;
@@ -1037,7 +1017,7 @@ static void report_tampering(struct payment *p,
 			     size_t report_pos,
 			     const char *style)
 {
-	const struct node_id *id = &p->route[report_pos].nodeid;
+	const struct node_id *id = &p->route[report_pos].node_id;
 
 	if (report_pos == 0) {
 		paymod_log(p, LOG_UNUSUAL,
@@ -1052,7 +1032,7 @@ static void report_tampering(struct payment *p,
 			   type_to_string(tmpctx, struct node_id, id),
 			   report_pos,
 			   type_to_string(tmpctx, struct node_id,
-					  &p->route[report_pos-1].nodeid),
+					  &p->route[report_pos-1].node_id),
 			   style);
 	}
 }
@@ -1229,7 +1209,7 @@ handle_intermediate_failure(struct command *cmd,
 		   type_to_string(tmpctx, struct node_id, errnode),
 		   failcode, onion_wire_name(failcode),
 		   type_to_string(tmpctx, struct short_channel_id,
-				  &errchan->channel_id),
+				  &errchan->scid),
 		   p->routetxt);
 
 	/* We use an exhaustive switch statement here so you get a compile
@@ -1257,7 +1237,7 @@ handle_intermediate_failure(struct command *cmd,
 	case WIRE_UNKNOWN_NEXT_PEER:
 	case WIRE_REQUIRED_CHANNEL_FEATURE_MISSING:
 		/* All of these result in the channel being marked as disabled. */
-		channel_hints_update(root, errchan->channel_id,
+		channel_hints_update(root, errchan->scid,
 				     errchan->direction, false, false, NULL,
 				     NULL);
 		break;
@@ -1265,7 +1245,7 @@ handle_intermediate_failure(struct command *cmd,
 	case WIRE_TEMPORARY_CHANNEL_FAILURE: {
 		/* These are an indication that the capacity was insufficient,
 		 * remember the amount we tried as an estimate. */
-		channel_hints_update(root, errchan->channel_id,
+		channel_hints_update(root, errchan->scid,
 				     errchan->direction, true, false,
 				     &errchan->amount, NULL);
 		goto error;
@@ -1336,7 +1316,7 @@ static bool assign_blame(const struct payment *p,
 	/* Final node *shouldn't* report BADONION, but don't assume. */
 	if (index >= tal_count(p->route)) {
 		*errchan = NULL;
-		*errnode = &p->route[tal_count(p->route) - 1].nodeid;
+		*errnode = &p->route[tal_count(p->route) - 1].node_id;
 		return true;
 	}
 
@@ -1344,7 +1324,7 @@ static bool assign_blame(const struct payment *p,
 	if (index == 0)
 		*errnode = p->local_id;
 	else
-		*errnode = &p->route[index - 1].nodeid;
+		*errnode = &p->route[index - 1].node_id;
 	return true;
 }
 
@@ -1525,11 +1505,11 @@ static struct command_result *payment_createonion_success(struct command *cmd,
 	json_add_hex_talarr(req->js, "onion", p->createonion_response->onion);
 
 	json_object_start(req->js, "first_hop");
-	json_add_short_channel_id(req->js, "channel", &first->channel_id);
+	json_add_short_channel_id(req->js, "channel", &first->scid);
 	json_add_num(req->js, "direction", first->direction);
 	json_add_amount_msat_only(req->js, "amount_msat", first->amount);
 	json_add_num(req->js, "delay", first->delay);
-	json_add_node_id(req->js, "id", &first->nodeid);
+	json_add_node_id(req->js, "id", &first->node_id);
 	json_object_end(req->js);
 
 	json_add_sha256(req->js, "payment_hash", p->payment_hash);
@@ -1594,7 +1574,7 @@ static void payment_add_hop_onion_payload(struct payment *p,
 	dst->style = node->style;
 	if (force_tlv)
 		dst->style = ROUTE_HOP_TLV;
-	dst->pubkey = node->nodeid;
+	dst->pubkey = node->node_id;
 
 	switch (dst->style) {
 	case ROUTE_HOP_LEGACY:
@@ -1602,7 +1582,7 @@ static void payment_add_hop_onion_payload(struct payment *p,
 		dst->legacy_payload->forward_amt = next->amount;
 
 		if (!final)
-			dst->legacy_payload->scid = next->channel_id;
+			dst->legacy_payload->scid = next->scid;
 		else
 			dst->legacy_payload->scid = all_zero_scid;
 
@@ -1619,7 +1599,7 @@ static void payment_add_hop_onion_payload(struct payment *p,
 		if (!final)
 			tlvstream_set_short_channel_id(fields,
 						       TLV_TLV_PAYLOAD_SHORT_CHANNEL_ID,
-						       &next->channel_id);
+						       &next->scid);
 
 		if (payment_secret != NULL) {
 			assert(final);
@@ -1670,7 +1650,7 @@ static void payment_compute_onion_payloads(struct payment *p)
 					      NULL);
 		tal_append_fmt(&routetxt, "%s -> ",
 			       type_to_string(tmpctx, struct short_channel_id,
-					      &p->route[i].channel_id));
+					      &p->route[i].scid));
 	}
 
 	/* Final hop */
@@ -1680,7 +1660,7 @@ static void payment_compute_onion_payloads(struct payment *p)
 	    root->payment_secret);
 	tal_append_fmt(&routetxt, "%s",
 		       type_to_string(tmpctx, struct short_channel_id,
-				      &p->route[hopcount - 1].channel_id));
+				      &p->route[hopcount - 1].scid));
 
 	paymod_log(p, LOG_DBG,
 		   "Created outgoing onion for route: %s", routetxt);
@@ -2636,7 +2616,7 @@ static void routehint_check_reachable(struct payment *p)
 	const struct gossmap_node *dst, *src;
 	struct gossmap *gossmap = get_gossmap(p->plugin);
 	const struct dijkstra *dij;
-	struct route **r;
+	struct route_hop *r;
 	struct payment *root = payment_root(p);
 	struct routehints_data *d = payment_mod_routehints_get_data(root);
 
@@ -2653,7 +2633,8 @@ static void routehint_check_reachable(struct payment *p)
 			       10 / 1000000.0,
 			       payment_route_can_carry_even_disabled,
 			       route_score_cheaper, p);
-		r = route_from_dijkstra(tmpctx, gossmap, dij, src);
+		r = route_from_dijkstra(tmpctx, gossmap, dij, src,
+					AMOUNT_MSAT(1000), 0);
 
 		/* If there was a route the destination is reachable
 		 * without routehints. */
@@ -2762,9 +2743,9 @@ static void routehint_step_cb(struct routehints_data *d, struct payment *p)
 				return payment_continue(p);
 			}
 
-			hop.nodeid = *route_pubkey(p, routehint, i + 1);
+			hop.node_id = *route_pubkey(p, routehint, i + 1);
 			hop.style = ROUTE_HOP_LEGACY;
-			hop.channel_id = routehint[i].short_channel_id;
+			hop.scid = routehint[i].short_channel_id;
 			hop.amount = dest_amount;
 			hop.delay = route_cltv(d->final_cltv, routehint + i + 1,
 					       tal_count(routehint) - i - 1);
@@ -2774,7 +2755,7 @@ static void routehint_step_cb(struct routehints_data *d, struct payment *p)
 			 * it's rather easy to compute given the two
 			 * subsequent hops. */
 			hop.direction =
-			    node_id_cmp(&prev_hop->nodeid, &hop.nodeid) > 0 ? 1
+			    node_id_cmp(&prev_hop->node_id, &hop.node_id) > 0 ? 1
 									    : 0;
 			tal_arr_expand(&p->route, hop);
 		}
@@ -3144,9 +3125,9 @@ static void direct_pay_override(struct payment *p) {
 		p->route = tal_arr(p, struct route_hop, 1);
 		p->route[0].amount = p->amount;
 		p->route[0].delay = p->getroute->cltv;
-		p->route[0].channel_id = hint->scid.scid;
+		p->route[0].scid = hint->scid.scid;
 		p->route[0].direction = hint->scid.dir;
-		p->route[0].nodeid = *p->destination;
+		p->route[0].node_id = *p->destination;
 		p->route[0].style = p->destination_has_tlv ? ROUTE_HOP_TLV : ROUTE_HOP_LEGACY;
 		paymod_log(p, LOG_DBG,
 			   "Found a direct channel (%s) with sufficient "

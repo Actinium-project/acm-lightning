@@ -18,6 +18,7 @@ GOSSIPD_TEST_COMMON_OBJS :=			\
 	common/setup.o				\
 	common/type_to_string.o			\
 	common/utils.o				\
+	gossipd/gossip_store_wiregen.o		\
 	wire/peer$(EXP)_wiregen.o		\
 	wire/fromwire.o				\
 	wire/tlvstream.o			\
@@ -25,8 +26,6 @@ GOSSIPD_TEST_COMMON_OBJS :=			\
 
 ALL_C_SOURCES += $(GOSSIPD_TEST_SRC)
 ALL_TEST_PROGRAMS += $(GOSSIPD_TEST_PROGRAMS)
-
-update-mocks: $(GOSSIPD_TEST_SRC:%=update-mocks/%)
 
 $(GOSSIPD_TEST_PROGRAMS): $(GOSSIPD_TEST_COMMON_OBJS) $(BITCOIN_OBJS)
 

@@ -45,12 +45,6 @@ u32 dijkstra_delay(const struct dijkstra *dij, u32 node_idx)
 	return dij[node_idx].total_delay;
 }
 
-/* Total cost to get here. */
-struct amount_msat dijkstra_amount(const struct dijkstra *dij, u32 node_idx)
-{
-	return dij[node_idx].cost;
-}
-
 struct gossmap_chan *dijkstra_best_chan(const struct dijkstra *dij,
 					u32 node_idx)
 {
@@ -149,7 +143,8 @@ dijkstra_(const tal_t *ctx,
 			     void *arg),
 	  u64 (*path_score)(u32 distance,
 			    struct amount_msat cost,
-			    struct amount_msat risk),
+			    struct amount_msat risk,
+			    const struct gossmap_chan *c),
 	  void *arg)
 {
 	struct dijkstra *dij;
@@ -256,7 +251,7 @@ dijkstra_(const tal_t *ctx,
 			risk = risk_price(cost, riskfactor,
 					  cur_d->total_delay
 					  + c->half[!which_half].delay);
-			score = path_score(cur_d->distance + 1, cost, risk);
+			score = path_score(cur_d->distance + 1, cost, risk, c);
 			if (score >= d->score)
 				continue;
 
