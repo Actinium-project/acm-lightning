@@ -680,7 +680,8 @@ def test_rbf_no_overlap(node_factory, bitcoind, chainparams):
 
     next_feerate = find_next_feerate(l1, l2)
 
-    # Initiate an RBF
+    # Initiate an RBF (this grabs the non-reserved utxo, which isnt the
+    # one we started with)
     startweight = 42 + 172  # base weight, funding output
     initpsbt = l1.rpc.fundpsbt(chan_amount, next_feerate, startweight,
                                min_witness_weight=110,
@@ -691,6 +692,275 @@ def test_rbf_no_overlap(node_factory, bitcoind, chainparams):
 
     with pytest.raises(RpcError, match='No overlapping input present.'):
         l1.rpc.openchannel_update(chan_id, bump['psbt'])
+
+
+@unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd doesnt yet support PSBT features we need')
+@pytest.mark.openchannel('v2')
+@pytest.mark.developer("uses dev-sign-last-tx")
+def test_rbf_fails_to_broadcast(node_factory, bitcoind, chainparams):
+    l1, l2 = node_factory.get_nodes(2,
+                                    opts={'allow_warning': True,
+                                          'may_reconnect': True})
+
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    amount = 2**24
+    chan_amount = 100000
+    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'], amount / 10**8 + 0.01)
+    bitcoind.generate_block(1)
+    # Wait for it to arrive.
+    wait_for(lambda: len(l1.rpc.listfunds()['outputs']) > 0)
+
+    # Really low feerate means that the bump wont work the first time
+    res = l1.rpc.fundchannel(l2.info['id'], chan_amount, feerate='253perkw')
+    chan_id = res['channel_id']
+    vins = bitcoind.rpc.decoderawtransaction(res['tx'])['vin']
+    assert(only_one(vins))
+    prev_utxos = ["{}:{}".format(vins[0]['txid'], vins[0]['vout'])]
+
+    # Check that we're waiting for lockin
+    l1.daemon.wait_for_log(' to DUALOPEND_AWAITING_LOCKIN')
+    inflights = only_one(only_one(l1.rpc.listpeers()['peers'])['channels'])['inflight']
+    assert inflights[-1]['funding_txid'] in bitcoind.rpc.getrawmempool()
+
+    def run_retry():
+        startweight = 42 + 173
+        next_feerate = find_next_feerate(l1, l2)
+        initpsbt = l1.rpc.utxopsbt(chan_amount, next_feerate, startweight,
+                                   prev_utxos, reservedok=True,
+                                   min_witness_weight=110,
+                                   excess_as_change=True)
+
+        l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+        bump = l1.rpc.openchannel_bump(chan_id, chan_amount, initpsbt['psbt'])
+        # We should be able to call this with while an open is progress
+        # but not yet committed
+        l1.rpc.dev_sign_last_tx(l2.info['id'])
+        update = l1.rpc.openchannel_update(chan_id, bump['psbt'])
+        assert update['commitments_secured']
+
+        return l1.rpc.signpsbt(update['psbt'])['signed_psbt']
+
+    signed_psbt = run_retry()
+    with pytest.raises(RpcError, match=r'insufficient fee, rejecting replacement'):
+        l1.rpc.openchannel_signed(chan_id, signed_psbt)
+    inflights = only_one(only_one(l1.rpc.listpeers()['peers'])['channels'])['inflight']
+    assert inflights[-1]['funding_txid'] not in bitcoind.rpc.getrawmempool()
+
+    # If we restart and listpeers, it will crash
+    l1.restart()
+
+    l1.rpc.listpeers()
+
+    # We've restarted. Let's RBF until we successfully get a
+    # new funding transaction for this channel
+    # do it again
+    signed_psbt = run_retry()
+    with pytest.raises(RpcError, match=r'insufficient fee, rejecting replacement'):
+        l1.rpc.openchannel_signed(chan_id, signed_psbt)
+    inflights = only_one(only_one(l1.rpc.listpeers()['peers'])['channels'])['inflight']
+    assert inflights[-1]['funding_txid'] not in bitcoind.rpc.getrawmempool()
+
+    # and again
+    signed_psbt = run_retry()
+    with pytest.raises(RpcError, match=r'insufficient fee, rejecting replacement'):
+        l1.rpc.openchannel_signed(chan_id, signed_psbt)
+    inflights = only_one(only_one(l1.rpc.listpeers()['peers'])['channels'])['inflight']
+    assert inflights[-1]['funding_txid'] not in bitcoind.rpc.getrawmempool()
+
+    # now we should be ok
+    signed_psbt = run_retry()
+    l1.rpc.openchannel_signed(chan_id, signed_psbt)
+    inflights = only_one(only_one(l1.rpc.listpeers()['peers'])['channels'])['inflight']
+    assert len(inflights) == 5
+    assert inflights[-1]['funding_txid'] in bitcoind.rpc.getrawmempool()
+
+    l1.restart()
+
+    # Are inflights the same post restart
+    prev_inflights = inflights
+    inflights = only_one(only_one(l1.rpc.listpeers()['peers'])['channels'])['inflight']
+    assert prev_inflights == inflights
+    assert inflights[-1]['funding_txid'] in bitcoind.rpc.getrawmempool()
+
+    # Produce a signature for every inflight
+    last_txs = l1.rpc.dev_sign_last_tx(l2.info['id'])
+    assert len(last_txs['inflights']) == len(inflights)
+    for last_tx, inflight in zip(last_txs['inflights'], inflights):
+        assert last_tx['funding_txid'] == inflight['funding_txid']
+    assert last_txs['tx']
+
+
+@unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd doesnt yet support PSBT features we need')
+@pytest.mark.openchannel('v2')
+def test_rbf_broadcast_close_inflights(node_factory, bitcoind, chainparams):
+    """
+    Close a channel before it's mined, and the most recent transaction
+    hasn't made it to the mempool. Should publish all the commitment
+    transactions that we have.
+    """
+    l1, l2 = node_factory.get_nodes(2,
+                                    opts={'allow_warning': True})
+
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    amount = 2**24
+    chan_amount = 100000
+    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'], amount / 10**8 + 0.01)
+    bitcoind.generate_block(1)
+    # Wait for it to arrive.
+    wait_for(lambda: len(l1.rpc.listfunds()['outputs']) > 0)
+
+    res = l1.rpc.fundchannel(l2.info['id'], chan_amount, feerate='7500perkw')
+    chan_id = res['channel_id']
+    vins = bitcoind.rpc.decoderawtransaction(res['tx'])['vin']
+    assert(only_one(vins))
+    prev_utxos = ["{}:{}".format(vins[0]['txid'], vins[0]['vout'])]
+
+    # Check that we're waiting for lockin
+    l1.daemon.wait_for_log(' to DUALOPEND_AWAITING_LOCKIN')
+    inflights = only_one(only_one(l1.rpc.listpeers()['peers'])['channels'])['inflight']
+    assert inflights[-1]['funding_txid'] in bitcoind.rpc.getrawmempool()
+
+    # Make it such that l1 and l2 cannot broadcast transactions
+    # (mimics failing to reach the miner with replacement)
+    def censoring_sendrawtx(r):
+        return {'id': r['id'], 'result': {}}
+
+    l1.daemon.rpcproxy.mock_rpc('sendrawtransaction', censoring_sendrawtx)
+    l2.daemon.rpcproxy.mock_rpc('sendrawtransaction', censoring_sendrawtx)
+
+    def run_retry():
+        startweight = 42 + 173
+        next_feerate = find_next_feerate(l1, l2)
+        initpsbt = l1.rpc.utxopsbt(chan_amount, next_feerate, startweight,
+                                   prev_utxos, reservedok=True,
+                                   min_witness_weight=110,
+                                   excess_as_change=True)
+
+        l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+        bump = l1.rpc.openchannel_bump(chan_id, chan_amount, initpsbt['psbt'])
+        update = l1.rpc.openchannel_update(chan_id, bump['psbt'])
+        assert update['commitments_secured']
+
+        return l1.rpc.signpsbt(update['psbt'])['signed_psbt']
+
+    signed_psbt = run_retry()
+    l1.rpc.openchannel_signed(chan_id, signed_psbt)
+    inflights = only_one(only_one(l1.rpc.listpeers()['peers'])['channels'])['inflight']
+    assert inflights[-1]['funding_txid'] not in bitcoind.rpc.getrawmempool()
+
+    cmtmt_txid = only_one(only_one(l1.rpc.listpeers()['peers'])['channels'])['scratch_txid']
+    assert cmtmt_txid == inflights[-1]['scratch_txid']
+
+    # l2 goes offline
+    l2.stop()
+
+    # l1 drops to chain.
+    l1.daemon.rpcproxy.mock_rpc('sendrawtransaction', None)
+    l1.rpc.close(chan_id, 1)
+    l1.daemon.wait_for_logs(['Broadcasting txid {}'.format(inflights[0]['scratch_txid']),
+                             'Broadcasting txid {}'.format(inflights[1]['scratch_txid']),
+                             'sendrawtx exit 0',
+                             'sendrawtx exit 25'])
+    assert inflights[0]['scratch_txid'] in bitcoind.rpc.getrawmempool()
+    assert inflights[1]['scratch_txid'] not in bitcoind.rpc.getrawmempool()
+
+
+@unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd doesnt yet support PSBT features we need')
+@pytest.mark.openchannel('v2')
+def test_rbf_non_last_mined(node_factory, bitcoind, chainparams):
+    """
+    What happens if a 'non-tip' RBF transaction is mined?
+    """
+    l1, l2 = node_factory.get_nodes(2,
+                                    opts={'allow_warning': True,
+                                          'may_reconnect': True})
+
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    amount = 2**24
+    chan_amount = 100000
+    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'], amount / 10**8 + 0.01)
+    bitcoind.generate_block(1)
+    # Wait for it to arrive.
+    wait_for(lambda: len(l1.rpc.listfunds()['outputs']) > 0)
+
+    res = l1.rpc.fundchannel(l2.info['id'], chan_amount, feerate='7500perkw')
+    chan_id = res['channel_id']
+    vins = bitcoind.rpc.decoderawtransaction(res['tx'])['vin']
+    assert(only_one(vins))
+    prev_utxos = ["{}:{}".format(vins[0]['txid'], vins[0]['vout'])]
+
+    # Check that we're waiting for lockin
+    l1.daemon.wait_for_log(' to DUALOPEND_AWAITING_LOCKIN')
+    inflights = only_one(only_one(l1.rpc.listpeers()['peers'])['channels'])['inflight']
+    assert inflights[-1]['funding_txid'] in bitcoind.rpc.getrawmempool()
+
+    def run_retry():
+        startweight = 42 + 173
+        next_feerate = find_next_feerate(l1, l2)
+        initpsbt = l1.rpc.utxopsbt(chan_amount, next_feerate, startweight,
+                                   prev_utxos, reservedok=True,
+                                   min_witness_weight=110,
+                                   excess_as_change=True)
+
+        l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+        bump = l1.rpc.openchannel_bump(chan_id, chan_amount, initpsbt['psbt'])
+        update = l1.rpc.openchannel_update(chan_id, bump['psbt'])
+        assert update['commitments_secured']
+
+        return l1.rpc.signpsbt(update['psbt'])['signed_psbt']
+
+    # Make a second inflight
+    signed_psbt = run_retry()
+    l1.rpc.openchannel_signed(chan_id, signed_psbt)
+
+    # Make it such that l1 and l2 cannot broadcast transactions
+    # (mimics failing to reach the miner with replacement)
+    def censoring_sendrawtx(r):
+        return {'id': r['id'], 'result': {}}
+
+    l1.daemon.rpcproxy.mock_rpc('sendrawtransaction', censoring_sendrawtx)
+    l2.daemon.rpcproxy.mock_rpc('sendrawtransaction', censoring_sendrawtx)
+
+    # Make a 3rd inflight that won't make it into the mempool
+    signed_psbt = run_retry()
+    l1.rpc.openchannel_signed(chan_id, signed_psbt)
+
+    l1.daemon.rpcproxy.mock_rpc('sendrawtransaction', None)
+    l2.daemon.rpcproxy.mock_rpc('sendrawtransaction', None)
+
+    # We fetch out our inflights list
+    inflights = only_one(only_one(l1.rpc.listpeers()['peers'])['channels'])['inflight']
+
+    # l2 goes offline
+    l2.stop()
+
+    # The funding transaction gets mined (should be the 2nd inflight)
+    bitcoind.generate_block(6, wait_for_mempool=1)
+
+    # l2 comes back up
+    l2.start()
+
+    # everybody's got the right things now
+    l1.daemon.wait_for_log(r'to CHANNELD_NORMAL')
+    l2.daemon.wait_for_log(r'to CHANNELD_NORMAL')
+
+    channel = only_one(only_one(l1.rpc.listpeers()['peers'])['channels'])
+    assert channel['funding_txid'] == inflights[1]['funding_txid']
+    assert channel['scratch_txid'] == inflights[1]['scratch_txid']
+
+    # We delete inflights when the channel is in normal ops
+    assert 'inflights' not in channel
+
+    # l2 stops, again
+    l2.stop()
+
+    # l1 drops to chain.
+    l1.rpc.close(chan_id, 1)
+    l1.daemon.wait_for_log('Broadcasting txid {}'.format(channel['scratch_txid']))
+
+    # The funding transaction gets mined (should be the 2nd inflight)
+    bitcoind.generate_block(1, wait_for_mempool=1)
+    l1.daemon.wait_for_log(r'to ONCHAIN')
 
 
 @unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd doesnt yet support PSBT features we need')
@@ -749,3 +1019,65 @@ def test_funder_options(node_factory, bitcoind):
     chan_info = only_one(only_one(l3.rpc.listpeers(l1.info['id'])['peers'])['channels'])
     # l1 contributed everything
     assert chan_info['funding_msat'][l1.info['id']] != '0msat'
+
+
+@unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd doesnt yet support PSBT features we need')
+def test_funder_contribution_limits(node_factory, bitcoind):
+    opts = {'experimental-dual-fund': None,
+            'feerates': (5000, 5000, 5000, 5000)}
+    l1, l2, l3 = node_factory.get_nodes(3, opts=opts)
+
+    l1.fundwallet(10**8)
+
+    # Give l2 lots of utxos
+    l2.fundwallet(10**3)  # this one is too small to add
+    l2.fundwallet(10**5)
+    l2.fundwallet(10**4)
+    l2.fundwallet(10**4)
+    l2.fundwallet(10**4)
+    l2.fundwallet(10**4)
+    l2.fundwallet(10**4)
+
+    # Give l3 lots of utxos
+    l3.fundwallet(10**3)  # this one is too small to add
+    l3.fundwallet(10**4)
+    l3.fundwallet(10**4)
+    l3.fundwallet(10**4)
+    l3.fundwallet(10**4)
+    l3.fundwallet(10**4)
+    l3.fundwallet(10**4)
+    l3.fundwallet(10**4)
+    l3.fundwallet(10**4)
+    l3.fundwallet(10**4)
+    l3.fundwallet(10**4)
+    l3.fundwallet(10**4)
+
+    # Contribute 100% of available funds to l2, all 6 utxos (smallest utxo
+    # 10**3 is left out)
+    l2.rpc.call('funderupdate',
+                {'policy': 'available',
+                 'policy_mod': 100,
+                 'min_their_funding': '1000msat',
+                 'per_channel_min': '1000000msat',
+                 'fund_probability': 100,
+                 'fuzz_percent': 0})
+
+    # Set our contribution to 50k sat, should only use 7 of 12 available utxos
+    l3.rpc.call('funderupdate',
+                {'policy': 'fixed',
+                 'policy_mod': '50000sat',
+                 'min_their_funding': '1000msat',
+                 'per_channel_min': '1000sat',
+                 'per_channel_max': '500000sat',
+                 'fund_probability': 100,
+                 'fuzz_percent': 0})
+
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    l1.fundchannel(l2, 10**7)
+    assert l2.daemon.is_in_log('Policy .* returned funding amount of 139020sat')
+    assert l2.daemon.is_in_log(r'calling `signpsbt` .* 6 inputs')
+
+    l1.rpc.connect(l3.info['id'], 'localhost', l3.port)
+    l1.fundchannel(l3, 10**7)
+    assert l3.daemon.is_in_log('Policy .* returned funding amount of 50000sat')
+    assert l3.daemon.is_in_log(r'calling `signpsbt` .* 7 inputs')

@@ -177,6 +177,7 @@ json_openchannel2_sign_call(struct command *cmd,
 	const char *err;
 	struct out_req *req;
 	struct pending_open *open;
+	size_t count;
 
 	err = json_scan(tmpctx, buf, params,
 			"{openchannel2_sign:"
@@ -219,16 +220,20 @@ json_openchannel2_sign_call(struct command *cmd,
 	/* Use input markers to identify which inputs
 	 * are ours, only sign those */
 	json_array_start(req->js, "signonly");
+	count = 0;
 	for (size_t i = 0; i < psbt->num_inputs; i++) {
-		if (psbt_input_is_ours(&psbt->inputs[i]))
+		if (psbt_input_is_ours(&psbt->inputs[i])) {
 			json_add_num(req->js, NULL, i);
+			count++;
+		}
 	}
 	json_array_end(req->js);
 
 	plugin_log(cmd->plugin, LOG_DBG,
-		   "calling `signpsbt` for channel %s",
+		   "calling `signpsbt` for channel %s for %zu input%s",
 		   type_to_string(tmpctx, struct channel_id,
-				  &open->channel_id));
+				  &open->channel_id), count,
+		   count == 1 ? "" : "s");
 	return send_outreq(cmd->plugin, req);
 }
 
@@ -345,10 +350,11 @@ listfunds_success(struct command *cmd,
 		  const jsmntok_t *result,
 		  struct open_info *info)
 {
-	struct amount_sat available_funds;
+	struct amount_sat available_funds, est_fee;
 	const jsmntok_t *outputs_tok, *tok;
 	struct out_req *req;
 	size_t i;
+	const char *funding_err;
 
 	outputs_tok = json_get_member(buf, result, "outputs");
 	if (!outputs_tok)
@@ -360,7 +366,7 @@ listfunds_success(struct command *cmd,
 	available_funds = AMOUNT_SAT(0);
 	json_for_each_arr(i, tok, outputs_tok) {
 		struct amount_sat val;
-		bool is_reserved;
+		bool is_reserved, is_p2sh;
 		char *status;
 		const char *err;
 
@@ -377,6 +383,16 @@ listfunds_success(struct command *cmd,
 				   err, json_tok_full_len(result),
 				   json_tok_full(buf, result));
 
+		/* is it a p2sh output? */
+		if (json_get_member(buf, tok, "redeemscript"))
+			is_p2sh = true;
+		else
+			is_p2sh = false;
+
+		/* The estimated fee per utxo. */
+		est_fee = amount_tx_fee(info->funding_feerate_perkw,
+					bitcoin_tx_input_weight(is_p2sh, 110));
+
 		/* we skip reserved funds */
 		if (is_reserved)
 			continue;
@@ -385,23 +401,28 @@ listfunds_success(struct command *cmd,
 		if (!streq(status, "confirmed"))
 			continue;
 
+		/* Don't include outputs that can't cover their weight;
+		 *  subtract the fee for this utxo out of the utxo */
+		if (!amount_sat_sub(&val, val, est_fee))
+			continue;
+
 		if (!amount_sat_add(&available_funds, available_funds, val))
 			plugin_err(cmd->plugin,
 				   "`listfunds` overflowed output values");
-
-		/* FIXME: count of utxos? */
 	}
 
-	info->our_funding = calculate_our_funding(current_policy,
-						  info->id,
-						  info->their_funding,
-						  available_funds,
-						  info->channel_max);
+	funding_err = calculate_our_funding(current_policy,
+					    info->id,
+					    info->their_funding,
+					    available_funds,
+					    info->channel_max,
+					    &info->our_funding);
 	plugin_log(cmd->plugin, LOG_DBG,
-		   "Policy %s returned funding amount of %s",
+		   "Policy %s returned funding amount of %s. %s",
 		   funder_policy_desc(tmpctx, current_policy),
 		   type_to_string(tmpctx, struct amount_sat,
-				  &info->our_funding));
+				  &info->our_funding),
+		   funding_err ? funding_err : "");
 
 	if (amount_sat_eq(info->our_funding, AMOUNT_SAT(0)))
 		return command_hook_success(cmd);

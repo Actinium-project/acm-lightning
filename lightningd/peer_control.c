@@ -180,19 +180,21 @@ u8 *p2wpkh_for_keyidx(const tal_t *ctx, struct lightningd *ld, u64 keyidx)
 	return scriptpubkey_p2wpkh(ctx, &shutdownkey);
 }
 
-static void sign_last_tx(struct channel *channel)
+static void sign_last_tx(struct channel *channel,
+			 struct bitcoin_tx *last_tx,
+			 struct bitcoin_signature *last_sig)
 {
 	struct lightningd *ld = channel->peer->ld;
 	struct bitcoin_signature sig;
 	u8 *msg, **witness;
 
-	assert(!channel->last_tx->wtx->inputs[0].witness);
+	assert(!last_tx->wtx->inputs[0].witness);
 	msg = towire_hsmd_sign_commitment_tx(tmpctx,
-					    &channel->peer->id,
-					    channel->dbid,
-					    channel->last_tx,
-					    &channel->channel_info
-					    .remote_fundingkey);
+					     &channel->peer->id,
+					     channel->dbid,
+					     last_tx,
+					     &channel->channel_info
+					     .remote_fundingkey);
 
 	if (!wire_sync_write(ld->hsm_fd, take(msg)))
 		fatal("Could not write to HSM: %s", strerror(errno));
@@ -203,11 +205,11 @@ static void sign_last_tx(struct channel *channel)
 		      tal_hex(tmpctx, msg));
 
 	witness =
-	    bitcoin_witness_2of2(channel->last_tx, &channel->last_sig,
+	    bitcoin_witness_2of2(last_tx, last_sig,
 				 &sig, &channel->channel_info.remote_fundingkey,
 				 &channel->local_funding_pubkey);
 
-	bitcoin_tx_input_set_witness(channel->last_tx, 0, take(witness));
+	bitcoin_tx_input_set_witness(last_tx, 0, take(witness));
 }
 
 static void remove_sig(struct bitcoin_tx *signed_tx)
@@ -337,10 +339,31 @@ static bool invalid_last_tx(const struct bitcoin_tx *tx)
 #endif
 }
 
+static void sign_and_send_last(struct lightningd *ld,
+			       struct channel *channel,
+			       struct bitcoin_tx *last_tx,
+			       struct bitcoin_signature *last_sig)
+{
+	struct bitcoin_txid txid;
+
+	sign_last_tx(channel, last_tx, last_sig);
+	bitcoin_txid(last_tx, &txid);
+	wallet_transaction_add(ld->wallet, last_tx->wtx, 0, 0);
+	wallet_transaction_annotate(ld->wallet, &txid,
+				    channel->last_tx_type,
+				    channel->dbid);
+
+	/* Keep broadcasting until we say stop (can fail due to dup,
+	 * if they beat us to the broadcast). */
+	broadcast_tx(ld->topology, channel, last_tx, NULL);
+
+	remove_sig(last_tx);
+}
+
 void drop_to_chain(struct lightningd *ld, struct channel *channel,
 		   bool cooperative)
 {
-	struct bitcoin_txid txid;
+	struct channel_inflight *inflight;
 	/* BOLT #2:
 	 *
 	 * - if `next_revocation_number` is greater than expected
@@ -357,16 +380,15 @@ void drop_to_chain(struct lightningd *ld, struct channel *channel,
 			   "Cannot broadcast our commitment tx:"
 			   " it's invalid! (ancient channel?)");
 	} else {
-		sign_last_tx(channel);
-		bitcoin_txid(channel->last_tx, &txid);
-		wallet_transaction_add(ld->wallet, channel->last_tx->wtx, 0, 0);
-		wallet_transaction_annotate(ld->wallet, &txid, channel->last_tx_type, channel->dbid);
-
-		/* Keep broadcasting until we say stop (can fail due to dup,
-		 * if they beat us to the broadcast). */
-		broadcast_tx(ld->topology, channel, channel->last_tx, NULL);
-
-		remove_sig(channel->last_tx);
+		/* We need to drop *every* commitment transaction to chain */
+		if (!cooperative && !list_empty(&channel->inflights)) {
+			list_for_each(&channel->inflights, inflight, list)
+				sign_and_send_last(ld, channel,
+						   inflight->last_tx,
+						   &inflight->last_sig);
+		} else
+			sign_and_send_last(ld, channel, channel->last_tx,
+					   &channel->last_sig);
 	}
 
 	resolve_close_command(ld, channel, cooperative);
@@ -744,8 +766,8 @@ static void json_add_channel(struct lightningd *ld,
 			type_to_string(tmpctx, struct channel_id, &channel->cid));
 	json_add_txid(response, "funding_txid", &channel->funding_txid);
 
-	if (channel->state == DUALOPEND_AWAITING_LOCKIN) {
-		struct channel_inflight *initial;
+	if (!list_empty(&channel->inflights)) {
+		struct channel_inflight *initial, *inflight;
 		u32 last_feerate, next_feerate, feerate;
 		u8 feestep;
 
@@ -771,6 +793,34 @@ static void json_add_channel(struct lightningd *ld,
 		for (feestep = 0; feerate < next_feerate; feestep++)
 			feerate += feerate / 4;
 		json_add_num(response, "next_fee_step", feestep);
+
+		/* List the inflights */
+		json_array_start(response, "inflight");
+		list_for_each(&channel->inflights, inflight, list) {
+			struct bitcoin_txid txid;
+
+			json_object_start(response, NULL);
+			json_add_txid(response, "funding_txid",
+				      &inflight->funding->txid);
+			json_add_num(response, "funding_outnum",
+				     inflight->funding->outnum);
+			json_add_string(response, "feerate",
+					tal_fmt(tmpctx, "%d%s",
+						inflight->funding->feerate,
+						feerate_style_name(
+							FEERATE_PER_KSIPA)));
+			json_add_amount_sat_only(response,
+						 "total_funding_msat",
+						 inflight->funding->total_funds);
+			json_add_amount_sat_only(response,
+						 "our_funding_msat",
+						 inflight->funding->our_funds);
+			/* Add the expected commitment tx id also */
+			bitcoin_txid(inflight->last_tx, &txid);
+			json_add_txid(response, "scratch_txid", &txid);
+			json_object_end(response);
+		}
+		json_array_end(response);
 	}
 
 	if (channel->shutdown_scriptpubkey[LOCAL]) {
@@ -1093,7 +1143,7 @@ send_error:
 	if (feature_negotiated(ld->our_features,
 			       peer->their_features,
 			       OPT_DUAL_FUND)) {
-		if (channel) {
+		if (channel && !list_empty(&channel->inflights)) {
 			assert(!channel->owner);
 			assert(channel->state == DUALOPEND_OPEN_INIT
 			       || channel->state == DUALOPEND_AWAITING_LOCKIN
@@ -1262,6 +1312,32 @@ static bool check_funding_tx(const struct bitcoin_tx *tx,
 	return false;
 }
 
+static void update_channel_from_inflight(struct lightningd *ld,
+					 struct channel *channel,
+					 struct channel_inflight *inflight)
+{
+	struct wally_psbt *psbt_copy;
+
+	channel->funding_txid = inflight->funding->txid;
+	channel->funding_outnum = inflight->funding->outnum;
+	channel->funding = inflight->funding->total_funds;
+	channel->our_funds = inflight->funding->our_funds;
+
+	/* Make a 'clone' of this tx */
+	psbt_copy = clone_psbt(channel, inflight->last_tx->psbt);
+	channel_set_last_tx(channel,
+			    bitcoin_tx_with_psbt(channel, psbt_copy),
+			    &inflight->last_sig,
+			    TX_CHANNEL_UNILATERAL);
+
+	/* Update the reserve */
+	channel_update_reserve(channel,
+			       &channel->channel_info.their_config,
+			       inflight->funding->total_funds);
+
+	wallet_channel_save(ld->wallet, channel);
+}
+
 static enum watch_result funding_depth_cb(struct lightningd *ld,
 					   struct channel *channel,
 					   const struct bitcoin_txid *txid,
@@ -1292,6 +1368,26 @@ static enum watch_result funding_depth_cb(struct lightningd *ld,
 	 * means the stale block with our funding tx was removed) */
 	if ((min_depth_reached && !channel->scid) || (depth && channel->scid)) {
 		struct txlocator *loc;
+		struct channel_inflight *inf;
+
+		/* Update the channel's info to the correct tx, if needed to
+		 * It's possible an 'inflight' has reached depth */
+		if (!list_empty(&channel->inflights)) {
+			inf = channel_inflight_find(channel, txid);
+			if (!inf) {
+				channel_fail_permanent(channel, REASON_LOCAL,
+					"Txid %s for channel"
+					" not found in inflights. (peer %s)",
+					type_to_string(tmpctx,
+						       struct bitcoin_txid,
+						       txid),
+					type_to_string(tmpctx,
+						       struct node_id,
+						       &channel->peer->id));
+				return DELETE_WATCH;
+			}
+			update_channel_from_inflight(ld, channel, inf);
+		}
 
 		wallet_annotate_txout(ld->wallet, txid, channel->funding_outnum,
 				      TX_CHANNEL_FUNDING, channel->dbid);
@@ -1375,6 +1471,19 @@ void channel_watch_funding(struct lightningd *ld, struct channel *channel)
 		  &channel->funding_txid, channel->funding_outnum,
 		  funding_spent);
 	channel_watch_wrong_funding(ld, channel);
+}
+
+static void channel_watch_inflight(struct lightningd *ld,
+				   struct channel *channel,
+				   struct channel_inflight *inflight)
+{
+	/* FIXME: Remove arg from cb? */
+	watch_txid(channel, ld->topology, channel,
+		   &inflight->funding->txid, funding_depth_cb);
+	watch_txo(channel, ld->topology, channel,
+		  &inflight->funding->txid,
+		  inflight->funding->outnum,
+		  funding_spent);
 }
 
 static void json_add_peer(struct lightningd *ld,
@@ -1741,6 +1850,7 @@ static void activate_peer(struct peer *peer, u32 delay)
 {
 	u8 *msg;
 	struct channel *channel;
+	struct channel_inflight *inflight;
 	struct lightningd *ld = peer->ld;
 
 	/* We can only have one active channel: make sure connectd
@@ -1774,6 +1884,17 @@ static void activate_peer(struct peer *peer, u32 delay)
 			continue;
 		/* Watching lockin may be unnecessary, but it's harmless. */
 		channel_watch_funding(ld, channel);
+
+		/* Also watch any inflight txs */
+		list_for_each(&channel->inflights, inflight, list) {
+			/* Don't double watch the txid that's also in
+			 * channel->funding_txid */
+			if (bitcoin_txid_eq(&channel->funding_txid,
+					    &inflight->funding->txid))
+				continue;
+
+			channel_watch_inflight(ld, channel, inflight);
+		}
 	}
 }
 
@@ -2263,9 +2384,27 @@ static struct command_result *json_sign_last_tx(struct command *cmd,
 	log_debug(channel->log, "dev-sign-last-tx: signing tx with %zu outputs",
 		  channel->last_tx->wtx->num_outputs);
 
-	sign_last_tx(channel);
+	sign_last_tx(channel, channel->last_tx, &channel->last_sig);
 	json_add_tx(response, "tx", channel->last_tx);
 	remove_sig(channel->last_tx);
+
+	/* If we've got inflights, return them */
+	if (!list_empty(&channel->inflights)) {
+		struct channel_inflight *inflight;
+
+		json_array_start(response, "inflights");
+		list_for_each(&channel->inflights, inflight, list) {
+			sign_last_tx(channel, inflight->last_tx,
+				     &inflight->last_sig);
+			json_object_start(response, NULL);
+			json_add_txid(response, "funding_txid",
+				      &inflight->funding->txid);
+			remove_sig(inflight->last_tx);
+			json_add_tx(response, "tx", channel->last_tx);
+			json_object_end(response);
+		}
+		json_array_end(response);
+	}
 
 	return command_success(cmd, response);
 }

@@ -969,7 +969,7 @@ void wallet_inflight_add(struct wallet *w, struct channel_inflight *inflight)
 	db_bind_amount_sat(stmt, 4, &inflight->funding->total_funds);
 	db_bind_amount_sat(stmt, 5, &inflight->funding->our_funds);
 	db_bind_psbt(stmt, 6, inflight->funding_psbt);
-	db_bind_tx(stmt, 7, inflight->last_tx->wtx);
+	db_bind_psbt(stmt, 7, inflight->last_tx->psbt);
 	db_bind_signature(stmt, 8, &inflight->last_sig.s);
 	db_exec_prepared_v2(stmt);
 	assert(!stmt->error);
@@ -1001,6 +1001,24 @@ void wallet_inflight_save(struct wallet *w,
 	db_exec_prepared_v2(take(stmt));
 }
 
+void wallet_channel_clear_inflights(struct wallet *w,
+				    struct channel *chan)
+{
+	struct db_stmt *stmt;
+	struct channel_inflight *inflight;
+
+	/* Remove all the inflights for the channel */
+	stmt = db_prepare_v2(w->db, SQL("DELETE FROM channel_funding_inflights"
+					" WHERE channel_id = ?"));
+	db_bind_u64(stmt, 0, chan->dbid);
+	db_exec_prepared_v2(take(stmt));
+
+	/* Empty out the list too */
+	while ((inflight = list_tail(&chan->inflights,
+				     struct channel_inflight, list)))
+		tal_free(inflight);
+}
+
 static struct channel_inflight *
 wallet_stmt2inflight(struct wallet *w, struct db_stmt *stmt,
 		     struct channel *chan)
@@ -1024,7 +1042,7 @@ wallet_stmt2inflight(struct wallet *w, struct db_stmt *stmt,
 				funding_sat,
 				our_funding_sat,
 				db_column_psbt(tmpctx, stmt, 5),
-				db_column_tx(tmpctx, stmt, 6),
+				db_column_psbt_to_tx(tmpctx, stmt, 6),
 				last_sig);
 
 	/* Pull out the serialized tx-sigs-received-ness */
@@ -1049,7 +1067,8 @@ static bool wallet_channel_load_inflights(struct wallet *w,
 					", last_sig" // 7
 					", funding_tx_remote_sigs_received" //8
 					" FROM channel_funding_inflights"
-					" WHERE channel_id = ?")); // ?0
+					" WHERE channel_id = ?" // ?0
+					" ORDER BY funding_feerate"));
 
 	db_bind_u64(stmt, 0, chan->dbid);
 	db_query_prepared(stmt);

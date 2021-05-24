@@ -115,6 +115,7 @@ void json_add_unsaved_channel(struct json_stream *response,
 			      const struct channel *channel)
 {
 	struct amount_msat total;
+	struct open_attempt *oa;
 
 	if (!channel)
 		return;
@@ -122,6 +123,8 @@ void json_add_unsaved_channel(struct json_stream *response,
 	/* If we're chatting but no channel, that's shown by connected: True */
 	if (!channel->open_attempt)
 		return;
+
+	oa = channel->open_attempt;
 
 	json_object_start(response, NULL);
 	json_add_string(response, "state", channel_state_name(channel));
@@ -139,13 +142,17 @@ void json_add_unsaved_channel(struct json_stream *response,
 		json_add_string(response, NULL, channel->billboard.transient);
 	json_array_end(response);
 
-	/* These should never fail. */
-	if (amount_sat_to_msat(&total, channel->open_attempt->funding)) {
-		json_add_amount_msat_compat(response, total,
-					    "msatoshi_to_us", "to_us_msat");
-		/* This will change if peer adds funds */
-		json_add_amount_msat_compat(response, total,
-					    "msatoshi_total", "total_msat");
+	/* funding + our_upfront_shutdown only available if we're initiator */
+	if (oa->role == TX_INITIATOR) {
+		if (amount_sat_to_msat(&total, oa->funding)) {
+			json_add_amount_msat_compat(response, total,
+						    "msatoshi_to_us",
+						    "to_us_msat");
+			/* This will change if peer adds funds */
+			json_add_amount_msat_compat(response, total,
+						    "msatoshi_total",
+						    "total_msat");
+		}
 	}
 
 	json_array_start(response, "features");
@@ -915,6 +922,12 @@ openchannel2_sign_hook_cb(struct openchannel2_psbt_payload *payload STEALS)
 	}
 
 	inflight = channel_current_inflight(channel);
+	if (!inflight) {
+		log_broken(channel->log,
+			   "No current channel inflight");
+		msg = towire_dualopend_fail(NULL, "No current channel inflight");
+		goto send_msg;
+	}
 
 	/* Check that we've got the same / correct PSBT */
 	psbt_txid(NULL, payload->psbt, &txid, NULL);
@@ -1020,9 +1033,9 @@ static struct amount_sat calculate_reserve(struct channel_config *their_config,
 	return reserve;
 }
 
-static void channel_update_reserve(struct channel *channel,
-				   struct channel_config *their_config,
-				   struct amount_sat funding_total)
+void channel_update_reserve(struct channel *channel,
+			    struct channel_config *their_config,
+			    struct amount_sat funding_total)
 {
 	struct amount_sat reserve;
 
@@ -1068,8 +1081,11 @@ wallet_update_channel(struct lightningd *ld,
 	channel->our_msat = our_msat;
 	channel->msat_to_us_min = our_msat;
 	channel->msat_to_us_max = our_msat;
-	channel->last_tx = tal_steal(channel, remote_commit);
-	channel->last_sig = *remote_commit_sig;
+
+	channel_set_last_tx(channel,
+			    tal_steal(channel, remote_commit),
+			    remote_commit_sig,
+			    TX_CHANNEL_UNILATERAL);
 
 	/* Update in database */
 	wallet_channel_save(ld->wallet, channel);
@@ -1138,8 +1154,11 @@ wallet_commit_channel(struct lightningd *ld,
 	channel->our_msat = our_msat;
 	channel->msat_to_us_min = our_msat;
 	channel->msat_to_us_max = our_msat;
+
 	channel->last_tx = tal_steal(channel, remote_commit);
 	channel->last_sig = *remote_commit_sig;
+	channel->last_tx_type = TX_CHANNEL_UNILATERAL;
+
 	channel->channel_info = *channel_info;
 	channel->fee_states = new_fee_states(channel,
 					     channel->opener,
@@ -1398,6 +1417,13 @@ static void handle_peer_tx_sigs_sent(struct subd *dualopend,
 	}
 
 	inflight = channel_current_inflight(channel);
+	if (!inflight) {
+		channel_internal_error(channel,
+				       "No inflight found for channel %s",
+				       type_to_string(tmpctx, struct channel,
+						      channel));
+		return;
+	}
 
 	/* Once we've sent our sigs to the peer, we're fine
 	 * to broadcast the transaction, even if they haven't
@@ -1420,6 +1446,8 @@ static void handle_peer_tx_sigs_sent(struct subd *dualopend,
 			return;
 		}
 
+		/* Saves the now finalized version of the psbt */
+		wallet_inflight_save(dualopend->ld->wallet, inflight);
 		send_funding_tx(channel, take(wtx));
 
 		/* Must be in an "init" state */
@@ -1518,6 +1546,9 @@ static void handle_channel_locked(struct subd *dualopend,
 			  "Lockin complete");
 	channel_record_open(channel);
 
+	/* Empty out the inflights */
+	wallet_channel_clear_inflights(dualopend->ld->wallet, channel);
+
 	/* FIXME: LND sigs/update_fee msgs? */
 	peer_start_channeld(channel, pps, NULL, false);
 	return;
@@ -1539,40 +1570,14 @@ void dualopen_tell_depth(struct subd *dualopend,
 	/* Are we there yet? */
 	if (to_go == 0) {
 		assert(channel->scid);
+		assert(bitcoin_txid_eq(&channel->funding_txid, txid));
 
-		/* Update the channel's info to the correct tx, if we need to */
-		if (!bitcoin_txid_eq(&channel->funding_txid, txid)) {
-			struct channel_inflight *inf;
-			inf = channel_inflight_find(channel, txid);
-			if (!inf) {
-				channel_internal_error(channel,
-					"Txid %s for channel"
-					" not found in available inflights."
-					"  (peer %s)",
-					type_to_string(tmpctx,
-						       struct bitcoin_txid,
-						       txid),
-					type_to_string(tmpctx,
-						       struct node_id,
-						       &channel->peer->id));
-				return;
-			}
+		channel_set_billboard(channel, false,
+				      tal_fmt(tmpctx, "Funding depth reached"
+					      " %d confirmations, alerting peer"
+					      " we're locked-in.",
+					      to_go));
 
-			channel->funding_txid = inf->funding->txid;
-			channel->funding_outnum = inf->funding->outnum;
-			channel->funding = inf->funding->total_funds;
-			channel->our_funds = inf->funding->our_funds;
-			channel->last_tx = tal_steal(channel, inf->last_tx);
-			channel->last_sig = inf->last_sig;
-
-			/* Update the reserve */
-			channel_update_reserve(channel,
-					       &channel->channel_info.their_config,
-					       inf->funding->total_funds);
-
-			wallet_channel_save(dualopend->ld->wallet, channel);
-			/* FIXME: delete inflights */
-		}
 		msg = towire_dualopend_depth_reached(NULL, depth);
 		subd_send_msg(dualopend, take(msg));
 	} else
@@ -1723,6 +1728,14 @@ static void handle_peer_tx_sigs_msg(struct subd *dualopend,
 	}
 
 	inflight = channel_current_inflight(channel);
+	if (!inflight) {
+		channel_internal_error(channel,
+				       "No inflight found for channel %s",
+				       type_to_string(tmpctx, struct channel,
+						      channel));
+		return;
+	}
+
 	/* Save that we've gotten their sigs. Sometimes
 	 * the peer doesn't send any sigs (no inputs), otherwise
 	 * we could just check the PSBT was finalized */
@@ -1935,9 +1948,13 @@ json_openchannel_abort(struct command *cmd,
 		return command_fail(cmd, FUNDING_PEER_NOT_CONNECTED,
 				    "Peer not connected");
 
-	if (!channel->open_attempt)
+	if (!channel->open_attempt) {
+		if (list_empty(&channel->inflights))
+			return command_fail(cmd, FUNDING_STATE_INVALID,
+					    "Channel open not in progress");
 		return command_fail(cmd, FUNDING_STATE_INVALID,
-				    "Channel open not in progress");
+				    "Sigs already exchanged, can't cancel");
+	}
 
 	if (channel->open_attempt->cmd)
 		return command_fail(cmd, FUNDING_STATE_INVALID,
@@ -2906,11 +2923,14 @@ void peer_restart_dualopend(struct peer *peer,
 		       &min_effective_htlc_capacity);
 
 	inflight = channel_current_inflight(channel);
+	assert(inflight);
+
 	/* Get the first inflight to figure out the original feerate
 	 * for this channel. It's fine if it's the same as the current */
 	first_inflight = list_top(&channel->inflights,
 				  struct channel_inflight,
 				  list);
+	assert(first_inflight);
 	msg = towire_dualopend_reinit(NULL,
 				      chainparams,
 				      peer->ld->our_features,
