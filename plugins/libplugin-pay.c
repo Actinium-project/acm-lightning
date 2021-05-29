@@ -2361,6 +2361,7 @@ static struct route_info **filter_routehints(struct gossmap *map,
 				       "Removed empty routehint %zu. ", i);
 			tal_arr_remove(&hints, i);
 			i--;
+			continue;
 		}
 
 		/* If routehint entrypoint is unreachable there's no
@@ -3264,6 +3265,9 @@ static void waitblockheight_cb(void *d, struct payment *p)
 	/* Check if we'd be waiting more than 0 seconds. If we have
 	 * less than a second then waitblockheight would return
 	 * immediately resulting in a loop. */
+	if (time_after(now, p->deadline))
+		return payment_continue(p);
+
 	remaining = time_between(p->deadline, now);
 	if (time_to_sec(remaining) < 1)
 		return payment_continue(p);

@@ -6,7 +6,7 @@ from pyln.testing.utils import SLOW_MACHINE
 from utils import (
     only_one, sync_blockheight, wait_for, TIMEOUT,
     account_balance, first_channel_id, basic_fee, TEST_NETWORK,
-    EXPERIMENTAL_FEATURES, scriptpubkey_addr
+    scriptpubkey_addr
 )
 
 import os
@@ -2626,7 +2626,7 @@ Try a range of future segwit versions as shutdown scripts.  We create many nodes
 """
     l1 = node_factory.get_node(allow_warning=True)
 
-    # BOLT-4e329271a358ee52bf43ddbd96776943c5d74508 #2:
+    # BOLT #2:
     # 5. if (and only if) `option_shutdown_anysegwit` is negotiated:
     #    * `OP_1` through `OP_16` inclusive, followed by a single push of 2 to 40 bytes
     #    (witness program versions 1 through 16)
@@ -2659,15 +2659,8 @@ Try a range of future segwit versions as shutdown scripts.  We create many nodes
     else:
         valid = edge_valid + other_valid
 
-    if EXPERIMENTAL_FEATURES:
-        xsuccess = valid
-        xfail = invalid
-    else:
-        xsuccess = []
-        xfail = valid + invalid
-
     # More efficient to create them all up-front.
-    nodes = node_factory.get_nodes(len(xfail) + len(xsuccess))
+    nodes = node_factory.get_nodes(len(valid) + len(invalid))
 
     # Give it one UTXO to spend for each node.
     addresses = {}
@@ -2680,7 +2673,7 @@ Try a range of future segwit versions as shutdown scripts.  We create many nodes
     # FIXME: Since we don't support other non-v0 encodings, we need a protocol
     # test for this (we're actually testing our upfront check, not the real
     # shutdown one!),
-    for script in xsuccess:
+    for script in valid:
         # Insist on upfront script we're not going to match.
         l1.stop()
         l1.daemon.env["DEV_OPENINGD_UPFRONT_SHUTDOWN_SCRIPT"] = script
@@ -2690,7 +2683,7 @@ Try a range of future segwit versions as shutdown scripts.  We create many nodes
         l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
         l1.rpc.fundchannel(l2.info['id'], 10**6)
 
-    for script in xfail:
+    for script in invalid:
         # Insist on upfront script we're not going to match.
         l1.stop()
         l1.daemon.env["DEV_OPENINGD_UPFRONT_SHUTDOWN_SCRIPT"] = script

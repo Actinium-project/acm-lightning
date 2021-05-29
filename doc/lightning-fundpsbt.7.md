@@ -33,8 +33,10 @@ added any inputs.
 *minconf* specifies the minimum number of confirmations that used
 outputs should have. Default is 1.
 
-*reserve* is a boolean: if true (the default), then *reserveinputs* is
-called (successfully, with *exclusive* true) on the returned PSBT.
+*reserve* is either boolean or a number: if *true* or a non-zero
+number then *reserveinputs* is called (successfully, with
+*exclusive* true) on the returned PSBT for this number of blocks (or
+72 blocks if *reserve* is simply *true*).
 
 *locktime* is an optional locktime: if not set, it is set to a recent
 block height.
@@ -77,8 +79,8 @@ available.  This could be zero, or dust.  If *satoshi* was "all",
 then *excess_msat* is the entire amount once fees are subtracted
 for the weights of the inputs and startweight.
 
-If *reserve* was true, then a *reservations* array is returned,
-exactly like *reserveinputs*.
+If *reserve* was *true* or a non-zero number, then a *reservations*
+array is returned, exactly like *reserveinputs*.
 
 If *excess_as_change* is true and the excess is enough to cover
 an additional output above the `dust_limit`, then an output is
@@ -108,3 +110,4 @@ RESOURCES
 
 Main web site: <https://github.com/ElementsProject/lightning>
 
+[comment]: # ( SHA256STAMP:25b32367f5bbf6f1e53036c38b7b7d19eebf62fa749a3ab580e4093eedc88584)

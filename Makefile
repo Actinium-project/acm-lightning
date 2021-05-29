@@ -24,7 +24,7 @@ CCANDIR := ccan
 
 # Where we keep the BOLT RFCs
 BOLTDIR := ../lightning-rfc/
-DEFAULT_BOLTVERSION := b201efe0546120c14bf154ce5f4e18da7243fe7a
+DEFAULT_BOLTVERSION := 3508e4e85d26240ae7492c3d2e02770cdc360fe9
 # Can be overridden on cmdline.
 BOLTVERSION := $(DEFAULT_BOLTVERSION)
 
@@ -258,6 +258,11 @@ endif
 
 default: show-flags all-programs all-test-programs doc-all
 
+ifneq ($(SUPPRESS_GENERATION),1)
+FORCE = FORCE
+FORCE::
+endif
+
 show-flags: config.vars
 	@$(ECHO) "CC: $(CC) $(CFLAGS) -c -o"
 	@$(ECHO) "LD: $(LINK.o) $(filter-out %.a,$^) $(LOADLIBES) $(EXTERNAL_LDLIBS) $(LDLIBS) -o"
@@ -288,30 +293,30 @@ else
 # Git doesn't maintain timestamps, so we only regen if sources actually changed:
 # We place the SHA inside some generated files so we can tell if they need updating.
 # Usage: $(call SHA256STAMP_CHANGED)
-SHA256STAMP_CHANGED = [ x"`sed -n 's/.*SHA256STAMP://p' $@ 2>/dev/null`" != x"`cat $(sort $(filter-out FORCE,$^)) | $(SHA256SUM) | cut -c1-64`" ]
-# Usage: $(call SHA256STAMP,commentprefix)
-SHA256STAMP = echo '$(1) SHA256STAMP:'`cat $(sort $(filter-out FORCE,$^)) | $(SHA256SUM) | cut -c1-64` >> $@
+SHA256STAMP_CHANGED = [ x"`sed -n 's/.*SHA256STAMP:\([a-f0-9]*\).*/\1/p' $@ 2>/dev/null`" != x"`cat $(sort $(filter-out FORCE,$^)) | $(SHA256SUM) | cut -c1-64`" ]
+# Usage: $(call SHA256STAMP,commentprefix,commentpostfix)
+SHA256STAMP = echo "$(1) SHA256STAMP:"`cat $(sort $(filter-out FORCE,$^)) | $(SHA256SUM) | cut -c1-64`"$(2)" >> $@
 endif
 
 # generate-wire.py --page [header|impl] hdrfilename wirename < csv > file
 %_wiregen.h: %_wire.csv $(WIRE_GEN_DEPS)
 	@if $(call SHA256STAMP_CHANGED); then if [ "$$NO_PYTHON" = 1 ]; then echo "Error: NO_PYTHON on $@"; exit 1; fi; \
-		$(call VERBOSE,"wiregen $@",tools/generate-wire.py --page header $($@_args) $@ `basename $< .csv | sed 's/_exp_/_/'` < $< > $@ && $(call SHA256STAMP,//)); \
+		$(call VERBOSE,"wiregen $@",tools/generate-wire.py --page header $($@_args) $@ `basename $< .csv | sed 's/_exp_/_/'` < $< > $@ && $(call SHA256STAMP,//,)); \
 	fi
 
 %_wiregen.c: %_wire.csv $(WIRE_GEN_DEPS)
 	@if $(call SHA256STAMP_CHANGED); then if [ "$$NO_PYTHON" = 1 ]; then echo "Error: NO_PYTHON on $@"; exit 1; fi; \
-		$(call VERBOSE,"wiregen $@",tools/generate-wire.py --page impl $($@_args) ${@:.c=.h} `basename $< .csv | sed 's/_exp_/_/'` < $< > $@ && $(call SHA256STAMP,//)); \
+		$(call VERBOSE,"wiregen $@",tools/generate-wire.py --page impl $($@_args) ${@:.c=.h} `basename $< .csv | sed 's/_exp_/_/'` < $< > $@ && $(call SHA256STAMP,//,)); \
 	fi
 
 %_printgen.h: %_wire.csv $(WIRE_GEN_DEPS)
 	@if $(call SHA256STAMP_CHANGED); then if [ "$$NO_PYTHON" = 1 ]; then echo "Error: NO_PYTHON on $@"; exit 1; fi; \
-		$(call VERBOSE,"printgen $@",tools/generate-wire.py -s -P --page header $($@_args) $@ `basename $< .csv | sed 's/_exp_/_/'` < $< > $@ && $(call SHA256STAMP,//)); \
+		$(call VERBOSE,"printgen $@",tools/generate-wire.py -s -P --page header $($@_args) $@ `basename $< .csv | sed 's/_exp_/_/'` < $< > $@ && $(call SHA256STAMP,//,)); \
 	fi
 
 %_printgen.c: %_wire.csv $(WIRE_GEN_DEPS)
 	@if $(call SHA256STAMP_CHANGED); then  if [ "$$NO_PYTHON" = 1 ]; then echo "Error: NO_PYTHON on $@"; exit 1; fi; \
-		$(call VERBOSE,"printgen $@",tools/generate-wire.py -s -P --page impl $($@_args) ${@:.c=.h} `basename $< .csv | sed 's/_exp_/_/'` < $< > $@ && $(call SHA256STAMP,//)); \
+		$(call VERBOSE,"printgen $@",tools/generate-wire.py -s -P --page impl $($@_args) ${@:.c=.h} `basename $< .csv | sed 's/_exp_/_/'` < $< > $@ && $(call SHA256STAMP,//,)); \
 	fi
 
 include external/Makefile
@@ -535,11 +540,6 @@ ncc: ${TARGET_DIR}/libwally-core-build/src/libwallycore.la
 # Ignore test/ directories.
 TAGS:
 	$(RM) TAGS; find * -name test -type d -prune -o -name '*.[ch]' -print -o -name '*.py' -print | xargs etags --append
-
-ifneq ($(SUPPRESS_GENERATION),1)
-FORCE = FORCE
-FORCE::
-endif
 
 ccan/ccan/cdump/tools/cdump-enumstr: ccan/ccan/cdump/tools/cdump-enumstr.o $(CDUMP_OBJS) $(CCAN_OBJS)
 

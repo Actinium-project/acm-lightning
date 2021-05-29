@@ -246,6 +246,40 @@ def test_second_channel(node_factory):
     l1.fundchannel(l3, 10**6)
 
 
+def test_channel_abandon(node_factory, bitcoind):
+    """Our open tx isn't mined, we doublespend it away"""
+    l1, l2 = node_factory.get_nodes(2)
+
+    SATS = 10**6
+
+    # Add some for fees
+    l1.fundwallet(SATS + 10000)
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    l1.rpc.fundchannel(l2.info['id'], SATS, feerate='1875perkw')
+
+    opening_utxo = only_one([o for o in l1.rpc.listfunds()['outputs'] if o['reserved']])
+    psbt = l1.rpc.utxopsbt(0, "253perkw", 0, [opening_utxo['txid'] + ':' + str(opening_utxo['output'])], reserve=False, reservedok=True)['psbt']
+
+    # We expect a reservation for 2016 blocks; unreserve it.
+    reservations = only_one(l1.rpc.unreserveinputs(psbt, reserve=2015)['reservations'])
+    assert reservations['reserved']
+    assert reservations['reserved_to_block'] == bitcoind.rpc.getblockchaininfo()['blocks'] + 1
+
+    assert only_one(l1.rpc.unreserveinputs(psbt, reserve=1)['reservations'])['reserved'] is False
+
+    # Now it's unreserved, we can doublespend it (as long as we exceed
+    # previous fee to RBF!).
+    withdraw = l1.rpc.withdraw(l1.rpc.newaddr()['bech32'], "all")
+
+    assert bitcoind.rpc.decoderawtransaction(withdraw['tx'])['vout'][0]['value'] > SATS / 10**8
+    bitcoind.generate_block(1, wait_for_mempool=withdraw['txid'])
+
+    # FIXME: lightningd should notice channel will never now open!
+    print(l1.rpc.listpeers())
+    assert (only_one(only_one(l1.rpc.listpeers()['peers'])['channels'])['state']
+            == 'CHANNELD_AWAITING_LOCKIN')
+
+
 @pytest.mark.developer
 @pytest.mark.openchannel('v1')
 @pytest.mark.openchannel('v2')
@@ -2925,9 +2959,11 @@ def test_restart_many_payments(node_factory, bitcoind):
         # OK to use change from previous fundings
         l1.rpc.fundchannel(n.info['id'], 10**6, minconf=0)
 
-    # Now mine them, get scids.
-    bitcoind.generate_block(6, wait_for_mempool=num * 2)
+    # Now mine them, get scids; make sure they all see the first block
+    # otherwise they may complain about channel_announcement from the future.
+    bitcoind.generate_block(1, wait_for_mempool=num * 2)
     sync_blockheight(bitcoind, [l1] + nodes)
+    bitcoind.generate_block(5)
 
     wait_for(lambda: [only_one(n.rpc.listpeers()['peers'])['channels'][0]['state'] for n in nodes] == ['CHANNELD_NORMAL'] * len(nodes))
 

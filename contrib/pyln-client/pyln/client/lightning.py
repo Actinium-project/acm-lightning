@@ -349,6 +349,7 @@ class UnixDomainSocketRpc(object):
                     "enable": True
                 },
             })
+            # FIXME: Notification schema support?
             _, buf = self._readobj(sock, buf)
 
         request = {
@@ -1246,22 +1247,24 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("txsend", payload)
 
-    def reserveinputs(self, psbt, exclusive=True):
+    def reserveinputs(self, psbt, exclusive=True, reserve=None):
         """
         Reserve any inputs in this psbt.
         """
         payload = {
             "psbt": psbt,
             "exclusive": exclusive,
+            "reserve": reserve,
         }
         return self.call("reserveinputs", payload)
 
-    def unreserveinputs(self, psbt):
+    def unreserveinputs(self, psbt, reserve=None):
         """
         Unreserve (or reduce reservation) on any UTXOs in this psbt were previously reserved.
         """
         payload = {
             "psbt": psbt,
+            "reserve": reserve,
         }
         return self.call("unreserveinputs", payload)
 
@@ -1308,12 +1311,13 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("signpsbt", payload)
 
-    def sendpsbt(self, psbt):
+    def sendpsbt(self, psbt, reserve=None):
         """
         Finalize extract and broadcast a PSBT
         """
         payload = {
             "psbt": psbt,
+            "reserve": reserve,
         }
         return self.call("sendpsbt", payload)
 

@@ -2902,6 +2902,9 @@ def test_blockheight_disagreement(node_factory, bitcoind, executor):
     # Make sure l1 sends out the HTLC.
     l1.daemon.wait_for_logs([r'NEW:: HTLC LOCAL'])
 
+    height = bitcoind.rpc.getblockchaininfo()['blocks']
+    l1.daemon.wait_for_log('Remote node appears to be on a longer chain.*catch up to block {}'.format(height))
+
     # Unblock l1 from new blocks.
     l1.daemon.rpcproxy.mock_rpc('getblockhash', None)
 
@@ -4252,3 +4255,26 @@ def test_unreachable_routehint(node_factory, bitcoind):
     # both directly, and via the routehints we should now just have a
     # single attempt.
     assert(len(excinfo.value.error['attempts']) == 1)
+
+
+def test_routehint_tous(node_factory, bitcoind):
+    """
+Test bug where trying to pay an invoice from an *offline* node which
+gives a routehint straight to us causes an issue
+"""
+
+    # Existence of l1 makes l3 use l2 for routehint (otherwise it sees deadend)
+    l1, l2 = node_factory.line_graph(2, wait_for_announce=True)
+    l3 = node_factory.get_node()
+    l3.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    scid23, _ = l2.fundchannel(l3, 1000000, announce_channel=False)
+    # Make sure l3 sees l1->l2 channel.
+    wait_for(lambda: l3.rpc.listnodes(l1.info['id'])['nodes'] != [])
+
+    inv = l3.rpc.invoice(10, "test", "test")['bolt11']
+    decoded = l3.rpc.decodepay(inv)
+    assert(only_one(only_one(decoded['routes']))['short_channel_id'] == scid23)
+
+    l3.stop()
+    with pytest.raises(RpcError, match=r'Destination .* is not reachable directly and all routehints were unusable'):
+        l2.rpc.pay(inv)
