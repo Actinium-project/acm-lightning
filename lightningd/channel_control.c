@@ -275,12 +275,6 @@ void channel_fallen_behind(struct channel *channel, const u8 *msg)
 	 * use its presence as a flag so set it any valid key in that case. */
 	if (!channel->future_per_commitment_point) {
 		struct pubkey *any = tal(channel, struct pubkey);
-		if (!channel->option_static_remotekey) {
-			channel_internal_error(channel,
-					       "bad channel_fail_fallen_behind %s",
-					       tal_hex(tmpctx, msg));
-			return;
-		}
 		if (!pubkey_from_node_id(any, &channel->peer->ld->id))
 			fatal("Our own id invalid?");
 		channel->future_per_commitment_point = any;
@@ -376,6 +370,29 @@ void forget_channel(struct channel *channel, const char *why)
 		forget(channel);
 }
 
+#if EXPERIMENTAL_FEATURES
+static void handle_channel_upgrade(struct channel *channel,
+				   const u8 *msg)
+{
+	bool option_static_remotekey;
+
+	if (!fromwire_channeld_upgraded(msg, &option_static_remotekey)) {
+		channel_internal_error(channel, "bad handle_channel_upgrade: %s",
+				       tal_hex(tmpctx, msg));
+		return;
+	}
+
+	channel->static_remotekey_start[LOCAL] = channel->next_index[LOCAL];
+	channel->static_remotekey_start[REMOTE] = channel->next_index[REMOTE];
+	log_debug(channel->log,
+		  "option_static_remotekey enabled at %"PRIu64"/%"PRIu64,
+		  channel->static_remotekey_start[LOCAL],
+		  channel->static_remotekey_start[REMOTE]);
+
+	wallet_channel_save(channel->peer->ld->wallet, channel);
+}
+#endif /* EXPERIMENTAL_FEATURES */
+
 static unsigned channel_msg(struct subd *sd, const u8 *msg, const int *fds)
 {
 	enum channeld_wire t = fromwire_peektype(msg);
@@ -411,6 +428,13 @@ static unsigned channel_msg(struct subd *sd, const u8 *msg, const int *fds)
 	case WIRE_CHANNELD_SEND_ERROR_REPLY:
 		handle_error_channel(sd->channel, msg);
 		break;
+#if EXPERIMENTAL_FEATURES
+	case WIRE_CHANNELD_UPGRADED:
+		handle_channel_upgrade(sd->channel, msg);
+		break;
+#else
+	case WIRE_CHANNELD_UPGRADED:
+#endif
 	/* And we never get these from channeld. */
 	case WIRE_CHANNELD_INIT:
 	case WIRE_CHANNELD_FUNDING_DEPTH:
@@ -425,11 +449,13 @@ static unsigned channel_msg(struct subd *sd, const u8 *msg, const int *fds)
 	case WIRE_CHANNELD_FEERATES:
 	case WIRE_CHANNELD_SPECIFIC_FEERATES:
 	case WIRE_CHANNELD_DEV_MEMLEAK:
+	case WIRE_CHANNELD_DEV_QUIESCE:
 		/* Replies go to requests. */
 	case WIRE_CHANNELD_OFFER_HTLC_REPLY:
 	case WIRE_CHANNELD_DEV_REENABLE_COMMIT_REPLY:
 	case WIRE_CHANNELD_DEV_MEMLEAK_REPLY:
 	case WIRE_CHANNELD_SEND_ERROR:
+	case WIRE_CHANNELD_DEV_QUIESCE_REPLY:
 		break;
 	}
 
@@ -606,7 +632,7 @@ void peer_start_channeld(struct channel *channel,
 				      remote_ann_bitcoin_sig,
 				      /* Set at channel open, even if not
 				       * negotiated now! */
-				      channel->option_static_remotekey,
+				      channel->next_index[LOCAL] >= channel->static_remotekey_start[LOCAL],
 				      channel->option_anchor_outputs,
 				      IFDEV(ld->dev_fast_gossip, false),
 				      IFDEV(dev_fail_process_onionpacket, false),
@@ -937,4 +963,54 @@ static const struct json_command dev_feerate_command = {
 	"Set feerate for {id} to {feerate}"
 };
 AUTODATA(json_command, &dev_feerate_command);
+
+#if EXPERIMENTAL_FEATURES
+static void quiesce_reply(struct subd *channeld UNUSED,
+			  const u8 *reply,
+			  const int *fds UNUSED,
+			  struct command *cmd)
+{
+	struct json_stream *response;
+
+	response = json_stream_success(cmd);
+	was_pending(command_success(cmd, response));
+}
+
+static struct command_result *json_dev_quiesce(struct command *cmd,
+					       const char *buffer,
+					       const jsmntok_t *obj UNNEEDED,
+					       const jsmntok_t *params)
+{
+	struct node_id *id;
+	struct peer *peer;
+	struct channel *channel;
+	const u8 *msg;
+
+	if (!param(cmd, buffer, params,
+		   p_req("id", param_node_id, &id),
+		   NULL))
+		return command_param_failed();
+
+	peer = peer_by_id(cmd->ld, id);
+	if (!peer)
+		return command_fail(cmd, LIGHTNINGD, "Peer not connected");
+
+	channel = peer_active_channel(peer);
+	if (!channel || !channel->owner || channel->state != CHANNELD_NORMAL)
+		return command_fail(cmd, LIGHTNINGD, "Peer bad state");
+
+	msg = towire_channeld_dev_quiesce(NULL);
+	subd_req(channel->owner, channel->owner, take(msg), -1, 0,
+		 quiesce_reply, cmd);
+	return command_still_pending(cmd);
+}
+
+static const struct json_command dev_quiesce_command = {
+	"dev-quiesce",
+	"developer",
+	json_dev_quiesce,
+	"Initiate quiscence protocol with peer"
+};
+AUTODATA(json_command, &dev_quiesce_command);
+#endif /* EXPERIMENTAL_FEATURES */
 #endif /* DEVELOPER */

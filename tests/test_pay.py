@@ -4,7 +4,7 @@ from fixtures import TEST_NETWORK
 from flaky import flaky  # noqa: F401
 from pyln.client import RpcError, Millisatoshi
 from pyln.proto.onion import TlvPayload
-from pyln.testing.utils import EXPERIMENTAL_DUAL_FUND
+from pyln.testing.utils import EXPERIMENTAL_DUAL_FUND, FUNDAMOUNT
 from utils import (
     DEVELOPER, wait_for, only_one, sync_blockheight, TIMEOUT,
     EXPERIMENTAL_FEATURES, env, VALGRIND
@@ -3498,6 +3498,20 @@ def test_listpays_ongoing_attempt(node_factory, bitcoind, executor):
     l1.rpc.listpays()
 
 
+def test_listsendpays_and_listpays_order(node_factory):
+    """listsendpays should be in increasing id order, listpays in created_at"""
+    l1, l2 = node_factory.line_graph(2)
+    for i in range(5):
+        inv = l2.rpc.invoice(1000 - i, "test {}".format(i), "test")['bolt11']
+        l1.rpc.pay(inv)
+
+    ids = [p['id'] for p in l1.rpc.listsendpays()['payments']]
+    assert ids == sorted(ids)
+
+    created_at = [p['created_at'] for p in l1.rpc.listpays()['pays']]
+    assert created_at == sorted(created_at)
+
+
 @pytest.mark.developer("needs use_shadow")
 def test_mpp_waitblockheight_routehint_conflict(node_factory, bitcoind, executor):
     '''
@@ -4278,3 +4292,15 @@ gives a routehint straight to us causes an issue
     l3.stop()
     with pytest.raises(RpcError, match=r'Destination .* is not reachable directly and all routehints were unusable'):
         l2.rpc.pay(inv)
+
+
+def test_pay_low_max_htlcs(node_factory):
+    """Test we can pay if *any* HTLC slots are available"""
+
+    l1, l2, l3 = node_factory.line_graph(3,
+                                         opts={'max-concurrent-htlcs': 1},
+                                         wait_for_announce=True)
+    l1.rpc.pay(l3.rpc.invoice(FUNDAMOUNT * 50, "test", "test")['bolt11'])
+    l1.daemon.wait_for_log(
+        r'Number of pre-split HTLCs \([0-9]+\) exceeds our HTLC budget \([0-9]+\), skipping pre-splitter'
+    )

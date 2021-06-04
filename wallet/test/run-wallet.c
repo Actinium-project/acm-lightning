@@ -641,8 +641,7 @@ void peer_memleak_done(struct command *cmd UNNEEDED, struct subd *leaker UNNEEDE
 /* Generated stub for peer_restart_dualopend */
 void peer_restart_dualopend(struct peer *peer UNNEEDED,
 			    struct per_peer_state *pps UNNEEDED,
-			    struct channel *channel UNNEEDED,
-			    const u8 *send_msg UNNEEDED)
+			    struct channel *channel UNNEEDED)
 { fprintf(stderr, "peer_restart_dualopend called!\n"); abort(); }
 /* Generated stub for peer_start_channeld */
 void peer_start_channeld(struct channel *channel UNNEEDED,
@@ -657,14 +656,11 @@ void peer_start_closingd(struct channel *channel UNNEEDED,
 			 const u8 *channel_reestablish UNNEEDED)
 { fprintf(stderr, "peer_start_closingd called!\n"); abort(); }
 /* Generated stub for peer_start_dualopend */
-void peer_start_dualopend(struct peer *peer UNNEEDED,
-			  struct per_peer_state *pps UNNEEDED,
-			  const u8 *send_msg UNNEEDED)
+void peer_start_dualopend(struct peer *peer UNNEEDED, struct per_peer_state *pps UNNEEDED)
 { fprintf(stderr, "peer_start_dualopend called!\n"); abort(); }
 /* Generated stub for peer_start_openingd */
 void peer_start_openingd(struct peer *peer UNNEEDED,
-			 struct per_peer_state *pps UNNEEDED,
-			 const u8 *msg UNNEEDED)
+			 struct per_peer_state *pps UNNEEDED)
 { fprintf(stderr, "peer_start_openingd called!\n"); abort(); }
 /* Generated stub for peer_wire_is_defined */
 bool peer_wire_is_defined(u16 type UNNEEDED)
@@ -706,6 +702,9 @@ void subd_req_(const tal_t *ctx UNNEEDED,
 	       void (*replycb)(struct subd * UNNEEDED, const u8 * UNNEEDED, const int * UNNEEDED, void *) UNNEEDED,
 	       void *replycb_data UNNEEDED)
 { fprintf(stderr, "subd_req_ called!\n"); abort(); }
+/* Generated stub for subd_send_fd */
+void subd_send_fd(struct subd *sd UNNEEDED, int fd UNNEEDED)
+{ fprintf(stderr, "subd_send_fd called!\n"); abort(); }
 /* Generated stub for subd_send_msg */
 void subd_send_msg(struct subd *sd UNNEEDED, const u8 *msg_out UNNEEDED)
 { fprintf(stderr, "subd_send_msg called!\n"); abort(); }
@@ -760,6 +759,9 @@ u8 *towire_connectd_connect_to_peer(const tal_t *ctx UNNEEDED, const struct node
 /* Generated stub for towire_connectd_peer_disconnected */
 u8 *towire_connectd_peer_disconnected(const tal_t *ctx UNNEEDED, const struct node_id *id UNNEEDED)
 { fprintf(stderr, "towire_connectd_peer_disconnected called!\n"); abort(); }
+/* Generated stub for towire_connectd_peer_final_msg */
+u8 *towire_connectd_peer_final_msg(const tal_t *ctx UNNEEDED, const struct node_id *id UNNEEDED, const struct per_peer_state *pps UNNEEDED, const u8 *msg UNNEEDED)
+{ fprintf(stderr, "towire_connectd_peer_final_msg called!\n"); abort(); }
 /* Generated stub for towire_custommsg_out */
 u8 *towire_custommsg_out(const tal_t *ctx UNNEEDED, const u8 *msg UNNEEDED)
 { fprintf(stderr, "towire_custommsg_out called!\n"); abort(); }
@@ -1519,7 +1521,7 @@ static bool test_channel_inflight_crud(struct lightningd *ld, const tal_t *ctx)
 			   &txid, 1,
 			   funding_sats, AMOUNT_MSAT(0),
 			   our_sats,
-			   false, false,
+			   0, false,
 			   &cid,
 			   AMOUNT_MSAT(3333333000),
 			   AMOUNT_MSAT(33333),
@@ -1538,7 +1540,7 @@ static bool test_channel_inflight_crud(struct lightningd *ld, const tal_t *ctx)
 			   &basepoints,
 			   &pk, NULL,
 			   1000, 100,
-			   NULL, true, true,
+			   NULL, 0, 0, true,
 			   LOCAL, REASON_UNKNOWN, NULL);
 	db_begin_transaction(w->db);
 	CHECK(!wallet_err);

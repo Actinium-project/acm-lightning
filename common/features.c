@@ -476,6 +476,20 @@ u8 *featurebits_or(const tal_t *ctx, const u8 *f1 TAKES, const u8 *f2 TAKES)
 	return result;
 }
 
+bool featurebits_eq(const u8 *f1, const u8 *f2)
+{
+	size_t len = tal_bytelen(f1);
+
+	if (tal_bytelen(f2) > len)
+		len = tal_bytelen(f2);
+
+	for (size_t i = 0; i < len * 8; i++) {
+		if (feature_is_set(f1, i) != feature_is_set(f2, i))
+			return false;
+	}
+	return true;
+}
+
 struct feature_set *fromwire_feature_set(const tal_t *ctx,
 					 const u8 **cursor, size_t *max)
 {
@@ -496,4 +510,19 @@ void towire_feature_set(u8 **pptr, const struct feature_set *fset)
 		towire_u16(pptr, tal_bytelen(fset->bits[i]));
 		towire_u8_array(pptr, fset->bits[i], tal_bytelen(fset->bits[i]));
 	}
+}
+
+const char *fmt_featurebits(const tal_t *ctx, const u8 *featurebits)
+{
+	size_t size = tal_count(featurebits);
+	char *fmt = tal_strdup(ctx, "");
+	const char *prefix = "";
+
+	for (size_t i = 0; i < size * 8; i++) {
+		if (feature_is_set(featurebits, i)) {
+			tal_append_fmt(&fmt, "%s%zu", prefix, i);
+			prefix = ",";
+		}
+	}
+	return fmt;
 }

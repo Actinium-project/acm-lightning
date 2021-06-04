@@ -103,7 +103,7 @@ wallet_commit_channel(struct lightningd *ld,
 	struct amount_msat our_msat;
 	struct amount_sat local_funding;
 	s64 final_key_idx;
-	bool option_static_remotekey;
+	u64 static_remotekey_start;
 	bool option_anchor_outputs;
 
 	/* We cannot both be the fundee *and* have a `fundchannel_start`
@@ -153,10 +153,13 @@ wallet_commit_channel(struct lightningd *ld,
 	 *        transactions
 	 */
 	/* i.e. We set it now for the channel permanently. */
-	option_static_remotekey
-		= feature_negotiated(ld->our_features,
-				     uc->peer->their_features,
-				     OPT_STATIC_REMOTEKEY);
+	if (feature_negotiated(ld->our_features,
+			       uc->peer->their_features,
+			       OPT_STATIC_REMOTEKEY))
+		static_remotekey_start = 0;
+	else
+		static_remotekey_start = 0x7FFFFFFFFFFFFFFF;
+
 	option_anchor_outputs
 		= feature_negotiated(ld->our_features,
 				     uc->peer->their_features,
@@ -209,7 +212,7 @@ wallet_commit_channel(struct lightningd *ld,
 			      ld->config.fee_base,
 			      ld->config.fee_per_satoshi,
 			      remote_upfront_shutdown_script,
-			      option_static_remotekey,
+			      static_remotekey_start, static_remotekey_start,
 			      option_anchor_outputs,
 			      NUM_SIDES, /* closer not yet known */
 			      uc->fc ? REASON_USER : REASON_REMOTE,
@@ -876,9 +879,7 @@ static unsigned int openingd_msg(struct subd *openingd,
 	return 0;
 }
 
-void peer_start_openingd(struct peer *peer,
-			 struct per_peer_state *pps,
-			 const u8 *send_msg)
+void peer_start_openingd(struct peer *peer, struct per_peer_state *pps)
 {
 	int hsmfd;
 	u32 max_to_self_delay;
@@ -944,7 +945,6 @@ void peer_start_openingd(struct peer *peer,
 				  feature_negotiated(peer->ld->our_features,
 						     peer->their_features,
 						     OPT_ANCHOR_OUTPUTS),
-				  send_msg,
 				  IFDEV(peer->ld->dev_force_tmp_channel_id, NULL),
 				  IFDEV(peer->ld->dev_fast_gossip, false));
 	subd_send_msg(uc->open_daemon, take(msg));
@@ -1177,6 +1177,15 @@ static struct command_result *json_fundchannel_start(struct command *cmd,
 	}
 
 	if (!peer->uncommitted_channel) {
+		if (feature_negotiated(cmd->ld->our_features,
+				       peer->their_features,
+				       OPT_DUAL_FUND))
+			return command_fail(cmd, FUNDING_STATE_INVALID,
+					    "Peer negotiated"
+					    " `option_dual_fund`,"
+					    " must use `openchannel_init` not"
+					    " `fundchannel_start`.");
+
 		return command_fail(cmd, FUNDING_PEER_NOT_CONNECTED,
 				    "Peer not connected");
 	}

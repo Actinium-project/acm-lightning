@@ -3463,11 +3463,218 @@ def test_openchannel_init_alternate(node_factory, executor):
 
     psbt1 = l1.rpc.fundpsbt('1000000msat', '253perkw', 250)['psbt']
     psbt2 = l2.rpc.fundpsbt('1000000msat', '253perkw', 250)['psbt']
-    l1.rpc.openchannel_init(l2.info['id'], 100000, psbt1)
+    init = l1.rpc.openchannel_init(l2.info['id'], 100000, psbt1)
 
     fut = executor.submit(l2.rpc.openchannel_init, l1.info['id'], '1000000msat', psbt2)
     with pytest.raises(RpcError):
         fut.result(10)
+
+    # FIXME: Clean up so it doesn't hang. Ok if these fail.
+    for node in [l1, l2]:
+        try:
+            node.rpc.openchannel_abort(init['channel_id'])
+        except RpcError:
+            # Ignoring all errors
+            print("nothing to do")
+
+
+@unittest.skipIf(not EXPERIMENTAL_FEATURES, "upgrade protocol not available")
+@pytest.mark.developer("dev-force-features required")
+def test_upgrade_statickey(node_factory, executor):
+    """l1 doesn't have option_static_remotekey, l2 offers it."""
+    l1, l2 = node_factory.line_graph(2, opts=[{'may_reconnect': True,
+                                               'dev-force-features': ["-13", "-21"]},
+                                              {'may_reconnect': True}])
+
+    l1.rpc.disconnect(l2.info['id'], force=True)
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+
+    l1.daemon.wait_for_logs([r"They sent current_type \[\]",
+                             r"They offered upgrade to \[13\]"])
+    l2.daemon.wait_for_log(r"They sent desired_type \[13\]")
+
+    l1.daemon.wait_for_log('option_static_remotekey enabled at 1/1')
+    l2.daemon.wait_for_log('option_static_remotekey enabled at 1/1')
+
+    # Make sure it's committed to db!
+    wait_for(lambda: l1.db_query('SELECT local_static_remotekey_start, remote_static_remotekey_start FROM channels;') == [{'local_static_remotekey_start': 1, 'remote_static_remotekey_start': 1}])
+
+    # They will consider themselves upgraded.
+    l1.rpc.disconnect(l2.info['id'], force=True)
+    # They won't offer upgrade!
+    assert not l1.daemon.is_in_log("They offered upgrade",
+                                   start=l1.daemon.logsearch_start)
+    l1.daemon.wait_for_log(r"They sent current_type \[13\]")
+    l2.daemon.wait_for_log(r"They sent desired_type \[13\]")
+
+
+@unittest.skipIf(not EXPERIMENTAL_FEATURES, "upgrade protocol not available")
+@pytest.mark.developer("dev-force-features required")
+def test_upgrade_statickey_onchaind(node_factory, executor, bitcoind):
+    """We test penalty before/after, and unilateral before/after"""
+    l1, l2 = node_factory.line_graph(2, opts=[{'may_reconnect': True,
+                                               'dev-force-features': ["-13", "-21"],
+                                               # We try to cheat!
+                                               'allow_broken_log': True},
+                                              {'may_reconnect': True}])
+
+    # TEST 1: Cheat from pre-upgrade.
+    tx = l1.rpc.dev_sign_last_tx(l2.info['id'])['tx']
+
+    l1.rpc.disconnect(l2.info['id'], force=True)
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    l1.daemon.wait_for_log('option_static_remotekey enabled at 1/1')
+
+    # Pre-statickey penalty works.
+    bitcoind.rpc.sendrawtransaction(tx)
+    bitcoind.generate_block(1)
+
+    l2.wait_for_onchaind_broadcast('OUR_PENALTY_TX',
+                                   'THEIR_REVOKED_UNILATERAL/DELAYED_CHEAT_OUTPUT_TO_THEM')
+    bitcoind.generate_block(100)
+    wait_for(lambda: len(l2.rpc.listpeers()['peers']) == 0)
+
+    # TEST 2: Cheat from post-upgrade.
+    node_factory.join_nodes([l1, l2])
+    l1.rpc.disconnect(l2.info['id'], force=True)
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+
+    l1.daemon.wait_for_log('option_static_remotekey enabled at 1/1')
+    l2.daemon.wait_for_log('option_static_remotekey enabled at 1/1')
+
+    l1.pay(l2, 1000000)
+
+    # We will try to cheat later.
+    tx = l1.rpc.dev_sign_last_tx(l2.info['id'])['tx']
+
+    l1.pay(l2, 1000000)
+
+    # Pre-statickey penalty works.
+    bitcoind.rpc.sendrawtransaction(tx)
+    bitcoind.generate_block(1)
+
+    l2.wait_for_onchaind_broadcast('OUR_PENALTY_TX',
+                                   'THEIR_REVOKED_UNILATERAL/DELAYED_CHEAT_OUTPUT_TO_THEM')
+    bitcoind.generate_block(100)
+    wait_for(lambda: len(l2.rpc.listpeers()['peers']) == 0)
+
+    # TEST 3: Unilateral close from pre-upgrade
+    node_factory.join_nodes([l1, l2])
+
+    # Give them both something for onchain close.
+    l1.pay(l2, 1000000)
+
+    # Make sure it's completely quiescent.
+    l1.daemon.wait_for_log("chan#3: Removing out HTLC 0 state RCVD_REMOVE_ACK_REVOCATION FULFILLED")
+
+    l1.rpc.disconnect(l2.info['id'], force=True)
+    l1.daemon.wait_for_log('option_static_remotekey enabled at 3/3')
+
+    # But this is the *pre*-update commit tx!
+    l2.stop()
+    l1.rpc.close(l2.info['id'], unilateraltimeout=1)
+    bitcoind.generate_block(1, wait_for_mempool=1)
+    l2.start()
+
+    # They should both handle it fine.
+    l1.daemon.wait_for_log('Propose handling OUR_UNILATERAL/DELAYED_OUTPUT_TO_US by OUR_DELAYED_RETURN_TO_WALLET .* after 5 blocks')
+    l2.daemon.wait_for_logs(['Ignoring output .*: THEIR_UNILATERAL/OUTPUT_TO_US',
+                             'Ignoring output .*: THEIR_UNILATERAL/DELAYED_OUTPUT_TO_THEM'])
+    bitcoind.generate_block(5)
+    bitcoind.generate_block(100, wait_for_mempool=1)
+
+    wait_for(lambda: len(l2.rpc.listpeers()['peers']) == 0)
+
+    # TEST 4: Unilateral close from post-upgrade
+    node_factory.join_nodes([l1, l2])
+
+    l1.rpc.disconnect(l2.info['id'], force=True)
+    l1.daemon.wait_for_log('option_static_remotekey enabled at 1/1')
+
+    # Move to static_remotekey.
+    l1.pay(l2, 1000000)
+
+    l2.stop()
+    l1.rpc.close(l2.info['id'], unilateraltimeout=1)
+    bitcoind.generate_block(1, wait_for_mempool=1)
+    l2.start()
+
+    # They should both handle it fine.
+    l1.daemon.wait_for_log('Propose handling OUR_UNILATERAL/DELAYED_OUTPUT_TO_US by OUR_DELAYED_RETURN_TO_WALLET .* after 5 blocks')
+    l2.daemon.wait_for_logs(['Ignoring output .*: THEIR_UNILATERAL/OUTPUT_TO_US',
+                             'Ignoring output .*: THEIR_UNILATERAL/DELAYED_OUTPUT_TO_THEM'])
+
+    bitcoind.generate_block(5)
+    bitcoind.generate_block(100, wait_for_mempool=1)
+
+    wait_for(lambda: len(l2.rpc.listpeers()['peers']) == 0)
+
+
+@unittest.skipIf(not EXPERIMENTAL_FEATURES, "upgrade protocol not available")
+@pytest.mark.developer("dev-force-features, dev-disconnect required")
+def test_upgrade_statickey_fail(node_factory, executor, bitcoind):
+    """We reconnect at all points during retransmit, and we won't upgrade."""
+    l1_disconnects = ['-WIRE_COMMITMENT_SIGNED',
+                      '-WIRE_REVOKE_AND_ACK']
+    l2_disconnects = ['-WIRE_REVOKE_AND_ACK',
+                      '-WIRE_COMMITMENT_SIGNED',
+                      '=WIRE_UPDATE_FAIL_HTLC-nocommit']
+
+    l1, l2 = node_factory.line_graph(2, opts=[{'may_reconnect': True,
+                                               'dev-no-reconnect': None,
+                                               'disconnect': l1_disconnects,
+                                               'dev-force-features': ["-13", "-21"],
+                                               # Don't have feerate changes!
+                                               'feerates': (7500, 7500, 7500, 7500)},
+                                              {'may_reconnect': True,
+                                               'dev-no-reconnect': None,
+                                               'disconnect': l2_disconnects}])
+
+    # This HTLC will fail
+    l1.rpc.sendpay([{'msatoshi': 1000, 'id': l2.info['id'], 'delay': 5, 'channel': '1x1x1'}], '00' * 32)
+
+    # Each one should cause one disconnection, no upgrade.
+    for d in l1_disconnects + l2_disconnects[:-1]:
+        l1.daemon.wait_for_log('Peer connection lost')
+        l2.daemon.wait_for_log('Peer connection lost')
+        assert not l1.daemon.is_in_log('option_static_remotekey enabled')
+        assert not l2.daemon.is_in_log('option_static_remotekey enabled')
+        l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+
+    # On the last reconnect, it retransmitted revoke_and_ack.
+    l1.daemon.wait_for_log('No upgrade: we retransmitted')
+    l2.daemon.wait_for_log('No upgrade: pending changes')
+
+    # Now when we reconnect, despite having an HTLC, we're quiescent.
+    l1.rpc.disconnect(l2.info['id'], force=True)
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+
+    l1.daemon.wait_for_log('option_static_remotekey enabled at 2/2')
+    l2.daemon.wait_for_log('option_static_remotekey enabled at 2/2')
+
+
+@unittest.skipIf(not EXPERIMENTAL_FEATURES, "quiescence is experimental")
+@pytest.mark.developer("quiescence triggering is dev only")
+def test_quiescence(node_factory, executor):
+    l1, l2 = node_factory.line_graph(2)
+
+    # Works fine.
+    l1.pay(l2, 1000)
+
+    assert l1.rpc.call('dev-quiesce', [l2.info['id']]) == {}
+
+    # Both should consider themselves quiescent.
+    l1.daemon.wait_for_log("STFU complete: we are quiescent")
+    l2.daemon.wait_for_log("STFU complete: we are quiescent")
+
+    # Should not be able to increase fees.
+    l1.rpc.call('dev-feerate', [l2.info['id'], 9999])
+
+    try:
+        l1.daemon.wait_for_log('peer_out WIRE_UPDATE_FEE', 5)
+        assert False
+    except TimeoutError:
+        pass
 
 
 def test_htlc_failed_noclose(node_factory):

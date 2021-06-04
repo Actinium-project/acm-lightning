@@ -84,8 +84,8 @@ static struct amount_msat our_msat;
 /* Needed for anchor outputs */
 static struct pubkey funding_pubkey[NUM_SIDES];
 
-/* Does option_static_remotekey apply to this commitment tx? */
-static bool option_static_remotekey;
+/* At what commit number does option_static_remotekey apply? */
+static u64 static_remotekey_start[NUM_SIDES];
 
 /* Does option_anchor_outputs apply to this commitment tx? */
 static bool option_anchor_outputs;
@@ -2615,7 +2615,7 @@ static void handle_our_unilateral(const struct tx_parts *tx,
 	if (!derive_keyset(&local_per_commitment_point,
 			   &basepoints[LOCAL],
 			   &basepoints[REMOTE],
-			   option_static_remotekey,
+			   commit_num >= static_remotekey_start[LOCAL],
 			   ks))
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Deriving keyset for %"PRIu64, commit_num);
@@ -3050,7 +3050,7 @@ static void handle_their_cheat(const struct tx_parts *tx,
 	if (!derive_keyset(remote_per_commitment_point,
 			   &basepoints[REMOTE],
 			   &basepoints[LOCAL],
-			   option_static_remotekey,
+			   commit_num >= static_remotekey_start[REMOTE],
 			   ks))
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Deriving keyset for %"PRIu64, commit_num);
@@ -3063,7 +3063,7 @@ static void handle_their_cheat(const struct tx_parts *tx,
 		     " other_payment_key: %s"
 		     " self_htlc_key: %s"
 		     " other_htlc_key: %s"
-		     " (option_static_remotekey = %i)",
+		     " (static_remotekey = %"PRIu64"/%"PRIu64")",
 		     commit_num,
 		     type_to_string(tmpctx, struct pubkey,
 				    &keyset->self_revocation_key),
@@ -3077,7 +3077,8 @@ static void handle_their_cheat(const struct tx_parts *tx,
 				    &keyset->self_htlc_key),
 		     type_to_string(tmpctx, struct pubkey,
 				    &keyset->other_htlc_key),
-		     option_static_remotekey);
+		     static_remotekey_start[LOCAL],
+		     static_remotekey_start[REMOTE]);
 
 	remote_wscript = to_self_wscript(tmpctx, to_self_delay[REMOTE], keyset);
 
@@ -3154,7 +3155,7 @@ static void handle_their_cheat(const struct tx_parts *tx,
 					      tx_blockheight,
 					      script[LOCAL],
 					      remote_per_commitment_point,
-					      option_static_remotekey);
+					      commit_num >= static_remotekey_start[REMOTE]);
 			script[LOCAL] = NULL;
 			add_amt(&total_outs, amt);
 			continue;
@@ -3206,10 +3207,10 @@ static void handle_their_cheat(const struct tx_parts *tx,
 		}
 
 		matches = match_htlc_output(tmpctx, tx->outputs[i], htlc_scripts);
-		if (tal_count(matches) == 0)
-			status_failed(STATUS_FAIL_INTERNAL_ERROR,
-				      "Could not find resolution for output %zu",
-				      i);
+		if (tal_count(matches) == 0) {
+			status_broken("Could not find resolution for output %zu: did *we* cheat?", i);
+			continue;
+		}
 
 		/* In this case, we don't care which HTLC we choose; so pick
 		   first one */
@@ -3334,7 +3335,7 @@ static void handle_their_unilateral(const struct tx_parts *tx,
 	if (!derive_keyset(remote_per_commitment_point,
 			   &basepoints[REMOTE],
 			   &basepoints[LOCAL],
-			   option_static_remotekey,
+			   commit_num >= static_remotekey_start[REMOTE],
 			   ks))
 		status_failed(STATUS_FAIL_INTERNAL_ERROR,
 			      "Deriving keyset for %"PRIu64, commit_num);
@@ -3434,7 +3435,7 @@ static void handle_their_unilateral(const struct tx_parts *tx,
 					      tx_blockheight,
 					      script[LOCAL],
 					      remote_per_commitment_point,
-					      option_static_remotekey);
+					      commit_num >= static_remotekey_start[REMOTE]);
 			script[LOCAL] = NULL;
 			add_amt(&our_outs, amt);
 			continue;
@@ -3585,7 +3586,6 @@ static void update_ledger_unknown(const struct bitcoin_txid *txid,
 
 static void handle_unknown_commitment(const struct tx_parts *tx,
 				      u32 tx_blockheight,
-				      u64 commit_num,
 				      const struct pubkey *possible_remote_per_commitment_point,
 				      const struct basepoints basepoints[NUM_SIDES],
 				      const struct htlc_stub *htlcs,
@@ -3594,79 +3594,86 @@ static void handle_unknown_commitment(const struct tx_parts *tx,
 				      bool is_replay)
 {
 	int to_us_output = -1;
-	u8 *local_script;
+	/* We have two possible local scripts, depending on options */
+	u8 *local_scripts[2];
 	struct amount_sat amt_salvaged = AMOUNT_SAT(0);
 
 	onchain_annotate_txin(&tx->txid, 0, TX_CHANNEL_UNILATERAL | TX_THEIRS);
 
 	resolved_by_other(outs[0], &tx->txid, UNKNOWN_UNILATERAL);
 
-	/* If they don't give us a per-commitment point and we rotate keys,
-	 * we're out of luck. */
-	if (!possible_remote_per_commitment_point
-	    && !option_static_remotekey) {
-		goto search_done;
-	}
-
-	if (!option_static_remotekey) {
+	/* This is the not-option_static_remotekey case, if we got a hint
+	 * from them about the per-commitment point */
+	if (possible_remote_per_commitment_point) {
 		struct keyset *ks = tal(tmpctx, struct keyset);
 		if (!derive_keyset(possible_remote_per_commitment_point,
 				   &basepoints[REMOTE],
 				   &basepoints[LOCAL],
-				   option_static_remotekey,
+				   false,
 				   ks))
 			status_failed(STATUS_FAIL_INTERNAL_ERROR,
 				      "Deriving keyset for possible_remote_per_commitment_point %s",
 				      type_to_string(tmpctx, struct pubkey,
 						     possible_remote_per_commitment_point));
 
-		local_script = scriptpubkey_p2wpkh(tmpctx,
-						   &ks->other_payment_key);
+		local_scripts[0] = scriptpubkey_p2wpkh(tmpctx,
+						       &ks->other_payment_key);
 	} else {
-		local_script = scriptpubkey_to_remote(tmpctx,
-						      &basepoints[LOCAL].payment);
+		local_scripts[0] = NULL;
 	}
+
+	/* Other possible local script is for option_static_remotekey */
+	local_scripts[1] = scriptpubkey_to_remote(tmpctx,
+						  &basepoints[LOCAL].payment);
 
 	for (size_t i = 0; i < tal_count(tx->outputs); i++) {
 		struct tracked_output *out;
 		struct amount_asset asset = wally_tx_output_get_amount(tx->outputs[i]);
 		struct amount_sat amt;
+		int which_script;
+
 		assert(amount_asset_is_main(&asset));
 		amt = amount_asset_to_sat(&asset);
 
-		if (local_script
-		    && wally_tx_output_scripteq(tx->outputs[i],
-						local_script)) {
-			/* BOLT #5:
-			 *
-			 * - MAY take no action in regard to the associated
-			 *   `to_remote`, which is simply a P2WPKH output to
-			 *   the *local node*.
-			 *   - Note: `to_remote` is considered *resolved* by the
-			 *     commitment transaction itself.
-			 */
-			out = new_tracked_output(&outs, &tx->txid, tx_blockheight,
-						 UNKNOWN_UNILATERAL,
-						 i, amt,
-						 OUTPUT_TO_US, NULL, NULL, NULL);
-			ignore_output(out);
+		/* Elements can have empty output scripts (fee output) */
+		if (local_scripts[0]
+		    && wally_tx_output_scripteq(tx->outputs[i], local_scripts[0]))
+			which_script = 0;
+		else if (local_scripts[1]
+			 && wally_tx_output_scripteq(tx->outputs[i],
+						     local_scripts[1]))
+			which_script = 1;
+		else
+			continue;
 
-			if (!is_replay)
-				record_channel_withdrawal(&tx->txid, tx_blockheight, out);
+		/* BOLT #5:
+		 *
+		 * - MAY take no action in regard to the associated
+		 *   `to_remote`, which is simply a P2WPKH output to
+		 *   the *local node*.
+		 *   - Note: `to_remote` is considered *resolved* by the
+		 *     commitment transaction itself.
+		 */
+		out = new_tracked_output(&outs, &tx->txid, tx_blockheight,
+					 UNKNOWN_UNILATERAL,
+					 i, amt,
+					 OUTPUT_TO_US, NULL, NULL, NULL);
+		ignore_output(out);
 
-			add_amt(&amt_salvaged, amt);
+		if (!is_replay)
+			record_channel_withdrawal(&tx->txid, tx_blockheight, out);
 
-			tell_wallet_to_remote(tx, i,
-					      tx_blockheight,
-					      local_script,
-					      possible_remote_per_commitment_point,
-					      option_static_remotekey);
-			local_script = NULL;
-			to_us_output = i;
-		}
+		add_amt(&amt_salvaged, amt);
+
+		tell_wallet_to_remote(tx, i,
+				      tx_blockheight,
+				      local_scripts[which_script],
+				      possible_remote_per_commitment_point,
+				      which_script == 1);
+		local_scripts[0] = local_scripts[1] = NULL;
+		to_us_output = i;
 	}
 
-search_done:
 	if (to_us_output == -1) {
 		status_broken("FUNDS LOST.  Unknown commitment #%"PRIu64"!",
 			      commit_num);
@@ -3769,7 +3776,8 @@ int main(int argc, char *argv[])
 				   &possible_remote_per_commitment_point,
 				   &funding_pubkey[LOCAL],
 				   &funding_pubkey[REMOTE],
-				   &option_static_remotekey,
+				   &static_remotekey_start[LOCAL],
+				   &static_remotekey_start[REMOTE],
 				   &option_anchor_outputs,
 				   &open_is_replay,
 				   &min_relay_feerate)) {
@@ -3905,7 +3913,6 @@ int main(int argc, char *argv[])
 						open_is_replay);
 		} else {
 			handle_unknown_commitment(tx, tx_blockheight,
-						  commit_num,
 						  possible_remote_per_commitment_point,
 						  basepoints,
 						  htlcs,

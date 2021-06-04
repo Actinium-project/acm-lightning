@@ -140,4 +140,21 @@ struct bitcoin_tx *initial_channel_tx(const tal_t *ctx,
  */
 u32 channel_feerate(const struct channel *channel, enum side side);
 
+#if EXPERIMENTAL_FEATURES
+/* BOLT-upgrade_protocol #2:
+ * Channel features are explicitly enumerated as `channel_type` bitfields,
+ * using odd features bits.
+ */
+struct channel_type *channel_type(const tal_t *ctx,
+				  const struct channel *channel);
+
+/* What features can we upgrade?  (Returns NULL if none). */
+struct channel_type **channel_upgradable_types(const tal_t *ctx,
+					       const struct channel *channel);
+
+/* What features do we want? */
+struct channel_type *channel_desired_type(const tal_t *ctx,
+					  const struct channel *channel);
+#endif /* EXPERIMENTAL_FEATURES */
+
 #endif /* LIGHTNING_COMMON_INITIAL_CHANNEL_H */

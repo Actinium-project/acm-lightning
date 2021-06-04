@@ -569,8 +569,7 @@ struct channel *peer_normal_channel(struct peer *peer UNNEEDED)
 /* Generated stub for peer_restart_dualopend */
 void peer_restart_dualopend(struct peer *peer UNNEEDED,
 			    struct per_peer_state *pps UNNEEDED,
-			    struct channel *channel UNNEEDED,
-			    const u8 *send_msg UNNEEDED)
+			    struct channel *channel UNNEEDED)
 { fprintf(stderr, "peer_restart_dualopend called!\n"); abort(); }
 /* Generated stub for peer_start_channeld */
 void peer_start_channeld(struct channel *channel UNNEEDED,
@@ -585,14 +584,11 @@ void peer_start_closingd(struct channel *channel UNNEEDED,
 			 const u8 *channel_reestablish UNNEEDED)
 { fprintf(stderr, "peer_start_closingd called!\n"); abort(); }
 /* Generated stub for peer_start_dualopend */
-void peer_start_dualopend(struct peer *peer UNNEEDED,
-			  struct per_peer_state *pps UNNEEDED,
-			  const u8 *send_msg UNNEEDED)
+void peer_start_dualopend(struct peer *peer UNNEEDED, struct per_peer_state *pps UNNEEDED)
 { fprintf(stderr, "peer_start_dualopend called!\n"); abort(); }
 /* Generated stub for peer_start_openingd */
 void peer_start_openingd(struct peer *peer UNNEEDED,
-			 struct per_peer_state *pps UNNEEDED,
-			 const u8 *msg UNNEEDED)
+			 struct per_peer_state *pps UNNEEDED)
 { fprintf(stderr, "peer_start_openingd called!\n"); abort(); }
 /* Generated stub for peer_unsaved_channel */
 struct channel *peer_unsaved_channel(struct peer *peer UNNEEDED)
@@ -613,6 +609,9 @@ void subd_req_(const tal_t *ctx UNNEEDED,
 	       void (*replycb)(struct subd * UNNEEDED, const u8 * UNNEEDED, const int * UNNEEDED, void *) UNNEEDED,
 	       void *replycb_data UNNEEDED)
 { fprintf(stderr, "subd_req_ called!\n"); abort(); }
+/* Generated stub for subd_send_fd */
+void subd_send_fd(struct subd *sd UNNEEDED, int fd UNNEEDED)
+{ fprintf(stderr, "subd_send_fd called!\n"); abort(); }
 /* Generated stub for subd_send_msg */
 void subd_send_msg(struct subd *sd UNNEEDED, const u8 *msg_out UNNEEDED)
 { fprintf(stderr, "subd_send_msg called!\n"); abort(); }
@@ -637,6 +636,9 @@ u8 *towire_channeld_specific_feerates(const tal_t *ctx UNNEEDED, u32 feerate_bas
 /* Generated stub for towire_connectd_connect_to_peer */
 u8 *towire_connectd_connect_to_peer(const tal_t *ctx UNNEEDED, const struct node_id *id UNNEEDED, u32 seconds_waited UNNEEDED, const struct wireaddr_internal *addrhint UNNEEDED)
 { fprintf(stderr, "towire_connectd_connect_to_peer called!\n"); abort(); }
+/* Generated stub for towire_connectd_peer_final_msg */
+u8 *towire_connectd_peer_final_msg(const tal_t *ctx UNNEEDED, const struct node_id *id UNNEEDED, const struct per_peer_state *pps UNNEEDED, const u8 *msg UNNEEDED)
+{ fprintf(stderr, "towire_connectd_peer_final_msg called!\n"); abort(); }
 /* Generated stub for towire_dualopend_send_shutdown */
 u8 *towire_dualopend_send_shutdown(const tal_t *ctx UNNEEDED, const u8 *shutdown_scriptpubkey UNNEEDED)
 { fprintf(stderr, "towire_dualopend_send_shutdown called!\n"); abort(); }
