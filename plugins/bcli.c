@@ -763,7 +763,7 @@ static void parse_getnetworkinfo_result(struct plugin *p, const char *buf)
 {
 	const jsmntok_t *result;
 	bool tx_relay;
-	u32 min_version = 160000;
+	u32 min_version = 2000;
 	const char *err;
 
 	result = json_parse_simple(NULL, buf, strlen(buf));
