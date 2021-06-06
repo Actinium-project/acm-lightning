@@ -163,6 +163,9 @@ static void plugin_hook_callback(const char *buffer, const jsmntok_t *toks,
 	struct plugin_hook_call_link *last, *it;
 	bool in_transaction = false;
 
+	log_debug(r->ld->log, "Plugin %s returned from %s hook call",
+		  r->plugin->shortname, r->hook->name);
+
 	if (r->ld->state == LD_STATE_SHUTDOWN) {
 		log_debug(r->ld->log,
 			  "Abandoning plugin hook call due to shutdown");
@@ -227,12 +230,14 @@ static void plugin_hook_call_next(struct plugin_hook_request *ph_req)
 	assert(!list_empty(&ph_req->call_chain));
 	ph_req->plugin = list_top(&ph_req->call_chain, struct plugin_hook_call_link, list)->plugin;
 
+	log_debug(ph_req->ld->log, "Calling %s hook of plugin %s",
+		  ph_req->hook->name, ph_req->plugin->shortname);
 	req = jsonrpc_request_start(NULL, hook->name,
 				    plugin_get_log(ph_req->plugin),
 				    NULL,
 				    plugin_hook_callback, ph_req);
 
-	hook->serialize_payload(ph_req->cb_arg, req->stream);
+	hook->serialize_payload(ph_req->cb_arg, req->stream, ph_req->plugin);
 	jsonrpc_request_end(req);
 	plugin_request_send(ph_req->plugin, req);
 }

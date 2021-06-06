@@ -1011,11 +1011,18 @@ static bool htlc_accepted_hook_deserialize(struct htlc_accepted_hook_payload *re
 }
 
 static void htlc_accepted_hook_serialize(struct htlc_accepted_hook_payload *p,
-					 struct json_stream *s)
+					 struct json_stream *s,
+					 struct plugin *plugin)
 {
 	const struct route_step *rs = p->route_step;
-	const struct htlc_in *hin = p->hin;
+	struct htlc_in *hin = p->hin;
 	s32 expiry = hin->cltv_expiry, blockheight = p->ld->topology->tip->height;
+
+	tal_free(hin->status);
+	hin->status =
+	    tal_fmt(hin, "Waiting for the htlc_accepted hook of plugin %s",
+		    plugin->shortname);
+
 	json_object_start(s, "onion");
 
 	json_add_hex_talarr(s, "payload", rs->raw_payload);
@@ -1066,6 +1073,8 @@ htlc_accepted_hook_final(struct htlc_accepted_hook_payload *request STEALS)
 	struct route_step *rs = request->route_step;
 	struct htlc_in *hin = request->hin;
 	struct channel *channel = request->channel;
+
+	request->hin->status = tal_free(request->hin->status);
 
 	/* *Now* we barf if it failed to decode */
 	if (!request->payload) {
@@ -2034,7 +2043,8 @@ struct commitment_revocation_payload {
 };
 
 static void commitment_revocation_hook_serialize(
-    struct commitment_revocation_payload *payload, struct json_stream *stream)
+    struct commitment_revocation_payload *payload, struct json_stream *stream,
+    struct plugin *plugin)
 {
 	json_add_txid(stream, "commitment_txid", &payload->commitment_txid);
 	json_add_tx(stream, "penalty_tx", payload->penalty_tx);

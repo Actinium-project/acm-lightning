@@ -505,6 +505,8 @@ static void json_add_htlcs(struct lightningd *ld,
 				    channel->our_config.dust_limit, LOCAL,
 				    channel->option_anchor_outputs))
 			json_add_bool(response, "local_trimmed", true);
+		if (hin->status != NULL)
+			json_add_string(response, "status", hin->status);
 		json_object_end(response);
 	}
 
@@ -1039,7 +1041,7 @@ struct peer_connected_hook_payload {
 
 static void
 peer_connected_serialize(struct peer_connected_hook_payload *payload,
-			 struct json_stream *stream)
+			 struct json_stream *stream, struct plugin *plugin)
 {
 	const struct peer *p = payload->peer;
 	json_object_start(stream, "peer");
@@ -2782,7 +2784,8 @@ static void custommsg_final(struct custommsg_payload *payload STEALS)
 }
 
 static void custommsg_payload_serialize(struct custommsg_payload *payload,
-					struct json_stream *stream)
+					struct json_stream *stream,
+					struct plugin *plugin)
 {
 	/* Backward compat for broken custommsg: if we get a custommsg
 	 * from an old c-lightning node, then we must identify and
