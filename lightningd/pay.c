@@ -10,6 +10,7 @@
 #include <common/onion.h>
 #include <common/onionreply.h>
 #include <common/param.h>
+#include <common/route.h>
 #include <common/timeout.h>
 #include <gossipd/gossipd_wiregen.h>
 #include <lightningd/chaintopology.h>
@@ -1000,7 +1001,7 @@ send_payment_core(struct lightningd *ld,
 		return offer_err;
 
 	channel = active_channel_by_id(ld, &first_hop->node_id, NULL);
-	if (!channel) {
+	if (!channel || !channel_can_add_htlc(channel)) {
 		struct json_stream *data
 			= json_stream_fail(cmd, PAY_TRY_OTHER_ROUTE,
 					   "No connection to first "

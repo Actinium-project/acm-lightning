@@ -2740,3 +2740,59 @@ def test_shutdown_alternate_txid(node_factory, bitcoind):
 
     wait_for(lambda: l2.rpc.listpeers()['peers'] == [])
     wait_for(lambda: l1.rpc.listpeers()['peers'] == [])
+
+
+@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "Uses regtest addresses")
+@pytest.mark.developer("too slow without fast polling for blocks")
+def test_segwit_anyshutdown(node_factory, bitcoind, executor):
+    """Try a range of future segwit versions for shutdown"""
+    l1, l2 = node_factory.line_graph(2, fundchannel=False)
+
+    l1.fundwallet(10**7)
+
+    # Based on BIP-320, but all changed to regtest.
+    addrs = ("BCRT1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KYGT080",
+             "bcrt1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qzf4jry",
+             "bcrt1pw508d6qejxtdg4y5r3zarvary0c5xw7kw508d6qejxtdg4y5r3zarvary0c5xw7k0ylj56",
+             "BCRT1SW50QT2UWHA",
+             "bcrt1zw508d6qejxtdg4y5r3zarvaryv2wuatf",
+             "bcrt1qqqqqp399et2xygdj5xreqhjjvcmzhxw4aywxecjdzew6hylgvseswlauz7",
+             "bcrt1pqqqqp399et2xygdj5xreqhjjvcmzhxw4aywxecjdzew6hylgvsesyga46z",
+             "bcrt1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqc8gma6")
+
+    for addr in addrs:
+        l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+        l1.rpc.fundchannel(l2.info['id'], 10**6)
+        # If we don't actually make a payment, two of the above cases fail
+        # because the resulting tx is too small!  Balance channel so close
+        # has two outputs.
+        bitcoind.generate_block(1, wait_for_mempool=1)
+        wait_for(lambda: any([c['state'] == 'CHANNELD_NORMAL' for c in only_one(l1.rpc.listpeers()['peers'])['channels']]))
+        l1.pay(l2, 10**9 // 2)
+        l1.rpc.close(l2.info['id'], destination=addr)
+        bitcoind.generate_block(1, wait_for_mempool=1)
+        wait_for(lambda: all([c['state'] == 'ONCHAIN' for c in only_one(l1.rpc.listpeers()['peers'])['channels']]))
+
+
+@pytest.mark.developer("needs to manipulate features")
+@unittest.skipIf(TEST_NETWORK == 'liquid-regtest', "Uses regtest addresses")
+def test_anysegwit_close_needs_feature(node_factory, bitcoind):
+    """Rather than have peer reject our shutdown, we should refuse to shutdown toa v1+ address if they don't support it"""
+    # L2 says "no option_shutdown_anysegwit"
+    l1, l2 = node_factory.line_graph(2, opts=[{'may_reconnect': True},
+                                              {'may_reconnect': True,
+                                               'dev-force-features': -27}])
+
+    with pytest.raises(RpcError, match=r'Peer does not allow v1\+ shutdown addresses'):
+        l1.rpc.close(l2.info['id'], destination='bcrt1pw508d6qejxtdg4y5r3zarvary0c5xw7kw508d6qejxtdg4y5r3zarvary0c5xw7k0ylj56')
+
+    # From TFM: "Tell your friends to upgrade!"
+    l2.stop()
+    del l2.daemon.opts['dev-force-features']
+    l2.start()
+
+    # Now it will work!
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    l1.rpc.close(l2.info['id'], destination='bcrt1pw508d6qejxtdg4y5r3zarvary0c5xw7kw508d6qejxtdg4y5r3zarvary0c5xw7k0ylj56')
+    wait_for(lambda: only_one(only_one(l1.rpc.listpeers()['peers'])['channels'])['state'] == 'CLOSINGD_COMPLETE')
+    bitcoind.generate_block(1, wait_for_mempool=1)
