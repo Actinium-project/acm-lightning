@@ -315,12 +315,16 @@ static void peer_start_closingd_after_shutdown(struct channel *channel,
 	per_peer_state_set_fds_arr(pps, fds);
 
 	/* This sets channel->owner, closes down channeld. */
-	peer_start_closingd(channel, pps, false, NULL);
-	channel_set_state(channel,
-			  CHANNELD_SHUTTING_DOWN,
-			  CLOSINGD_SIGEXCHANGE,
-			  REASON_UNKNOWN,
-			  "Start closingd");
+	peer_start_closingd(channel, pps);
+
+	/* We might have reconnected, so already be here. */
+	if (!channel_closed(channel)
+	    && channel->state != CLOSINGD_SIGEXCHANGE)
+		channel_set_state(channel,
+				  CHANNELD_SHUTTING_DOWN,
+				  CLOSINGD_SIGEXCHANGE,
+				  REASON_UNKNOWN,
+				  "Start closingd");
 }
 
 static void forget(struct channel *channel)
@@ -478,7 +482,8 @@ static unsigned channel_msg(struct subd *sd, const u8 *msg, const int *fds)
 void peer_start_channeld(struct channel *channel,
 			 struct per_peer_state *pps,
 			 const u8 *fwd_msg,
-			 bool reconnected)
+			 bool reconnected,
+			 const u8 *reestablish_only)
 {
 	u8 *initmsg;
 	int hsmfd;
@@ -619,7 +624,11 @@ void peer_start_channeld(struct channel *channel,
 				      channel->remote_funding_locked,
 				      &scid,
 				      reconnected,
-				      channel->state == CHANNELD_SHUTTING_DOWN,
+				       /* Anything that indicates we are or have
+					* shut down */
+				      channel->state == CHANNELD_SHUTTING_DOWN
+				       || channel->state == CLOSINGD_SIGEXCHANGE
+				       || channel_closed(channel),
 				      channel->shutdown_scriptpubkey[REMOTE] != NULL,
 				      channel->shutdown_scriptpubkey[LOCAL],
 				      channel->channel_flags,
@@ -636,7 +645,8 @@ void peer_start_channeld(struct channel *channel,
 				      channel->option_anchor_outputs,
 				      IFDEV(ld->dev_fast_gossip, false),
 				      IFDEV(dev_fail_process_onionpacket, false),
-				      pbases);
+				      pbases,
+				      reestablish_only);
 
 	/* We don't expect a response: we are triggered by funding_depth_cb. */
 	subd_send_msg(channel->owner, take(initmsg));
@@ -784,8 +794,8 @@ void channel_notify_new_block(struct lightningd *ld,
 	tal_free(to_forget);
 }
 
-static struct channel *find_channel_by_id(const struct peer *peer,
-					  const struct channel_id *cid)
+struct channel *find_channel_by_id(const struct peer *peer,
+				   const struct channel_id *cid)
 {
 	struct channel *c;
 

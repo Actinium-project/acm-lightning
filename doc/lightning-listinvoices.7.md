@@ -20,18 +20,23 @@ query parameters can be used at once.
 RETURN VALUE
 ------------
 
-On success, an array *invoices* of objects is returned. Each object contains
-*label*, *description*, *payment\_hash*, *status* (one of *unpaid*, *paid* or *expired*),
-*payment\_preimage* (for paid invoices), and *expires\_at* (a UNIX
-timestamp).  If the *msatoshi* argument to lightning-invoice(7) was not "any",
-there will be an *msatoshi* field as a number, and *amount\_msat* as the same
-number ending in *msat*.  If the invoice was created with a bolt11 string,
-there will be a *bolt11* field.
-If the invoice *status* is *paid*, there will be a
-*pay\_index* field and an *msatoshi\_received* field (which may be slightly
-greater than *msatoshi* as some overpaying is permitted to allow clients to
-obscure payment paths); there will also be an *amount\_received\_msat* field
-with the same number as *msatoshi\_received* but ending in *msat*.
+[comment]: # (GENERATE-FROM-SCHEMA-START)
+On success, an object containing **invoices** is returned.  It is an array of objects, where each object contains:
+- **label** (string): unique label supplied at invoice creation
+- **description** (string): description used in the invoice
+- **payment_hash** (hex): the hash of the *payment_preimage* which will prove payment (always 64 characters)
+- **status** (string): Whether it's paid, unpaid or unpayable (one of "unpaid", "paid", "expired")
+- **expires_at** (u64): UNIX timestamp of when it will become / became unpayable
+- **amount_msat** (msat, optional): the amount required to pay this invoice
+- **bolt11** (string, optional): the BOLT11 string (always present unless *bolt12* is)
+- **bolt12** (string, optional): the BOLT12 string (always present unless *bolt11* is)
+
+If **status** is "paid":
+  - **pay_index** (u64): Unique incrementing index for this payment
+  - **amount_received_msat** (msat): the amount actually received (could be slightly greater than *amount_msat*, since clients may overpay)
+  - **paid_at** (u64): UNIX timestamp of when it was paid
+  - **payment_preimage** (hex): proof of payment (always 64 characters)
+[comment]: # (GENERATE-FROM-SCHEMA-END)
 
 AUTHOR
 ------
@@ -48,3 +53,4 @@ RESOURCES
 
 Main web site: <https://github.com/ElementsProject/lightning>
 
+[comment]: # ( SHA256STAMP:67ff5d9aa945301f23d6694304e4b657a37f0b3f80cc1c13c2ff23a55fe51d4b)

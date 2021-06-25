@@ -588,7 +588,7 @@ def test_reconnect_no_update(node_factory, executor, bitcoind):
     # Close will trigger the @WIRE_SHUTDOWN and we then wait for the
     # automatic reconnection to trigger the retransmission.
     l1.rpc.close(l2.info['id'], 0)
-    l2.daemon.wait_for_log(r"closingd.* Retransmitting funding_locked for channel")
+    l2.daemon.wait_for_log(r"channeld.* Retransmitting funding_locked for channel")
     l1.daemon.wait_for_log(r"CLOSINGD_COMPLETE")
 
 
@@ -1242,7 +1242,7 @@ def test_funding_external_wallet_corners(node_factory, bitcoind):
 
     # on reconnect, channel should get destroyed
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
-    l1.daemon.wait_for_log('Rejecting WIRE_CHANNEL_REESTABLISH for unknown channel_id')
+    l1.daemon.wait_for_log('Reestablish on UNKNOWN channel')
     wait_for(lambda: len(l1.rpc.listpeers()['peers']) == 0)
     wait_for(lambda: len(l2.rpc.listpeers()['peers']) == 0)
 
@@ -1895,7 +1895,7 @@ def test_multifunding_feerates(node_factory, bitcoind):
     assert only_one(only_one(l1.rpc.listpeers(l2.info['id'])['peers'])['channels'])['feerate']['perkw'] == commitment_tx_feerate_int
     assert only_one(only_one(l1.rpc.listpeers(l2.info['id'])['peers'])['channels'])['feerate']['perkb'] == commitment_tx_feerate_int * 4
 
-    txfee = only_one(only_one(l1.rpc.listpeers(l2.info['id'])['peers'])['channels'])['last_tx_fee']
+    txfee = only_one(only_one(l1.rpc.listpeers(l2.info['id'])['peers'])['channels'])['last_tx_fee_msat']
 
     # We get the expected close txid, force close the channel, then fish
     # the details about the transaction out of the mempoool entry
@@ -1923,7 +1923,7 @@ def test_multifunding_feerates(node_factory, bitcoind):
         expected_fee += 330
 
     assert expected_fee == entry['fees']['base'] * 10 ** 8
-    assert Millisatoshi(str(expected_fee) + 'sat') == Millisatoshi(txfee)
+    assert Millisatoshi(str(expected_fee) + 'sat') == txfee
 
 
 def test_multifunding_param_failures(node_factory):
@@ -3326,8 +3326,8 @@ def test_wumbo_channels(node_factory, bitcoind):
     wait_for(lambda: 'CHANNELD_NORMAL' in [c['state'] for c in only_one(l1.rpc.listpeers(l2.info['id'])['peers'])['channels']])
 
     # Exact amount depends on fees, but it will be wumbo!
-    amount = [c['funding_msat'][l1.info['id']] for c in only_one(l1.rpc.listpeers(l2.info['id'])['peers'])['channels'] if c['state'] == 'CHANNELD_NORMAL'][0]
-    assert Millisatoshi(amount) > Millisatoshi(str((1 << 24) - 1) + "sat")
+    amount = [c['funding']['local_msat'] for c in only_one(l1.rpc.listpeers(l2.info['id'])['peers'])['channels'] if c['state'] == 'CHANNELD_NORMAL'][0]
+    assert amount > Millisatoshi(str((1 << 24) - 1) + "sat")
 
 
 @pytest.mark.openchannel('v1')

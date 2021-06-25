@@ -51,7 +51,7 @@ void json_add_uncommitted_channel(struct json_stream *response,
 	json_object_start(response, NULL);
 	json_add_string(response, "state", "OPENINGD");
 	json_add_string(response, "owner", "lightning_openingd");
-	json_add_string(response, "funding", "LOCAL");
+	json_add_string(response, "opener", "local");
 	if (uc->transient_billboard) {
 		json_array_start(response, "status");
 		json_add_string(response, NULL, uc->transient_billboard);
@@ -420,7 +420,7 @@ static void opening_funder_finished(struct subd *openingd, const u8 *resp,
 		wallet_penalty_base_add(ld->wallet, channel->dbid, pbase);
 
 	funding_success(channel);
-	peer_start_channeld(channel, pps, NULL, false);
+	peer_start_channeld(channel, pps, NULL, false, NULL);
 
 cleanup:
 	subd_release_channel(openingd, fc->uc);
@@ -535,7 +535,7 @@ static void opening_fundee_finished(struct subd *openingd,
 		wallet_penalty_base_add(ld->wallet, channel->dbid, pbase);
 
 	/* On to normal operation! */
-	peer_start_channeld(channel, pps, fwd_msg, false);
+	peer_start_channeld(channel, pps, fwd_msg, false, NULL);
 
 	subd_release_channel(openingd, uc);
 	uc->open_daemon = NULL;
@@ -801,6 +801,31 @@ static void opening_got_offer(struct subd *openingd,
 	plugin_hook_call_openchannel(openingd->ld, payload);
 }
 
+static void opening_got_reestablish(struct subd *openingd, const u8 *msg,
+				    const int fds[3],
+				    struct uncommitted_channel *uc)
+{
+	struct lightningd *ld = openingd->ld;
+	struct node_id peer_id = uc->peer->id;
+	struct channel_id channel_id;
+	u8 *reestablish;
+	struct per_peer_state *pps;
+
+	if (!fromwire_openingd_got_reestablish(tmpctx, msg, &channel_id,
+					       &reestablish, &pps)) {
+		log_broken(openingd->log, "Malformed opening_got_reestablish %s",
+			   tal_hex(tmpctx, msg));
+		tal_free(openingd);
+		return;
+	}
+	per_peer_state_set_fds_arr(pps, fds);
+
+	/* This could free peer */
+	tal_free(uc);
+
+	handle_reestablish(ld, &peer_id, &channel_id, reestablish, pps);
+}
+
 static unsigned int openingd_msg(struct subd *openingd,
 				 const u8 *msg, const int *fds)
 {
@@ -846,6 +871,12 @@ static unsigned int openingd_msg(struct subd *openingd,
 
 	case WIRE_OPENINGD_GOT_OFFER:
 		opening_got_offer(openingd, msg, uc);
+		return 0;
+
+	case WIRE_OPENINGD_GOT_REESTABLISH:
+		if (tal_count(fds) != 3)
+			return 3;
+		opening_got_reestablish(openingd, msg, fds, uc);
 		return 0;
 
 	/* We send these! */

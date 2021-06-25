@@ -720,9 +720,9 @@ def test_channel_state_changed_bilateral(node_factory, bitcoind):
     # check channel 'opener' and 'closer' within this testcase ...
     assert(l1.rpc.listpeers()['peers'][0]['channels'][0]['opener'] == 'local')
     assert(l2.rpc.listpeers()['peers'][0]['channels'][0]['opener'] == 'remote')
-    # the 'closer' should be null initially
-    assert(l2.rpc.listpeers()['peers'][0]['channels'][0]['closer'] is None)
-    assert(l2.rpc.listpeers()['peers'][0]['channels'][0]['closer'] is None)
+    # the 'closer' should be missing initially
+    assert 'closer' not in l1.rpc.listpeers()['peers'][0]['channels'][0]
+    assert 'closer' not in l2.rpc.listpeers()['peers'][0]['channels'][0]
 
     event1 = wait_for_event(l1)
     event2 = wait_for_event(l2)
@@ -1385,6 +1385,9 @@ def test_rpc_command_hook(node_factory):
     assert decoded["description"] == "rpc_command_1 modified this description"
     l1.daemon.wait_for_log("rpc_command hook 'invoice' already modified, ignoring.")
 
+    # Disable schema checking here!
+    schemas = l1.rpc.jsonschemas
+    l1.rpc.jsonschemas = {}
     # rpc_command_1 plugin sends a custom response to "listfunds"
     funds = l1.rpc.listfunds()
     assert funds[0] == "Custom rpc_command_1 result"
@@ -1403,6 +1406,8 @@ def test_rpc_command_hook(node_factory):
     else:
         l1.rpc.plugin_stop('rpc_command_1.py')
         l1.rpc.plugin_stop('rpc_command_2.py')
+
+    l1.rpc.jsonschemas = schemas
 
 
 def test_libplugin(node_factory):
