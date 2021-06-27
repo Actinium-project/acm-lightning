@@ -267,6 +267,7 @@ struct onion_payload *onion_decode(const tal_t *ctx,
 				   const struct route_step *rs,
 				   const struct pubkey *blinding,
 				   const struct secret *blinding_ss,
+				   u64 *accepted_extra_tlvs,
 				   u64 *failtlvtype,
 				   size_t *failtlvpos)
 {
@@ -305,6 +306,7 @@ struct onion_payload *onion_decode(const tal_t *ctx,
 		/* If they somehow got an invalid onion this far, fail. */
 		if (!cursor)
 			return tal_free(p);
+		p->tlv = NULL;
 		return p;
 
 	case ONION_TLV_PAYLOAD:
@@ -312,7 +314,7 @@ struct onion_payload *onion_decode(const tal_t *ctx,
 		if (!fromwire_tlv_payload(&cursor, &max, tlv))
 			goto fail;
 
-		if (!tlv_payload_is_valid(tlv, failtlvpos)) {
+		if (!tlv_fields_valid(tlv->fields, accepted_extra_tlvs, failtlvpos)) {
 			*failtlvtype = tlv->fields[*failtlvpos].numtype;
 			goto fail;
 		}
@@ -403,7 +405,7 @@ struct onion_payload *onion_decode(const tal_t *ctx,
 			*p->total_msat
 				= amount_msat(tlv->payment_data->total_msat);
 		}
-		tal_free(tlv);
+		p->tlv = tal_steal(p, tlv);
 		return p;
 	}
 

@@ -28,6 +28,7 @@ static struct node_id my_id;
 
 struct keysend_data {
 	struct preimage preimage;
+	struct tlv_field *extra_tlvs;
 };
 
 REGISTER_PAYMENT_MODIFIER_HEADER(keysend, struct keysend_data);
@@ -44,6 +45,9 @@ static struct keysend_data *keysend_init(struct payment *p)
 		randombytes_buf(&d->preimage, sizeof(d->preimage));
 		ccan_sha256(&payment_hash, &d->preimage, sizeof(d->preimage));
 		p->payment_hash = tal_dup(p, struct sha256, &payment_hash);
+#if EXPERIMENTAL_FEATURES
+		d->extra_tlvs = NULL;
+#endif
 		return d;
 	} else {
 		/* If we are a child payment (retry or split) we copy the
@@ -91,6 +95,16 @@ static void keysend_cb(struct keysend_data *d, struct payment *p) {
 	tlvstream_set_raw(&last_payload->tlv_payload->fields, PREIMAGE_TLV_TYPE,
 			  &d->preimage, sizeof(struct preimage));
 
+#if EXPERIMENTAL_FEATURES
+	if (d->extra_tlvs != NULL) {
+		for (size_t i = 0; i < tal_count(d->extra_tlvs); i++) {
+			struct tlv_field *f = &d->extra_tlvs[i];
+			tlvstream_set_raw(&last_payload->tlv_payload->fields,
+					  f->numtype, f->value, f->length);
+		}
+	}
+#endif
+
 	return payment_continue(p);
 }
 
@@ -135,6 +149,10 @@ static struct command_result *json_keysend(struct command *cmd, const char *buf,
 	u64 *maxfee_pct_millionths;
 	u32 *maxdelay;
 	unsigned int *retryfor;
+#if EXPERIMENTAL_FEATURES
+	struct tlv_field *extra_fields;
+#endif
+
 #if DEVELOPER
 	bool *use_shadow;
 #endif
@@ -150,6 +168,9 @@ static struct command_result *json_keysend(struct command *cmd, const char *buf,
 		   p_opt_def("exemptfee", param_msat, &exemptfee, AMOUNT_MSAT(5000)),
 #if DEVELOPER
 		   p_opt_def("use_shadow", param_bool, &use_shadow, true),
+#endif
+#if EXPERIMENTAL_FEATURES
+		   p_opt("extratlvs", param_extra_tlvs, &extra_fields),
 #endif
 		   NULL))
 		return command_param_failed();
@@ -186,6 +207,11 @@ static struct command_result *json_keysend(struct command *cmd, const char *buf,
 	}
 
 	p->constraints.cltv_budget = *maxdelay;
+
+#if EXPERIMENTAL_FEATURES
+	payment_mod_keysend_get_data(p)->extra_tlvs =
+	    tal_steal(p, extra_fields);
+#endif
 
 	payment_mod_exemptfee_get_data(p)->amount = *exemptfee;
 #if DEVELOPER
@@ -261,9 +287,8 @@ static struct command_result *htlc_accepted_call(struct command *cmd,
 	struct sha256 payment_hash;
 	size_t max;
 	struct tlv_tlv_payload *payload;
-	struct tlv_field *preimage_field = NULL;
+	struct tlv_field *preimage_field = NULL, *unknown_field = NULL;
 	bigsize_t s;
-	bool unknown_even_type = false;
 	struct tlv_field *field;
 	struct keysend_in *ki;
 	struct out_req *req;
@@ -299,8 +324,7 @@ static struct command_result *htlc_accepted_call(struct command *cmd,
 			preimage_field = field;
 			break;
 		} else if (field->numtype % 2 == 0 && field->meta == NULL) {
-			unknown_even_type = true;
-			break;
+			unknown_field = field;
 		}
 	}
 
@@ -309,14 +333,22 @@ static struct command_result *htlc_accepted_call(struct command *cmd,
 	if (preimage_field == NULL)
 		return htlc_accepted_continue(cmd, NULL);
 
-	if (unknown_even_type) {
+	if (unknown_field != NULL) {
+#if !EXPERIMENTAL_FEATURES
 		plugin_log(cmd->plugin, LOG_UNUSUAL,
 			   "Payload contains unknown even TLV-type %" PRIu64
 			   ", can't safely accept the keysend. Deferring to "
 			   "other plugins.",
-			   preimage_field->numtype);
+			   unknown_field->numtype);
 		return htlc_accepted_continue(cmd, NULL);
+#else
+		plugin_log(cmd->plugin, LOG_INFORM,
+			   "Experimental: Accepting the keysend payment "
+			   "despite having unknown even TLV type %" PRIu64 ".",
+			   unknown_field->numtype);
+#endif
 	}
+
 
 	/* If the preimage is not 32 bytes long then we can't accept the
 	 * payment. */

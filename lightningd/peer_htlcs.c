@@ -927,6 +927,7 @@ static bool htlc_accepted_hook_deserialize(struct htlc_accepted_hook_payload *re
 		rs->raw_payload = prepend_length(rs, take(payload));
 		request->payload = onion_decode(request, rs,
 						hin->blinding, &hin->blinding_ss,
+						ld->accept_extra_tlv_types,
 						&request->failtlvtype,
 						&request->failtlvpos);
 
@@ -1075,6 +1076,10 @@ htlc_accepted_hook_final(struct htlc_accepted_hook_payload *request STEALS)
 	struct channel *channel = request->channel;
 
 	request->hin->status = tal_free(request->hin->status);
+
+	/* Hand the payload to the htlc_in since we'll want to have that info
+	 * handy for the hooks and notifications. */
+	request->hin->payload = tal_steal(request->hin, request->payload);
 
 	/* *Now* we barf if it failed to decode */
 	if (!request->payload) {
@@ -1243,6 +1248,7 @@ static bool peer_accepted_htlc(const tal_t *ctx,
 	hook_payload->route_step = tal_steal(hook_payload, rs);
 	hook_payload->payload = onion_decode(hook_payload, rs,
 					     hin->blinding, &hin->blinding_ss,
+					     ld->accept_extra_tlv_types,
 					     &hook_payload->failtlvtype,
 					     &hook_payload->failtlvpos);
 	hook_payload->ld = ld;

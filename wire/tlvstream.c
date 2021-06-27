@@ -1,5 +1,6 @@
 #include "config.h"
 #include <assert.h>
+#include <ccan/asort/asort.h>
 #include <common/bigsize.h>
 #include <wire/tlvstream.h>
 #include <wire/wire.h>
@@ -8,10 +9,18 @@
 #define SUPERVERBOSE(...)
 #endif
 
-void towire_tlvstream_raw(u8 **pptr, const struct tlv_field *fields)
+static int tlv_field_cmp(const struct tlv_field *a, const struct tlv_field *b,
+			 void *x)
+{
+	return a->numtype > b->numtype ? 1 : -1;
+}
+
+void towire_tlvstream_raw(u8 **pptr, struct tlv_field *fields)
 {
 	if (!fields)
 		return;
+
+	asort(fields, tal_count(fields), tlv_field_cmp, NULL);
 
 	for (size_t i = 0; i < tal_count(fields); i++) {
 		const struct tlv_field *field = &fields[i];
@@ -205,14 +214,31 @@ fail:
 	return false;
 }
 
-bool tlv_fields_valid(const struct tlv_field *fields, size_t *err_index)
+static bool tlv_type_is_allowed(const struct tlv_field *f, u64 *extra_types) {
+	/* Simple case: we have internal meta fields or it's an odd field. */
+	if (f->numtype % 2 != 0 || f->meta != NULL)
+		return true;
+
+	if (extra_types == NULL)
+		return false;
+
+	/* Now iterate through the extras and see if we should make an
+	 * exception. */
+	for (size_t i = 0; i < tal_count(extra_types); i++)
+		if (extra_types[i] == f->numtype)
+			return true;
+	return false;
+}
+
+bool tlv_fields_valid(const struct tlv_field *fields, u64 *allow_extra,
+		      size_t *err_index)
 {
 	size_t numfields = tal_count(fields);
 	bool first = true;
 	u64 prev_type = 0;
 	for (int i=0; i<numfields; i++) {
 		const struct tlv_field *f = &fields[i];
-		if (f->numtype % 2 == 0 && f->meta == NULL) {
+		if (!tlv_type_is_allowed(f, allow_extra)) {
 			/* BOLT #1:
 			 * - otherwise, if `type` is unknown:
 			 *   - if `type` is even:

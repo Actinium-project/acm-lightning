@@ -24,6 +24,9 @@ struct onion_payload {
 	/* If blinding is set, blinding_ss is the shared secret.*/
 	struct pubkey *blinding;
 	struct secret blinding_ss;
+
+	/* The raw TLVs contained in the payload. */
+	struct tlv_tlv_payload *tlv;
 };
 
 u8 *onion_nonfinal_hop(const tal_t *ctx,
@@ -68,6 +71,7 @@ size_t onion_payload_length(const u8 *raw_payload, size_t len,
  *       onion_payload_length().
  * @blinding: the optional incoming blinding point.
  * @blinding_ss: the shared secret derived from @blinding (iff that's non-NULL)
+ * @accepted_extra_tlvs: Allow these types to be in the TLV without failing
  * @failtlvtype: (out) the tlv type which failed to parse.
  * @failtlvpos: (out) the offset in the tlv which failed to parse.
  *
@@ -77,6 +81,7 @@ struct onion_payload *onion_decode(const tal_t *ctx,
 				   const struct route_step *rs,
 				   const struct pubkey *blinding,
 				   const struct secret *blinding_ss,
+				   u64 *accepted_extra_tlvs,
 				   u64 *failtlvtype,
 				   size_t *failtlvpos);
 
